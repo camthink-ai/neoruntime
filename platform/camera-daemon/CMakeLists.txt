@@ -198,6 +198,7 @@ set(SOURCES
     src/camera_daemon.cpp
     ${AUTO_AF_CORE_DIR}/af_calibration.cpp
     ${AUTO_AF_CORE_DIR}/af_follow.cpp
+    ${AUTO_AF_CORE_DIR}/af_ir_follow.cpp
     ${AUTO_AF_CORE_DIR}/af_metric.cpp
     ${AUTO_AF_CORE_DIR}/af_scan.cpp
 )
