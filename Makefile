@@ -463,6 +463,10 @@ _pack-internal: _pack-stage
 	else \
 		echo "  - imaging configs not found at $$IMAGING_BASE"; \
 	fi
+	@mkdir -p "$(STAGE_DIR)/opt/aipc/etc/imaging" \
+		"$(STAGE_DIR)/opt/aipc/etc"
+	@cp -a configs/imaging/. "$(STAGE_DIR)/opt/aipc/etc/imaging/" 2>/dev/null || true
+	@cp -f configs/platform/ir_zoom_lut.csv "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@mkdir -p "$(RELEASE_DIR)"
 	tar czf "$(TARBALL)" -C "$(RELEASE_DIR)" "$(PKG_NAME)"
 	@echo "=== Release Package Ready ==="

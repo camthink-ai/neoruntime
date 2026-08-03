@@ -2874,6 +2874,25 @@ void CameraDaemon::start_grpc_server() {
         HAL_LOG_WARNING("CameraDaemon: autofocus unavailable (lens/ISP/video missing)");
     }
 
+    if (config_.infrared.enabled) {
+        illumination_controller_ = std::make_unique<IlluminationController>(
+            config_.infrared,
+            [this](uint32_t led_id, uint32_t duty) {
+                return set_led_duty_raw(led_id, duty);
+            });
+        std::string warning;
+        illumination_controller_->initialize(&warning);
+        illumination_controller_->set_active_profile(get_current_profile());
+        if (!warning.empty()) {
+            HAL_LOG_WARNING("CameraDaemon: %s", warning.c_str());
+        }
+        std::string error;
+        illumination_controller_->set_mode(
+            config_.infrared.default_mode == "infrared"
+                ? ImagingMode::Infrared : ImagingMode::Day,
+            current_zoom_ratio(), &error);
+    }
+
     camera_control_service_ = std::make_unique<CameraControlServiceImpl>(this);
     builder.RegisterService(camera_control_service_.get());
 
@@ -2900,6 +2919,7 @@ void CameraDaemon::stop_grpc_server() {
     lens_controller_ = nullptr;
     lens_hal_service_.reset();
     camera_control_service_.reset();
+    illumination_controller_.reset();
 }
 #endif
 
@@ -3861,7 +3881,7 @@ bool CameraDaemon::get_ircut(uint32_t& mode) {
     return true;
 }
 
-bool CameraDaemon::set_led_duty(uint32_t led_id, uint32_t duty_percent) {
+bool CameraDaemon::set_led_duty_raw(uint32_t led_id, uint32_t duty_percent) {
     if (!hal_loader_ || !hal_loader_->has_led()) {
         HAL_LOG_ERROR("CameraDaemon: LED HAL not loaded");
         return false;
@@ -3882,6 +3902,159 @@ bool CameraDaemon::set_led_duty(uint32_t led_id, uint32_t duty_percent) {
     }
     HAL_LOG_INFO("CameraDaemon: LED %u duty set to %u%%", led_id, duty_percent);
     return true;
+}
+
+double CameraDaemon::current_zoom_ratio() const {
+#ifdef HAS_GRPC
+    if (lens_controller_) {
+        LensControllerState state{};
+        if (lens_controller_->state_get(&state) == HAL_OK) {
+            return std::clamp(static_cast<double>(lens_controller_->pos_to_ratio(state.zoom_pos)),
+                              1.0, 2.88);
+        }
+    }
+#endif
+    return 1.0;
+}
+
+bool CameraDaemon::set_led_duty(uint32_t led_id, uint32_t duty_percent) {
+    if (!illumination_controller_ ||
+        (led_id != config_.infrared.near_led_id && led_id != config_.infrared.far_led_id)) {
+        return set_led_duty_raw(led_id, duty_percent);
+    }
+    const auto status = illumination_controller_->status();
+    int near_pwm = status.manual_override ? status.requested_near_pwm
+                                          : status.applied_near_pwm;
+    int far_pwm = status.manual_override ? status.requested_far_pwm
+                                         : status.applied_far_pwm;
+    if (led_id == config_.infrared.near_led_id) near_pwm = static_cast<int>(duty_percent);
+    if (led_id == config_.infrared.far_led_id) far_pwm = static_cast<int>(duty_percent);
+    std::string error;
+    return illumination_controller_->set_manual_pwm(
+        near_pwm, far_pwm, current_zoom_ratio(), &error);
+}
+
+bool CameraDaemon::set_imaging_mode(ImagingMode mode, std::string* message) {
+    std::lock_guard<std::mutex> mode_lock(imaging_mode_mu_);
+    if (!illumination_controller_) {
+        if (message) *message = "infrared controller unavailable";
+        return false;
+    }
+
+    const auto before = illumination_controller_->status();
+    if (before.transition == ImagingModeTransition::Switching) {
+        if (message) *message = "imaging mode switch already active";
+        return false;
+    }
+    if (before.mode == mode && before.transition == ImagingModeTransition::Idle) {
+        return true;
+    }
+
+    illumination_controller_->set_transition(ImagingModeTransition::Switching);
+    const std::string previous_profile = get_current_profile();
+    const double ratio = current_zoom_ratio();
+
+#ifdef HAS_GRPC
+    if (autofocus_controller_) {
+        autofocus_controller_->stop();
+        autofocus_controller_->invalidate_anchor("imaging mode changed");
+    }
+#endif
+
+    auto restart_af = [&]() {
+#ifdef HAS_GRPC
+        if (autofocus_controller_) {
+            autofocus_controller_->update_video_context(video_source_->video_ctx());
+            autofocus_controller_->start();
+        }
+#endif
+    };
+    auto wait_stable = [&]() {
+        if (!frame_router_ || config_.infrared.mode_settle_frames <= 0) return true;
+        return frame_router_->wait_next_frames(
+            config_.autofocus.stream_name,
+            static_cast<uint32_t>(config_.infrared.mode_settle_frames),
+            std::chrono::milliseconds(std::max(
+                config_.autofocus.frame_wait_timeout_ms *
+                    config_.infrared.mode_settle_frames,
+                1)));
+    };
+
+    std::string error;
+    bool ok = true;
+    if (mode == ImagingMode::Infrared) {
+        illumination_controller_->set_mode(ImagingMode::Day, ratio, nullptr);
+        ok = switch_profile_internal(config_.infrared.infrared_profile, false, &error);
+        if (ok) ok = set_ircut(1);
+        if (ok) ok = illumination_controller_->set_mode(ImagingMode::Infrared, ratio, &error);
+        if (ok) ok = wait_stable();
+        if (ok) day_profile_before_infrared_ = previous_profile;
+    } else {
+        illumination_controller_->set_mode(ImagingMode::Day, ratio, nullptr);
+        ok = set_ircut(0);
+        const std::string day_profile = day_profile_before_infrared_.empty()
+            ? "Daylight_Basic" : day_profile_before_infrared_;
+        if (ok) ok = switch_profile_internal(day_profile, false, &error);
+        if (ok) ok = wait_stable();
+    }
+
+    if (!ok) {
+        HAL_LOG_ERROR("CameraDaemon: imaging mode switch to %s failed: %s",
+                      imaging_mode_name(mode), error.c_str());
+        illumination_controller_->set_mode(ImagingMode::Day, ratio, nullptr);
+        set_ircut(0);
+        if (!previous_profile.empty() && get_current_profile() != previous_profile) {
+            std::string rollback_error;
+            switch_profile_internal(previous_profile, false, &rollback_error);
+        }
+        illumination_controller_->set_transition(
+            ImagingModeTransition::Failed,
+            error.empty() ? "imaging mode switch failed" : error);
+        restart_af();
+        if (message) *message = error.empty() ? "imaging mode switch failed" : error;
+        return false;
+    }
+
+    illumination_controller_->set_active_profile(get_current_profile());
+    illumination_controller_->set_transition(ImagingModeTransition::Idle);
+    restart_af();
+    HAL_LOG_INFO("CameraDaemon: imaging mode switched to %s", imaging_mode_name(mode));
+    return true;
+}
+
+bool CameraDaemon::set_infrared_manual(uint32_t near_pwm, uint32_t far_pwm,
+                                       std::string* message) {
+    if (!illumination_controller_) {
+        if (message) *message = "infrared controller unavailable";
+        return false;
+    }
+    return illumination_controller_->set_manual_pwm(
+        static_cast<int>(std::min(near_pwm, 100u)),
+        static_cast<int>(std::min(far_pwm, 100u)),
+        current_zoom_ratio(), message);
+}
+
+bool CameraDaemon::clear_infrared_manual(std::string* message) {
+    if (!illumination_controller_) {
+        if (message) *message = "infrared controller unavailable";
+        return false;
+    }
+    return illumination_controller_->clear_manual(current_zoom_ratio(), message);
+}
+
+bool CameraDaemon::set_infrared_auto_follow(bool enabled, std::string* message) {
+    if (!illumination_controller_) {
+        if (message) *message = "infrared controller unavailable";
+        return false;
+    }
+    return illumination_controller_->set_auto_follow(enabled, current_zoom_ratio(), message);
+}
+
+IlluminationStatus CameraDaemon::get_illumination_status() const {
+    if (illumination_controller_) return illumination_controller_->status();
+    IlluminationStatus status;
+    status.error = "infrared controller unavailable";
+    return status;
 }
 
 bool CameraDaemon::get_led_duty(uint32_t led_id, uint32_t& duty_percent) {
@@ -4770,6 +4943,12 @@ bool CameraDaemon::backup_profile(const std::string& path) {
 }
 
 bool CameraDaemon::switch_profile(const std::string& profile_name, std::string* message) {
+    return switch_profile_internal(profile_name, true, message);
+}
+
+bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
+                                           bool restart_af,
+                                           std::string* message) {
     // Throttle gate 1/3 — reject a switch while another is already in flight.
     // op_mu_ is intentionally released around the blocking HAL switch and through
     // the verify/rollback windows below; without this guard a second concurrent
@@ -4839,7 +5018,7 @@ bool CameraDaemon::switch_profile(const std::string& profile_name, std::string* 
                  profile_name.c_str(), prev_profile.c_str());
 
 #ifdef HAS_GRPC
-    if (autofocus_controller_) {
+    if (restart_af && autofocus_controller_) {
         autofocus_controller_->stop();
         autofocus_controller_->invalidate_anchor("media profile changed");
     }
@@ -4870,7 +5049,7 @@ bool CameraDaemon::switch_profile(const std::string& profile_name, std::string* 
             HAL_LOG_ERROR("CameraDaemon: failed to restart FdPublisher after profile switch failure");
         }
 #ifdef HAS_GRPC
-        if (autofocus_controller_) {
+        if (restart_af && autofocus_controller_) {
             autofocus_controller_->update_video_context(video_source_->video_ctx());
             autofocus_controller_->start();
         }
@@ -5000,7 +5179,7 @@ bool CameraDaemon::switch_profile(const std::string& profile_name, std::string* 
     if (fd_pub_) fd_pub_->start();
 
 #ifdef HAS_GRPC
-    if (autofocus_controller_) {
+    if (restart_af && autofocus_controller_) {
         autofocus_controller_->update_video_context(video_source_->video_ctx());
         autofocus_controller_->start();
     }
@@ -5111,6 +5290,9 @@ bool CameraDaemon::switch_profile(const std::string& profile_name, std::string* 
     // OS-upgrade. Best-effort: the HAL switch already succeeded; only the
     // restart-survival mirror is at stake (a failure is logged, not fatal).
     persist_profile_config(profile_name);
+    if (illumination_controller_) {
+        illumination_controller_->set_active_profile(profile_name);
+    }
     return true;
 }
 

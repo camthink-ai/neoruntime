@@ -48,6 +48,7 @@ class CameraControlServiceImpl;
 class HalLoader;
 #include "audio_service.h"
 #include "autofocus_controller.h"
+#include "illumination_controller.h"
 class VideoSource;
 class FrameRouter;
 class FrameWatchdog;
@@ -200,6 +201,7 @@ struct DaemonConfig {
     int32_t     lens_focus_max     = 592;
 
     AutofocusConfig autofocus;
+    IlluminationConfig infrared;
 };
 
 /* ========== Camera Daemon ========== */
@@ -458,6 +460,13 @@ public:
     bool set_led_duty(uint32_t led_id, uint32_t duty_percent);
     bool get_led_duty(uint32_t led_id, uint32_t& duty_percent);
 
+    bool set_imaging_mode(ImagingMode mode, std::string* message = nullptr);
+    bool set_infrared_manual(uint32_t near_pwm, uint32_t far_pwm,
+                             std::string* message = nullptr);
+    bool clear_infrared_manual(std::string* message = nullptr);
+    bool set_infrared_auto_follow(bool enabled, std::string* message = nullptr);
+    IlluminationStatus get_illumination_status() const;
+
     // Device hardware status
     bool get_device_hardware_status(aipc::camera::DeviceHardwareStatus& status);
 
@@ -570,6 +579,9 @@ private:
     // ~1-2s) happen OUTSIDE the lock so the frontend thread never stalls.
     std::shared_ptr<DpmWorker>           dpm_worker_;
     mutable std::shared_mutex            dpm_mu_;
+    std::unique_ptr<IlluminationController> illumination_controller_;
+    mutable std::mutex imaging_mode_mu_;
+    std::string day_profile_before_infrared_;
 
 #ifdef HAS_GRPC
     std::unique_ptr<CameraControlServiceImpl> camera_control_service_;
@@ -580,6 +592,11 @@ private:
     void start_grpc_server();
     void stop_grpc_server();
 #endif
+
+    bool switch_profile_internal(const std::string& profile_name, bool restart_af,
+                                 std::string* message);
+    bool set_led_duty_raw(uint32_t led_id, uint32_t duty_percent);
+    double current_zoom_ratio() const;
 
     struct FpsTracker {
         uint64_t frame_count = 0;

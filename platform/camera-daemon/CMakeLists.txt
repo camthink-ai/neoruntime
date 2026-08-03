@@ -10,6 +10,7 @@ add_compile_options(-g)
 # Sanitizer options (enable with -DENABLE_ASAN=ON or -DENABLE_TSAN=ON)
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+option(CAMERA_DAEMON_BUILD_TESTS "Build camera-daemon native unit tests" OFF)
 if(ENABLE_ASAN)
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address)
@@ -193,6 +194,7 @@ set(SOURCES
     src/audio_service.cpp
     src/dpm_worker.cpp
     src/autofocus_controller.cpp
+    src/illumination_controller.cpp
     src/camera_control_service.cpp
     src/lens_hal_service.cpp
     src/camera_daemon.cpp
@@ -252,3 +254,21 @@ endif()
 
 # Install
 install(TARGETS camera-daemon DESTINATION /opt/aipc/bin)
+
+if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
+    enable_testing()
+    add_executable(illumination-controller-test
+        tests/illumination_controller_test.cpp
+        src/illumination_controller.cpp
+        ${AUTO_AF_CORE_DIR}/af_ir_follow.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(illumination-controller-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${AUTO_AF_CORE_DIR}
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+    )
+    target_link_libraries(illumination-controller-test PRIVATE pthread)
+    add_test(NAME illumination-controller-test COMMAND illumination-controller-test)
+endif()
