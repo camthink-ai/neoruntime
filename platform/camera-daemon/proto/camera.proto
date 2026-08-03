@@ -325,6 +325,34 @@ message LedStatus {
   uint32 duty_percent = 3;
 }
 
+message ImagingModeRequest {
+  string mode = 1; // day / infrared
+}
+
+message InfraredSettingsRequest {
+  optional bool auto_follow = 1;
+  optional uint32 near_pwm = 2;
+  optional uint32 far_pwm = 3;
+}
+
+message InfraredStatusResponse {
+  bool success = 1;
+  string message = 2;
+  string mode = 3;
+  string transition = 4;
+  string output_source = 5;
+  bool auto_follow = 6;
+  bool follow_active = 7;
+  bool manual_override = 8;
+  bool degraded = 9;
+  uint32 requested_near_pwm = 10;
+  uint32 requested_far_pwm = 11;
+  uint32 applied_near_pwm = 12;
+  uint32 applied_far_pwm = 13;
+  float zoom_ratio = 14;
+  string active_profile = 15;
+}
+
 // Device hardware status (sensor readings, MCU version, LED states)
 message DeviceHardwareStatus {
   bool success = 1;
@@ -558,6 +586,10 @@ service CameraControl {
   // LED / White Light / IR LED control
   rpc SetLedDuty(SetLedDutyRequest) returns (LedStatus);
   rpc GetLedDuty(GetLedDutyRequest) returns (LedStatus);
+  rpc SetImagingMode(ImagingModeRequest) returns (InfraredStatusResponse);
+  rpc GetInfraredStatus(Empty) returns (InfraredStatusResponse);
+  rpc SetInfraredSettings(InfraredSettingsRequest) returns (InfraredStatusResponse);
+  rpc ClearInfraredManual(Empty) returns (InfraredStatusResponse);
 
   // Device status (sensors, MCU version, LED state)
   rpc GetDeviceHardwareStatus(Empty) returns (DeviceHardwareStatus);

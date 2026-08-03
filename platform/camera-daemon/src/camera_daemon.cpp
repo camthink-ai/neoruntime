@@ -2865,15 +2865,6 @@ void CameraDaemon::start_grpc_server() {
         }
     }
 
-    if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
-        hal_loader_->has_isp() && video_source_ && frame_router_) {
-        autofocus_controller_ = std::make_unique<AutofocusController>(
-            hal_loader_->isp(), hal_loader_->video(), video_source_->video_ctx(),
-            frame_router_.get(), lens_controller_, config_.autofocus, 0, 0);
-    } else if (config_.autofocus.enabled) {
-        HAL_LOG_WARNING("CameraDaemon: autofocus unavailable (lens/ISP/video missing)");
-    }
-
     if (config_.infrared.enabled) {
         illumination_controller_ = std::make_unique<IlluminationController>(
             config_.infrared,
@@ -2891,6 +2882,16 @@ void CameraDaemon::start_grpc_server() {
             config_.infrared.default_mode == "infrared"
                 ? ImagingMode::Infrared : ImagingMode::Day,
             current_zoom_ratio(), &error);
+    }
+
+    if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
+        hal_loader_->has_isp() && video_source_ && frame_router_) {
+        autofocus_controller_ = std::make_unique<AutofocusController>(
+            hal_loader_->isp(), hal_loader_->video(), video_source_->video_ctx(),
+            frame_router_.get(), lens_controller_, illumination_controller_.get(),
+            config_.autofocus, 0, 0);
+    } else if (config_.autofocus.enabled) {
+        HAL_LOG_WARNING("CameraDaemon: autofocus unavailable (lens/ISP/video missing)");
     }
 
     camera_control_service_ = std::make_unique<CameraControlServiceImpl>(this);

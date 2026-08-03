@@ -755,6 +755,75 @@ func (s *DeviceControlServer) SetIrCut(ctx context.Context, req *pb.IrCutRequest
 	return &pb.Status{Success: resp.Success, Message: resp.Message}, nil
 }
 
+func infraredStatusFromCamera(resp *camerapb.InfraredStatusResponse) *pb.InfraredStatusResponse {
+	if resp == nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: "empty camera response"}
+	}
+	return &pb.InfraredStatusResponse{
+		Success: resp.Success, Message: resp.Message, Mode: resp.Mode,
+		Transition: resp.Transition, OutputSource: resp.OutputSource,
+		AutoFollow: resp.AutoFollow, FollowActive: resp.FollowActive,
+		ManualOverride: resp.ManualOverride, Degraded: resp.Degraded,
+		RequestedNearPwm: resp.RequestedNearPwm, RequestedFarPwm: resp.RequestedFarPwm,
+		AppliedNearPwm: resp.AppliedNearPwm, AppliedFarPwm: resp.AppliedFarPwm,
+		ZoomRatio: resp.ZoomRatio, ActiveProfile: resp.ActiveProfile,
+	}
+}
+
+func (s *DeviceControlServer) SetImagingMode(ctx context.Context, req *pb.ImagingModeRequest) (*pb.InfraredStatusResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.SetImagingMode(ctx, &camerapb.ImagingModeRequest{Mode: req.Mode})
+	if err != nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: err.Error()}, nil
+	}
+	return infraredStatusFromCamera(resp), nil
+}
+
+func (s *DeviceControlServer) GetInfraredStatus(ctx context.Context, _ *pb.Empty) (*pb.InfraredStatusResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.GetInfraredStatus(ctx, &camerapb.Empty{})
+	if err != nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: err.Error()}, nil
+	}
+	return infraredStatusFromCamera(resp), nil
+}
+
+func (s *DeviceControlServer) SetInfraredSettings(ctx context.Context, req *pb.InfraredSettingsRequest) (*pb.InfraredStatusResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	cameraReq := &camerapb.InfraredSettingsRequest{}
+	if req.AutoFollow != nil {
+		cameraReq.AutoFollow = req.AutoFollow
+	}
+	if req.NearPwm != nil {
+		cameraReq.NearPwm = req.NearPwm
+	}
+	if req.FarPwm != nil {
+		cameraReq.FarPwm = req.FarPwm
+	}
+	resp, err := s.cameraDaemonClient.SetInfraredSettings(ctx, cameraReq)
+	if err != nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: err.Error()}, nil
+	}
+	return infraredStatusFromCamera(resp), nil
+}
+
+func (s *DeviceControlServer) ClearInfraredManual(ctx context.Context, _ *pb.Empty) (*pb.InfraredStatusResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.ClearInfraredManual(ctx, &camerapb.Empty{})
+	if err != nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: err.Error()}, nil
+	}
+	return infraredStatusFromCamera(resp), nil
+}
+
 // PTZ Control
 
 func (s *DeviceControlServer) Pan(ctx context.Context, req *pb.PanRequest) (*pb.Status, error) {

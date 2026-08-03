@@ -5,6 +5,7 @@ import type {
   AutofocusStatus,
   DeviceStatus,
   IrCutMode,
+  InfraredStatus,
   LensStatus,
 } from '@/services/api/device';
 
@@ -52,6 +53,37 @@ export const useSetIrCut = () => {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['device', 'status'] });
     },
+  });
+};
+
+export const useInfraredStatus = () => useQuery<InfraredStatus>({
+  queryKey: ['device', 'infrared'],
+  queryFn: async () => {
+    const response = await deviceApi.getInfraredStatus();
+    return (response as any).data as InfraredStatus;
+  },
+  refetchInterval: 400,
+});
+
+export const useSetInfraredSettings = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (settings: { auto_follow?: boolean; near_pwm?: number; far_pwm?: number }) => {
+      const response = await deviceApi.setInfraredSettings(settings);
+      return (response as any).data as InfraredStatus;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['device', 'infrared'] }),
+  });
+};
+
+export const useClearInfraredManual = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const response = await deviceApi.clearInfraredManual();
+      return (response as any).data as InfraredStatus;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['device', 'infrared'] }),
   });
 };
 

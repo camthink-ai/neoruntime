@@ -175,6 +175,80 @@ func (h *APIHandlers) SetIrCut(c *gin.Context) {
 	Resp(c).OK(resp)
 }
 
+func (h *APIHandlers) SetImagingMode(c *gin.Context) {
+	var req struct {
+		Mode string `json:"mode" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
+		return
+	}
+	req.Mode = strings.ToLower(req.Mode)
+	if req.Mode != "day" && req.Mode != "infrared" {
+		Resp(c).FailMsg(CodeInvalidRequest, "Mode must be 'day' or 'infrared'")
+		return
+	}
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := client.SetImagingMode(ctx, &devicepb.ImagingModeRequest{Mode: req.Mode})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
+func (h *APIHandlers) GetInfraredStatus(c *gin.Context) {
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.GetInfraredStatus(ctx, &devicepb.Empty{})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
+func (h *APIHandlers) SetInfraredSettings(c *gin.Context) {
+	var req struct {
+		AutoFollow *bool   `json:"auto_follow"`
+		NearPWM    *uint32 `json:"near_pwm"`
+		FarPWM     *uint32 `json:"far_pwm"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
+		return
+	}
+	if (req.NearPWM != nil && *req.NearPWM > 100) || (req.FarPWM != nil && *req.FarPWM > 100) {
+		Resp(c).FailMsg(CodeInvalidRequest, "PWM must be between 0 and 100")
+		return
+	}
+	pbReq := &devicepb.InfraredSettingsRequest{AutoFollow: req.AutoFollow, NearPwm: req.NearPWM, FarPwm: req.FarPWM}
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.SetInfraredSettings(ctx, pbReq)
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
+func (h *APIHandlers) ClearInfraredManual(c *gin.Context) {
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.ClearInfraredManual(ctx, &devicepb.Empty{})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
 func (h *APIHandlers) ControlPTZ(c *gin.Context) {
 	if h.grpcClients.DeviceControl == nil {
 		Resp(c).FailMsg(CodeServiceUnavailable, "Device Control not available")

@@ -16,6 +16,7 @@ extern "C" {
 
 class FrameRouter;
 class LensController;
+class IlluminationController;
 
 enum class AutofocusOperation {
     None,
@@ -125,7 +126,8 @@ class AutofocusController {
 public:
     AutofocusController(HalIspOps* isp_ops, HalVideoOps* video_ops,
                         void* video_ctx, FrameRouter* frame_router,
-                        LensController* lens, const AutofocusConfig& config,
+                        LensController* lens, IlluminationController* illumination,
+                        const AutofocusConfig& config,
                         int sensor_native_width = 0, int sensor_native_height = 0);
     ~AutofocusController();
 

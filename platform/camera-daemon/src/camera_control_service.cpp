@@ -14,6 +14,32 @@ extern "C" {
     #include "peripheral/devices/hal_rs485.h"
 }
 
+namespace {
+
+void fill_infrared_status(const IlluminationStatus& status, bool success,
+                          const std::string& message,
+                          aipc::camera::InfraredStatusResponse* response) {
+    response->set_success(success);
+    response->set_message(message.empty() ? status.error : message);
+    response->set_mode(imaging_mode_name(status.mode));
+    const char* transition = status.transition == ImagingModeTransition::Switching
+        ? "switching" : (status.transition == ImagingModeTransition::Failed ? "failed" : "idle");
+    response->set_transition(transition);
+    response->set_output_source(infrared_output_source_name(status.source));
+    response->set_auto_follow(status.auto_follow);
+    response->set_follow_active(status.follow_active);
+    response->set_manual_override(status.manual_override);
+    response->set_degraded(status.degraded);
+    response->set_requested_near_pwm(status.requested_near_pwm);
+    response->set_requested_far_pwm(status.requested_far_pwm);
+    response->set_applied_near_pwm(status.applied_near_pwm);
+    response->set_applied_far_pwm(status.applied_far_pwm);
+    response->set_zoom_ratio(static_cast<float>(status.zoom_ratio));
+    response->set_active_profile(status.active_profile);
+}
+
+} // namespace
+
 CameraControlServiceImpl::CameraControlServiceImpl(CameraDaemon* daemon)
     : daemon_(daemon) {
 }
@@ -622,6 +648,57 @@ grpc::Status CameraControlServiceImpl::GetLedDuty(
         response->set_duty_percent(duty);
     }
 
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::SetImagingMode(
+    grpc::ServerContext*, const aipc::camera::ImagingModeRequest* request,
+    aipc::camera::InfraredStatusResponse* response) {
+    std::string error;
+    const bool valid = request->mode() == "day" || request->mode() == "infrared";
+    const bool ok = daemon_ && valid && daemon_->set_imaging_mode(
+        request->mode() == "infrared" ? ImagingMode::Infrared : ImagingMode::Day, &error);
+    fill_infrared_status(daemon_ ? daemon_->get_illumination_status() : IlluminationStatus{},
+                         ok, valid ? error : "invalid imaging mode", response);
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::GetInfraredStatus(
+    grpc::ServerContext*, const aipc::camera::Empty*,
+    aipc::camera::InfraredStatusResponse* response) {
+    const bool ok = daemon_ != nullptr;
+    fill_infrared_status(ok ? daemon_->get_illumination_status() : IlluminationStatus{},
+                         ok, ok ? "" : "daemon unavailable", response);
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::SetInfraredSettings(
+    grpc::ServerContext*, const aipc::camera::InfraredSettingsRequest* request,
+    aipc::camera::InfraredStatusResponse* response) {
+    std::string error;
+    bool ok = daemon_ != nullptr;
+    if (ok && request->has_auto_follow())
+        ok = daemon_->set_infrared_auto_follow(request->auto_follow(), &error);
+    if (ok && (request->has_near_pwm() || request->has_far_pwm())) {
+        const auto current = daemon_->get_illumination_status();
+        const uint32_t near_pwm = request->has_near_pwm()
+            ? request->near_pwm() : static_cast<uint32_t>(current.requested_near_pwm);
+        const uint32_t far_pwm = request->has_far_pwm()
+            ? request->far_pwm() : static_cast<uint32_t>(current.requested_far_pwm);
+        ok = daemon_->set_infrared_manual(near_pwm, far_pwm, &error);
+    }
+    fill_infrared_status(daemon_ ? daemon_->get_illumination_status() : IlluminationStatus{},
+                         ok, error, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::ClearInfraredManual(
+    grpc::ServerContext*, const aipc::camera::Empty*,
+    aipc::camera::InfraredStatusResponse* response) {
+    std::string error;
+    const bool ok = daemon_ && daemon_->clear_infrared_manual(&error);
+    fill_infrared_status(daemon_ ? daemon_->get_illumination_status() : IlluminationStatus{},
+                         ok, error, response);
     return grpc::Status::OK;
 }
 

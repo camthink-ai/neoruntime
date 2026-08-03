@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
-import { Lightbulb, Minus, Plus } from 'lucide-react';
+import { Lightbulb, Minus, Plus, RotateCcw } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -11,8 +11,9 @@ import { cn } from '@/lib/utils';
 import { LightingControlSkeleton } from './DeviceControlSkeletons';
 import {
   useDeviceStatus,
-  useSetLight,
-  useSetIrLed,
+  useInfraredStatus,
+  useSetInfraredSettings,
+  useClearInfraredManual,
 } from '@/hooks/useDeviceControl';
 
 const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
@@ -81,8 +82,9 @@ function IrBrightnessSlider({
 export default function LightingControl() {
   const { t } = useTranslation();
   const { data: status, isLoading } = useDeviceStatus();
-  const setLight = useSetLight();
-  const setIrLed = useSetIrLed();
+  const { data: infrared } = useInfraredStatus();
+  const setInfrared = useSetInfraredSettings();
+  const clearManual = useClearInfraredManual();
 
   const [nearLevel, setNearLevel] = useState(
     status?.white_light_level ?? DEFAULT_LEVEL
@@ -90,41 +92,36 @@ export default function LightingControl() {
   const [farLevel, setFarLevel] = useState(DEFAULT_LEVEL);
 
   useEffect(() => {
-    if (status?.white_light_level != null && status.white_light_level > 0) {
-      setNearLevel(status.white_light_level);
+    if (infrared) {
+      setNearLevel(infrared.requested_near_pwm);
+      setFarLevel(infrared.requested_far_pwm);
     }
-  }, [status?.white_light_level]);
-
-  useEffect(() => {
-    if (status?.ir_led_level != null) {
-      setFarLevel(status.ir_led_level > 0 ? status.ir_led_level : 0);
-    }
-  }, [status?.ir_led_level]);
+  }, [infrared]);
 
   const handleNearLevelCommit = useCallback(
     async (level: number) => {
       try {
-        await setLight.mutateAsync(level);
+        await setInfrared.mutateAsync({ near_pwm: level, far_pwm: farLevel });
       } catch {
         toast.error(
           t('sys.device.lighting.set_failed', 'Failed to update setting')
         );
       }
     },
-    [setLight, t]
+    [farLevel, setInfrared, t]
   );
 
   const handleFarLevelCommit = useCallback(
     async (level: number) => {
       try {
-        await setIrLed.mutateAsync(level);
+        await setInfrared.mutateAsync({ near_pwm: nearLevel, far_pwm: level });
       } catch {
         toast.error(
           t('sys.device.lighting.set_failed', 'Failed to update setting')
         );
       }
     },
-    [setIrLed, t]
+    [nearLevel, setInfrared, t]
   );
 
   const handleNearStep = async (direction: -1 | 1) => {
@@ -147,7 +144,7 @@ export default function LightingControl() {
       setNearLevel(level);
     }
     try {
-      await setLight.mutateAsync(level);
+      await setInfrared.mutateAsync({ near_pwm: level, far_pwm: farLevel });
     } catch {
       toast.error(
         t('sys.device.lighting.set_failed', 'Failed to update setting')
@@ -165,7 +162,7 @@ export default function LightingControl() {
       setFarLevel(0);
     }
     try {
-      await setIrLed.mutateAsync(level);
+      await setInfrared.mutateAsync({ near_pwm: nearLevel, far_pwm: level });
     } catch {
       toast.error(
         t('sys.device.lighting.set_failed', 'Failed to update setting')
@@ -177,8 +174,10 @@ export default function LightingControl() {
     return <LightingControlSkeleton />;
   }
 
-  const nearIrOn = (status?.white_light_level ?? 0) > 0;
-  const farIrOn = (status?.ir_led_level ?? 0) > 0;
+  const nearIrOn = nearLevel > 0;
+  const farIrOn = farLevel > 0;
+  const infraredActive = infrared?.mode === 'infrared';
+  const busy = setInfrared.isPending || clearManual.isPending;
 
   return (
     <Card className="shadow-sm bg-background">
@@ -188,6 +187,35 @@ export default function LightingControl() {
           {t('sys.device.lighting.title', 'IR Light Control')}
         </h3>
 
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-sm text-muted-foreground">{t('sys.device.lighting.auto_zoom', 'Auto follow Zoom')}</div>
+            <div className="text-xs text-muted-foreground">
+              {infrared?.follow_active
+                ? t('sys.device.lighting.follow_active', 'Zoom LUT active')
+                : (infrared?.output_source ?? 'off')}
+            </div>
+          </div>
+          <Switch
+            checked={infrared?.auto_follow ?? true}
+            disabled={!infraredActive || busy}
+            onCheckedChange={value => setInfrared.mutate({ auto_follow: value })}
+          />
+        </div>
+
+        {infrared?.manual_override && (
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full"
+            disabled={busy || infrared.follow_active}
+            onClick={() => clearManual.mutate()}
+          >
+            <RotateCcw className="mr-2 h-4 w-4" />
+            {t('sys.device.lighting.restore_auto', 'Restore automatic output')}
+          </Button>
+        )}
+
         <div className="space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-sm text-muted-foreground">
@@ -196,7 +224,7 @@ export default function LightingControl() {
             <Switch
               checked={nearIrOn}
               onCheckedChange={handleNearIrToggle}
-              disabled={setLight.isPending}
+              disabled={!infraredActive || busy}
             />
           </div>
           <div className="space-y-2">
@@ -213,7 +241,7 @@ export default function LightingControl() {
             </div>
             <IrBrightnessSlider
               level={nearLevel}
-              disabled={!nearIrOn || setLight.isPending}
+              disabled={!infraredActive || !nearIrOn || busy}
               onLevelChange={setNearLevel}
               onLevelCommit={handleNearLevelCommit}
               onStep={handleNearStep}
@@ -229,7 +257,7 @@ export default function LightingControl() {
             <Switch
               checked={farIrOn}
               onCheckedChange={handleFarIrToggle}
-              disabled={setIrLed.isPending}
+              disabled={!infraredActive || busy}
             />
           </div>
           <div className="space-y-2">
@@ -246,7 +274,7 @@ export default function LightingControl() {
             </div>
             <IrBrightnessSlider
               level={farLevel}
-              disabled={!farIrOn || setIrLed.isPending}
+              disabled={!infraredActive || !farIrOn || busy}
               onLevelChange={setFarLevel}
               onLevelCommit={handleFarLevelCommit}
               onStep={handleFarStep}
