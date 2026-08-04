@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
-import { Loader2, Sparkles } from 'lucide-react';
+import { Loader2, Moon, Sparkles } from 'lucide-react';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Slider } from '@/components/ui/slider';
@@ -26,6 +26,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { ImageIcon, RotateCw } from 'lucide-react';
+import { useInfraredStatus, useSetIrCut } from '@/hooks/useDeviceControl';
 import ImageSettingsSkeleton from './ImageSettingsSkeleton';
 import {
   fetchISPConfig,
@@ -99,6 +100,10 @@ export default function ImageSettings() {
   );
 
   const isInSwitchCooldown = () => Date.now() - lastSwitchAtRef.current < SWITCH_COOLDOWN_MS;
+  const { data: infrared } = useInfraredStatus();
+  const setIrCut = useSetIrCut();
+  const infraredActive = infrared?.mode === 'infrared';
+  const infraredSwitching = setIrCut.isPending || infrared?.transition === 'switching';
 
   // Remembers the last AI ISP Gen profile the user had active so toggling
   // AI ISP off→on restores it instead of always jumping to the default. Set
@@ -214,6 +219,28 @@ export default function ImageSettings() {
     [t]
   );
 
+  const handleInfraredModeChange = useCallback(
+    async (enabled: boolean) => {
+      try {
+        await setIrCut.mutateAsync(enabled ? 'night' : 'day');
+        await loadData();
+        window.dispatchEvent(
+          new CustomEvent('aipc:media-profile-changed', {
+            detail: { interrupt_ms: 0 },
+          })
+        );
+        toast.success(
+          enabled
+            ? t('sys.media_settings.ir_cut_success', 'Switched to infrared mode')
+            : t('sys.media_settings.ir_cut_success', 'Switched to day mode')
+        );
+      } catch {
+        toast.error(t('sys.media_settings.ir_cut_failed', 'Failed to switch imaging mode'));
+      }
+    },
+    [loadData, setIrCut, t]
+  );
+
   const ispDebounceRef = useRef<
     Record<string, { value: number; timer: ReturnType<typeof setTimeout> }>
   >({});
@@ -323,6 +350,28 @@ export default function ImageSettings() {
 
   return (
     <div className="flex flex-col gap-4">
+      <Card className="shadow-sm bg-background">
+        <CardContent className="p-5 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="space-y-0.5">
+              <h3 className="flex items-center gap-1.5 text-sm font-bold text-muted-foreground">
+                <Moon className="w-4 h-4" />
+                {t('sys.media_settings.infrared_mode', 'Infrared Mode')}
+              </h3>
+              <p className="text-xs text-muted-foreground">
+                {infraredActive
+                  ? t('sys.media_settings.infrared_on_hint', 'Infrared profile and IR illumination are active')
+                  : t('sys.media_settings.infrared_off_hint', 'Use the daylight profile with IR illumination off')}
+              </p>
+            </div>
+            <Switch
+              checked={infraredActive}
+              disabled={infraredSwitching}
+              onCheckedChange={handleInfraredModeChange}
+            />
+          </div>
+        </CardContent>
+      </Card>
       {/* AI ISP Profile Card */}
         <Card className="shadow-sm bg-background">
           <CardContent className="p-5 space-y-4">
@@ -341,7 +390,7 @@ export default function ImageSettings() {
                 <Switch
                   id="ai-isp-enable"
                   checked={aiEnabled}
-                  disabled={switching || aiProfiles.length === 0}
+                  disabled={infraredActive || switching || aiProfiles.length === 0}
                   onCheckedChange={checked => {
                     if (isInSwitchCooldown()) {
                       toast.warning(
