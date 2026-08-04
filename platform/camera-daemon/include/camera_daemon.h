@@ -511,6 +511,7 @@ public:
 private:
     void try_share_lens_mcu_ctx();
     void init_mcu_context();
+    void* refresh_autofocus_video_context();
 
     DaemonConfig config_;
     std::atomic<bool> running_{false};

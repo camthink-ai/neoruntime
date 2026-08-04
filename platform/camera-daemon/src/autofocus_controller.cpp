@@ -108,9 +108,11 @@ public:
     Impl(HalIspOps* isp_ops, HalVideoOps* video_ops, void* video_ctx,
          FrameRouter* frame_router, LensController* lens,
          IlluminationController* illumination, const AutofocusConfig& config,
-         int sensor_native_width, int sensor_native_height)
+         int sensor_native_width, int sensor_native_height,
+         AutofocusVideoContextRefreshFn refresh_video_context)
         : isp_ops_(isp_ops), video_ops_(video_ops), video_ctx_(video_ctx),
           frame_router_(frame_router), lens_(lens), illumination_(illumination),
+          refresh_video_context_(std::move(refresh_video_context)),
           config_(config) {
         // Priority: explicit constructor params > config fields > video_ctx query
         if (sensor_native_width > 0 && sensor_native_height > 0) {
@@ -291,6 +293,7 @@ private:
     FrameRouter* frame_router_ = nullptr;
     LensController* lens_ = nullptr;
     IlluminationController* illumination_ = nullptr;
+    AutofocusVideoContextRefreshFn refresh_video_context_;
     AutofocusConfig config_;
     hal_auto_af::IntegrationDefaults defaults_{};
     hal_auto_af::MetricConfig metric_config_{};
@@ -377,12 +380,17 @@ private:
         return false;
     }
 
-    bool configure_windows() {
-        void* video_ctx = video_ctx_.load();
-        if (!isp_ops_ || !isp_ops_->set_af_windows_config || !video_ctx) {
-            HAL_LOG_WARNING("Autofocus: configure_windows skipped — isp=%p set_af=%p ctx=%p",
-                         (void*)isp_ops_, (void*)(isp_ops_ ? isp_ops_->set_af_windows_config : nullptr),
-                         video_ctx);
+    bool configure_windows_once(void* video_ctx) {
+        if (!isp_ops_) {
+            HAL_LOG_ERROR("Autofocus: AF window setup failed: ISP operations are unavailable");
+            return false;
+        }
+        if (!isp_ops_->set_af_windows_config) {
+            HAL_LOG_ERROR("Autofocus: AF window setup failed: set_af_windows_config is unavailable");
+            return false;
+        }
+        if (!video_ctx) {
+            HAL_LOG_ERROR("Autofocus: AF window setup failed: video context is null");
             return false;
         }
 
@@ -426,6 +434,33 @@ private:
         }
         HAL_LOG_INFO("Autofocus: AF windows configured OK");
         return true;
+    }
+
+    bool configure_windows() {
+        void* video_ctx = video_ctx_.load();
+        if (configure_windows_once(video_ctx)) {
+            return true;
+        }
+
+        // A MediaLibrary/profile rebuild can invalidate HalVideoContext while
+        // the daemon itself remains alive. Refresh the FROM_MEDIA contexts once
+        // and retry with the new primary context instead of requiring a manual
+        // resolution change to rebuild the binding.
+        if (!refresh_video_context_) {
+            return false;
+        }
+
+        HAL_LOG_WARNING("Autofocus: AF window setup failed; refreshing video context and retrying once");
+        void* refreshed_ctx = refresh_video_context_();
+        if (!refreshed_ctx) {
+            HAL_LOG_ERROR("Autofocus: video context refresh returned null");
+            return false;
+        }
+
+        update_video_context(refreshed_ctx);
+        HAL_LOG_INFO("Autofocus: retrying AF window setup with refreshed video_ctx=%p",
+                     refreshed_ctx);
+        return configure_windows_once(refreshed_ctx);
     }
 
     int wait_frames(int count) {
@@ -1180,10 +1215,12 @@ AutofocusController::AutofocusController(
     HalIspOps* isp_ops, HalVideoOps* video_ops, void* video_ctx,
     FrameRouter* frame_router, LensController* lens,
     IlluminationController* illumination, const AutofocusConfig& config,
-    int sensor_native_width, int sensor_native_height)
+    int sensor_native_width, int sensor_native_height,
+    AutofocusVideoContextRefreshFn refresh_video_context)
     : impl_(std::make_unique<Impl>(isp_ops, video_ops, video_ctx,
                                    frame_router, lens, illumination, config,
-                                   sensor_native_width, sensor_native_height)) {}
+                                   sensor_native_width, sensor_native_height,
+                                   std::move(refresh_video_context))) {}
 
 AutofocusController::~AutofocusController() = default;
 void AutofocusController::start() { impl_->start(); }

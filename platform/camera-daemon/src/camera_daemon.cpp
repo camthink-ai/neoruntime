@@ -2912,7 +2912,9 @@ void CameraDaemon::start_grpc_server() {
         autofocus_controller_ = std::make_unique<AutofocusController>(
             hal_loader_->isp(), hal_loader_->video(), video_source_->video_ctx(),
             frame_router_.get(), lens_controller_, illumination_controller_.get(),
-            config_.autofocus, 0, 0);
+            config_.autofocus,
+            0, 0,
+            [this]() { return refresh_autofocus_video_context(); });
     } else if (config_.autofocus.enabled) {
         HAL_LOG_WARNING("CameraDaemon: autofocus unavailable (lens/ISP/video missing)");
     }
@@ -3163,6 +3165,83 @@ bool CameraDaemon::init_video() {
     }
 
     return true;
+}
+
+void* CameraDaemon::refresh_autofocus_video_context() {
+    // Serialize with a full pipeline reconfigure. The AF worker calls this
+    // only after a window-configuration failure, so a single refresh is enough
+    // and does not restart the media pipeline.
+    std::unique_lock<std::mutex> reconfig_lock(pipeline_reconfig_mu_);
+    std::unique_lock<std::shared_mutex> lock(op_mu_);
+
+    auto* media_ops = hal_loader_ ? hal_loader_->media() : nullptr;
+    if (!media_ops || !media_ctx_ || !media_ops->get_video_list || !video_source_) {
+        HAL_LOG_ERROR("CameraDaemon: cannot refresh AF video context: media/video unavailable");
+        return nullptr;
+    }
+
+    void* video_list = nullptr;
+    uint32_t video_count = 0;
+    const int ret = media_ops->get_video_list(media_ctx_, &video_list, &video_count);
+    if (ret < 0 || !video_list || video_count == 0) {
+        HAL_LOG_ERROR("CameraDaemon: AF video context refresh get_video_list failed: ret=%d list=%p count=%u",
+                      ret, video_list, video_count);
+        return nullptr;
+    }
+
+    void** vlist = static_cast<void**>(video_list);
+    if (!video_source_->init_from_context(vlist, video_count)) {
+        HAL_LOG_ERROR("CameraDaemon: AF video context refresh init_from_context failed");
+        return nullptr;
+    }
+
+    config_.streams.clear();
+    video_name_map_.clear();
+    for (uint32_t i = 0; i < video_count; ++i) {
+        auto* vc = static_cast<HalVideoContext*>(vlist[i]);
+        StreamCfg stream;
+        stream.name = vc->video_name;
+        stream.width = vc->config.width;
+        stream.height = vc->config.height;
+        stream.fps = vc->config.framerate;
+        stream.pool_max_buffers = 8;
+        stream.max_queue_size = 12;
+        config_.streams.push_back(stream);
+
+        std::string display_name;
+        switch (i) {
+            case 0: display_name = "main"; break;
+            case 1: display_name = "sub"; break;
+            case 2: display_name = "third"; break;
+            default: display_name = "stream" + std::to_string(i); break;
+        }
+        video_name_map_[stream.name] = display_name;
+    }
+
+    // init_from_context clears callbacks and running flags. Rebind the frame
+    // router before subscribing to the refreshed contexts.
+    for (auto& slot : video_source_->streams()) {
+        std::string dispatch_name = slot.name;
+        auto it = video_name_map_.find(slot.name);
+        if (it != video_name_map_.end()) dispatch_name = it->second;
+
+        video_source_->set_frame_callback(slot.name,
+            [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
+                frame_router_->on_frame_arrived(dispatch_name, frame);
+            });
+    }
+    for (auto& slot : video_source_->streams()) {
+        if (!video_source_->start_stream(slot.name)) {
+            HAL_LOG_ERROR("CameraDaemon: AF video context refresh failed to start stream '%s'",
+                          slot.name.c_str());
+            return nullptr;
+        }
+    }
+
+    void* refreshed_ctx = video_source_->video_ctx();
+    HAL_LOG_INFO("CameraDaemon: refreshed AF video context primary=%p streams=%u",
+                 refreshed_ctx, video_count);
+    return refreshed_ctx;
 }
 
 bool CameraDaemon::init_encoders() {
