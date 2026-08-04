@@ -5146,8 +5146,11 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
         return false;
     }
 
-    // 3. Re-discover stream config from new pipeline contexts
-    // Video contexts may have changed (different stream count/resolution)
+    // 3. Re-discover stream config from new pipeline contexts.
+    // Profile switching rebuilds the MediaLibrary video contexts. The old
+    // VideoSource primary context may therefore be dangling even when the
+    // stream names and resolutions are unchanged. Rebind VideoSource and its
+    // callbacks before giving a context back to autofocus.
     lock.lock();
     {
         void* video_list = nullptr;
@@ -5155,23 +5158,60 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
         ret = media_ops->get_video_list(media_ctx_, &video_list, &video_count);
         if (ret >= 0 && video_list && video_count > 0) {
             void** vlist = static_cast<void**>(video_list);
-            // Clear and rebuild config_.streams
-            auto& vs_streams = video_source_->streams();
-            // Update existing entries (matched by order)
-            for (size_t i = 0; i < vs_streams.size(); i++) {
-                auto* vc = static_cast<HalVideoContext*>(vlist[i]);
-                if (i < config_.streams.size()) {
-                    if (video_name_map_.count(vs_streams[i].name)) {
-                        // Already mapped — update params
-                        config_.streams[i].width = vc->config.width;
-                        config_.streams[i].height = vc->config.height;
-                        config_.streams[i].fps = vc->config.framerate;
+            if (!video_source_->init_from_context(vlist, video_count)) {
+                HAL_LOG_ERROR("CameraDaemon: failed to refresh VideoSource contexts after "
+                              "profile switch");
+            } else {
+                config_.streams.clear();
+                video_name_map_.clear();
+
+                for (uint32_t i = 0; i < video_count; ++i) {
+                    auto* vc = static_cast<HalVideoContext*>(vlist[i]);
+                    StreamCfg stream;
+                    stream.name = vc->video_name;
+                    stream.width = vc->config.width;
+                    stream.height = vc->config.height;
+                    stream.fps = vc->config.framerate;
+                    config_.streams.push_back(stream);
+
+                    std::string display_name;
+                    switch (i) {
+                        case 0: display_name = "main"; break;
+                        case 1: display_name = "sub"; break;
+                        case 2: display_name = "third"; break;
+                        default: display_name = "stream" + std::to_string(i); break;
                     }
-                    HAL_LOG_INFO("CameraDaemon: Post-switch video '%s' (%ux%u@%u)",
-                                vs_streams[i].name.c_str(),
-                                vc->config.width, vc->config.height, vc->config.framerate);
+                    video_name_map_[stream.name] = display_name;
+
+                    HAL_LOG_INFO("CameraDaemon: Post-switch video '%s' ctx=%p (%ux%u@%u)",
+                                 stream.name.c_str(), vlist[i], stream.width,
+                                 stream.height, stream.fps);
                 }
+
+                // init_from_context clears the old stream slots and callbacks.
+                // Rebind them before restarting frame delivery.
+                for (auto& slot : video_source_->streams()) {
+                    std::string dispatch_name = slot.name;
+                    auto vnit = video_name_map_.find(slot.name);
+                    if (vnit != video_name_map_.end()) dispatch_name = vnit->second;
+
+                    video_source_->set_frame_callback(slot.name,
+                        [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
+                            frame_router_->on_frame_arrived(dispatch_name, frame);
+                        });
+                }
+                for (auto& slot : video_source_->streams()) {
+                    video_source_->start_stream(slot.name);
+                }
+
+                HAL_LOG_INFO("CameraDaemon: refreshed VideoSource after profile switch "
+                             "primary_ctx=%p streams=%u",
+                             video_source_->video_ctx(), video_count);
             }
+        } else {
+            HAL_LOG_ERROR("CameraDaemon: failed to refresh VideoSource after profile switch: "
+                          "get_video_list ret=%d list=%p count=%u",
+                          ret, video_list, video_count);
         }
     }
 
