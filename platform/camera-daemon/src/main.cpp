@@ -199,6 +199,44 @@ static std::string derive_install_prefix(const std::string& config_path) {
     return "/opt/aipc";
 }
 
+static bool media_config_contains_profile(const std::string& path,
+                                          const std::string& profile_name) {
+    if (path.empty() || profile_name.empty()) return false;
+
+    std::ifstream file(path);
+    if (!file.is_open()) return false;
+
+    std::ostringstream contents;
+    contents << file.rdbuf();
+    const std::string json = contents.str();
+    const std::string quoted_name = "\"" + profile_name + "\"";
+    return json.find("\"name\"") != std::string::npos &&
+           json.find(quoted_name) != std::string::npos;
+}
+
+static void select_product_media_config_for_infrared(DaemonConfig& config) {
+    static constexpr const char* kProductMediaConfig =
+        "/data/aipc/etc/imaging/hailo15h/imx678/theia_sl410m/4k/"
+        "medialib_configs/webserver_medialib_config.json";
+
+    if (!config.infrared.enabled ||
+        media_config_contains_profile(config.media_config_path,
+                                      config.infrared.infrared_profile)) {
+        return;
+    }
+    if (!media_config_contains_profile(kProductMediaConfig,
+                                       config.infrared.infrared_profile)) {
+        return;
+    }
+
+    HAL_LOG_WARNING("Configured media file '%s' does not provide profile '%s'; "
+                    "using product media file '%s'",
+                    config.media_config_path.c_str(),
+                    config.infrared.infrared_profile.c_str(),
+                    kProductMediaConfig);
+    config.media_config_path = kProductMediaConfig;
+}
+
 static DaemonConfig load_config(const std::string& path) {
     DaemonConfig cfg;
 
@@ -626,6 +664,7 @@ int main(int argc, char** argv) {
     // Load configuration
     DaemonConfig config = load_config(config_path);
     setup_logging(config.log_level, config.log_file, config_path);
+    select_product_media_config_for_infrared(config);
 
     HAL_LOG_INFO("===================================");
     HAL_LOG_INFO("AIPC Camera Daemon v2.0.0");

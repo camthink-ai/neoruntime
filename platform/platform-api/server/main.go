@@ -26,6 +26,7 @@ import (
 	"aipc/platform/common/events"
 	"aipc/platform/common/logger"
 	eventpb "aipc/platform/event-bus/proto"
+	mediaadapter "aipc/platform/platform-api/adapters/media"
 	"aipc/platform/platform-api/auth"
 	cfgctrl "aipc/platform/platform-api/config"
 	platformdb "aipc/platform/platform-api/db"
@@ -410,6 +411,21 @@ func (s *PlatformAPIServer) setupRoutes() {
 	// store (R-migration) without overwriting the file. Non-fatal: a reconcile
 	// error is logged and the server continues serving.
 	if cm := apiHandlers.ConfigManager(); cm != nil {
+		cameraConfigPath := s.config.Stream.CameraConfig
+		if cameraConfigPath == "" {
+			cameraConfigPath = constants.ConfigPath() + "/camera-daemon.yaml"
+		}
+		migrated, changed, migrateErr := mediaadapter.MigrateProductInfraredConfig(cameraConfigPath)
+		if migrateErr != nil {
+			logger.Warn("Infrared media config migration skipped: %v", migrateErr)
+		} else if changed {
+			if _, revision, applyErr := cm.Apply(context.Background(), "media", "config", string(migrated), "system"); applyErr != nil {
+				logger.Warn("Infrared media config migration failed: %v", applyErr)
+			} else {
+				logger.Info("Infrared media config migration applied at revision %d", revision)
+			}
+		}
+
 		targets := []cfgctrl.ReconcileTarget{{Domain: "media", Key: "config"}}
 		if err := cm.Reconcile(context.Background(), targets, "system"); err != nil {
 			logger.Warn("Config reconcile completed with errors: %v", err)
