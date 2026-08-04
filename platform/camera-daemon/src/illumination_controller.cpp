@@ -202,6 +202,16 @@ bool IlluminationController::clear_manual(double zoom_ratio, std::string* error)
 bool IlluminationController::begin_zoom_follow(double zoom_ratio, std::string* error) {
     {
         std::lock_guard<std::mutex> lock(mu_);
+        /*
+         * A new automatic zoom cycle owns the final output as well as the
+         * in-flight updates.  Manual PWM is intentionally an idle-only
+         * override: discard an older manual request before LUT takeover so
+         * end_zoom_follow() leaves the endpoint LUT applied.
+         */
+        if (state_.night_mode && state_.config.auto_follow) {
+            hal_auto_af::clear_ir_manual(&state_);
+            status_.manual_override = false;
+        }
         hal_auto_af::begin_ir_follow(&state_);
         status_.follow_active = state_.follow_active;
     }

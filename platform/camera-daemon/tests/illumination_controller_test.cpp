@@ -31,10 +31,15 @@ int main() {
     assert(controller.begin_zoom_follow(2.5));
     assert(outputs[0] == 32 && outputs[1] == 50);
     assert(controller.status().source == InfraredOutputSource::ZoomFollow);
+    assert(!controller.status().manual_override);
 
     assert(controller.apply_endpoint_ratio(2.88));
     assert(outputs[0] == 0 && outputs[1] == 100);
     assert(controller.end_zoom_follow(2.88));
+    assert(outputs[0] == 0 && outputs[1] == 100);
+    assert(controller.status().source == InfraredOutputSource::Automatic);
+
+    assert(controller.set_manual_pwm(40, 20, 2.88));
     assert(outputs[0] == 40 && outputs[1] == 20);
     assert(controller.status().source == InfraredOutputSource::Manual);
 
