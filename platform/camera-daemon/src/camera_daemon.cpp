@@ -484,7 +484,25 @@ bool CameraDaemon::init(const DaemonConfig& config) {
         std::string persisted_profile;
         if (load_profile_config(&persisted_profile)) {
             std::string current = get_current_profile();
-            if (!persisted_profile.empty() && persisted_profile != current) {
+            const bool force_day_on_boot = config_.infrared.enabled &&
+                config_.infrared.default_mode != "infrared";
+            const bool persisted_infrared_profile =
+                persisted_profile == config_.infrared.infrared_profile;
+            if (force_day_on_boot && persisted_infrared_profile) {
+                // Infrared is an operating mode, not a boot profile. Do not
+                // restore a stale night profile when product policy is Day.
+                HAL_LOG_INFO("CameraDaemon: ignoring persisted infrared profile '%s'; default_mode=day",
+                             persisted_profile.c_str());
+                if (current == config_.infrared.infrared_profile) {
+                    std::string msg;
+                    if (!switch_profile("Daylight_Basic", &msg)) {
+                        HAL_LOG_ERROR("CameraDaemon: failed to restore Daylight_Basic from infrared profile: %s",
+                                      msg.c_str());
+                    }
+                    current = get_current_profile();
+                }
+                persist_profile_config(current);
+            } else if (!persisted_profile.empty() && persisted_profile != current) {
                 HAL_LOG_INFO("CameraDaemon: applying persisted profile '%s' (current '%s')",
                              persisted_profile.c_str(), current.c_str());
                 std::string msg;
@@ -2878,10 +2896,15 @@ void CameraDaemon::start_grpc_server() {
             HAL_LOG_WARNING("CameraDaemon: %s", warning.c_str());
         }
         std::string error;
-        illumination_controller_->set_mode(
-            config_.infrared.default_mode == "infrared"
-                ? ImagingMode::Infrared : ImagingMode::Day,
-            current_zoom_ratio(), &error);
+        const auto startup_mode = config_.infrared.default_mode == "infrared"
+            ? ImagingMode::Infrared : ImagingMode::Day;
+        if (startup_mode == ImagingMode::Day && !set_ircut(0)) {
+            HAL_LOG_WARNING("CameraDaemon: failed to force IR-cut to day during startup");
+        }
+        if (!illumination_controller_->set_mode(startup_mode, current_zoom_ratio(), &error)) {
+            HAL_LOG_WARNING("CameraDaemon: failed to apply startup illumination mode: %s",
+                            error.c_str());
+        }
     }
 
     if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
@@ -3947,8 +3970,22 @@ bool CameraDaemon::set_imaging_mode(ImagingMode mode, std::string* message) {
         if (message) *message = "imaging mode switch already active";
         return false;
     }
-    if (before.mode == mode && before.transition == ImagingModeTransition::Idle) {
+    const std::string active_profile = get_current_profile();
+    const bool profile_matches = mode == ImagingMode::Infrared
+        ? active_profile == config_.infrared.infrared_profile
+        : active_profile != config_.infrared.infrared_profile;
+    uint32_t ircut_mode = 0;
+    const bool ircut_matches = get_ircut(ircut_mode) &&
+        ircut_mode == (mode == ImagingMode::Infrared ? 1u : 0u);
+    if (before.mode == mode && before.transition == ImagingModeTransition::Idle &&
+        profile_matches && ircut_matches) {
         return true;
+    }
+    if (before.mode == mode && before.transition == ImagingModeTransition::Idle) {
+        HAL_LOG_WARNING("CameraDaemon: reconciling %s mode; controller/profile/IR-cut are inconsistent "
+                        "(profile='%s' profile_matches=%d ircut_matches=%d)",
+                        imaging_mode_name(mode), active_profile.c_str(),
+                        profile_matches, ircut_matches);
     }
 
     illumination_controller_->set_transition(ImagingModeTransition::Switching);
@@ -3989,7 +4026,12 @@ bool CameraDaemon::set_imaging_mode(ImagingMode mode, std::string* message) {
         if (ok) ok = set_ircut(1);
         if (ok) ok = illumination_controller_->set_mode(ImagingMode::Infrared, ratio, &error);
         if (ok) ok = wait_stable();
-        if (ok) day_profile_before_infrared_ = previous_profile;
+        if (ok) {
+            day_profile_before_infrared_ = previous_profile;
+            // Always boot into the saved daytime/AI profile. Infrared remains
+            // an explicit mode selection and is never replayed after reboot.
+            persist_profile_config(previous_profile);
+        }
     } else {
         illumination_controller_->set_mode(ImagingMode::Day, ratio, nullptr);
         ok = set_ircut(0);

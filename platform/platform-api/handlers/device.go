@@ -196,6 +196,14 @@ func (h *APIHandlers) SetImagingMode(c *gin.Context) {
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
 		return
 	}
+	if !resp.GetSuccess() {
+		message := resp.GetMessage()
+		if message == "" {
+			message = "Imaging mode switch failed"
+		}
+		Resp(c).FailMsg(CodeDeviceError, message)
+		return
+	}
 	Resp(c).OK(resp)
 }
 
