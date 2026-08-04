@@ -2037,8 +2037,17 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
     using json = nlohmann::json;
     json cfg = json::parse(stored_json);
 
-    std::string prof_name = target_profile.name;
-    if (prof_name.empty() && cfg.contains("default_profile"))
+    std::string prof_name;
+    if (!target_profile.name.empty())
+    {
+        /* A layout reinit is also used while switching profiles.  Select the
+         * requested target profile instead of the previous JSON default. */
+        prof_name = target_profile.name;
+        cfg["default_profile"] = prof_name;
+        HAL_LOG_INFO("hailo15_media: patch_json: selecting target profile '%s'",
+                     prof_name.c_str());
+    }
+    else if (cfg.contains("default_profile"))
         prof_name = cfg["default_profile"].get<std::string>();
     if (!prof_name.empty())
         cfg["default_profile"] = prof_name;
@@ -4917,9 +4926,18 @@ static std::string hailo15_generate_pipeline_config_json(
 
     json cfg = json::parse(stored_json);
 
-    /* Preserve the runtime profile across full MediaLibrary reinit. */
-    std::string prof_name = active_profile_name;
-    if (prof_name.empty() && cfg.contains("default_profile"))
+    /* Preserve the profile that is active in MediaLibrary.  The stored JSON
+     * commonly declares a daytime default, which would otherwise replace an
+     * active infrared profile during a full stream-layout reinitialization. */
+    std::string prof_name;
+    if (!active_profile_name.empty())
+    {
+        prof_name = active_profile_name;
+        cfg["default_profile"] = prof_name;
+        HAL_LOG_INFO("hailo15_media: generate_config: preserving active profile '%s'",
+                     prof_name.c_str());
+    }
+    else if (cfg.contains("default_profile"))
     {
         prof_name = cfg["default_profile"].get<std::string>();
     }
