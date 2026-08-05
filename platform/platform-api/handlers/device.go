@@ -283,6 +283,63 @@ func (h *APIHandlers) ClearInfraredManual(c *gin.Context) {
 	Resp(c).OK(resp)
 }
 
+func (h *APIHandlers) ListIrPresets(c *gin.Context) {
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.ListIrPresets(ctx, &devicepb.Empty{})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
+func (h *APIHandlers) SaveIrPreset(c *gin.Context) {
+	var req struct {
+		Name      string  `json:"name" binding:"required"`
+		ZoomRatio float32 `json:"zoom_ratio"`
+		NearPWM   uint32  `json:"near_pwm"`
+		FarPWM    uint32  `json:"far_pwm"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
+		return
+	}
+	if req.ZoomRatio < 1.0 || req.ZoomRatio > 2.88 || req.NearPWM > 100 || req.FarPWM > 100 {
+		Resp(c).FailMsg(CodeInvalidRequest, "zoom_ratio must be 1.0-2.88 and pwm 0-100")
+		return
+	}
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.SaveIrPreset(ctx, &devicepb.IrPreset{
+		Name: req.Name, ZoomRatio: req.ZoomRatio, NearPwm: req.NearPWM, FarPwm: req.FarPWM,
+	})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
+func (h *APIHandlers) DeleteIrPreset(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		Resp(c).FailMsg(CodeInvalidRequest, "missing preset name")
+		return
+	}
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.DeleteIrPreset(ctx, &devicepb.DeleteIrPresetRequest{Name: name})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
 func (h *APIHandlers) ControlPTZ(c *gin.Context) {
 	if h.grpcClients.DeviceControl == nil {
 		Resp(c).FailMsg(CodeServiceUnavailable, "Device Control not available")

@@ -7,6 +7,7 @@ import type {
   DeviceStatus,
   IrCutMode,
   InfraredStatus,
+  IrPreset,
   LensStatus,
 } from '@/services/api/device';
 
@@ -101,6 +102,43 @@ export const useClearInfraredManual = () => {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['device', 'infrared'] }),
   });
 };
+
+export const useIrPresets = () => useQuery<{ presets: IrPreset[] } | undefined>({
+    queryKey: ['device', 'ir-presets'],
+    queryFn: async () => {
+      const response = await deviceApi.listIrPresets();
+      return (response as any).data as { presets: IrPreset[] };
+    },
+  });
+
+export const useSaveIrPreset = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (preset: IrPreset) => {
+      const response = await deviceApi.saveIrPreset(preset);
+      return (response as any).data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['device', 'ir-presets'] }),
+  });
+};
+
+export const useDeleteIrPreset = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (name: string) => {
+      const response = await deviceApi.deleteIrPreset(name);
+      return (response as any).data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['device', 'ir-presets'] }),
+  });
+};
+
+export const useLensGoto = () => useMutation({
+    mutationFn: async (params: { zoomRatio: number; focusDistanceM?: number }) => {
+      const response = await deviceApi.lensGoto(params.zoomRatio, params.focusDistanceM);
+      return (response as any).data;
+    },
+  });
 
 export const useControlZoom = () => useMutation({
     mutationFn: async (speed: number) => {

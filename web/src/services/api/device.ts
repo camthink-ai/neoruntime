@@ -98,6 +98,14 @@ export interface InfraredStatus {
   day_enter: number;
 }
 
+/** IR preset = snapshot of (zoom position + near/far IR intensity) for one-click recall. */
+export interface IrPreset {
+  name: string;
+  zoom_ratio: number;
+  near_pwm: number;
+  far_pwm: number;
+}
+
 // ── API ───────────────────────────────────────────────────────────────
 
 export const deviceApi = {
@@ -114,6 +122,13 @@ export const deviceApi = {
   getInfraredStatus: () => request.get('/api/v1/device/infrared/status', { silent: true }),
   setInfraredSettings: (settings: { auto_follow?: boolean; near_pwm?: number; far_pwm?: number; night_enter?: number; day_enter?: number }) => request.put('/api/v1/device/infrared/settings', settings),
   clearInfraredManual: () => request.delete('/api/v1/device/infrared/manual'),
+
+  // IR preset save/load (zoom + IR intensity snapshot), persisted on the device.
+  listIrPresets: () => request.get('/api/v1/device/ir-presets', { silent: true }),
+  saveIrPreset: (preset: IrPreset) => request.put('/api/v1/device/ir-presets', preset),
+  deleteIrPreset: (name: string) => request.delete(`/api/v1/device/ir-presets/${encodeURIComponent(name)}`),
+  // Move zoom motor to a ratio (used to restore a preset's zoom position).
+  lensGoto: (zoomRatio: number, focusDistanceM = 0) => request.post('/api/v1/device/lens/goto', { zoom_ratio: zoomRatio, focus_distance_m: focusDistanceM }),
 
   controlZoom: (speed: number) => request.post('/api/v1/device/zoom', { speed }),
 

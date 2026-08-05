@@ -71,6 +71,24 @@ message InfraredStatusResponse {
   int32 day_enter = 22;
 }
 
+// IR preset = snapshot of (zoom position + near/far IR intensity) for one-click recall.
+message IrPreset {
+  string name = 1;
+  float zoom_ratio = 2;   // 1.0 ~ 2.88 (optical zoom ratio)
+  uint32 near_pwm = 3;    // 0 ~ 100
+  uint32 far_pwm = 4;     // 0 ~ 100
+}
+
+message IrPresetListResponse {
+  bool success = 1;
+  string message = 2;
+  repeated IrPreset presets = 3;
+}
+
+message DeleteIrPresetRequest {
+  string name = 1;
+}
+
 // ============ PTZ control ============
 
 enum PanDirection {
@@ -365,6 +383,10 @@ service DeviceControl {
   rpc GetInfraredStatus(Empty) returns (InfraredStatusResponse);
   rpc SetInfraredSettings(InfraredSettingsRequest) returns (InfraredStatusResponse);
   rpc ClearInfraredManual(Empty) returns (InfraredStatusResponse);
+  // IR preset save/load (zoom + IR intensity snapshot)
+  rpc ListIrPresets(Empty) returns (IrPresetListResponse);
+  rpc SaveIrPreset(IrPreset) returns (IrPresetListResponse);
+  rpc DeleteIrPreset(DeleteIrPresetRequest) returns (IrPresetListResponse);
   
   // PTZ control
   rpc Pan(PanRequest) returns (Status);

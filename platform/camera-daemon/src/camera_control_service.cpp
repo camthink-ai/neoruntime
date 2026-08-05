@@ -718,6 +718,57 @@ grpc::Status CameraControlServiceImpl::ClearInfraredManual(
     return grpc::Status::OK;
 }
 
+namespace {
+void fill_ir_preset_list(const std::vector<IrPresetEntry>& presets, bool success,
+                         const std::string& message,
+                         aipc::camera::IrPresetListResponse* response) {
+    response->set_success(success);
+    response->set_message(message);
+    response->clear_presets();
+    for (const auto& p : presets) {
+        auto* out = response->add_presets();
+        out->set_name(p.name);
+        out->set_zoom_ratio(p.zoom_ratio);
+        out->set_near_pwm(p.near_pwm);
+        out->set_far_pwm(p.far_pwm);
+    }
+}
+} // namespace
+
+grpc::Status CameraControlServiceImpl::ListIrPresets(
+    grpc::ServerContext*, const aipc::camera::Empty*,
+    aipc::camera::IrPresetListResponse* response) {
+    std::string error;
+    const auto presets = daemon_ ? daemon_->list_ir_presets(&error) : std::vector<IrPresetEntry>{};
+    fill_ir_preset_list(presets, daemon_ != nullptr && error.empty(), error, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::SaveIrPreset(
+    grpc::ServerContext*, const aipc::camera::IrPreset* request,
+    aipc::camera::IrPresetListResponse* response) {
+    std::string error;
+    IrPresetEntry entry;
+    entry.name = request->name();
+    entry.zoom_ratio = request->zoom_ratio();
+    entry.near_pwm = request->near_pwm();
+    entry.far_pwm = request->far_pwm();
+    const bool ok = daemon_ && daemon_->save_ir_preset(entry, &error);
+    fill_ir_preset_list(ok ? daemon_->list_ir_presets() : std::vector<IrPresetEntry>{},
+                        ok, error, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::DeleteIrPreset(
+    grpc::ServerContext*, const aipc::camera::DeleteIrPresetRequest* request,
+    aipc::camera::IrPresetListResponse* response) {
+    std::string error;
+    const bool ok = daemon_ && daemon_->delete_ir_preset(request->name(), &error);
+    fill_ir_preset_list(ok ? daemon_->list_ir_presets() : std::vector<IrPresetEntry>{},
+                        ok, error, response);
+    return grpc::Status::OK;
+}
+
 grpc::Status CameraControlServiceImpl::GetDeviceHardwareStatus(
     grpc::ServerContext* context,
     const aipc::camera::Empty* request,

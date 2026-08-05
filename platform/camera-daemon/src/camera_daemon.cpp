@@ -29,6 +29,9 @@
 #include <cstdint>
 #include <algorithm>
 #include <cctype>
+#include <fstream>
+#include <cstdio>
+#include <nlohmann/json.hpp>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -4326,6 +4329,133 @@ bool CameraDaemon::set_light_thresholds(int night_enter, int day_enter, std::str
     daynight_state_.stable_count = 0; /* reset accumulation on threshold change */
     HAL_LOG_INFO("CameraDaemon: light thresholds updated night_enter=%d day_enter=%d",
                  night_enter, day_enter);
+    return true;
+}
+
+/* ========== IR preset persistence (zoom + IR intensity snapshots) ========== */
+
+namespace {
+constexpr const char* kIrPresetsPath = "/data/aipc/etc/ir_presets.json";
+} // namespace
+
+void CameraDaemon::load_ir_presets_locked(std::string* error) {
+    ir_presets_cache_.clear();
+    ir_presets_loaded_ = true;
+    std::ifstream in(kIrPresetsPath);
+    if (!in.is_open()) {
+        /* No file yet -> empty preset list (not an error). */
+        return;
+    }
+    try {
+        nlohmann::json j;
+        in >> j;
+        if (!j.is_array()) {
+            if (error) *error = "preset file is not a JSON array";
+            return;
+        }
+        for (const auto& el : j) {
+            IrPresetEntry p;
+            p.name = el.value("name", std::string{});
+            p.zoom_ratio = el.value("zoom_ratio", 1.0f);
+            p.near_pwm = el.value("near_pwm", 0u);
+            p.far_pwm = el.value("far_pwm", 0u);
+            if (!p.name.empty()) {
+                ir_presets_cache_.push_back(std::move(p));
+            }
+        }
+    } catch (const std::exception& e) {
+        if (error) *error = std::string("preset parse failed: ") + e.what();
+        HAL_LOG_WARNING("CameraDaemon: IR preset parse failed: %s", e.what());
+    }
+}
+
+bool CameraDaemon::write_ir_presets_locked(std::string* error) {
+    try {
+        nlohmann::json j = nlohmann::json::array();
+        for (const auto& p : ir_presets_cache_) {
+            j.push_back({{"name", p.name},
+                         {"zoom_ratio", p.zoom_ratio},
+                         {"near_pwm", p.near_pwm},
+                         {"far_pwm", p.far_pwm}});
+        }
+        const std::string tmp = std::string(kIrPresetsPath) + ".tmp";
+        std::ofstream out(tmp);
+        if (!out.is_open()) {
+            if (error) *error = "cannot open preset file for write";
+            return false;
+        }
+        out << j.dump(2);
+        out.close();
+        if (std::rename(tmp.c_str(), kIrPresetsPath) != 0) {
+            if (error) *error = "preset rename failed";
+            return false;
+        }
+    } catch (const std::exception& e) {
+        if (error) *error = std::string("preset write failed: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+std::vector<IrPresetEntry> CameraDaemon::list_ir_presets(std::string* error) {
+    std::lock_guard<std::mutex> lk(ir_preset_mu_);
+    if (!ir_presets_loaded_) {
+        load_ir_presets_locked(error);
+    }
+    return ir_presets_cache_;
+}
+
+bool CameraDaemon::save_ir_preset(const IrPresetEntry& preset, std::string* error) {
+    if (preset.name.empty()) {
+        if (error) *error = "preset name is empty";
+        return false;
+    }
+    if (preset.zoom_ratio < 1.0f || preset.zoom_ratio > 2.88f ||
+        preset.near_pwm > 100 || preset.far_pwm > 100) {
+        if (error) *error = "invalid preset (zoom 1.0-2.88, pwm 0-100)";
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(ir_preset_mu_);
+    if (!ir_presets_loaded_) {
+        load_ir_presets_locked();
+    }
+    bool found = false;
+    for (auto& p : ir_presets_cache_) {
+        if (p.name == preset.name) {
+            p = preset;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        ir_presets_cache_.push_back(preset);
+    }
+    if (!write_ir_presets_locked(error)) {
+        return false;
+    }
+    HAL_LOG_INFO("CameraDaemon: IR preset saved '%s' zoom=%.2f near=%u far=%u",
+                 preset.name.c_str(), preset.zoom_ratio, preset.near_pwm, preset.far_pwm);
+    return true;
+}
+
+bool CameraDaemon::delete_ir_preset(const std::string& name, std::string* error) {
+    std::lock_guard<std::mutex> lk(ir_preset_mu_);
+    if (!ir_presets_loaded_) {
+        load_ir_presets_locked();
+    }
+    const size_t before = ir_presets_cache_.size();
+    ir_presets_cache_.erase(
+        std::remove_if(ir_presets_cache_.begin(), ir_presets_cache_.end(),
+                       [&](const IrPresetEntry& p) { return p.name == name; }),
+        ir_presets_cache_.end());
+    if (ir_presets_cache_.size() == before) {
+        if (error) *error = "preset not found";
+        return false;
+    }
+    if (!write_ir_presets_locked(error)) {
+        return false;
+    }
+    HAL_LOG_INFO("CameraDaemon: IR preset deleted '%s'", name.c_str());
     return true;
 }
 

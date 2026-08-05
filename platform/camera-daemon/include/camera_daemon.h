@@ -217,6 +217,14 @@ enum class SelectedMode {
 const char* selected_mode_name(SelectedMode mode);
 SelectedMode parse_selected_mode(const std::string& text);
 
+/** IR preset = snapshot of (zoom position + near/far IR intensity) for one-click recall. */
+struct IrPresetEntry {
+    std::string name;
+    float zoom_ratio = 1.0f;   // 1.0 ~ 2.88
+    uint32_t near_pwm = 0;     // 0 ~ 100
+    uint32_t far_pwm = 0;      // 0 ~ 100
+};
+
 /* ========== Camera Daemon ========== */
 
 class CameraDaemon {
@@ -484,6 +492,11 @@ public:
     bool set_selected_mode(const std::string& mode, std::string* message = nullptr);
     bool set_light_thresholds(int night_enter, int day_enter, std::string* message = nullptr);
 
+    // IR preset save/load (zoom + IR intensity snapshot), persisted on the device.
+    std::vector<IrPresetEntry> list_ir_presets(std::string* error = nullptr);
+    bool save_ir_preset(const IrPresetEntry& preset, std::string* error = nullptr);
+    bool delete_ir_preset(const std::string& name, std::string* error = nullptr);
+
     // Device hardware status
     bool get_device_hardware_status(aipc::camera::DeviceHardwareStatus& status);
 
@@ -609,6 +622,11 @@ private:
     std::thread light_thread_;
     std::atomic<bool> light_stop_{true};
 
+    // IR preset persistence (zoom + IR intensity snapshots)
+    mutable std::mutex ir_preset_mu_;
+    std::vector<IrPresetEntry> ir_presets_cache_;
+    bool ir_presets_loaded_ = false;
+
 #ifdef HAS_GRPC
     std::unique_ptr<CameraControlServiceImpl> camera_control_service_;
     std::unique_ptr<grpc::Service> lens_hal_service_;
@@ -629,6 +647,10 @@ private:
     void stop_light_monitor();
     void light_monitor_loop();
     LightSample read_light_sample();
+
+    // IR preset persistence helpers (callers hold ir_preset_mu_)
+    void load_ir_presets_locked(std::string* error = nullptr);
+    bool write_ir_presets_locked(std::string* error = nullptr);
 
     struct FpsTracker {
         uint64_t frame_count = 0;

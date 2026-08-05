@@ -163,6 +163,16 @@ public:
         const aipc::camera::Empty*,
         aipc::camera::InfraredStatusResponse*) override;
 
+    grpc::Status ListIrPresets(grpc::ServerContext*,
+        const aipc::camera::Empty*,
+        aipc::camera::IrPresetListResponse*) override;
+    grpc::Status SaveIrPreset(grpc::ServerContext*,
+        const aipc::camera::IrPreset*,
+        aipc::camera::IrPresetListResponse*) override;
+    grpc::Status DeleteIrPreset(grpc::ServerContext*,
+        const aipc::camera::DeleteIrPresetRequest*,
+        aipc::camera::IrPresetListResponse*) override;
+
     grpc::Status GetDeviceHardwareStatus(
         grpc::ServerContext* context,
         const aipc::camera::Empty* request,

@@ -833,6 +833,54 @@ func (s *DeviceControlServer) ClearInfraredManual(ctx context.Context, _ *pb.Emp
 	return infraredStatusFromCamera(resp), nil
 }
 
+func irPresetListFromCamera(resp *camerapb.IrPresetListResponse) *pb.IrPresetListResponse {
+	if resp == nil {
+		return &pb.IrPresetListResponse{Success: false, Message: "empty camera response"}
+	}
+	out := &pb.IrPresetListResponse{Success: resp.Success, Message: resp.Message}
+	for _, p := range resp.Presets {
+		out.Presets = append(out.Presets, &pb.IrPreset{
+			Name: p.Name, ZoomRatio: p.ZoomRatio, NearPwm: p.NearPwm, FarPwm: p.FarPwm,
+		})
+	}
+	return out
+}
+
+func (s *DeviceControlServer) ListIrPresets(ctx context.Context, _ *pb.Empty) (*pb.IrPresetListResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.IrPresetListResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.ListIrPresets(ctx, &camerapb.Empty{})
+	if err != nil {
+		return &pb.IrPresetListResponse{Success: false, Message: err.Error()}, nil
+	}
+	return irPresetListFromCamera(resp), nil
+}
+
+func (s *DeviceControlServer) SaveIrPreset(ctx context.Context, req *pb.IrPreset) (*pb.IrPresetListResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.IrPresetListResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.SaveIrPreset(ctx, &camerapb.IrPreset{
+		Name: req.Name, ZoomRatio: req.ZoomRatio, NearPwm: req.NearPwm, FarPwm: req.FarPwm,
+	})
+	if err != nil {
+		return &pb.IrPresetListResponse{Success: false, Message: err.Error()}, nil
+	}
+	return irPresetListFromCamera(resp), nil
+}
+
+func (s *DeviceControlServer) DeleteIrPreset(ctx context.Context, req *pb.DeleteIrPresetRequest) (*pb.IrPresetListResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.IrPresetListResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.DeleteIrPreset(ctx, &camerapb.DeleteIrPresetRequest{Name: req.Name})
+	if err != nil {
+		return &pb.IrPresetListResponse{Success: false, Message: err.Error()}, nil
+	}
+	return irPresetListFromCamera(resp), nil
+}
+
 // PTZ Control
 
 func (s *DeviceControlServer) Pan(ctx context.Context, req *pb.PanRequest) (*pb.Status, error) {
