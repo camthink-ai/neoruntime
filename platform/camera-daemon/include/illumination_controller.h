@@ -60,6 +60,15 @@ struct IlluminationStatus {
     double zoom_ratio = 1.0;
     std::string active_profile;
     std::string error;
+
+    // Day/night auto (light-sensor) policy — filled by CameraDaemon.
+    std::string selected_mode = "day";   // operator selection: auto | day | infrared
+    int light_percent = 0;               // 0..100, endpoint-normalized
+    uint16_t light_mv = 0;               // raw photodiode milli-volts
+    int32_t light_milli = 0;             // raw scaled value
+    bool light_valid = false;
+    int night_enter = 28;
+    int day_enter = 82;
 };
 
 class IlluminationController {

@@ -25,6 +25,7 @@
 #include <atomic>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <cstdint>
 #include <ctime>
 #include <chrono>
@@ -49,6 +50,7 @@ class HalLoader;
 #include "audio_service.h"
 #include "autofocus_controller.h"
 #include "illumination_controller.h"
+#include "daynight_policy.h"
 class VideoSource;
 class FrameRouter;
 class FrameWatchdog;
@@ -202,7 +204,18 @@ struct DaemonConfig {
 
     AutofocusConfig autofocus;
     IlluminationConfig infrared;
+    LightSensorConfig light_sensor;
 };
+
+/* Operator-selected day/night mode (distinct from the optical ImagingMode):
+ * Auto = light-sensor driven; Day/Infrared = forced optical state. */
+enum class SelectedMode {
+    Auto,
+    Day,
+    Infrared,
+};
+const char* selected_mode_name(SelectedMode mode);
+SelectedMode parse_selected_mode(const std::string& text);
 
 /* ========== Camera Daemon ========== */
 
@@ -467,6 +480,10 @@ public:
     bool set_infrared_auto_follow(bool enabled, std::string* message = nullptr);
     IlluminationStatus get_illumination_status() const;
 
+    // Day/night auto (light-sensor) policy
+    bool set_selected_mode(const std::string& mode, std::string* message = nullptr);
+    bool set_light_thresholds(int night_enter, int day_enter, std::string* message = nullptr);
+
     // Device hardware status
     bool get_device_hardware_status(aipc::camera::DeviceHardwareStatus& status);
 
@@ -584,6 +601,14 @@ private:
     mutable std::mutex imaging_mode_mu_;
     std::string day_profile_before_infrared_;
 
+    // Day/night auto (light-sensor) policy
+    mutable std::mutex daynight_mu_;
+    mutable DayNightPolicyState daynight_state_;
+    mutable LightSensorConfig light_sensor_cfg_;   // runtime thresholds (adjustable)
+    SelectedMode selected_mode_ = SelectedMode::Day;
+    std::thread light_thread_;
+    std::atomic<bool> light_stop_{true};
+
 #ifdef HAS_GRPC
     std::unique_ptr<CameraControlServiceImpl> camera_control_service_;
     std::unique_ptr<grpc::Service> lens_hal_service_;
@@ -598,6 +623,12 @@ private:
                                  std::string* message);
     bool set_led_duty_raw(uint32_t led_id, uint32_t duty_percent);
     double current_zoom_ratio() const;
+
+    // Day/night auto (light-sensor) policy
+    void start_light_monitor();
+    void stop_light_monitor();
+    void light_monitor_loop();
+    LightSample read_light_sample();
 
     struct FpsTracker {
         uint64_t frame_count = 0;

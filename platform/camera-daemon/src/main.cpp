@@ -316,6 +316,7 @@ static DaemonConfig load_config(const std::string& path) {
         if (trimmed.find("audio:") == 0) { section = "audio"; continue; }
         if (trimmed.find("autofocus:") == 0) { section = "autofocus"; continue; }
         if (trimmed.find("infrared:") == 0) { section = "infrared"; continue; }
+        if (trimmed.find("light_sensor:") == 0) { section = "light_sensor"; continue; }
         if (trimmed.find("service:") == 0) { section = "service"; continue; }
         if (trimmed.find("streams:") == 0) { section = "streams"; cfg.streams.clear(); continue; }
         if (trimmed.find("encoders:") == 0) { section = "encoders"; cfg.encoders.clear(); continue; }
@@ -564,6 +565,23 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.infrared.mode_settle_frames = static_cast<int>(parse_u32_config(val, "infrared.mode_settle_frames"));
             else if (trimmed.find("log_updates:") != std::string::npos)
                 cfg.infrared.log_updates = (val == "true" || val == "1");
+        } else if (section == "light_sensor") {
+            if (trimmed.find("enabled:") != std::string::npos)
+                cfg.light_sensor.enabled = (val == "true" || val == "1");
+            else if (trimmed.find("auto_on_boot:") != std::string::npos)
+                cfg.light_sensor.auto_on_boot = (val == "true" || val == "1");
+            else if (trimmed.find("night_enter:") != std::string::npos)
+                cfg.light_sensor.night_enter = static_cast<int>(parse_u32_config(val, "light_sensor.night_enter", 100));
+            else if (trimmed.find("day_enter:") != std::string::npos)
+                cfg.light_sensor.day_enter = static_cast<int>(parse_u32_config(val, "light_sensor.day_enter", 100));
+            else if (trimmed.find("sample_interval_ms:") != std::string::npos)
+                cfg.light_sensor.sample_interval_ms = static_cast<int>(parse_u32_config(val, "light_sensor.sample_interval_ms", 60000));
+            else if (trimmed.find("stable_samples:") != std::string::npos)
+                cfg.light_sensor.stable_samples = static_cast<int>(parse_u32_config(val, "light_sensor.stable_samples", 100));
+            else if (trimmed.find("dark_mv:") != std::string::npos)
+                cfg.light_sensor.dark_mv = static_cast<int>(parse_u32_config(val, "light_sensor.dark_mv", 3300));
+            else if (trimmed.find("bright_mv:") != std::string::npos)
+                cfg.light_sensor.bright_mv = static_cast<int>(parse_u32_config(val, "light_sensor.bright_mv", 3300));
         } else if (section == "service") {
             if (trimmed.find("log_level:") != std::string::npos)
                 cfg.log_level = val;

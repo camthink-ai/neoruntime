@@ -3,6 +3,7 @@ import { deviceApi } from '@/services/api';
 import type {
   AutofocusJob,
   AutofocusStatus,
+  DayNightMode,
   DeviceStatus,
   IrCutMode,
   InfraredStatus,
@@ -56,6 +57,20 @@ export const useSetIrCut = () => {
   });
 };
 
+export const useSetImagingMode = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (mode: DayNightMode) => {
+      const response = await deviceApi.setImagingMode(mode);
+      return (response as any).data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['device', 'status'] });
+      queryClient.invalidateQueries({ queryKey: ['device', 'infrared'] });
+    },
+  });
+};
+
 export const useInfraredStatus = () => useQuery<InfraredStatus>({
   queryKey: ['device', 'infrared'],
   queryFn: async () => {
@@ -68,7 +83,7 @@ export const useInfraredStatus = () => useQuery<InfraredStatus>({
 export const useSetInfraredSettings = () => {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (settings: { auto_follow?: boolean; near_pwm?: number; far_pwm?: number }) => {
+    mutationFn: async (settings: { auto_follow?: boolean; near_pwm?: number; far_pwm?: number; night_enter?: number; day_enter?: number }) => {
       const response = await deviceApi.setInfraredSettings(settings);
       return (response as any).data as InfraredStatus;
     },

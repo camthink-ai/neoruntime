@@ -767,6 +767,9 @@ func infraredStatusFromCamera(resp *camerapb.InfraredStatusResponse) *pb.Infrare
 		RequestedNearPwm: resp.RequestedNearPwm, RequestedFarPwm: resp.RequestedFarPwm,
 		AppliedNearPwm: resp.AppliedNearPwm, AppliedFarPwm: resp.AppliedFarPwm,
 		ZoomRatio: resp.ZoomRatio, ActiveProfile: resp.ActiveProfile,
+		SelectedMode: resp.SelectedMode, LightPercent: resp.LightPercent,
+		LightMv: resp.LightMv, LightMilli: resp.LightMilli,
+		LightValid: resp.LightValid, NightEnter: resp.NightEnter, DayEnter: resp.DayEnter,
 	}
 }
 
@@ -805,6 +808,12 @@ func (s *DeviceControlServer) SetInfraredSettings(ctx context.Context, req *pb.I
 	}
 	if req.FarPwm != nil {
 		cameraReq.FarPwm = req.FarPwm
+	}
+	if req.NightEnter != nil {
+		cameraReq.NightEnter = req.NightEnter
+	}
+	if req.DayEnter != nil {
+		cameraReq.DayEnter = req.DayEnter
 	}
 	resp, err := s.cameraDaemonClient.SetInfraredSettings(ctx, cameraReq)
 	if err != nil {

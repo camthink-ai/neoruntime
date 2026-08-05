@@ -41,6 +41,8 @@ message InfraredSettingsRequest {
   optional bool auto_follow = 1;
   optional uint32 near_pwm = 2;
   optional uint32 far_pwm = 3;
+  optional int32 night_enter = 4;  // light-sensor night threshold (auto mode)
+  optional int32 day_enter = 5;    // light-sensor day threshold (auto mode)
 }
 
 message InfraredStatusResponse {
@@ -59,6 +61,14 @@ message InfraredStatusResponse {
   uint32 applied_far_pwm = 13;
   float zoom_ratio = 14;
   string active_profile = 15;
+  // Day/night auto (light-sensor) policy
+  string selected_mode = 16;   // operator selection: auto / day / infrared
+  int32 light_percent = 17;    // 0..100, endpoint-normalized
+  uint32 light_mv = 18;        // raw photodiode milli-volts
+  int32 light_milli = 19;      // raw scaled value
+  bool light_valid = 20;
+  int32 night_enter = 21;
+  int32 day_enter = 22;
 }
 
 // ============ PTZ control ============

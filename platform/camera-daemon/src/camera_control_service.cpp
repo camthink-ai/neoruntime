@@ -36,6 +36,14 @@ void fill_infrared_status(const IlluminationStatus& status, bool success,
     response->set_applied_far_pwm(status.applied_far_pwm);
     response->set_zoom_ratio(static_cast<float>(status.zoom_ratio));
     response->set_active_profile(status.active_profile);
+    // Day/night auto (light-sensor) policy
+    response->set_selected_mode(status.selected_mode);
+    response->set_light_percent(status.light_percent);
+    response->set_light_mv(status.light_mv);
+    response->set_light_milli(status.light_milli);
+    response->set_light_valid(status.light_valid);
+    response->set_night_enter(status.night_enter);
+    response->set_day_enter(status.day_enter);
 }
 
 } // namespace
@@ -655,9 +663,9 @@ grpc::Status CameraControlServiceImpl::SetImagingMode(
     grpc::ServerContext*, const aipc::camera::ImagingModeRequest* request,
     aipc::camera::InfraredStatusResponse* response) {
     std::string error;
-    const bool valid = request->mode() == "day" || request->mode() == "infrared";
-    const bool ok = daemon_ && valid && daemon_->set_imaging_mode(
-        request->mode() == "infrared" ? ImagingMode::Infrared : ImagingMode::Day, &error);
+    const std::string& mode = request->mode();
+    const bool valid = mode == "day" || mode == "infrared" || mode == "auto";
+    const bool ok = daemon_ && valid && daemon_->set_selected_mode(mode, &error);
     fill_infrared_status(daemon_ ? daemon_->get_illumination_status() : IlluminationStatus{},
                          ok, valid ? error : "invalid imaging mode", response);
     return grpc::Status::OK;
@@ -686,6 +694,14 @@ grpc::Status CameraControlServiceImpl::SetInfraredSettings(
         const uint32_t far_pwm = request->has_far_pwm()
             ? request->far_pwm() : static_cast<uint32_t>(current.requested_far_pwm);
         ok = daemon_->set_infrared_manual(near_pwm, far_pwm, &error);
+    }
+    if (ok && (request->has_night_enter() || request->has_day_enter())) {
+        const auto current = daemon_->get_illumination_status();
+        const int night_enter = request->has_night_enter()
+            ? request->night_enter() : current.night_enter;
+        const int day_enter = request->has_day_enter()
+            ? request->day_enter() : current.day_enter;
+        ok = daemon_->set_light_thresholds(night_enter, day_enter, &error);
     }
     fill_infrared_status(daemon_ ? daemon_->get_illumination_status() : IlluminationStatus{},
                          ok, error, response);

@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstdint>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -2907,6 +2908,21 @@ void CameraDaemon::start_grpc_server() {
         }
     }
 
+    /* Day/night auto (light-sensor) policy: take a runtime copy of the thresholds
+     * (live-adjustable via set_light_thresholds) and optionally start in auto mode. */
+    {
+        std::lock_guard<std::mutex> lk(daynight_mu_);
+        light_sensor_cfg_ = config_.light_sensor;
+        daynight_state_.mode = LightMode::Day;
+    }
+    if (config_.light_sensor.enabled && config_.light_sensor.auto_on_boot) {
+        (void)set_selected_mode("auto", nullptr);
+    } else {
+        std::lock_guard<std::mutex> lk(daynight_mu_);
+        selected_mode_ = (config_.infrared.default_mode == "infrared")
+                             ? SelectedMode::Infrared : SelectedMode::Day;
+    }
+
     if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
         hal_loader_->has_isp() && video_source_ && frame_router_) {
         autofocus_controller_ = std::make_unique<AutofocusController>(
@@ -4144,6 +4160,175 @@ bool CameraDaemon::set_imaging_mode(ImagingMode mode, std::string* message) {
     return true;
 }
 
+/* ========== Day/Night auto (light-sensor) policy ========== */
+
+const char* selected_mode_name(SelectedMode mode) {
+    switch (mode) {
+    case SelectedMode::Auto:     return "auto";
+    case SelectedMode::Infrared: return "infrared";
+    case SelectedMode::Day:
+    default:                     return "day";
+    }
+}
+
+SelectedMode parse_selected_mode(const std::string& text) {
+    std::string s;
+    s.reserve(text.size());
+    for (char c : text) {
+        s += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (s == "auto") return SelectedMode::Auto;
+    if (s == "infrared" || s == "night") return SelectedMode::Infrared;
+    return SelectedMode::Day;
+}
+
+LightSample CameraDaemon::read_light_sample() {
+    LightSample sample{};
+    auto* ops = hal_loader_ ? hal_loader_->sensor() : nullptr;
+    void* ctx = hal_loader_ ? hal_loader_->mcu_ctx() : nullptr;
+    if (!ops || !ops->pd_get || !ctx) {
+        sample.valid = false;
+        return sample;
+    }
+    HalAdcValue av{};
+    if (ops->pd_get(ctx, &av) != HAL_OK) {
+        sample.valid = false;
+        return sample;
+    }
+    sample.valid = true;
+    sample.mv = av.mv;
+    sample.milli = av.milli;
+    LightSensorConfig cfg;
+    {
+        std::lock_guard<std::mutex> lk(daynight_mu_);
+        cfg = light_sensor_cfg_;
+    }
+    sample.percent = normalize_light_percent(av.mv, av.milli, cfg);
+    return sample;
+}
+
+void CameraDaemon::start_light_monitor() {
+    stop_light_monitor();
+    light_stop_.store(false, std::memory_order_release);
+    light_thread_ = std::thread([this] { light_monitor_loop(); });
+    HAL_LOG_INFO("CameraDaemon: light-sensor auto monitor started");
+}
+
+void CameraDaemon::stop_light_monitor() {
+    light_stop_.store(true, std::memory_order_release);
+    if (light_thread_.joinable()) {
+        light_thread_.join();
+    }
+}
+
+void CameraDaemon::light_monitor_loop() {
+    while (!light_stop_.load(std::memory_order_acquire)) {
+        SelectedMode sel = SelectedMode::Day;
+        {
+            std::lock_guard<std::mutex> lk(daynight_mu_);
+            sel = selected_mode_;
+        }
+
+        if (sel == SelectedMode::Auto) {
+            const LightSample sample = read_light_sample();
+            bool apply = false;
+            LightMode apply_target = LightMode::Day;
+            {
+                std::lock_guard<std::mutex> lk(daynight_mu_);
+                if (selected_mode_ == SelectedMode::Auto) {
+                    const bool lens_active =
+                        (lens_controller_ && lens_controller_->autofocus_operation_active());
+                    const auto decision =
+                        evaluate(daynight_state_, sample, light_sensor_cfg_, lens_active);
+                    if (decision == LightSwitchDecision::ToDay ||
+                        decision == LightSwitchDecision::ToNight) {
+                        apply = true;
+                        apply_target = daynight_state_.mode;
+                    } else if (daynight_state_.has_pending && !lens_active) {
+                        /* apply a switch that was deferred while a lens/AF op was active */
+                        apply = true;
+                        apply_target = daynight_state_.pending_target;
+                        daynight_state_.has_pending = false;
+                        daynight_state_.mode = apply_target;
+                        daynight_state_.stable_count = 0;
+                    }
+                }
+            }
+            if (apply) {
+                HAL_LOG_INFO(
+                    "CameraDaemon: auto day/night -> %s (light percent=%d mv=%u valid=%d)",
+                    light_mode_name(apply_target), sample.percent,
+                    static_cast<unsigned>(sample.mv), sample.valid ? 1 : 0);
+                (void)set_imaging_mode(apply_target == LightMode::Night
+                                           ? ImagingMode::Infrared
+                                           : ImagingMode::Day);
+            }
+        }
+
+        int interval_ms = 500;
+        {
+            std::lock_guard<std::mutex> lk(daynight_mu_);
+            interval_ms = light_sensor_cfg_.sample_interval_ms > 0
+                              ? light_sensor_cfg_.sample_interval_ms
+                              : 500;
+        }
+        for (int waited = 0;
+             waited < interval_ms && !light_stop_.load(std::memory_order_acquire);
+             waited += 20) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(std::min(20, interval_ms - waited)));
+        }
+    }
+}
+
+bool CameraDaemon::set_selected_mode(const std::string& mode, std::string* message) {
+    const SelectedMode sel = parse_selected_mode(mode);
+    if (sel == SelectedMode::Auto) {
+        const bool optical_night =
+            (illumination_controller_ &&
+             illumination_controller_->status().mode == ImagingMode::Infrared);
+        {
+            std::lock_guard<std::mutex> lk(daynight_mu_);
+            selected_mode_ = SelectedMode::Auto;
+            daynight_state_.mode = optical_night ? LightMode::Night : LightMode::Day;
+            daynight_state_.stable_count = 0;
+            daynight_state_.has_pending = false;
+        }
+        start_light_monitor();
+        HAL_LOG_INFO("CameraDaemon: selected mode = auto (light-driven)");
+        return true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(daynight_mu_);
+        selected_mode_ = sel;
+        daynight_state_.stable_count = 0;
+        daynight_state_.has_pending = false;
+    }
+    stop_light_monitor();
+    const bool ok = set_imaging_mode(
+        sel == SelectedMode::Infrared ? ImagingMode::Infrared : ImagingMode::Day, message);
+    if (ok) {
+        HAL_LOG_INFO("CameraDaemon: selected mode = %s", selected_mode_name(sel));
+    }
+    return ok;
+}
+
+bool CameraDaemon::set_light_thresholds(int night_enter, int day_enter, std::string* message) {
+    std::string err;
+    if (!validate_light_thresholds(night_enter, day_enter, &err)) {
+        if (message) *message = err;
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(daynight_mu_);
+    light_sensor_cfg_.night_enter = night_enter;
+    light_sensor_cfg_.day_enter = day_enter;
+    daynight_state_.stable_count = 0; /* reset accumulation on threshold change */
+    HAL_LOG_INFO("CameraDaemon: light thresholds updated night_enter=%d day_enter=%d",
+                 night_enter, day_enter);
+    return true;
+}
+
 bool CameraDaemon::set_infrared_manual(uint32_t near_pwm, uint32_t far_pwm,
                                        std::string* message) {
     if (!illumination_controller_) {
@@ -4173,9 +4358,23 @@ bool CameraDaemon::set_infrared_auto_follow(bool enabled, std::string* message) 
 }
 
 IlluminationStatus CameraDaemon::get_illumination_status() const {
-    if (illumination_controller_) return illumination_controller_->status();
     IlluminationStatus status;
-    status.error = "infrared controller unavailable";
+    if (illumination_controller_) {
+        status = illumination_controller_->status();
+    } else {
+        status.error = "infrared controller unavailable";
+    }
+    /* Day/night auto (light-sensor) fields. */
+    {
+        std::lock_guard<std::mutex> lk(daynight_mu_);
+        status.selected_mode = selected_mode_name(selected_mode_);
+        status.light_percent = daynight_state_.last.percent;
+        status.light_mv = daynight_state_.last.mv;
+        status.light_milli = daynight_state_.last.milli;
+        status.light_valid = daynight_state_.last.valid;
+        status.night_enter = light_sensor_cfg_.night_enter;
+        status.day_enter = light_sensor_cfg_.day_enter;
+    }
     return status;
 }
 
@@ -5749,6 +5948,10 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
 
 void CameraDaemon::shutdown() {
     HAL_LOG_INFO("CameraDaemon: Shutting down...");
+
+    // Stop the light-sensor auto monitor first so it cannot fire a mode switch
+    // (which touches illumination/media) during teardown.
+    stop_light_monitor();
 
 #ifdef HAS_GRPC
     stop_grpc_server();

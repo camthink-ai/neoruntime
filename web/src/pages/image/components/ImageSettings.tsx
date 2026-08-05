@@ -6,6 +6,7 @@ import { Loader2, Moon, Sparkles } from 'lucide-react';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Slider } from '@/components/ui/slider';
+import { Button } from '@/components/ui/button';
 import {
   Select,
   SelectContent,
@@ -26,7 +27,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { ImageIcon, RotateCw } from 'lucide-react';
-import { useInfraredStatus, useSetIrCut } from '@/hooks/useDeviceControl';
+import { useInfraredStatus, useSetImagingMode, useSetInfraredSettings } from '@/hooks/useDeviceControl';
 import ImageSettingsSkeleton from './ImageSettingsSkeleton';
 import {
   fetchISPConfig,
@@ -101,9 +102,14 @@ export default function ImageSettings() {
 
   const isInSwitchCooldown = () => Date.now() - lastSwitchAtRef.current < SWITCH_COOLDOWN_MS;
   const { data: infrared } = useInfraredStatus();
-  const setIrCut = useSetIrCut();
+  const setImagingMode = useSetImagingMode();
+  const setInfraredSettings = useSetInfraredSettings();
   const infraredActive = infrared?.mode === 'infrared';
-  const infraredSwitching = setIrCut.isPending || infrared?.transition === 'switching';
+  const infraredSwitching = setImagingMode.isPending || infrared?.transition === 'switching';
+  const selectedMode = infrared?.selected_mode ?? (infraredActive ? 'infrared' : 'day');
+  const nightEnter = infrared?.night_enter ?? 28;
+  const dayEnter = infrared?.day_enter ?? 82;
+  const isAutoMode = selectedMode === 'auto';
 
   // Remembers the last AI ISP Gen profile the user had active so toggling
   // AI ISP off→on restores it instead of always jumping to the default. Set
@@ -219,26 +225,33 @@ export default function ImageSettings() {
     [t]
   );
 
-  const handleInfraredModeChange = useCallback(
-    async (enabled: boolean) => {
+  const handleSelectMode = useCallback(
+    async (mode: 'auto' | 'day' | 'infrared') => {
       try {
-        await setIrCut.mutateAsync(enabled ? 'night' : 'day');
+        await setImagingMode.mutateAsync(mode);
         await loadData();
         window.dispatchEvent(
-          new CustomEvent('aipc:media-profile-changed', {
-            detail: { interrupt_ms: 0 },
-          })
+          new CustomEvent('aipc:media-profile-changed', { detail: { interrupt_ms: 0 } })
         );
-        toast.success(
-          enabled
-            ? t('sys.media_settings.ir_cut_success', 'Switched to infrared mode')
-            : t('sys.media_settings.ir_cut_success', 'Switched to day mode')
-        );
+        toast.success(t('sys.media_settings.ir_cut_success', 'Imaging mode updated'));
       } catch {
         toast.error(t('sys.media_settings.ir_cut_failed', 'Failed to switch imaging mode'));
       }
     },
-    [loadData, setIrCut, t]
+    [loadData, setImagingMode, t]
+  );
+
+  const handleNightEnter = useCallback(
+    (v: number) => {
+      setInfraredSettings.mutate({ night_enter: Math.min(v, dayEnter - 1), day_enter: dayEnter });
+    },
+    [setInfraredSettings, dayEnter]
+  );
+  const handleDayEnter = useCallback(
+    (v: number) => {
+      setInfraredSettings.mutate({ night_enter: nightEnter, day_enter: Math.max(v, nightEnter + 1) });
+    },
+    [setInfraredSettings, nightEnter]
   );
 
   const ispDebounceRef = useRef<
@@ -351,24 +364,81 @@ export default function ImageSettings() {
   return (
     <div className="flex flex-col gap-4">
       <Card className="shadow-sm bg-background">
-        <CardContent className="p-5 space-y-3">
-          <div className="flex items-center justify-between gap-3">
-            <div className="space-y-0.5">
-              <h3 className="flex items-center gap-1.5 text-sm font-bold text-muted-foreground">
-                <Moon className="w-4 h-4" />
-                {t('sys.media_settings.infrared_mode', 'Infrared Mode')}
-              </h3>
-              <p className="text-xs text-muted-foreground">
-                {infraredActive
+        <CardContent className="p-5 space-y-4">
+          <div className="space-y-0.5">
+            <h3 className="flex items-center gap-1.5 text-sm font-bold text-muted-foreground">
+              <Moon className="w-4 h-4" />
+              {t('sys.media_settings.daynight_mode', 'Day / Night Mode')}
+            </h3>
+            <p className="text-xs text-muted-foreground">
+              {selectedMode === 'auto'
+                ? t('sys.media_settings.daynight_auto_hint', 'Auto: switches day/night with the light sensor')
+                : infraredActive
                   ? t('sys.media_settings.infrared_on_hint', 'Infrared profile and IR illumination are active')
                   : t('sys.media_settings.infrared_off_hint', 'Use the daylight profile with IR illumination off')}
-              </p>
+            </p>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            {(['auto', 'day', 'infrared'] as const).map(m => (
+              <Button
+                key={m}
+                variant={selectedMode === m ? 'default' : 'outline'}
+                size="sm"
+                disabled={infraredSwitching}
+                onClick={() => handleSelectMode(m)}
+              >
+                {m === 'auto'
+                  ? t('sys.media_settings.daynight_auto', 'Auto')
+                  : m === 'day'
+                    ? t('sys.media_settings.daynight_day', 'Day')
+                    : t('sys.media_settings.daynight_night', 'Night')}
+              </Button>
+            ))}
+          </div>
+
+          {/* Light-sensor thresholds (auto mode) */}
+          <div className={`space-y-3 ${isAutoMode ? '' : 'opacity-50 pointer-events-none'}`}>
+            <Label className="text-xs">
+              {t('sys.media_settings.light_thresholds', 'Light thresholds (auto)')}
+            </Label>
+            <div className="space-y-1.5">
+              <Label className="text-xs">
+                {t('sys.media_settings.night_enter', 'Enter night ≤')}
+              </Label>
+              <div className="flex items-center space-x-3">
+                <Slider
+                  value={[nightEnter]}
+                  onValueChange={v => handleNightEnter(v[0])}
+                  min={0}
+                  max={Math.max(1, dayEnter - 1)}
+                  step={1}
+                  className="flex-1"
+                  disabled={!isAutoMode}
+                />
+                <span className="text-xs text-muted-foreground w-8 text-right tabular-nums">
+                  {nightEnter}
+                </span>
+              </div>
             </div>
-            <Switch
-              checked={infraredActive}
-              disabled={infraredSwitching}
-              onCheckedChange={handleInfraredModeChange}
-            />
+            <div className="space-y-1.5">
+              <Label className="text-xs">
+                {t('sys.media_settings.day_enter', 'Enter day ≥')}
+              </Label>
+              <div className="flex items-center space-x-3">
+                <Slider
+                  value={[dayEnter]}
+                  onValueChange={v => handleDayEnter(v[0])}
+                  min={Math.min(99, nightEnter + 1)}
+                  max={100}
+                  step={1}
+                  className="flex-1"
+                  disabled={!isAutoMode}
+                />
+                <span className="text-xs text-muted-foreground w-8 text-right tabular-nums">
+                  {dayEnter}
+                </span>
+              </div>
+            </div>
           </div>
         </CardContent>
       </Card>

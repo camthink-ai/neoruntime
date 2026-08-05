@@ -70,6 +70,7 @@ export interface DeviceStatus {
 
 export type IrCutMode = 'day' | 'night';
 export type ImagingMode = 'day' | 'infrared';
+export type DayNightMode = 'auto' | 'day' | 'infrared'; // operator-selected mode (3-button)
 
 export interface InfraredStatus {
   success: boolean;
@@ -87,6 +88,14 @@ export interface InfraredStatus {
   applied_far_pwm: number;
   zoom_ratio: number;
   active_profile: string;
+  // Day/night auto (light-sensor) policy
+  selected_mode: DayNightMode;
+  light_percent: number;
+  light_mv: number;
+  light_milli: number;
+  light_valid: boolean;
+  night_enter: number;
+  day_enter: number;
 }
 
 // ── API ───────────────────────────────────────────────────────────────
@@ -101,9 +110,9 @@ export const deviceApi = {
   setIrCut: (mode: IrCutMode) => request.put('/api/v1/device/imaging-mode', {
     mode: mode === 'night' ? 'infrared' : 'day',
   }),
-  setImagingMode: (mode: ImagingMode) => request.put('/api/v1/device/imaging-mode', { mode }),
+  setImagingMode: (mode: DayNightMode) => request.put('/api/v1/device/imaging-mode', { mode }),
   getInfraredStatus: () => request.get('/api/v1/device/infrared/status', { silent: true }),
-  setInfraredSettings: (settings: { auto_follow?: boolean; near_pwm?: number; far_pwm?: number }) => request.put('/api/v1/device/infrared/settings', settings),
+  setInfraredSettings: (settings: { auto_follow?: boolean; near_pwm?: number; far_pwm?: number; night_enter?: number; day_enter?: number }) => request.put('/api/v1/device/infrared/settings', settings),
   clearInfraredManual: () => request.delete('/api/v1/device/infrared/manual'),
 
   controlZoom: (speed: number) => request.post('/api/v1/device/zoom', { speed }),

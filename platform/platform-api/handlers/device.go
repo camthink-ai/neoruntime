@@ -184,8 +184,8 @@ func (h *APIHandlers) SetImagingMode(c *gin.Context) {
 		return
 	}
 	req.Mode = strings.ToLower(req.Mode)
-	if req.Mode != "day" && req.Mode != "infrared" {
-		Resp(c).FailMsg(CodeInvalidRequest, "Mode must be 'day' or 'infrared'")
+	if req.Mode != "day" && req.Mode != "infrared" && req.Mode != "auto" {
+		Resp(c).FailMsg(CodeInvalidRequest, "Mode must be 'auto', 'day' or 'infrared'")
 		return
 	}
 	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
@@ -224,6 +224,8 @@ func (h *APIHandlers) SetInfraredSettings(c *gin.Context) {
 		AutoFollow *bool   `json:"auto_follow"`
 		NearPWM    *uint32 `json:"near_pwm"`
 		FarPWM     *uint32 `json:"far_pwm"`
+		NightEnter *int    `json:"night_enter"`
+		DayEnter   *int    `json:"day_enter"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
@@ -233,7 +235,31 @@ func (h *APIHandlers) SetInfraredSettings(c *gin.Context) {
 		Resp(c).FailMsg(CodeInvalidRequest, "PWM must be between 0 and 100")
 		return
 	}
-	pbReq := &devicepb.InfraredSettingsRequest{AutoFollow: req.AutoFollow, NearPwm: req.NearPWM, FarPwm: req.FarPWM}
+	// Light-sensor thresholds (validated only when at least one is provided)
+	if req.NightEnter != nil || req.DayEnter != nil {
+		ne, de := 0, 100
+		if req.NightEnter != nil {
+			ne = *req.NightEnter
+		}
+		if req.DayEnter != nil {
+			de = *req.DayEnter
+		}
+		if ne < 0 || ne > 100 || de < 0 || de > 100 || ne >= de {
+			Resp(c).FailMsg(CodeInvalidRequest, "thresholds must be 0..100 and night_enter < day_enter")
+			return
+		}
+	}
+	pbReq := &devicepb.InfraredSettingsRequest{
+		AutoFollow: req.AutoFollow, NearPwm: req.NearPWM, FarPwm: req.FarPWM,
+	}
+	if req.NightEnter != nil {
+		v := int32(*req.NightEnter)
+		pbReq.NightEnter = &v
+	}
+	if req.DayEnter != nil {
+		v := int32(*req.DayEnter)
+		pbReq.DayEnter = &v
+	}
 	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

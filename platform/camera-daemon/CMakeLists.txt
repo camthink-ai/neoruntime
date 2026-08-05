@@ -195,6 +195,7 @@ set(SOURCES
     src/dpm_worker.cpp
     src/autofocus_controller.cpp
     src/illumination_controller.cpp
+    src/daynight_policy.cpp
     src/camera_control_service.cpp
     src/lens_hal_service.cpp
     src/camera_daemon.cpp
@@ -271,4 +272,14 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     )
     target_link_libraries(illumination-controller-test PRIVATE pthread)
     add_test(NAME illumination-controller-test COMMAND illumination-controller-test)
+
+    add_executable(daynight-policy-test
+        tests/daynight_policy_test.cpp
+        src/daynight_policy.cpp
+    )
+    target_include_directories(daynight-policy-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(daynight-policy-test PRIVATE pthread)
+    add_test(NAME daynight-policy-test COMMAND daynight-policy-test)
 endif()
