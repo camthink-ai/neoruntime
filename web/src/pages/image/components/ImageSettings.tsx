@@ -107,9 +107,16 @@ export default function ImageSettings() {
   const infraredActive = infrared?.mode === 'infrared';
   const infraredSwitching = setImagingMode.isPending || infrared?.transition === 'switching';
   const selectedMode = infrared?.selected_mode ?? (infraredActive ? 'infrared' : 'day');
-  const nightEnter = infrared?.night_enter ?? 28;
-  const dayEnter = infrared?.day_enter ?? 82;
   const isAutoMode = selectedMode === 'auto';
+  // Local state drives the sliders (smooth drag); synced from the polled status.
+  const [nightEnter, setNightEnter] = useState(infrared?.night_enter ?? 28);
+  const [dayEnter, setDayEnter] = useState(infrared?.day_enter ?? 82);
+  useEffect(() => {
+    if (infrared) {
+      setNightEnter(infrared.night_enter ?? 28);
+      setDayEnter(infrared.day_enter ?? 82);
+    }
+  }, [infrared]);
 
   // Remembers the last AI ISP Gen profile the user had active so toggling
   // AI ISP off→on restores it instead of always jumping to the default. Set
@@ -241,17 +248,30 @@ export default function ImageSettings() {
     [loadData, setImagingMode, t]
   );
 
-  const handleNightEnter = useCallback(
-    (v: number) => {
-      setInfraredSettings.mutate({ night_enter: Math.min(v, dayEnter - 1), day_enter: dayEnter });
-    },
-    [setInfraredSettings, dayEnter]
+  // Live local update (smooth drag, clamped to keep night < day); commit to backend on release.
+  const onNightEnterChange = useCallback(
+    (v: number) => setNightEnter(Math.min(Math.max(v, 0), dayEnter - 1)),
+    [dayEnter]
   );
-  const handleDayEnter = useCallback(
+  const onDayEnterChange = useCallback(
+    (v: number) => setDayEnter(Math.min(Math.max(v, nightEnter + 1), 100)),
+    [nightEnter]
+  );
+  const commitNightEnter = useCallback(
     (v: number) => {
-      setInfraredSettings.mutate({ night_enter: nightEnter, day_enter: Math.max(v, nightEnter + 1) });
+      const clamped = Math.min(Math.max(v, 0), dayEnter - 1);
+      setNightEnter(clamped);
+      setInfraredSettings.mutate({ night_enter: clamped, day_enter: dayEnter });
     },
-    [setInfraredSettings, nightEnter]
+    [dayEnter, setInfraredSettings]
+  );
+  const commitDayEnter = useCallback(
+    (v: number) => {
+      const clamped = Math.min(Math.max(v, nightEnter + 1), 100);
+      setDayEnter(clamped);
+      setInfraredSettings.mutate({ night_enter: nightEnter, day_enter: clamped });
+    },
+    [nightEnter, setInfraredSettings]
   );
 
   const ispDebounceRef = useRef<
@@ -408,9 +428,10 @@ export default function ImageSettings() {
               <div className="flex items-center space-x-3">
                 <Slider
                   value={[nightEnter]}
-                  onValueChange={v => handleNightEnter(v[0])}
+                  onValueChange={v => onNightEnterChange(v[0])}
+                  onValueCommit={v => commitNightEnter(v[0])}
                   min={0}
-                  max={Math.max(1, dayEnter - 1)}
+                  max={100}
                   step={1}
                   className="flex-1"
                   disabled={!isAutoMode}
@@ -427,8 +448,9 @@ export default function ImageSettings() {
               <div className="flex items-center space-x-3">
                 <Slider
                   value={[dayEnter]}
-                  onValueChange={v => handleDayEnter(v[0])}
-                  min={Math.min(99, nightEnter + 1)}
+                  onValueChange={v => onDayEnterChange(v[0])}
+                  onValueCommit={v => commitDayEnter(v[0])}
+                  min={0}
                   max={100}
                   step={1}
                   className="flex-1"
