@@ -1,0 +1,96 @@
+# NE503 AI Runtime Configuration
+
+# Service configuration
+service:
+  name: ai-runtime
+  listen: unix:///run/aipc/ai-runtime.sock
+  log_level: debug
+  log_file: /var/log/aipc/ai-runtime.log
+
+# HAL ML configuration
+hal:
+  library_path: /data/aipc/lib/hal/libaipc_hal.so
+  # library_path: /data/aipc/lib/hal/libaipc_hal.so   # HAL v2 stub for host testing
+  device_path: /dev/hailo0
+  # Scheduler config passed to HAL create() as platform_config.
+  # Enables shared VDevice + Round-Robin model scheduling on Hailo-15 NPU.
+  platform_config: |
+    {
+      "scheduler": {
+        "algorithm": "round_robin",
+        "group_id": "aipc",
+        "multi_process_service": true,
+        "threshold": 4,
+        "timeout_ms": 100
+      }
+    }
+  
+# Model repository
+models:
+  repository_path: /data/aipc/models
+  cache_path: /var/cache/aipc/models
+  
+  # Preload models — keep minimal to avoid NPU context exhaustion
+  # Each loaded model (network group) consumes NPU resources that are never
+  # released. Heavy models like vit_large (32 contexts, ~280MB) fail with
+  # DEADLINE_EXCEEDED when too many models are preloaded.
+  preload: []
+
+
+# Inference scheduler configuration
+scheduler:
+  # Global quota
+  global_qps_limit: 100
+  global_concurrent_limit: 8
+  
+  # Default session quota
+  default_session:
+    max_qps: 30
+    max_concurrent: 2
+    priority: 5
+  
+  # Scheduler strategy
+  strategy: fair  # priority | fifo | fair
+  queue_size: 64
+  timeout_ms: 5000
+
+# FD Receiver (zero-copy DMA-BUF from camera-daemon)
+fd_receiver:
+  socket_path: /run/aipc/camera.sock
+
+# Performance configuration
+performance:
+  # NPU performance mode
+  device_mode: high  # high | normal | low
+  
+  # Batch processing
+  batch_enabled: false
+  batch_size: 1
+  batch_timeout_ms: 100
+  
+  # Memory management
+  max_model_cache: 3
+  memory_limit_mb: 2048
+
+# Monitoring and statistics
+monitoring:
+  enabled: true
+  stats_interval_sec: 10
+  metrics_port: 9090
+  
+  # Temperature protection
+  temperature_limit_c: 85
+  throttle_temperature_c: 80
+
+# Event Bus integration
+event_bus:
+  enabled: true
+  endpoint: "unix:///run/aipc/event-bus.sock"
+  
+  # Auto-publish inference results
+  auto_publish_results: true
+  result_topic_prefix: "inference/"
+
+# Auto-inference (no external client needed)
+auto_infer:
+  enabled: false

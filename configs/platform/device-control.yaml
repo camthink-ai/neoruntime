@@ -1,0 +1,93 @@
+# NE503 Device Control Configuration
+
+# Service configuration
+service:
+  name: device-control
+  listen: unix:///run/aipc/device-control.sock
+  log_level: info
+  log_file: /var/log/aipc/device-control.log
+
+# Camera-daemon gRPC endpoint for HAL operations
+camera_daemon:
+  lens_endpoint: /run/aipc/camera-control.sock
+  # camera_control_endpoint: defaults to lens_endpoint if not set
+
+# MCU communication configuration
+mcu:
+  protocol: uart
+  device: /dev/ttyS0
+  baudrate: 921600
+  data_bits: 8
+  parity: none
+  stop_bits: 1
+  
+  # Timeout and retry
+  timeout_ms: 1000
+  max_retries: 3
+  retry_delay_ms: 100
+  
+  # Heartbeat
+  heartbeat_enabled: true
+  heartbeat_interval_sec: 30
+
+# Device capabilities configuration
+capabilities:
+  # Light control
+  light:
+    white_light: true
+    ir_led: true
+    ir_cut: true
+    
+  # PTZ control
+  ptz:
+    enabled: true
+    pan_range: [-180, 180]    # degrees
+    tilt_range: [-45, 45]     # degrees
+    max_speed: 100
+    presets: 16               # number of presets
+    
+  # Lens control
+  lens:
+    zoom: true
+    focus: true
+    autofocus: true
+    iris: true
+    zoom_range: [1.0, 2.88]     # zoom ratio (AF0832-D09 optical)
+    focus_range: [0.1, 10.0]    # meters
+    default_zoom_limit: [-3236, 760]   # AF0832-D09 micro steps
+    default_focus_limit: [-844, 592]
+    
+  # GPIO
+  gpio:
+    available_pins: [12, 13, 21, 22]
+    input_pins: [12, 13]
+    output_pins: [21, 22]
+
+# Automation control
+automation:
+  # Day/night auto switching
+  day_night_auto:
+    enabled: true
+    light_sensor_threshold: 300  # Light sensor threshold
+    hysteresis: 50
+    delay_sec: 10
+    
+  # Temperature protection
+  temperature_protection:
+    enabled: true
+    warning_temp_c: 75
+    critical_temp_c: 85
+    action: throttle  # throttle | shutdown | alert
+
+# Event Bus integration
+event_bus:
+  enabled: true
+  endpoint: unix:///run/aipc/event-bus.sock
+  
+  # Auto-publish status changes
+  publish_events:
+    - gpio_change
+    - temperature_alert
+    - day_night_switch
+    - ptz_preset_reached
+

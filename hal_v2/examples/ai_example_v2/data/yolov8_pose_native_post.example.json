@@ -1,0 +1,9 @@
+{
+  "native_yolov8_pose": true,
+  "confidence_threshold": 0.6,
+  "score_threshold": 0.6,
+  "keypoint_threshold": 0.25,
+  "iou_threshold": 0.7,
+  "yolov8_pose_network_width": 640,
+  "yolov8_pose_network_height": 640
+}

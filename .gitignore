@@ -1,0 +1,363 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+*.out
+# Project binaries (if built in root)
+/server
+/platform-api
+/ai-runtime
+/device-control
+/event-bus
+/app-manager
+/camera-daemon
+
+# Go
+*.test
+*.prof
+go.work
+go.work.sum
+vendor/
+# Go build cache (optional - usually in GOCACHE)
+# .go-cache/
+
+# Build artifacts
+build/output/
+build/toolchain/
+project.zip
+platform/camera-daemon/build/
+hal/build*
+# Platform service binaries (if built in source tree)
+platform/*/server/*-runtime
+platform/*/server/*-daemon
+platform/*/cmd/*-manager
+platform/*/cmd/*-api
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+*.cmake
+!cmake/*.cmake
+!CMakeLists.txt
+.cmake/
+
+# Generated files (Protobuf)
+*.pb.go
+*_grpc.pb.go
+*.pb.gw.go
+*_pb2.py
+*_pb2_grpc.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+dist-*/
+# Build artifacts / old snapshots / packed trees — never commit these
+*.backup
+*.stash
+archive.zip
+downloads/
+eggs/
+.eggs/
+lib/
+!web/src/**/lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.cover
+*.log
+.coverage
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# IDEs
+.vscode/
+.idea/
+.zed/
+.agents/
+.cursor/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm
+.eslintcache
+
+# Frontend build outputs
+web/dist/
+web/console/dist/
+web/**/dist/
+web/**/dist-ssr/
+web/**/build/
+web/**/.next/
+web/**/.vite/
+web/**/.turbo/
+web/**/.cache/
+!web/src/lib/
+
+# Frontend environment
+web/.env
+web/.env.local
+web/.env.*.local
+web/console/.env
+web/console/.env.local
+web/console/.env.*.local
+web/**/.env*.local
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+/tmp/
+
+# Logs
+*.log
+logs/
+!web/**/logs/
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Project specific
+/rootfs/opt/ne503/bin/
+/rootfs/opt/ne503/lib/
+*.sock
+*.pid
+# Runtime directories
+/run/aipc/
+/var/lib/aipc/
+# Containerd runtime files
+containerd-state/
+containerd-sock/
+
+# Test artifacts
+coverage.out
+coverage.html
+*.test
+test-results/
+
+# Configuration overrides (keep templates)
+configs/**/*-local.yaml
+configs/**/*-dev.yaml
+configs/**/*-prod.yaml
+!configs/**/*-template.yaml
+
+# Data directories
+data/
+!hal_v2/examples/ai_example_v2/data/
+!hal_v2/examples/ai_example_v2/data/*.example.json
+*.db
+*.sqlite
+
+# Images and models
+*.hef
+*.rknn
+*.trt
+*.onnx
+*.tar
+*.tar.gz
+models/hef/*.hef
+models/onnx/*.onnx
+models/trt/*.trt
+# Container images
+*.img
+*.iso
+# Docker/containerd
+docker-compose.override.yml
+.dockerignore.local
+
+# Credentials
+*.key
+*.pem
+*.crt
+secrets/
+# Exception: platform/platform-api/internal/secrets is a Go *source* package
+# (bcrypt hashing, RSA password decryption, replay protection) — not runtime
+# credentials. Un-ignore it so the auth feature compiles for anyone cloning.
+!platform/platform-api/internal/secrets/
+.env
+.envrc.local
+.env.local
+# SSH keys
+*.pub
+id_rsa
+id_ed25519
+
+# HAL v2
+hal_v2/doc/hailo-media-library
+hal_v2/doc/hailo-apps
+hal_v2/doc/hailodsp
+hal_v2/doc/hailort
+hal_v2/build*
+
+# Claude
+.claude/
+
+# Additional build artifacts
+bin/
+platform/bin/
+platform/ai-runtime/.cache/
+platform/ai-runtime/proto_gen_arm/
+platform/ai-runtime/build-*/
+platform/ai-runtime/build_arm/
+platform/camera-daemon/build-*/
+platform/camera-daemon/build-check/
+
+# The packaged nginx gateway runtime is part of release source. It intentionally
+# carries a small target-side binary/runtime slice under directories named bin/
+# and lib/, so keep it visible despite the generic artifact rules above.
+!deploy/nginx/runtime/**
+platform/camera-daemon/proto_gen_arm/
+tools/shm-reader/build-*/
+platform/platform-api/platform-api
+platform/platform-api/platform-api-arm64
+*-arm64
+NE503/
+yocto/
+test.py
+
+# Backup files
+*_bak.cpp
+*.copy.yaml
+tools/aipc-cli/aipc-cli
+
+# Web resources
+web/resources/
+
+# Root-level build artifacts
+/cmd
+/server
+/platform-api-bin
+/app-manager-arm64
+/build-output/
+/build-v2/
+
+# Archives (not source)
+*.tar
+*.tar.gz
+!configs/**/*.tar.gz
+aipc-arm-deploy.tar.gz
+
+# Go installer archives
+go*.linux-*.tar.gz
+
+# Top-level generated protobuf
+/camera.pb.go
+/camera_grpc.pb.go
+
+# Test results
+docs/testing/results/
+
+# Local settings
+.claude/settings.local.json
+Makefile.docker
+Makefile.local
+
+mcu_board_prj/boot/build/
+mcu_board_prj/boot/Debug/
+mcu_board_prj/app/build/
+mcu_board_prj/app/Debug/
+Makefile.local
+
+mcu_board_prj/boot/build/
+mcu_board_prj/boot/Debug/
+mcu_board_prj/app/build/
+mcu_board_prj/app/Debug/
+mcu_board_prj/app/Debug/
+mcu_board_prj/build/
+mcu_board_prj/firmware/ne503_mcu_boot.*
+mcu_board_prj/firmware/ne503_Main_*.hex
+
+# Binary artifacts
+*.tar
+*.whl
+
+# Build outputs
+platform/app-manager/build*/
+.pnpm-store/
+
+# Temp files
+*.tmp*
+scripts/verify_time_*.sh
+
+# Third-party tools with own repos
+bugtap/
+
+# Local fallback copy; release builds use hal_v2/build-*/ne503_boot_prep.
+/tools/ne503_boot_prep
+
+# Mock bundles
+web/src/mock/_*.bundled_*.mjs
+
+# PDF and zip archives
+*.pdf
+docs-wiki-bundle.zip
+hailort/
+
+# OS firmware images (build outputs, ~800MB each) and variant suffixes
+*.swu
+*.swu.*
+
+# os-updater binary (built, ARM aarch64)
+/platform/os-updater/aipc-os-updater
+
+# Nested Yocto BSP repo (separate upstream repo — not part of ne503)
+/meta-hailo-os/
+
+# ======== Open-source hygiene (added 2026-07-14) ========
+# Root prebuilt binaries — ships from CI release artifacts, not the tree
+/aipc-cli
+/platform-api
+/server
+/cmd
+/docker/build/build-server
+
+# CMake / stray build artifacts at repo root
+/CMakeCache.txt
+/CMakeFiles/
+/.tmp.*
+
+# Stale per-component temp binaries
+/platform/platform-api/temp-bin
+
+# Dropped archive bundles (>100MB; keep in release artifacts instead)
+/archive.zip
+/project.zip
+*.aipc
+*.tar.old
+
+# Python build artifacts
+__pycache__/
+*.pyc
+
+# Prebuilt ct-disc GUI binary (rebuilt from source)
+/tools/ct-disc/gui/ct-disc-gui/ct-disc-gui

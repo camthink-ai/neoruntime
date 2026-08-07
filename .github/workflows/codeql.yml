@@ -1,0 +1,30 @@
+name: CodeQL
+
+on:
+  # Code scanning upload requires a public repository or GitHub Advanced Security.
+  # Keep CodeQL manual while this repository is private.
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-22.04
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [go, javascript, python]
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.25.0' }
+        if: matrix.language == 'go'
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # config-file: ./.github/codeql-config.yml  # add if tuning
+      - uses: github/codeql-action/analyze@v3

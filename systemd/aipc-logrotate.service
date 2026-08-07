@@ -1,0 +1,12 @@
+[Unit]
+Description=AIPC log rotation (Go service logs; logger.go has no built-in rotation)
+Documentation=https://github.com/yourorg/ne503
+# Run after firstboot so /data/logs exists and after local filesystems are up.
+After=local-fs.target aipc-firstboot.service
+
+[Service]
+Type=oneshot
+ExecStart=/data/aipc/scripts/aipc-logrotate.sh
+# Rotation must never aggravate a stressed (or about-to-hang) system.
+Nice=10
+IOSchedulingClass=idle

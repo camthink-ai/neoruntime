@@ -1,0 +1,9 @@
+[Unit]
+Description=AIPC Application Platform (stable grouping handle)
+Documentation=https://github.com/yourorg/ne503
+# Stable handle that OS-owned boot/bootstrap units (aipc-os-verify, etc.)
+# reference instead of naming individual business services. This file is
+# AIPC-owned, so AIPC may freely add/remove/rename services here without
+# forcing an OS image rebuild.
+After=aipc-firstboot.service aipc-mcu-prep.service aipc-restore.service
+Wants=aipc-healthmon.service event-bus.service camera-daemon.service ai-runtime.service device-control.service device-discovery.service platform-api.service app-manager.service aipc-nginx-gateway.service

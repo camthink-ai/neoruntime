@@ -1,0 +1,42 @@
+# golangci-lint configuration for the AIPC platform Go services.
+# Invoke via `make lint` (runs `golangci-lint run ./platform/...`).
+run:
+  timeout: 5m
+  tests: false  # unit tests are exercised by `make test-unit`, not the linter
+  # Use mod (module cache) rather than vendor: the committed vendor/modules.txt
+  # is stale relative to go.mod (several packages version-skewed), which makes
+  # any vendor-mode tool fail with "inconsistent vendoring". The test suite
+  # already runs under GOFLAGS=-mod=mod; match it here so lint and test agree.
+  modules-download-mode: mod
+  go: "1.25"
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck      # unchecked errors
+    - govet         # go vet
+    - staticcheck   # static analysis
+    - ineffassign   # ineffectual assignments
+    - unused        # unused identifiers
+    - gocritic      # idiomatic checks
+    - gosec         # security
+    - gofmt         # formatting
+    - goimports     # import ordering
+
+linters-settings:
+  gosec:
+    excludes:
+      - G104  # unhandled errors are already caught by errcheck
+  errcheck:
+    check-type-assertions: true
+
+issues:
+  exclude-rules:
+    # Examples and tools tolerate looser error handling.
+    - path: (_test\.go|examples/|tools/)
+      linters: [errcheck, gosec]
+    # HAL/board code legitimately uses unsafe and fixed-size math.
+    - path: (hal/|hal_v2/|board/)
+      linters: [gosec]
+  max-issues-per-linter: 0
+  max-same-issues: 0

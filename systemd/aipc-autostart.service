@@ -1,0 +1,19 @@
+[Unit]
+Description=Enable and start AIPC services after OS restore
+Documentation=https://github.com/yourorg/ne503
+Wants=aipc-restore.service
+Requires=aipc-firstboot.service
+After=aipc-restore.service aipc-firstboot.service
+RequiresMountsFor=/data
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/aipc-autostart
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+SyslogIdentifier=aipc-autostart
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

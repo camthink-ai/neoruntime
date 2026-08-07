@@ -1,0 +1,406 @@
+syntax = "proto3";
+
+package aipc.device;
+
+option go_package = "aipc/platform/device-control/proto;device";
+
+// ============ Common types ============
+
+message Empty {}
+
+message Status {
+  bool success = 1;
+  string message = 2;
+}
+
+// ============ Light control ============
+
+message LightLevelRequest {
+  uint32 level = 1;  // 0-100
+}
+
+message LightSwitchRequest {
+  bool on = 1;
+}
+
+enum IrCutMode {
+  IRCUT_AUTO = 0;
+  IRCUT_DAY = 1;
+  IRCUT_NIGHT = 2;
+}
+
+message IrCutRequest {
+  IrCutMode mode = 1;
+}
+
+// ============ PTZ control ============
+
+enum PanDirection {
+  PAN_STOP = 0;
+  PAN_LEFT = 1;
+  PAN_RIGHT = 2;
+}
+
+enum TiltDirection {
+  TILT_STOP = 0;
+  TILT_UP = 1;
+  TILT_DOWN = 2;
+}
+
+message PanRequest {
+  PanDirection direction = 1;
+  uint32 speed = 2;  // 0-100
+}
+
+message TiltRequest {
+  TiltDirection direction = 1;
+  uint32 speed = 2;  // 0-100
+}
+
+message PTZStopRequest {}
+
+message PresetRequest {
+  uint32 preset_id = 1;  // 1-255
+}
+
+// ============ Lens control ============
+
+message ZoomRequest {
+  int32 speed = 1;  // -100 ~ 100, negative to zoom out, positive to zoom in, 0 to stop
+}
+
+message FocusRequest {
+  int32 speed = 1;  // -100 ~ 100, negative to move back, positive to move forward, 0 to stop
+}
+
+message AutofocusRequest {
+  bool enable = 1;
+}
+
+message ZoomLevelRequest {
+  float level = 1;  // 0.0 ~ 1.0 (widest angle to longest focal length)
+}
+
+message FocusLevelRequest {
+  float level = 1;  // 0.0 ~ 1.0 (near to far)
+}
+
+message LensResetRequest {
+  bool zoom = 1;    // reset-zero zoom axis
+  bool focus = 2;   // reset-zero focus axis
+}
+
+message IrisRequest {
+  int32 speed = 1;  // -100 ~ 100
+}
+
+message IrisTargetRequest {
+  uint32 target = 1;  // absolute iris ADC target
+}
+
+message LensLimit {
+  int32 min_pos = 1;
+  int32 max_pos = 2;
+}
+
+message LensLimitsRequest {
+  LensLimit zoom_limit = 1;
+  LensLimit focus_limit = 2;
+}
+
+message LensStatusResponse {
+  uint32 zoom_state = 1;    // motor state: 0=NO_CFG 1=STOPPED 2=RUNNING 3=RESET_ZERO 4=ERROR
+  uint32 focus_state = 2;
+  bool zoom_rz_done = 3;    // reset-zero complete
+  bool focus_rz_done = 4;
+  int32 zoom_pos = 5;
+  int32 focus_pos = 6;
+  uint32 iris_adc = 7;
+  bool autofocus_enabled = 8;
+  LensLimit zoom_limit = 9;
+  LensLimit focus_limit = 10;
+}
+
+// AF0832 high-level lens positioning
+message GotoRatioDistanceRequest {
+  float zoom_ratio = 1;        // 1.0 ~ 2.88 (optical zoom ratio)
+  float focus_distance_m = 2;  // focus distance in meters (e.g. 0.5, 1.0, 5.0)
+}
+
+message LensInitRequest {
+  // Empty — uses configured limits from device-control.yaml
+}
+
+// ============ AF window / measurement ============
+
+message AfWindow {
+  int32 x = 1;  // left in pixels
+  int32 y = 2;  // top in pixels
+  int32 w = 3;  // width in pixels
+  int32 h = 4;  // height in pixels
+}
+
+message SetAfWindowsRequest {
+  bool enabled = 1;         // enable/disable AF statistics
+  repeated AfWindow windows = 2;  // 1-3 windows
+  string stream_id = 3;     // optional: which video stream (default "main")
+}
+
+message AfMeasurementResponse {
+  repeated uint32 focus_energy = 1;  // sum[0..2] — higher = sharper at peak focus
+  repeated uint32 mean_luma = 2;     // luma[0..2] — mean brightness per window
+  uint64 frame_id = 3;
+}
+
+message AfJobResponse {
+  bool accepted = 1;
+  uint64 job_id = 2;
+  string message = 3;
+}
+
+message ZoomFollowRequest {
+  float ratio = 1;
+}
+
+message AfJobRequest {
+  uint64 job_id = 1;  // 0 cancels the active job
+}
+
+message AfStatusResponse {
+  uint64 job_id = 1;
+  string operation = 2;
+  string state = 3;
+  double progress = 4;
+  bool busy = 5;
+  bool anchor_valid = 6;
+  float requested_ratio = 7;
+  float effective_ratio = 8;
+  int32 zoom_pos = 9;
+  int32 focus_pos = 10;
+  int32 best_focus = 11;
+  double metric = 12;
+  double confidence = 13;
+  double reproducibility = 14;
+  float estimated_distance_m = 15;
+  uint64 elapsed_ms = 16;
+  int32 error_code = 17;
+  string message = 18;
+}
+
+// ============ GPIO control ============
+
+message GPIOWriteRequest {
+  uint32 pin = 1;
+  bool value = 2;
+}
+
+message GPIOReadRequest {
+  uint32 pin = 1;
+}
+
+message GPIOReadResponse {
+  uint32 pin = 1;
+  bool value = 2;
+  Status status = 3;
+  string direction = 4;  // "input" | "output" | "" (populated by batch read from config)
+}
+
+// Batch GPIO read: catalog (from config) + live value per pin.
+// Empty `pins` = read all configured available_pins.
+message GPIOBatchReadRequest {
+  repeated uint32 pins = 1;
+}
+
+message GPIOBatchReadResponse {
+  repeated uint32 available_pins = 1;  // full catalog from config (always returned)
+  repeated uint32 input_pins = 2;     // pins wired as inputs
+  repeated uint32 output_pins = 3;    // pins wired as outputs
+  repeated GPIOReadResponse results = 4;  // per-pin live value; each carries its own Status
+}
+
+// ============ Device status ============
+
+message DeviceStatus {
+  // Temperature
+  float soc_temp_c = 1;
+  float mcu_temp_c = 2;
+  
+  // Sensors
+  uint32 light_sensor = 3;  // 0-1023
+  
+  // PTZ status
+  int32 ptz_pan_pos = 10;
+  int32 ptz_tilt_pos = 11;
+  
+  // Lens status
+  int32 zoom_pos = 20;
+  int32 focus_pos = 21;
+  bool autofocus_enabled = 22;
+  
+  // IR-Cut status
+  IrCutMode ircut_mode = 30;
+  
+  // Light status
+  uint32 white_light_level = 40;
+  uint32 ir_led_level = 41;
+  
+  // MCU version
+  string mcu_version = 50;
+  uint64 mcu_uptime_ms = 51;
+}
+
+// ============ Environment control ============
+
+message EnvCtrlRequest {
+  bool enable = 1;
+}
+
+message EnvCtrlStatus {
+  bool success = 1;
+  string message = 2;
+  bool enabled = 3;
+}
+
+// ============ Alarm I/O ============
+
+message AlarmChannelRequest {
+  uint32 channel = 1;
+  bool enable = 2;
+}
+
+message AlarmChannelStatus {
+  bool success = 1;
+  string message = 2;
+  bool enabled = 3;
+}
+
+message AlarmOutputsState {
+  bool success = 1;
+  string message = 2;
+  bool alarm_out0 = 3;
+  bool alarm_out1 = 4;
+  bool wiegand0 = 5;
+  bool wiegand1 = 6;
+}
+
+// ============ RS485 ============
+
+message Rs485InitRequest {
+  uint32 baudrate = 1;
+  string config = 2;
+}
+
+message Rs485TxRequest {
+  bytes data = 1;
+}
+
+// ============ Event subscription (status change notifications) ============
+
+message DeviceEvent {
+  enum EventType {
+    GPIO_CHANGE = 0;
+    LIGHT_SENSOR_CHANGE = 1;
+    TEMPERATURE_ALERT = 2;
+    PTZ_MOVE_COMPLETE = 3;
+    FOCUS_COMPLETE = 4;
+  }
+  
+  EventType type = 1;
+  uint64 timestamp_ns = 2;
+  
+  // Event data (varies by type)
+  oneof data {
+    GPIOReadResponse gpio_state = 10;
+    uint32 light_sensor_value = 11;
+    float temperature = 12;
+  }
+}
+
+// ============ Device Control Service ============
+
+service DeviceControl {
+  // Light control
+  rpc SetWhiteLight(LightLevelRequest) returns (Status);
+  rpc SetIrLed(LightLevelRequest) returns (Status);
+  rpc SetIrCut(IrCutRequest) returns (Status);
+  
+  // PTZ control
+  rpc Pan(PanRequest) returns (Status);
+  rpc Tilt(TiltRequest) returns (Status);
+  rpc PTZStop(PTZStopRequest) returns (Status);
+  rpc SavePreset(PresetRequest) returns (Status);
+  rpc CallPreset(PresetRequest) returns (Status);
+  
+  // Lens control
+  rpc Zoom(ZoomRequest) returns (Status);
+  rpc Focus(FocusRequest) returns (Status);
+  rpc SetAutofocus(AutofocusRequest) returns (Status);
+  rpc SetZoomLevel(ZoomLevelRequest) returns (Status);
+  rpc GetLensStatus(Empty) returns (LensStatusResponse);
+  rpc SetFocusLevel(FocusLevelRequest) returns (Status);
+  rpc LensResetZero(LensResetRequest) returns (Status);
+  rpc ControlIris(IrisRequest) returns (Status);
+  rpc SetIrisTarget(IrisTargetRequest) returns (Status);
+  rpc SetLensLimits(LensLimitsRequest) returns (Status);
+  rpc StartOneShotAf(Empty) returns (AfJobResponse);
+  rpc StartZoomFollow(ZoomFollowRequest) returns (AfJobResponse);
+  rpc GetAutofocusStatus(Empty) returns (AfStatusResponse);
+  rpc CancelAutofocus(AfJobRequest) returns (Status);
+
+  // AF0832 high-level API
+  rpc LensInit(LensInitRequest) returns (Status);
+  rpc LensGotoRatioDistance(GotoRatioDistanceRequest) returns (Status);
+
+  // AF window / measurement
+  rpc SetAfWindows(SetAfWindowsRequest) returns (Status);
+  rpc GetAfMeasurement(Empty) returns (AfMeasurementResponse);
+  
+  // GPIO
+  rpc GPIOWrite(GPIOWriteRequest) returns (Status);
+  rpc GPIORead(GPIOReadRequest) returns (GPIOReadResponse);
+  rpc GPIOBatchRead(GPIOBatchReadRequest) returns (GPIOBatchReadResponse);
+  
+  // Status query
+  rpc GetDeviceStatus(Empty) returns (DeviceStatus);
+  
+  // Event subscription
+  rpc SubscribeEvents(Empty) returns (stream DeviceEvent);
+
+  // Environment control
+  rpc SetFan(EnvCtrlRequest) returns (EnvCtrlStatus);
+  rpc GetFan(Empty) returns (EnvCtrlStatus);
+  rpc SetHeat(EnvCtrlRequest) returns (EnvCtrlStatus);
+  rpc GetHeat(Empty) returns (EnvCtrlStatus);
+  rpc SetRadar(EnvCtrlRequest) returns (EnvCtrlStatus);
+  rpc GetRadar(Empty) returns (EnvCtrlStatus);
+
+  // Alarm I/O
+  rpc SetAlarmOut(AlarmChannelRequest) returns (AlarmChannelStatus);
+  rpc GetAlarmOut(AlarmChannelRequest) returns (AlarmChannelStatus);
+  rpc SetWiegandOut(AlarmChannelRequest) returns (AlarmChannelStatus);
+  rpc GetWiegandOut(AlarmChannelRequest) returns (AlarmChannelStatus);
+  rpc GetAlarmOutputs(Empty) returns (AlarmOutputsState);
+
+  // RS485
+  rpc Rs485Init(Rs485InitRequest) returns (Status);
+  rpc Rs485Deinit(Empty) returns (Status);
+  rpc Rs485Tx(Rs485TxRequest) returns (Status);
+
+  // Capabilities (auto-detected from HAL)
+  rpc GetCapabilities(Empty) returns (CapabilitiesResponse);
+}
+
+// Device capabilities auto-detected from loaded HAL modules
+message CapabilitiesResponse {
+  bool has_video = 1;
+  bool has_codec = 2;
+  bool has_led = 3;
+  bool has_sensor = 4;
+  bool has_mcu = 5;
+  bool has_env_ctrl = 6;
+  bool has_alarm = 7;
+  bool has_rs485 = 8;
+  bool has_osd = 9;
+  bool has_draw = 10;
+  bool has_audio = 11;
+}

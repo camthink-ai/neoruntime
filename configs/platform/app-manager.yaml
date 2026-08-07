@@ -1,0 +1,135 @@
+# NE503 App Manager Configuration
+
+# Service configuration
+service:
+  name: app-manager
+  listen: unix:///run/aipc/app-manager.sock
+  http_port: 8081          # REST API port
+  log_level: info
+  log_file: /var/log/aipc/app-manager.log
+
+# Containerd configuration
+containerd:
+  address: /run/containerd/containerd.sock
+  namespace: aipc
+  
+  # Image management
+  registry:
+    default: registry.aipc.local
+    mirrors:
+      - https://docker.io
+  
+  # Runtime
+  runtime: io.containerd.runc.v2
+  snapshotter: overlayfs
+
+# Application paths
+apps:
+  registry_path: /data/aipc/apps/registry     # App metadata database
+  instances_path: /data/aipc/apps/instances   # Running app instances
+  manifests_path: /etc/aipc/apps             # App manifest files
+  images_path: /var/lib/containerd/images
+  
+  # Logs
+  logs_path: /data/aipc/logs/apps
+  log_retention_days: 7
+
+# Security configuration
+security:
+  # Seccomp profile
+  seccomp_profile: /etc/aipc/seccomp-default.json
+  
+  # Capabilities to drop (all by default)
+  capabilities_drop:
+    - CAP_SYS_ADMIN
+    - CAP_NET_ADMIN
+    - CAP_SYS_MODULE
+    - CAP_SYS_TIME
+    - CAP_SYS_BOOT
+    - CAP_SYS_NICE
+    - CAP_SYS_RESOURCE
+    - CAP_SYS_RAWIO
+    - CAP_SYS_PTRACE
+  
+  # Namespaces
+  namespaces:
+    - pid
+    - net
+    - ipc
+    - uts
+    - mount
+    # user namespace optional (may need privilege)
+  
+  # Readonly rootfs
+  readonly_rootfs: true
+  
+  # No new privileges
+  no_new_privileges: true
+
+# Resource defaults
+resources:
+  default_cpu_quota: 50       # 50% of one core
+  default_memory_mb: 256
+  default_pids_limit: 128
+  
+  # Global limits
+  max_total_cpu_cores: 2
+  max_total_memory_gb: 2
+
+# Network configuration
+network:
+  mode: none                  # none | bridge | host
+  bridge_name: aipc-br0
+  
+  # DNS
+  dns_servers:
+    - 8.8.8.8
+    - 8.8.4.4
+
+# Health check
+healthcheck:
+  enabled: true
+  interval_sec: 30
+  timeout_sec: 5
+  
+  # Auto restart policy
+  auto_restart: true
+  max_restart_count: 5
+  restart_backoff_sec: 10
+
+# AI Runtime integration
+ai_runtime:
+  enabled: true
+  endpoint: unix:///run/aipc/ai-runtime.sock
+  
+  # Auto register app permissions
+  auto_register_permissions: true
+
+# Event Bus integration
+event_bus:
+  enabled: true
+  endpoint: unix:///run/aipc/event-bus.sock
+  
+  # System events to publish
+  publish_events:
+    - app.installed
+    - app.started
+    - app.stopped
+    - app.crashed
+    - app.updated
+
+# Monitoring
+monitoring:
+  enabled: true
+  metrics_port: 9092
+  stats_interval_sec: 10
+  
+  # Resource monitoring
+  monitor_cpu: true
+  monitor_memory: true
+  monitor_network: true
+  
+  # Alerts
+  alert_cpu_percent: 90
+  alert_memory_percent: 90
+

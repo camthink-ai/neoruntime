@@ -1,0 +1,12 @@
+{
+  "name": "ne503-ci",
+  "private": true,
+  "description": "Root package for repo-wide tooling (commitlint). Per-language tooling lives in web/.",
+  "scripts": {
+    "commitlint": "commitlint --from=origin/main --to=HEAD"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^20.5.0",
+    "@commitlint/config-conventional": "^20.5.0"
+  }
+}

@@ -1,0 +1,26 @@
+[Unit]
+Description=AIPC AI Runtime Service
+Documentation=https://github.com/yourorg/ne503
+Wants=aipc-restore.service
+Requires=aipc-firstboot.service
+After=aipc-restore.service aipc-firstboot.service network.target containerd.service
+Wants=containerd.service
+
+[Service]
+Type=simple
+Environment=AIPC_APP_MANIFEST=/data/aipc/app-manifest.json
+ExecStartPre=/bin/mkdir -p /data/aipc/logs /data/aipc/apps /run/aipc
+ExecStartPre=/bin/sh -c 'if [ -x /usr/libexec/aipc-compat-check ]; then exec /usr/libexec/aipc-compat-check; else echo "aipc-compat-check not installed yet; skip pre-start guard" >&2; fi'
+ExecStart=/usr/bin/ai-runtime -config /data/aipc/etc/ai-runtime.yaml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-runtime
+
+# Resource limits
+LimitNOFILE=65536
+LimitCORE=infinity
+
+[Install]
+WantedBy=multi-user.target

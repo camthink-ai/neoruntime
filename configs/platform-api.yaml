@@ -1,0 +1,109 @@
+service:
+  name: "platform-api"
+  http_addr: "127.0.0.1:8080"
+  # Total time allowed to read request headers and body. Keep this long enough
+  # for large .swu OS upgrade uploads over slower LAN/Wi-Fi links.
+  read_timeout_seconds: 1800
+  log_level: "debug"
+  log_file: "/var/log/aipc/platform-api.log"
+  # HTTPS is terminated by the nginx app gateway on :443. platform-api stays on
+  # loopback HTTP so nginx owns external TLS and app URL proxying.
+  tls:
+    enabled: false
+    https_addr: ":443"
+    cert_file: ""                         # empty = device auto-generates self-signed
+    key_file: ""                          # empty = device auto-generates self-signed
+    auto_cert_dir: "/data/aipc/etc/ssl"
+    redirect_http: false
+
+services:
+  ai_runtime: "unix:///run/aipc/ai-runtime.sock"
+  event_bus: "unix:///run/aipc/event-bus.sock"
+  device_control: "unix:///run/aipc/device-control.sock"
+  app_manager: "unix:///run/aipc/app-manager.sock"
+  camera_control: "unix:///run/aipc/camera-control.sock"
+
+model:
+  storage_path: "/data/aipc/models"
+
+storage:
+  root_path: "/data/aipc"
+  model_blob_path: "/data/aipc/models/blobs"
+  min_free_bytes: 104857600  # 100MB minimum free space
+
+files:
+  # File-management roots. Keep this broad enough for on-device maintenance,
+  # while still avoiding arbitrary filesystem access.
+  allowed_roots:
+    - "/data"
+    - "/tmp"
+
+stream:
+  camera_config: "/data/aipc/etc/camera-daemon.yaml"
+  rtsp_base_url: "rtsp://localhost:8554"
+  encoded_pub_dir: "/run/aipc/encoded"
+
+web:
+  static_path: "/data/aipc/web"
+  enable_cors: true
+
+auth:
+  enabled: true
+  # Auth secrets ship empty so the public repo carries no baked-in credentials.
+  # Override at deploy time with env vars (checked by platform-api at startup):
+  #   AIPC_TOKEN_KEY       – JWT/Bearer signing secret (random per boot if unset)
+  #   AIPC_AUTH_USERNAME   – login username
+  #   AIPC_AUTH_PASSWORD   – login password
+  # Leave empty only on a trusted first-boot device; a missing token_key is
+  # auto-generated and logged once, then rotated via env for persistence.
+  token_key: "aipc-secure-token-secret"
+  username: "admin"
+  password: "password"
+
+database:
+  path: "/data/aipc/data/platform.db"
+
+# Gyro / attitude SSE source (LSM6DSR IMU via Linux IIO sysfs).
+# Drives GET /api/v1/monitor/gyro/attitude. Disable on hosts without the IMU;
+# a missing sensor degrades gracefully (status=offline, no crash).
+gyro:
+  enabled: true
+  # Sensor read cadence. Each lsm6dsr in_*_raw sysfs read blocks until the next
+  # fresh conversion (~1/ODR), so poll_rate_hz must stay <= odr_hz or reads
+  # queue up. 26 Hz keeps the attitude card responsive without using the very
+  # noisy high-ODR gyro regimes.
+  poll_rate_hz: 26
+  # Output data rate written to the device's sampling_frequency at open time
+  # (the driver accepts the bare int: 12 -> 12.5 Hz). 0 = code default.
+  #
+  # Stability vs fps trade-off on this lsm6dsr board: the gyro's per-sample
+  # mean-bias and noise explode in high-ODR regimes (416 Hz shows ~23 dps
+  # mean-bias + 27 dps std). The attitude card now publishes pitch/roll from
+  # accelerometer gravity with a wall-clock low-pass, so 26 is the responsive
+  # default. Drop to 12 if the board is mechanically noisy; raise only if fps
+  # matters more than gyro-derived quaternion quality.
+  # Not persistent — re-applied on every probe/open.
+  odr_hz: 26
+  fusion_alpha: 0.05       # complementary filter coefficient in (0,1); smaller = smoother/slower
+  iio_base: "/sys/bus/iio/devices"
+  # Optional fleet calibration JSON. Keep disabled unless verified for this
+  # board/sensor coordinate convention; the 93.72 unit reads level with the
+  # identity mount matrix, while this file's rot_* projects it to ~20° roll.
+  # Setting calibration_path alone has no effect; opt into each field explicitly.
+  # calibration_path: "/home/root/apps/resources/final_calibration.json"
+  # use_calibration_mount: false
+  # use_calibration_bias: false
+  # Optional device-dir overrides (auto-discovered when blank):
+  # accel_path: "/sys/bus/iio/devices/iio:device1"
+  # gyro_path: "/sys/bus/iio/devices/iio:device0"
+  # Row-major 3x3 body -> world mount matrix (X forward, Y right, Z up).
+  # Calibrate per PCB orientation; the identity below assumes the sensor axes
+  # already match the spec frame.
+  mount_matrix: [1, 0, 0,  0, 1, 0,  0, 0, 1]
+  # One-shot startup static gyro-bias calibration: averages the first window of
+  # gyro samples (assumes the device is still at boot) and subtracts the mean
+  # from every subsequent sample. Kills the ~15 deg/min yaw self-rotation caused
+  # by integrating the sensor's zero-rate offset. Disable if the device is
+  # guaranteed to be moving at boot (would corrupt the estimate instead).
+  calibrate_bias: true
+  calibration_ms: 2000   # averaging window; N = calibration_ms/1000 * poll_rate_hz (clamped 12..200)

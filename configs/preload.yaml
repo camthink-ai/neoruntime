@@ -1,0 +1,43 @@
+# Factory preload configuration
+# Factory preload manifest, consumed by factory packaging tooling at release
+# time (no in-tree Makefile target).
+#
+# This file declares which AI models and container apps are bundled
+# into the factory firmware image. Testers receive the pre-built
+# tarball and only need to run deploy.sh on the target device.
+
+models:
+  # Detection
+  - detection/hailo_yolov8n_384_640.hef
+  - detection/yolov5m_vehicles.hef
+  - detection/tiny_yolov4_license_plates.hef
+
+  # Classification
+  - classification/vit_large.hef
+
+  # Segmentation
+  - segmentation/linknet_mbv1_ss_dpm_256.hef
+
+  # Keypoint
+  - keypoint/face_landmarks_lite.hef
+
+  # CLIP (zero-shot classification)
+  - clip/clip_vit_b_32_image_encoder_nv12.hef
+  - clip/clip_vit_b_16_image_encoder.hef
+
+  # Depth estimation
+  - depth/scdepthv3.hef
+
+  # OCR
+  - ocr/paddle_ocr_v5_mobile_detection.hef
+  - ocr/paddle_ocr_v5_mobile_recognition_nv12.hef
+  - ocr/lprnet.hef
+
+  # GenAI (~3GB, uncomment to include)
+  # - genai/Qwen3-VL-2B-Instruct.hef
+
+apps:
+  - id: model-showcase
+    manifest: ../ne503-aipc-apps/showcases/model-showcase/app.yaml
+    image: ../ne503-aipc-apps/showcases/model-showcase/model-showcase-image.tar
+    autostart: false

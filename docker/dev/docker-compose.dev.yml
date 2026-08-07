@@ -1,0 +1,52 @@
+# NE503 Docker Dev Environment
+#
+# Persistent dev container with tools. The Hailo SDK is mounted from the host.
+# Source code is cloned inside the container and persists via volume.
+#
+# Quick start:
+#   docker compose -f docker/dev/docker-compose.dev.yml up -d
+#   docker exec -it ne503-dev bash
+#
+# Or mount host source:
+#   docker compose -f docker/dev/docker-compose.dev.yml --profile mount up -d
+
+services:
+  dev:
+    image: ne503-dev-env:latest
+    container_name: ne503-dev
+    restart: unless-stopped
+    environment:
+      - TERM=xterm-256color
+      - HAILO_SDK_PATH=/opt/hailo-sdk
+      - SDK_PATH=/opt/hailo-sdk
+      - HAL_PLATFORM=hailo15
+    stdin_open: true
+    tty: true
+    volumes:
+      - ne503-workspace:/home/ubuntu
+      - ${HOST_HAILO_SDK_PATH:-/opt/poky/4.0.23}:/opt/hailo-sdk:ro
+    working_dir: /home/ubuntu
+
+  # Mount host source code (read-write)
+  dev-mount:
+    image: ne503-dev-env:latest
+    container_name: ne503-dev-mount
+    restart: unless-stopped
+    profiles:
+      - mount
+    environment:
+      - TERM=xterm-256color
+      - HAILO_SDK_PATH=/opt/hailo-sdk
+      - SDK_PATH=/opt/hailo-sdk
+      - HAL_PLATFORM=hailo15
+    stdin_open: true
+    tty: true
+    volumes:
+      - ../..:/ne503
+      - ne503-go-cache:/home/ubuntu/go
+      - ${HOST_HAILO_SDK_PATH:-/opt/poky/4.0.23}:/opt/hailo-sdk:ro
+    working_dir: /ne503
+
+volumes:
+  ne503-workspace:
+  ne503-go-cache:

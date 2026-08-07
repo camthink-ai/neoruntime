@@ -1,0 +1,26 @@
+[Unit]
+Description=AIPC Nginx App Gateway
+Documentation=https://github.com/yourorg/ne503
+Wants=aipc-restore.service platform-api.service app-manager.service
+Requires=aipc-firstboot.service
+After=aipc-restore.service aipc-firstboot.service network.target platform-api.service app-manager.service
+RequiresMountsFor=/data
+ConditionPathExists=/data/nginx/bin/nginx
+ConditionPathExists=/data/nginx/conf/nginx.conf
+
+[Service]
+Type=simple
+Environment=LD_LIBRARY_PATH=/data/nginx/rootfs/lib/aarch64-linux-gnu:/data/nginx/rootfs/usr/lib/aarch64-linux-gnu:/usr/lib:/lib
+ExecStartPre=/bin/mkdir -p /data/nginx/run /data/nginx/logs /data/nginx/tmp/client_body /data/nginx/tmp/proxy /data/nginx/tmp/fastcgi /data/nginx/tmp/uwsgi /data/nginx/tmp/scgi
+ExecStart=/usr/bin/python3 /data/nginx/sbin/aipc-nginx-app-route-sync.py --serve --ensure-cert --interval 2 --debounce 0.5
+ExecReload=/usr/bin/python3 /data/nginx/sbin/aipc-nginx-app-route-sync.py --ensure-cert --reload
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aipc-nginx-gateway
+
+[Install]
+WantedBy=multi-user.target

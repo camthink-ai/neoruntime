@@ -1,0 +1,53 @@
+# NE503 Event Bus Configuration
+
+# Service configuration
+service:
+  name: event-bus
+  listen: unix:///run/aipc/event-bus.sock
+  tcp_listen: "127.0.0.1:50053"    # for C++ gRPC clients (Hailo gRPC lacks unix: resolver)
+  log_level: info
+  log_file: /var/log/aipc/event-bus.log
+
+# Bus configuration
+bus:
+  # Queue settings
+  queue_size: 1000          # Per-subscriber queue size
+  max_topics: 1000          # Maximum number of topics
+  
+  # Persistence
+  persist_enabled: false    # Enable message persistence
+  persist_path: /data/aipc/data/event-bus
+  
+  # Performance
+  workers: 4                # Number of worker goroutines
+  batch_size: 10            # Batch delivery size
+  
+  # Cleanup
+  inactive_topic_ttl: 3600  # Remove inactive topics after N seconds
+
+# Topic routing rules
+routing:
+  # Topic prefixes and their priorities
+  priorities:
+    "system/": 10           # Highest priority
+    "alert/": 8
+    "model/": 5
+    "app/": 5
+    
+  # Rate limiting (per topic)
+  rate_limits:
+    "model/*": 1000         # Max 1000 msg/sec
+    "app/*": 100            # Max 100 msg/sec
+
+# Monitoring
+monitoring:
+  stats_enabled: true
+  stats_interval_sec: 10
+  metrics_port: 9091
+
+# Security
+security:
+  auth_enabled: false       # Enable authentication
+  acl_enabled: true         # Enable topic ACL
+  acl_file: /data/aipc/etc/security/event-acl.yaml
+

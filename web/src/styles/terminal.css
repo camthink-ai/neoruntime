@@ -1,0 +1,48 @@
+/*
+ * xterm 的滚动发生在内部 .xterm-viewport 上，无法外包一层 ScrollArea。
+ * 滚动条颜色：浅色 UI 下终端仍为深色底，滑块用固定深灰；.dark 下用 theme-colors 的 --scrollbar-thumb。
+ * 使用处需给容器加 class `terminal-shell`（见 terminal-theme.ts）。
+ */
+.terminal-shell {
+  /* 与浅色 UI + 深色终端底搭配（同 theme-colors 暗色滚动条数值） */
+  --term-scrollbar-thumb: #44403c;
+  --term-scrollbar-hover: #57534e;
+}
+
+/* 避免中文输入法拦截数字键，确保终端能正常输入 0-9 */
+.terminal-shell .xterm-helper-textarea {
+  ime-mode: disabled;
+  -webkit-ime-mode: disabled;
+}
+
+.dark .terminal-shell {
+  --term-scrollbar-thumb: var(--scrollbar-thumb);
+  --term-scrollbar-hover: var(--scrollbar-thumb-hover);
+}
+
+.terminal-shell .xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: var(--term-scrollbar-thumb) transparent;
+}
+
+.terminal-shell .xterm-viewport::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.terminal-shell .xterm-viewport::-webkit-scrollbar-thumb {
+  background: var(--term-scrollbar-thumb);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.terminal-shell .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: var(--term-scrollbar-hover);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.terminal-shell .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}

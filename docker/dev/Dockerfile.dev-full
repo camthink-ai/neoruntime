@@ -1,0 +1,154 @@
+# syntax=docker/dockerfile:1.7
+# NE503 Platform Development Environment (FULL - with Hailo SDK baked in)
+#
+# Builds on top of the lightweight zerobot/ne503-dev-env image,
+# adding the ~13GB Hailo SDK as a new layer.
+#
+# Build:
+#   docker build -f docker/dev/Dockerfile.dev-full \
+#     --build-context sdk=/opt/poky/4.0.23 \
+#     -t zerobot/ne503-dev-env-full:latest docker/dev/
+#
+# Run (no SDK mount needed):
+#   docker run -it zerobot/ne503-dev-env-full:latest
+
+FROM zerobot/ne503-dev-env:latest
+
+ARG POKY_VERSION=4.0.23
+
+LABEL maintainer="NE503 Platform"
+LABEL description="Full dev environment for AIPC Platform (includes Hailo SDK)"
+
+# ── Hailo SDK (baked into image via --build-context) ──────────────────────────
+# The ~13 GB SDK is copied as several smaller layers instead of one monolithic
+# layer: a single ~13 GB blob makes Docker Hub's registry gateway return 502 on
+# the monolithic PUT during push, while multiple ≤~2.5 GB layers push reliably.
+# The merged filesystem is byte-identical to a single `COPY /` — only the layer
+# count differs. (Target sysroot name is fixed for the Poky 4.0.23 armv8a SDK.)
+ENV HAILO_SDK_PATH=/opt/hailo-sdk
+ARG HOST_SYSROOT=sysroots/x86_64-pokysdk-linux
+ARG TGT_SYSROOT=sysroots/armv8a-poky-linux
+USER root
+RUN mkdir -p ${HAILO_SDK_PATH}/sysroots /opt/poky
+
+# Top-level setup scripts. These are FILES, so multi-source COPY is safe (only
+# directory sources flatten/merge — see the note below).
+COPY --from=sdk /environment-setup-armv8a-poky-linux \
+                /site-config-armv8a-poky-linux \
+                /version-armv8a-poky-linux \
+                ${HAILO_SDK_PATH}/
+
+# Host sysroot: x86_64-pokysdk-linux (~1.3 GB).
+COPY --from=sdk /${HOST_SYSROOT} ${HAILO_SDK_PATH}/${HOST_SYSROOT}/
+
+# Target sysroot: armv8a-poky-linux (~12.5 GB).
+#
+# IMPORTANT — COPY semantics: a multi-source `COPY dirA dirB dest/` FLATTENS the
+# contents of every directory source directly into dest (verified empirically),
+# destroying the subtree structure. So each subtree MUST be its OWN single-source
+# COPY into the matching-named subdir. (Glob COPY like `usr/lib/[a-g]*` flattens
+# too — matched directories get merged — so it is also unusable here.)
+#
+# Each layer below is a single dir copied whole, so every layer is ≤5.5 GB — far
+# under the Docker Hub large-blob 502 threshold (which bites around ~10 GB+ on a
+# monolithic PUT). The merged /opt/hailo-sdk tree is byte-identical to the SDK.
+
+# Target top-level dirs (each small; bin..tmp).
+COPY --from=sdk /${TGT_SYSROOT}/bin ${HAILO_SDK_PATH}/${TGT_SYSROOT}/bin/
+COPY --from=sdk /${TGT_SYSROOT}/sbin ${HAILO_SDK_PATH}/${TGT_SYSROOT}/sbin/
+COPY --from=sdk /${TGT_SYSROOT}/etc ${HAILO_SDK_PATH}/${TGT_SYSROOT}/etc/
+COPY --from=sdk /${TGT_SYSROOT}/var ${HAILO_SDK_PATH}/${TGT_SYSROOT}/var/
+COPY --from=sdk /${TGT_SYSROOT}/boot ${HAILO_SDK_PATH}/${TGT_SYSROOT}/boot/
+COPY --from=sdk /${TGT_SYSROOT}/home ${HAILO_SDK_PATH}/${TGT_SYSROOT}/home/
+COPY --from=sdk /${TGT_SYSROOT}/opt ${HAILO_SDK_PATH}/${TGT_SYSROOT}/opt/
+COPY --from=sdk /${TGT_SYSROOT}/lib ${HAILO_SDK_PATH}/${TGT_SYSROOT}/lib/
+# Empty sysroot mount-point stubs (kept for completeness).
+COPY --from=sdk /${TGT_SYSROOT}/media ${HAILO_SDK_PATH}/${TGT_SYSROOT}/media/
+COPY --from=sdk /${TGT_SYSROOT}/mnt ${HAILO_SDK_PATH}/${TGT_SYSROOT}/mnt/
+COPY --from=sdk /${TGT_SYSROOT}/proc ${HAILO_SDK_PATH}/${TGT_SYSROOT}/proc/
+COPY --from=sdk /${TGT_SYSROOT}/run ${HAILO_SDK_PATH}/${TGT_SYSROOT}/run/
+COPY --from=sdk /${TGT_SYSROOT}/srv ${HAILO_SDK_PATH}/${TGT_SYSROOT}/srv/
+COPY --from=sdk /${TGT_SYSROOT}/sys ${HAILO_SDK_PATH}/${TGT_SYSROOT}/sys/
+COPY --from=sdk /${TGT_SYSROOT}/tmp ${HAILO_SDK_PATH}/${TGT_SYSROOT}/tmp/
+
+# Target /usr: each immediate child its own single-source layer.
+COPY --from=sdk /${TGT_SYSROOT}/usr/bin ${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/bin/
+COPY --from=sdk /${TGT_SYSROOT}/usr/src ${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/src/
+COPY --from=sdk /${TGT_SYSROOT}/usr/libexec ${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/libexec/
+COPY --from=sdk /${TGT_SYSROOT}/usr/include ${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/include/
+COPY --from=sdk /${TGT_SYSROOT}/usr/share ${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/share/
+COPY --from=sdk /${TGT_SYSROOT}/usr/sbin ${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/sbin/
+COPY --from=sdk /${TGT_SYSROOT}/usr/local ${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/local/
+COPY --from=sdk /${TGT_SYSROOT}/usr/aarch64-poky-linux ${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/aarch64-poky-linux/
+COPY --from=sdk /${TGT_SYSROOT}/usr/games ${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/games/
+# /usr/lib is large enough to exceed Docker Hub's upload-session lifetime on
+# slow links if it is emitted as one blob. Copy it from a read-only SDK mount in
+# smaller groups while preserving the exact tree below usr/lib.
+RUN --mount=from=sdk,source=/sysroots/armv8a-poky-linux/usr/lib,target=/mnt/sdk-usr-lib,readonly \
+    set -e; \
+    dst="${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/lib"; \
+    mkdir -p "${dst}"; \
+    cd /mnt/sdk-usr-lib; \
+    find . -maxdepth 1 -mindepth 1 ! -type d -print0 \
+        | rsync -a --from0 --files-from=- . "${dst}/"
+
+RUN --mount=from=sdk,source=/sysroots/armv8a-poky-linux/usr/lib,target=/mnt/sdk-usr-lib,readonly \
+    set -e; \
+    dst="${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/lib"; \
+    mkdir -p "${dst}/.debug"; \
+    cd /mnt/sdk-usr-lib; \
+    find .debug -maxdepth 1 -mindepth 1 ! -type d -name 'libQt*' -print0 \
+        | rsync -a --from0 --files-from=- . "${dst}/"
+
+RUN --mount=from=sdk,source=/sysroots/armv8a-poky-linux/usr/lib,target=/mnt/sdk-usr-lib,readonly \
+    set -e; \
+    dst="${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/lib"; \
+    mkdir -p "${dst}/.debug"; \
+    cd /mnt/sdk-usr-lib; \
+    find .debug -maxdepth 1 -mindepth 1 ! -type d -name 'lib[a-g]*' -print0 \
+        | rsync -a --from0 --files-from=- . "${dst}/"
+
+RUN --mount=from=sdk,source=/sysroots/armv8a-poky-linux/usr/lib,target=/mnt/sdk-usr-lib,readonly \
+    set -e; \
+    dst="${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/lib"; \
+    mkdir -p "${dst}/.debug"; \
+    cd /mnt/sdk-usr-lib; \
+    find .debug -maxdepth 1 -mindepth 1 ! -type d -name 'lib[h-n]*' -print0 \
+        | rsync -a --from0 --files-from=- . "${dst}/"
+
+RUN --mount=from=sdk,source=/sysroots/armv8a-poky-linux/usr/lib,target=/mnt/sdk-usr-lib,readonly \
+    set -e; \
+    dst="${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/lib"; \
+    mkdir -p "${dst}/.debug"; \
+    cd /mnt/sdk-usr-lib; \
+    find .debug -maxdepth 1 -mindepth 1 ! -type d -name 'lib[o-z]*' -print0 \
+        | rsync -a --from0 --files-from=- . "${dst}/"
+
+RUN --mount=from=sdk,source=/sysroots/armv8a-poky-linux/usr/lib,target=/mnt/sdk-usr-lib,readonly \
+    set -e; \
+    dst="${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/lib"; \
+    mkdir -p "${dst}/.debug"; \
+    cd /mnt/sdk-usr-lib; \
+    find .debug -maxdepth 1 -mindepth 1 ! -type d \
+        ! -name 'libQt*' ! -name 'lib[a-g]*' ! -name 'lib[h-n]*' ! -name 'lib[o-z]*' -print0 \
+        | rsync -a --from0 --files-from=- . "${dst}/"
+
+RUN --mount=from=sdk,source=/sysroots/armv8a-poky-linux/usr/lib,target=/mnt/sdk-usr-lib,readonly \
+    set -e; \
+    dst="${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/lib"; \
+    mkdir -p "${dst}"; \
+    cd /mnt/sdk-usr-lib; \
+    rsync -a openssl qtbase python3.10 rust qtdeclarative plugins gstreamer-1.0 "${dst}/"
+
+RUN --mount=from=sdk,source=/sysroots/armv8a-poky-linux/usr/lib,target=/mnt/sdk-usr-lib,readonly \
+    set -e; \
+    dst="${HAILO_SDK_PATH}/${TGT_SYSROOT}/usr/lib"; \
+    mkdir -p "${dst}"; \
+    cd /mnt/sdk-usr-lib; \
+    find . -maxdepth 1 -mindepth 1 -type d \
+        ! -name '.debug' ! -name 'openssl' ! -name 'qtbase' ! -name 'python3.10' \
+        ! -name 'rust' ! -name 'qtdeclarative' ! -name 'plugins' ! -name 'gstreamer-1.0' -print0 \
+        | rsync -ar --from0 --files-from=- . "${dst}/"
+
+RUN ln -sf /opt/hailo-sdk /opt/poky/${POKY_VERSION}
+USER ubuntu

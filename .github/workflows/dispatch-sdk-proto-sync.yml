@@ -1,0 +1,50 @@
+name: Dispatch SDK proto sync
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "platform/*/proto/*.proto"
+  workflow_dispatch:
+    inputs:
+      platform_ref:
+        description: Branch, tag, or commit SHA to sync into ne503-aipc-sdks.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Dispatch SDK sync workflow
+        env:
+          GH_TOKEN: ${{ secrets.SDK_SYNC_TOKEN }}
+          PLATFORM_REF_INPUT: ${{ github.event.inputs.platform_ref || '' }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::Missing SDK_SYNC_TOKEN secret. Create a token that can dispatch workflows in camthink-ai/ne503-aipc-sdks."
+            exit 1
+          fi
+
+          if [ -n "${PLATFORM_REF_INPUT:-}" ]; then
+            platform_ref="$PLATFORM_REF_INPUT"
+            source_sha=""
+          else
+            platform_ref="$SOURCE_SHA"
+            source_sha="$SOURCE_SHA"
+          fi
+
+          gh api \
+            --method POST \
+            "repos/camthink-ai/ne503-aipc-sdks/actions/workflows/sync-platform-protos.yml/dispatches" \
+            -f ref="main" \
+            -f "inputs[platform_ref]=$platform_ref" \
+            -f "inputs[source_sha]=$source_sha"

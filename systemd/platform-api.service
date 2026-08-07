@@ -1,0 +1,42 @@
+[Unit]
+Description=AIPC Platform API Gateway
+Documentation=https://github.com/yourorg/ne503
+Wants=aipc-restore.service
+Requires=aipc-firstboot.service
+After=aipc-restore.service aipc-firstboot.service network.target ai-runtime.service app-manager.service device-control.service event-bus.service
+Wants=ai-runtime.service app-manager.service device-control.service event-bus.service
+
+[Service]
+Type=simple
+Environment=AIPC_FILESYSTEM_DEVICE=mmcblk1
+Environment=AIPC_OS_MACHINE=hailo15-ne503
+Environment=AIPC_OS_PRODUCT=ne503
+Environment=AIPC_OS_HARDWARE_VERSION=1.0
+Environment=AIPC_RECOVERY_DIR=/data/aipc/recovery
+Environment=AIPC_APP_MANIFEST=/data/aipc/app-manifest.json
+Environment=AIPC_CURRENT_ROOT_INSTALLER=/data/aipc/scripts/aipc-install-current-root.sh
+Environment=AIPC_CURRENT_ROOT_UNITS=/data/aipc/systemd
+# Signature gate relaxed for hailo15-ne503: the on-device SWUpdate does not verify
+# signatures (run_swupdate.sh runs `swupdate -k` only for Hailo-10h; signed.cfg /
+# CONFIG_SIGNED_IMAGES is compiled in only for hailo10-usb-dongle), and no CMS signing
+# is wired for the hailo15 image yet. Flip back to true once SWUPDATE_SIGNING=CMS +
+# a deployed device pubkey land. See platform/osupgrade/validate.go (presence-only).
+Environment=AIPC_OS_REQUIRE_SIGNATURE=false
+Environment=AIPC_OS_REQUIRE_BUILD_TIME=true
+ExecStartPre=/bin/mkdir -p /data/aipc/logs /run/aipc /data/aipc/etc/ssl
+ExecStartPre=/bin/sh -c 'if [ -x /usr/libexec/aipc-compat-check ]; then exec /usr/libexec/aipc-compat-check; else echo "aipc-compat-check not installed yet; skip pre-start guard" >&2; fi'
+ExecStart=/usr/bin/platform-api -config /data/aipc/etc/platform-api.yaml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=platform-api
+
+# Network
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

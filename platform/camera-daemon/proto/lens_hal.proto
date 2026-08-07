@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package aipc.lens;
+
+option go_package = "aipc/platform/device-control/lens/lenspb;lenspb";
+
+message Empty {}
+
+message HalStatus {
+  bool   ok       = 1;
+  int32  hal_code = 2;
+  string message  = 3;
+}
+
+// ── State ────────────────────────────────────────────────────────────────
+
+message LensState {
+  uint32 iris_state   = 1;
+  uint32 zoom_state   = 2;
+  uint32 focus_state  = 3;
+  bool   zoom_rz_done = 4;
+  bool   focus_rz_done = 5;
+  int32  zoom_pos     = 6;
+  int32  focus_pos    = 7;
+}
+
+message LensLimit {
+  int32 min_pos = 1;
+  int32 max_pos = 2;
+}
+
+message LensLimitsResponse {
+  LensLimit zoom  = 1;
+  LensLimit focus = 2;
+}
+
+message IrisAdcResponse {
+  uint32 adc = 1;
+}
+
+// ── Motor Commands ───────────────────────────────────────────────────────
+
+message MotorRunRequest {
+  uint32 pps   = 1;
+  int32  steps = 2;
+}
+
+message MotorAbsRequest {
+  uint32 pps      = 1;
+  int32  position = 2;
+}
+
+message LimitSetRequest {
+  int32 min_pos = 1;
+  int32 max_pos = 2;
+}
+
+message WaitRequest {
+  uint32 timeout_ms = 1;
+}
+
+// ── Iris ─────────────────────────────────────────────────────────────────
+
+message IrisTargetRequest {
+  uint32 target = 1;
+}
+
+// ── AF0832 ───────────────────────────────────────────────────────────────
+
+message AF0832GotoRequest {
+  float zoom_ratio       = 1;
+  float focus_distance_m = 2;
+}
+
+message AF0832PosToRatioRequest {
+  int32 hal_zoom_pos = 1;
+}
+
+message AF0832PosToRatioResponse {
+  float ratio = 1;
+}
+
+message AF0832BootstrappedResponse {
+  bool bootstrapped = 1;
+}
+
+// ── Service ──────────────────────────────────────────────────────────────
+
+service LensHAL {
+  // Lifecycle
+  rpc Init(Empty)   returns (HalStatus);
+  rpc ReInit(Empty) returns (HalStatus);
+  rpc Shutdown(Empty) returns (HalStatus);
+
+  // State
+  rpc StateGet(Empty)  returns (LensState);
+  rpc IrisAdcGet(Empty) returns (IrisAdcResponse);
+  rpc GetLimits(Empty)  returns (LensLimitsResponse);
+
+  // Zoom
+  rpc ZoomRun(MotorRunRequest)      returns (HalStatus);
+  rpc ZoomAbs(MotorAbsRequest)      returns (HalStatus);
+  rpc ZoomStop(Empty)               returns (HalStatus);
+  rpc ZoomResetZero(Empty)          returns (HalStatus);
+  rpc ZoomLimitSet(LimitSetRequest) returns (HalStatus);
+  rpc WaitZoomStopped(WaitRequest)  returns (HalStatus);
+  rpc WaitZoomRzDone(WaitRequest)   returns (HalStatus);
+
+  // Focus
+  rpc FocusRun(MotorRunRequest)      returns (HalStatus);
+  rpc FocusAbs(MotorAbsRequest)      returns (HalStatus);
+  rpc FocusStop(Empty)               returns (HalStatus);
+  rpc FocusResetZero(Empty)          returns (HalStatus);
+  rpc FocusLimitSet(LimitSetRequest) returns (HalStatus);
+  rpc WaitFocusStopped(WaitRequest)  returns (HalStatus);
+  rpc WaitFocusRzDone(WaitRequest)   returns (HalStatus);
+
+  // Iris
+  rpc IrisRun(MotorRunRequest)         returns (HalStatus);
+  rpc IrisStop(Empty)                  returns (HalStatus);
+  rpc IrisTargetSet(IrisTargetRequest) returns (HalStatus);
+
+  // AF0832
+  rpc AF0832Bootstrap(Empty)                        returns (HalStatus);
+  rpc AF0832MarkBootstrapped(Empty)                 returns (HalStatus);
+  rpc AF0832ForceResetZero(Empty)                   returns (HalStatus);
+  rpc AF0832GotoRatioDistance(AF0832GotoRequest)     returns (HalStatus);
+  rpc AF0832PosToRatio(AF0832PosToRatioRequest)     returns (AF0832PosToRatioResponse);
+  rpc IsAF0832Bootstrapped(Empty)                   returns (AF0832BootstrappedResponse);
+
+  // Compound
+  rpc StopAndWaitAll(WaitRequest) returns (HalStatus);
+}

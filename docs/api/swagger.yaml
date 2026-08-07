@@ -1,0 +1,5338 @@
+openapi: 3.0.3
+info:
+  title: AIPC Platform API
+  description: 'AIPC Platform REST API for edge AI computing platform.
+
+
+    Provides unified access to:
+
+    - AI Runtime (model management, inference)
+
+    - Event Bus (pub/sub messaging)
+
+    - Device Control (camera, PTZ, GPIO)
+
+    - App Manager (container lifecycle)
+
+    - Stream (HLS video streaming)
+
+    '
+  version: 1.0.0
+  contact:
+    name: AIPC Platform Team
+    email: support@camthink.ai
+servers:
+- url: http://localhost:8080/api/v1
+  description: Development server
+- url: http://{host}:8080/api/v1
+  description: Production server
+  variables:
+    host:
+      default: localhost
+security:
+- BearerAuth: []
+tags:
+- name: System
+  description: System information and health
+- name: AI Runtime
+  description: Model management and inference
+- name: Event Bus
+  description: Pub/sub event messaging
+- name: Device Control
+  description: Camera and device control
+- name: App Manager
+  description: Container application lifecycle
+- name: Stream
+  description: Video streaming
+- name: Settings
+  description: Dynamic system configuration (key-value store)
+- name: Monitor
+  description: System resource monitoring (CPU, memory, disk, network)
+- name: Processes
+  description: System process management
+- name: Files
+  description: Remote file management
+- name: Terminal
+  description: Web-based terminal access
+- name: SSH
+  description: SSH service configuration
+- name: Logs
+  description: System and service log viewing
+- name: Storage
+  description: Disk manipulation and hot-plug support
+- name: Media
+  description: Camera and media configuration
+- name: Event Logs
+  description: Event log management and querying
+- name: Debug Logs
+  description: Debug log export and service log access
+- name: Network
+  description: Network interface configuration (DHCP, static IP)
+- name: Device Info
+  description: Device information and naming
+- name: Store
+  description: Application store for discovering and installing apps
+- name: Dev
+  description: Application development workbench
+- name: Containers
+  description: Container management (containerd)
+- name: Images
+  description: Container image management
+paths:
+  /system/info:
+    get:
+      tags:
+      - System
+      summary: Get system information
+      description: Returns platform version and service availability status
+      operationId: getSystemInfo
+      responses:
+        '200':
+          description: System information
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        version:
+                          type: string
+                          example: 0.1.0
+                        services:
+                          type: object
+                          properties:
+                            ai-runtime:
+                              type: boolean
+                            event-bus:
+                              type: boolean
+                            device-control:
+                              type: boolean
+                            app-manager:
+                              type: boolean
+  /system/stats:
+    get:
+      tags:
+      - System
+      summary: Get system statistics
+      description: Returns real-time system and service statistics
+      operationId: getSystemStats
+      responses:
+        '200':
+          description: System statistics
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        timestamp:
+                          type: integer
+                          format: int64
+                        services:
+                          type: object
+                          additionalProperties:
+                            type: object
+  /system/health:
+    get:
+      tags:
+      - System
+      summary: Health check
+      description: Returns service health status (no authentication required)
+      operationId: healthCheck
+      security: []
+      responses:
+        '200':
+          description: Health status
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        status:
+                          type: string
+                          example: healthy
+                        time:
+                          type: integer
+                          format: int64
+                        service:
+                          type: string
+                          example: platform-api
+  /ai/models:
+    get:
+      tags:
+      - AI Runtime
+      summary: List all registered models
+      operationId: listModels
+      responses:
+        '200':
+          description: List of models
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/ModelListResponse'
+        '503':
+          description: AI Runtime not available
+    post:
+      tags:
+      - AI Runtime
+      summary: Register a new model
+      description: Register a model by specifying its file path
+      operationId: registerModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - model_path
+              properties:
+                model_path:
+                  type: string
+                  description: Absolute path to model file
+                  example: /data/aipc/models/yolov8n.hef
+                model_id:
+                  type: string
+                  description: Optional model identifier
+                  example: yolo_detection_v1
+      responses:
+        '200':
+          description: Model registered
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/ModelRegisterResponse'
+        '400':
+          description: Invalid request
+        '503':
+          description: AI Runtime not available
+  /ai/models/upload:
+    post:
+      tags:
+      - AI Runtime
+      summary: Upload and register a model file
+      description: Upload a model file (HEF, ONNX, TFLite) and register it
+      operationId: uploadModel
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+              - model
+              properties:
+                model:
+                  type: string
+                  format: binary
+                  description: Model file (.hef, .onnx, .bin, .tflite)
+                model_id:
+                  type: string
+                  description: Optional model identifier
+                model_type:
+                  type: string
+                  description: Optional model type (hef, onnx, tflite)
+                variant:
+                  type: string
+                  description: Optional model variant
+                threshold:
+                  type: number
+                  format: float
+                  description: Optional detection threshold
+                max_detections:
+                  type: integer
+                  description: Optional maximum detections
+      responses:
+        '200':
+          description: Model uploaded and registered
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        model_id:
+                          type: string
+                        model_path:
+                          type: string
+                        filename:
+                          type: string
+                        size:
+                          type: integer
+                        status:
+                          type: object
+                          description: Empty data
+  /ai/models/{model_id}:
+    get:
+      tags:
+      - AI Runtime
+      summary: Get model information
+      operationId: getModelInfo
+      parameters:
+      - name: model_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Model information
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/ModelInfo'
+        '404':
+          description: Model not found
+    delete:
+      tags:
+      - AI Runtime
+      summary: Unregister a model
+      operationId: unregisterModel
+      parameters:
+      - name: model_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Model unregistered
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /ai/models/{model_id}/apps:
+    get:
+      tags:
+      - AI Runtime
+      summary: Get apps using a model
+      description: Returns list of applications that are using this model
+      operationId: getModelApps
+      parameters:
+      - name: model_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: List of apps using the model
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: array
+                      items:
+                        type: string
+                      description: List of app IDs using this model
+        '404':
+          description: Model not found
+  /ai/stats:
+    get:
+      tags:
+      - AI Runtime
+      summary: Get AI runtime statistics
+      operationId: getAIStats
+      responses:
+        '200':
+          description: AI statistics
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/SystemStats'
+  /events/topics:
+    get:
+      tags:
+      - Event Bus
+      summary: List all event topics
+      operationId: listTopics
+      responses:
+        '200':
+          description: List of topics
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        topics:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/TopicInfo'
+  /events/publish:
+    post:
+      tags:
+      - Event Bus
+      summary: Publish an event
+      operationId: publishEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - topic
+              properties:
+                topic:
+                  type: string
+                  example: app/detection/result
+                payload:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: Event published
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /events/stream:
+    get:
+      tags:
+      - Event Bus
+      summary: Subscribe to event stream (WebSocket)
+      description: 'WebSocket endpoint for real-time event subscription.
+
+
+        Connect with: `ws://{host}/api/v1/events/stream?token={jwt_token}`
+
+        '
+      operationId: eventStream
+      responses:
+        '101':
+          description: Switching to WebSocket protocol
+  /device/status:
+    get:
+      tags:
+      - Device Control
+      summary: Get device status
+      operationId: getDeviceStatus
+      responses:
+        '200':
+          description: Device status
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/DeviceStatus'
+  /device/light:
+    post:
+      tags:
+      - Device Control
+      summary: Set white light level
+      operationId: setLight
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - level
+              properties:
+                level:
+                  type: integer
+                  minimum: 0
+                  maximum: 100
+                  description: Light level (0-100)
+      responses:
+        '200':
+          description: Light set
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /device/ir-led:
+    post:
+      tags:
+      - Device Control
+      summary: Control IR LED
+      operationId: setIrLed
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - status
+              properties:
+                status:
+                  type: boolean
+                  description: Turn IR LED on/off
+      responses:
+        '200':
+          description: IR LED set
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /device/ir-cut:
+    post:
+      tags:
+      - Device Control
+      summary: Set IR-CUT filter mode
+      operationId: setIrCut
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - mode
+              properties:
+                mode:
+                  type: string
+                  enum:
+                  - auto
+                  - day
+                  - night
+                  description: IR-CUT filter mode
+      responses:
+        '200':
+          description: IR-CUT mode set
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /device/ptz:
+    post:
+      tags:
+      - Device Control
+      summary: Control PTZ (Pan/Tilt/Zoom)
+      operationId: controlPTZ
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - action
+              properties:
+                action:
+                  type: string
+                  enum:
+                  - pan
+                  - tilt
+                  - stop
+                  - preset
+                  - zoom
+                  - focus
+                direction:
+                  type: string
+                  enum:
+                  - left
+                  - right
+                  - up
+                  - down
+                  - stop
+                  description: Direction for pan/tilt
+                speed:
+                  type: integer
+                  minimum: 0
+                  maximum: 100
+                  description: Pan/tilt speed
+                preset_id:
+                  type: integer
+                  minimum: 1
+                  maximum: 255
+                  description: Preset ID to call
+                zoom_speed:
+                  type: integer
+                  minimum: -100
+                  maximum: 100
+                  description: Zoom speed (negative=out, positive=in)
+                focus_speed:
+                  type: integer
+                  minimum: -100
+                  maximum: 100
+                  description: Focus speed (negative=near, positive=far)
+      responses:
+        '200':
+          description: PTZ command executed
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /device/zoom:
+    post:
+      tags:
+      - Device Control
+      summary: Control zoom
+      operationId: controlZoom
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - speed
+              properties:
+                speed:
+                  type: integer
+                  minimum: -100
+                  maximum: 100
+                  description: Zoom speed
+      responses:
+        '200':
+          description: Zoom command executed
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /device/focus:
+    post:
+      tags:
+      - Device Control
+      summary: Control focus
+      operationId: controlFocus
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - speed
+              properties:
+                speed:
+                  type: integer
+                  minimum: -100
+                  maximum: 100
+                  description: Focus speed
+      responses:
+        '200':
+          description: Focus command executed
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /device/autofocus:
+    post:
+      tags:
+      - Device Control
+      summary: Enable/disable autofocus
+      operationId: setAutofocus
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - enable
+              properties:
+                enable:
+                  type: boolean
+      responses:
+        '200':
+          description: Autofocus setting updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /device/gpio:
+    post:
+      tags:
+      - Device Control
+      summary: Write GPIO value
+      operationId: gpioWrite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - pin
+              - value
+              properties:
+                pin:
+                  type: integer
+                  description: GPIO pin number
+                value:
+                  type: boolean
+                  description: Pin value (high/low)
+      responses:
+        '200':
+          description: GPIO written
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /device/gpio/{pin}:
+    get:
+      tags:
+      - Device Control
+      summary: Read GPIO value
+      operationId: gpioRead
+      parameters:
+      - name: pin
+        in: path
+        required: true
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: GPIO value
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        pin:
+                          type: integer
+                        value:
+                          type: boolean
+  /apps:
+    get:
+      tags:
+      - App Manager
+      summary: List all applications
+      operationId: listApps
+      responses:
+        '200':
+          description: List of applications
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/AppListResponse'
+    post:
+      tags:
+      - App Manager
+      summary: Install an application
+      operationId: installApp
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - manifest_path
+              properties:
+                manifest_path:
+                  type: string
+                  description: Path to app.yaml manifest
+                image_path:
+                  type: string
+                  description: Optional path to container image
+      responses:
+        '200':
+          description: Application installed
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/InstallResponse'
+  /apps/{app_id}:
+    get:
+      tags:
+      - App Manager
+      summary: Get application info
+      operationId: getApp
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Application info
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/AppInfo'
+    delete:
+      tags:
+      - App Manager
+      summary: Uninstall application
+      operationId: uninstallApp
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: keep_logs
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: Application uninstalled
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /apps/{app_id}/start:
+    post:
+      tags:
+      - App Manager
+      summary: Start an application
+      operationId: startApp
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Application started
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /apps/{app_id}/stop:
+    post:
+      tags:
+      - App Manager
+      summary: Stop an application
+      operationId: stopApp
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: timeout
+        in: query
+        schema:
+          type: integer
+          default: 30
+        description: Stop timeout in seconds
+      responses:
+        '200':
+          description: Application stopped
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /apps/{app_id}/stats:
+    get:
+      tags:
+      - App Manager
+      summary: Get application statistics
+      operationId: getAppStats
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Application statistics
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/AppStats'
+  /apps/{app_id}/logs:
+    get:
+      tags:
+      - App Manager
+      summary: Get application logs
+      operationId: getAppLogs
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: max_lines
+        in: query
+        schema:
+          type: integer
+          default: 100
+      - name: follow
+        in: query
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: Application logs
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: array
+                      items:
+                        type: string
+  /apps/{app_id}/permissions:
+    get:
+      tags:
+      - App Manager
+      summary: Get app permissions
+      description: Returns the permissions granted to an application
+      operationId: getAppPermissions
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: App permissions
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/AppPermissions'
+        '404':
+          description: App not found
+  /streams:
+    get:
+      tags:
+      - Stream
+      summary: List available streams
+      operationId: listStreams
+      responses:
+        '200':
+          description: List of streams
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/StreamListResponse'
+  /streams/{stream_id}:
+    get:
+      tags:
+      - Stream
+      summary: Get stream information
+      operationId: getStreamInfo
+      parameters:
+      - name: stream_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Stream information
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/StreamInfo'
+  /h264/{stream_id}:
+    get:
+      tags:
+      - Stream
+      summary: Subscribe to H264 video stream (WebSocket)
+      description: >
+        WebSocket endpoint for zero-latency H264 video stream.
+        Connect with: `ws://{host}/api/v1/h264/{stream_id}`
+      operationId: h264Stream
+      parameters:
+      - name: stream_id
+        in: path
+        required: true
+        schema:
+          type: string
+          example: main
+      responses:
+        '101':
+          description: Switching to WebSocket protocol
+  /settings:
+    get:
+      tags:
+      - Settings
+      summary: Get all settings
+      operationId: getAllSettings
+      responses:
+        '200':
+          description: All settings as key-value pairs
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        settings:
+                          type: object
+                          additionalProperties:
+                            type: string
+    post:
+      tags:
+      - Settings
+      summary: Create or update a setting
+      operationId: setSetting
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - key
+              properties:
+                key:
+                  type: string
+                  example: detection_threshold
+                value:
+                  type: string
+                  example: '0.75'
+      responses:
+        '200':
+          description: Setting saved
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        key:
+                          type: string
+                        value:
+                          type: string
+  /settings/{key}:
+    delete:
+      tags:
+      - Settings
+      summary: Delete a setting
+      operationId: deleteSetting
+      parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Setting deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+  /monitor/summary:
+    get:
+      tags:
+      - Monitor
+      summary: Get system resource summary
+      description: Returns CPU, memory, disk, network, and host info in one call
+      operationId: getMonitorSummary
+      responses:
+        '200':
+          description: System resource summary
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        cpu:
+                          type: object
+                          properties:
+                            usage_percent:
+                              type: number
+                            cores:
+                              type: integer
+                            arch:
+                              type: string
+                        memory:
+                          type: object
+                          properties:
+                            total:
+                              type: integer
+                            used:
+                              type: integer
+                            available:
+                              type: integer
+                            usage_percent:
+                              type: number
+                        disk:
+                          type: object
+                          properties:
+                            total:
+                              type: integer
+                            used:
+                              type: integer
+                            free:
+                              type: integer
+                            usage_percent:
+                              type: number
+                        host:
+                          type: object
+                          properties:
+                            hostname:
+                              type: string
+                            os:
+                              type: string
+                            platform:
+                              type: string
+                            kernel_version:
+                              type: string
+                            uptime_seconds:
+                              type: integer
+                        network:
+                          type: object
+                          properties:
+                            bytes_sent:
+                              type: integer
+                            bytes_recv:
+                              type: integer
+  /monitor/cpu:
+    get:
+      tags:
+      - Monitor
+      summary: Get CPU usage details
+      operationId: getMonitorCPU
+      responses:
+        '200':
+          description: CPU details with per-core usage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+  /monitor/memory:
+    get:
+      tags:
+      - Monitor
+      summary: Get memory and swap usage
+      operationId: getMonitorMemory
+      responses:
+        '200':
+          description: Virtual memory and swap statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+  /monitor/disk:
+    get:
+      tags:
+      - Monitor
+      summary: Get disk partition usage
+      operationId: getMonitorDisk
+      responses:
+        '200':
+          description: Per-partition disk usage
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        partitions:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              device:
+                                type: string
+                              mountpoint:
+                                type: string
+                              fstype:
+                                type: string
+                              total:
+                                type: integer
+                              used:
+                                type: integer
+                              free:
+                                type: integer
+                              usage_percent:
+                                type: number
+  /monitor/network:
+    get:
+      tags:
+      - Monitor
+      summary: Get network I/O counters
+      operationId: getMonitorNetwork
+      responses:
+        '200':
+          description: Per-interface network statistics
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        interfaces:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              name:
+                                type: string
+                              bytes_sent:
+                                type: integer
+                              bytes_recv:
+                                type: integer
+                              packets_sent:
+                                type: integer
+                              packets_recv:
+                                type: integer
+  /monitor/gyro/attitude:
+    get:
+      tags:
+      - Monitor
+      summary: Stream gyroscope attitude (SSE)
+      description: >-
+        Server-Sent Events stream of device tilt (pitch/roll). `EventSource`
+        cannot set custom headers, so authentication uses the `token` query
+        parameter (raw value, no `Bearer ` prefix). The response sets
+        `X-Accel-Buffering: no`. See `docs/references/gyro-attitude-sse.md` for the full
+        client contract.
+      operationId: streamGyroAttitude
+      parameters:
+      - name: token
+        in: query
+        required: true
+        schema:
+          type: string
+        description: Authentication token (raw value, no `Bearer ` prefix)
+      - name: rate
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 50
+        description: Output frequency cap (Hz), clamped to [1, 200]
+      responses:
+        '200':
+          description: |-
+            SSE event stream. Events:
+            - `orientation` — data: `{"pitch": <deg>, "roll": <deg>}` — tilt only, yaw stripped; finite numbers in [-90, 90]
+            - `status` — data: `{"sensor": "online" | "offline" | "error"}`
+            - `error` — data: `{"code": "SENSOR_ERROR" | "SENSOR_UNAVAILABLE", "message": <text>}`
+            - `heartbeat` — data: `{"timestamp": <ms>}` every 15s to keep proxies from closing the stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |-
+                event: orientation
+                data: {"pitch":12.34,"roll":-5.67}
+
+        '503':
+          description: >-
+            Gyro sensor source is disabled or not available (non-SSE JSON
+            error); EventSource transitions to CLOSED and fires `onError`.
+  /processes:
+    get:
+      tags:
+      - Processes
+      summary: List running processes
+      operationId: listProcesses
+      parameters:
+      - name: sort
+        in: query
+        schema:
+          type: string
+          enum:
+          - cpu
+          - mem
+          - pid
+          default: cpu
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          default: 50
+      responses:
+        '200':
+          description: Process list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        total:
+                          type: integer
+                        processes:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              pid:
+                                type: integer
+                              name:
+                                type: string
+                              status:
+                                type: string
+                              cpu_percent:
+                                type: number
+                              mem_percent:
+                                type: number
+                              mem_rss:
+                                type: integer
+                              username:
+                                type: string
+                              cmdline:
+                                type: string
+  /processes/{pid}:
+    get:
+      tags:
+      - Processes
+      summary: Get process details
+      operationId: getProcessInfo
+      parameters:
+      - name: pid
+        in: path
+        required: true
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: Process details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+        '404':
+          description: Process not found
+  /processes/{pid}/kill:
+    post:
+      tags:
+      - Processes
+      summary: Send signal to process
+      operationId: killProcess
+      parameters:
+      - name: pid
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: signal
+        in: query
+        schema:
+          type: string
+          enum:
+          - SIGTERM
+          - SIGKILL
+          - SIGINT
+          - SIGHUP
+          default: SIGTERM
+      responses:
+        '200':
+          description: Signal sent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+        '404':
+          description: Process not found
+  /files:
+    get:
+      tags:
+      - Files
+      summary: List directory contents
+      operationId: listFiles
+      parameters:
+      - name: path
+        in: query
+        schema:
+          type: string
+          default: /data/aipc
+      responses:
+        '200':
+          description: Directory listing
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        path:
+                          type: string
+                        files:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              name:
+                                type: string
+                              path:
+                                type: string
+                              is_dir:
+                                type: boolean
+                              size:
+                                type: integer
+                              mod_time:
+                                type: string
+                              mode:
+                                type: string
+        '403':
+          description: Access denied (path outside allowed roots)
+    delete:
+      tags:
+      - Files
+      summary: Delete file or directory
+      operationId: deleteFile
+      parameters:
+      - name: path
+        in: query
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: File deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+        '403':
+          description: Access denied
+  /files/content:
+    get:
+      tags:
+      - Files
+      summary: Read file content
+      description: Returns text content of a file (max 1MB)
+      operationId: readFileContent
+      parameters:
+      - name: path
+        in: query
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: File content
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        path:
+                          type: string
+                        size:
+                          type: integer
+                        content:
+                          type: string
+    post:
+      tags:
+      - Files
+      summary: Write file content
+      operationId: writeFileContent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - path
+              properties:
+                path:
+                  type: string
+                content:
+                  type: string
+      responses:
+        '200':
+          description: File written
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+  /files/upload:
+    post:
+      tags:
+      - Files
+      summary: Upload a file
+      operationId: uploadFile
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+              - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                path:
+                  type: string
+                  description: Destination directory
+                  default: /data/aipc
+      responses:
+        '200':
+          description: File uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+  /files/download:
+    get:
+      tags:
+      - Files
+      summary: Download a file
+      operationId: downloadFile
+      parameters:
+      - name: path
+        in: query
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: File download
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+  /files/mkdir:
+    post:
+      tags:
+      - Files
+      summary: Create directory
+      operationId: makeDir
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - path
+              properties:
+                path:
+                  type: string
+      responses:
+        '200':
+          description: Directory created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+  /files/rename:
+    post:
+      tags:
+      - Files
+      summary: Rename or move file/directory
+      operationId: renameFile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - old_path
+              - new_path
+              properties:
+                old_path:
+                  type: string
+                new_path:
+                  type: string
+      responses:
+        '200':
+          description: File renamed/moved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+  /terminal/ws:
+    get:
+      tags:
+      - Terminal
+      summary: Web terminal (WebSocket)
+      description: 'WebSocket endpoint for interactive shell access.
+
+
+        Connect with: `ws://{host}/api/v1/terminal/ws`
+
+
+        - Text messages: terminal I/O
+
+        - Binary messages: resize `{"cols":80,"rows":24}`
+
+        '
+      operationId: terminalWS
+      responses:
+        '101':
+          description: Switching to WebSocket protocol
+  /ssh/config:
+    get:
+      tags:
+      - SSH
+      summary: Get SSH configuration
+      description: Returns parsed sshd_config settings
+      operationId: getSSHConfig
+      responses:
+        '200':
+          description: SSH configuration
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        config:
+                          type: object
+                          additionalProperties:
+                            type: string
+                          example:
+                            Port: '22'
+                            PermitRootLogin: 'yes'
+                            PasswordAuthentication: 'yes'
+    post:
+      tags:
+      - SSH
+      summary: Update SSH configuration
+      description: Updates sshd_config and optionally restarts the service
+      operationId: setSSHConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                port:
+                  type: string
+                permit_root_login:
+                  type: string
+                  enum:
+                  - 'yes'
+                  - 'no'
+                  - prohibit-password
+                password_authentication:
+                  type: string
+                  enum:
+                  - 'yes'
+                  - 'no'
+                pubkey_authentication:
+                  type: string
+                  enum:
+                  - 'yes'
+                  - 'no'
+                max_auth_tries:
+                  type: string
+                restart_service:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Configuration updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+  /ssh/status:
+    get:
+      tags:
+      - SSH
+      summary: Get SSH service status
+      operationId: getSSHStatus
+      responses:
+        '200':
+          description: Service status
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        status:
+                          type: string
+                          enum:
+                          - active
+                          - inactive
+                          - unknown
+  /ssh/logs:
+    get:
+      tags:
+      - SSH
+      summary: Get SSH login logs
+      description: Returns recent SSH authentication log entries
+      operationId: getSSHLogs
+      responses:
+        '200':
+          description: SSH log entries
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        logs:
+                          type: array
+                          items:
+                            type: string
+  /logs/services:
+    get:
+      tags: [Logs]
+      summary: Get available system services for logs
+      operationId: getLogServices
+      responses:
+        '200':
+          description: List of services
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        services:
+                          type: array
+                          items:
+                            type: string
+
+  /logs/files:
+    get:
+      tags: [Logs]
+      summary: Get list of readable log files
+      operationId: getLogFiles
+      responses:
+        '200':
+          description: List of log files
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        files:
+                          type: array
+                          items:
+                            type: string
+
+  /logs/content:
+    get:
+      tags: [Logs]
+      summary: Read log content
+      operationId: getLogContent
+      parameters:
+        - name: type
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [service, file]
+        - name: target
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: lines
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 500
+      responses:
+        '200':
+          description: Log content payload
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        target:
+                          type: string
+                        type:
+                          type: string
+                        lines:
+                          type: integer
+                        content:
+                          type: string
+
+  /logs/download:
+    get:
+      tags: [Logs]
+      summary: Download a complete log file or service journal
+      operationId: downloadLog
+      parameters:
+        - name: type
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [service, file]
+        - name: target
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The log file content stream
+
+  /logs/stream/ws:
+    get:
+      tags: [Logs]
+      summary: Stream logs in real-time over WebSocket
+      operationId: handleLogStreamWS
+      parameters:
+        - name: type
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [service, file]
+        - name: target
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: token
+          in: query
+          required: false
+          schema:
+            type: string
+          description: JWT token for authentication
+      responses:
+        '101':
+          description: Switching to WebSocket protocol
+        '400':
+          description: Invalid request
+
+  # ==================== Store API ====================
+  /store/apps:
+    get:
+      tags: [Store]
+      summary: List store applications
+      operationId: listStoreApps
+      parameters:
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: featured
+          in: query
+          schema:
+            type: boolean
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: List of store apps
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        apps:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/StoreApp'
+                        total:
+                          type: integer
+                        page:
+                          type: integer
+                        page_size:
+                          type: integer
+
+  /store/apps/{key}:
+    get:
+      tags: [Store]
+      summary: Get store app details
+      operationId: getStoreApp
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Store app details
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        app:
+                          $ref: '#/components/schemas/StoreApp'
+                        versions:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/StoreAppDetail'
+                        tags:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/StoreTag'
+
+  /store/apps/{key}/install:
+    post:
+      tags: [Store]
+      summary: Install app from store
+      operationId: installFromStore
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                version:
+                  type: string
+                config:
+                  type: object
+      responses:
+        '200':
+          description: App installed
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        app_id:
+                          type: string
+                        message:
+                          type: string
+
+  /store/categories:
+    get:
+      tags: [Store]
+      summary: List app categories
+      operationId: listStoreCategories
+      responses:
+        '200':
+          description: List of categories
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        categories:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/StoreCategory'
+
+  /store/tags:
+    get:
+      tags: [Store]
+      summary: List app tags
+      operationId: listStoreTags
+      responses:
+        '200':
+          description: List of tags
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        tags:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/StoreTag'
+
+  /store/installs:
+    get:
+      tags: [Store]
+      summary: List installed apps
+      operationId: listInstalls
+      responses:
+        '200':
+          description: List of installed apps
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        installs:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/AppInstall'
+    post:
+      tags: [Store]
+      summary: Create install record
+      operationId: createInstall
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [app_id, name]
+              properties:
+                app_id:
+                  type: string
+                name:
+                  type: string
+                version:
+                  type: string
+                image:
+                  type: string
+                store_app_id:
+                  type: integer
+      responses:
+        '200':
+          description: Install created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  /store/installs/{app_id}:
+    get:
+      tags: [Store]
+      summary: Get install details
+      operationId: getInstall
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Install details
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        install:
+                          $ref: '#/components/schemas/AppInstall'
+    put:
+      tags: [Store]
+      summary: Update install record
+      operationId: updateInstall
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                container_id:
+                  type: string
+                pid:
+                  type: integer
+                message:
+                  type: string
+                config:
+                  type: string
+      responses:
+        '200':
+          description: Install updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+    delete:
+      tags: [Store]
+      summary: Delete install record
+      operationId: deleteInstall
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Install deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  # ==================== Dev API ====================
+  /dev/base-images:
+    get:
+      tags: [Dev]
+      summary: List base images for development
+      operationId: listBaseImages
+      responses:
+        '200':
+          description: List of base images
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        images:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/BaseImage'
+
+  /dev/projects:
+    get:
+      tags: [Dev]
+      summary: List development projects
+      operationId: listProjects
+      responses:
+        '200':
+          description: List of projects
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        projects:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/AppProject'
+    post:
+      tags: [Dev]
+      summary: Create a new project
+      operationId: createProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, key]
+              properties:
+                name:
+                  type: string
+                key:
+                  type: string
+                description:
+                  type: string
+                base_image_id:
+                  type: integer
+                language:
+                  type: string
+      responses:
+        '200':
+          description: Project created
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        project:
+                          $ref: '#/components/schemas/AppProject'
+
+  /dev/projects/{id}:
+    get:
+      tags: [Dev]
+      summary: Get project details
+      operationId: getProject
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Project details
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        project:
+                          $ref: '#/components/schemas/AppProject'
+                        base_image:
+                          $ref: '#/components/schemas/BaseImage'
+    put:
+      tags: [Dev]
+      summary: Update project
+      operationId: updateProject
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                base_image_id:
+                  type: integer
+                entry_file:
+                  type: string
+                app_config:
+                  type: string
+                volumes:
+                  type: string
+      responses:
+        '200':
+          description: Project updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+    delete:
+      tags: [Dev]
+      summary: Delete project
+      operationId: deleteProject
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Project deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  /dev/projects/{id}/upload:
+    post:
+      tags: [Dev]
+      summary: Upload file to project
+      operationId: uploadProjectFile
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                path:
+                  type: string
+      responses:
+        '200':
+          description: File uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  /dev/projects/{id}/source:
+    post:
+      tags: [Dev]
+      summary: Upload source archive to project
+      operationId: uploadProjectSource
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Source uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  /dev/projects/{id}/files:
+    get:
+      tags: [Dev]
+      summary: List project files
+      operationId: listProjectFiles
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: path
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of files
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        files:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              name:
+                                type: string
+                              path:
+                                type: string
+                              is_dir:
+                                type: boolean
+                              size:
+                                type: integer
+
+  /dev/projects/{id}/file:
+    get:
+      tags: [Dev]
+      summary: Get file content
+      operationId: getProjectFileContent
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: File content
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        path:
+                          type: string
+                        content:
+                          type: string
+    post:
+      tags: [Dev]
+      summary: Save file content
+      operationId: saveProjectFileContent
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, content]
+              properties:
+                path:
+                  type: string
+                content:
+                  type: string
+      responses:
+        '200':
+          description: File saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  /dev/projects/{id}/builds:
+    get:
+      tags: [Dev]
+      summary: List project builds
+      operationId: listProjectBuilds
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: List of builds
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        builds:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/AppBuild'
+
+  /dev/projects/{id}/build:
+    post:
+      tags: [Dev]
+      summary: Start a new build
+      operationId: createProjectBuild
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                version:
+                  type: string
+      responses:
+        '200':
+          description: Build started
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        build:
+                          $ref: '#/components/schemas/AppBuild'
+
+  # ==================== Container API ====================
+  /containers:
+    get:
+      tags: [Containers]
+      summary: List containers
+      operationId: listContainers
+      parameters:
+        - name: state
+          in: query
+          schema:
+            type: string
+            enum: [running, stopped, all]
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: List of containers
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        containers:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/Container'
+                        total:
+                          type: integer
+                        status_count:
+                          type: object
+
+  /containers/{id}:
+    get:
+      tags: [Containers]
+      summary: Get container details
+      operationId: getContainer
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Container details
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        container:
+                          $ref: '#/components/schemas/Container'
+    delete:
+      tags: [Containers]
+      summary: Remove container
+      operationId: removeContainer
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Container removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  /containers/{id}/stats:
+    get:
+      tags: [Containers]
+      summary: Get container stats
+      operationId: getContainerStats
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Container stats
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        stats:
+                          $ref: '#/components/schemas/ContainerStats'
+
+  /containers/{id}/logs:
+    get:
+      tags: [Containers]
+      summary: Get container logs
+      operationId: getContainerLogs
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: tail
+          in: query
+          schema:
+            type: integer
+            default: 100
+      responses:
+        '200':
+          description: Container logs
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        logs:
+                          type: string
+
+  /containers/{id}/logs/stream:
+    get:
+      tags: [Containers]
+      summary: Stream container logs (SSE)
+      operationId: streamContainerLogs
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Log stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /containers/{id}/start:
+    post:
+      tags: [Containers]
+      summary: Start container
+      operationId: startContainer
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Container started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  /containers/{id}/stop:
+    post:
+      tags: [Containers]
+      summary: Stop container
+      operationId: stopContainer
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Container stopped
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  /containers/{id}/restart:
+    post:
+      tags: [Containers]
+      summary: Restart container
+      operationId: restartContainer
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Container restarted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  # ==================== Images API ====================
+  /images:
+    get:
+      tags: [Images]
+      summary: List container images
+      operationId: listImages
+      responses:
+        '200':
+          description: List of images
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        images:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/ContainerImage'
+
+  /images/pull:
+    post:
+      tags: [Images]
+      summary: Pull an image
+      operationId: pullImage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+      responses:
+        '200':
+          description: Image pulled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  /images/{image}:
+    delete:
+      tags: [Images]
+      summary: Delete an image
+      operationId: deleteImage
+      parameters:
+        - name: image
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Image deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  # ==================== App Manager Extensions ====================
+  /apps/wizard:
+    post:
+      tags: [App Manager]
+      summary: Install app via wizard
+      operationId: wizardInstall
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [app_id, name, image]
+              properties:
+                app_id:
+                  type: string
+                name:
+                  type: string
+                image:
+                  type: string
+                config:
+                  type: object
+      responses:
+        '200':
+          description: App installed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  /apps/upload-image:
+    post:
+      tags: [App Manager]
+      summary: Upload container image
+      operationId: uploadImage
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Image uploaded
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        image:
+                          type: string
+
+  # ==================== Container Log / Exec WebSockets ====================
+  /containers/{id}/logs/ws:
+    get:
+      tags: [App Manager]
+      summary: Stream container logs in real-time over WebSocket
+      operationId: streamContainerLogsWS
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: tail
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+        - name: token
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '101':
+          description: Switching to WebSocket protocol
+        '400':
+          description: Invalid request
+
+  /containers/{id}/exec/ws:
+    get:
+      tags: [App Manager]
+      summary: Interactive container console over WebSocket
+      operationId: execContainerWS
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: cols
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 80
+        - name: rows
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 24
+        - name: command
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "/bin/sh"
+        - name: token
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '101':
+          description: Switching to WebSocket protocol
+        '400':
+          description: Invalid request
+
+  # ==================== Storage Management ====================
+  /storage/disks:
+    get:
+      tags: [Storage]
+      summary: List available disks and partitions
+      operationId: listDisks
+      responses:
+        '200':
+          description: List of block devices
+
+  /storage/mount:
+    post:
+      tags: [Storage]
+      summary: Mount a block device to a destination
+      operationId: mountDisk
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device]
+              properties:
+                device:
+                  type: string
+                  example: /dev/sda1
+                target:
+                  type: string
+                  example: /mnt/sda1
+      responses:
+        '200':
+          description: Mount successful
+
+  /storage/unmount:
+    post:
+      tags: [Storage]
+      summary: Unmount a previously mounted disk
+      operationId: unmountDisk
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target]
+              properties:
+                target:
+                  type: string
+                  example: /mnt/sda1
+      responses:
+        '200':
+          description: Unmount successful
+
+  /storage/format:
+    post:
+      tags: [Storage]
+      summary: Format a disk with a specific filesystem
+      operationId: formatDisk
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device]
+              properties:
+                device:
+                  type: string
+                  example: /dev/sda1
+                fstype:
+                  type: string
+                  example: ext4
+                  enum: [ext4, vfat, fat32]
+      responses:
+        '200':
+          description: Format successful
+
+  # ==================== Media Config ====================
+  /media/config:
+    get:
+      tags: [Media]
+      summary: Get the camera daemon's configuration
+      operationId: getMediaConfig
+      responses:
+        '200':
+          description: camera-daemon configuration
+    post:
+      tags: [Media]
+      summary: Update the camera daemon's configuration and apply changes
+      operationId: setMediaConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Partial configuration object overlay
+      responses:
+        '200':
+          description: Configuration updated
+
+  /media/config/field:
+    get:
+      tags: [Media]
+      summary: Read one scalar media profile field
+      operationId: getMediaConfigField
+      parameters:
+      - name: field_path
+        in: query
+        required: true
+        schema:
+          type: string
+          example: frontend.hailort.use-hailort-service
+      responses:
+        '200':
+          description: Current scalar field value
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        field_path:
+                          type: string
+                        type:
+                          type: integer
+                          description: ConfigFieldType enum value
+                        type_name:
+                          type: string
+                        value:
+                          type: string
+    put:
+      tags: [Media]
+      summary: Update one allow-listed scalar media profile field
+      operationId: setMediaConfigField
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [field_path, type, value]
+              properties:
+                field_path:
+                  type: string
+                  example: frontend.hailort.use-hailort-service
+                type:
+                  type: integer
+                  description: ConfigFieldType enum value (0=BOOL, 1=INT32, 2=UINT32, 3=FLOAT64, 4=STRING)
+                  minimum: 0
+                  maximum: 4
+                value:
+                  type: string
+                  example: 'true'
+      responses:
+        '200':
+          description: Config field applied
+
+  /media/config/export:
+    get:
+      tags: [Media]
+      summary: Export the unified media configuration envelope
+      operationId: exportMediaConfig
+      responses:
+        '200':
+          description: Versioned media configuration envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      additionalProperties: true
+
+  /media/config/import:
+    post:
+      tags: [Media]
+      summary: Import a unified media configuration envelope
+      operationId: importMediaConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [schema, version, config]
+              properties:
+                schema:
+                  type: string
+                  enum: [aipc.media_config]
+                version:
+                  type: integer
+                  enum: [1]
+                config:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: Configuration imported and camera-daemon restart requested
+
+  # ==================== System OTA ====================
+  /system/password:
+    post:
+      tags: [System]
+      summary: Update background login password
+      operationId: updateSystemPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_password]
+              properties:
+                old_password:
+                  type: string
+                new_password:
+                  type: string
+      responses:
+        '200':
+          description: Update successful
+
+  /system/restart:
+    post:
+      tags: [System]
+      summary: Trigger a system restart
+      operationId: restartSystem
+      responses:
+        '200':
+          description: Restart initiated
+
+  /system/ota/detect:
+    get:
+      tags: [System]
+      summary: Check for new OTA firmware updates
+      operationId: detectOTAUpdate
+      responses:
+        '200':
+          description: Update availability status
+
+  /system/ota/install:
+    post:
+      tags: [System]
+      summary: Upload and install a new firmware package
+      operationId: installOTA
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                firmware:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: OTA installation process started
+
+  # ==================== Login ====================
+  /login:
+    post:
+      tags: [System]
+      summary: Authenticate and get API token
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/LoginResponse'
+        '401':
+          description: Invalid credentials
+
+  # ==================== OTA Extended ====================
+  /system/ota/status:
+    get:
+      tags: [System]
+      summary: Get OTA upgrade status
+      operationId: getOTAStatus
+      responses:
+        '200':
+          description: OTA status
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/OTAStatusResponse'
+
+  /system/ota/parse:
+    post:
+      tags: [System]
+      summary: Parse firmware file without installing
+      description: Upload a firmware file and inspect version info
+      operationId: parseOTAFirmware
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [firmware]
+              properties:
+                firmware:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Firmware metadata
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/OTAParseResponse'
+
+  /system/ota/install-from-path:
+    post:
+      tags: [System]
+      summary: Install OTA firmware from local path
+      operationId: installOTAFromPath
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OTAInstallFromPathRequest'
+      responses:
+        '200':
+          description: OTA upgrade started
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        message:
+                          type: string
+                        status:
+                          type: string
+                        progress:
+                          type: string
+                        source_path:
+                          type: string
+
+  # ==================== OS A/B Upgrade ====================
+  /system/os-upgrade/upload:
+    post:
+      tags: [System]
+      summary: Stream an SWUpdate OS package to persistent storage
+      operationId: uploadOSUpgrade
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [package]
+              properties:
+                package:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Package uploaded
+
+  /system/os-upgrade/validate:
+    post:
+      tags: [System]
+      summary: Validate an uploaded OS package
+      operationId: validateOSUpgrade
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OSUpgradeJobRequest'
+      responses:
+        '200':
+          description: Package validation result
+
+  /system/os-upgrade/install:
+    post:
+      tags: [System]
+      summary: Start writing the inactive OS copy
+      operationId: installOSUpgrade
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OSUpgradeJobRequest'
+      responses:
+        '200':
+          description: Independent updater service started
+
+  /system/os-upgrade/status:
+    get:
+      tags: [System]
+      summary: Get the persistent OS upgrade status and log tail
+      operationId: getOSUpgradeStatus
+      parameters:
+      - in: query
+        name: job_id
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Current OS upgrade status
+
+  /system/os-upgrade/reboot:
+    post:
+      tags: [System]
+      summary: Reboot into the newly installed OS copy
+      operationId: rebootOSUpgrade
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OSUpgradeJobRequest'
+      responses:
+        '200':
+          description: Reboot service started
+
+  /system/os-upgrade/cancel:
+    post:
+      tags: [System]
+      summary: Cancel a job before installation
+      operationId: cancelOSUpgrade
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OSUpgradeJobRequest'
+      responses:
+        '200':
+          description: Job cancelled
+
+  /system/os-upgrade/package:
+    delete:
+      tags: [System]
+      summary: Delete a stored OS upgrade package
+      operationId: deleteOSUpgradePackage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OSUpgradeJobRequest'
+      responses:
+        '200':
+          description: Package deleted
+
+  # ==================== System Time ====================
+  /system/time:
+    get:
+      tags: [System]
+      summary: Get current system time
+      operationId: getSystemTime
+      responses:
+        '200':
+          description: Current system time
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        time:
+                          type: string
+                          format: date-time
+                        timezone:
+                          type: string
+                        uptime:
+                          type: integer
+                          format: int64
+
+  /system/time/set:
+    post:
+      tags: [System]
+      summary: Set system time manually
+      operationId: setSystemTime
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetTimeRequest'
+      responses:
+        '200':
+          description: Time set successfully
+
+  /system/time/config:
+    get:
+      tags: [System]
+      summary: Get time configuration (NTP settings)
+      operationId: getTimeConfig
+      responses:
+        '200':
+          description: Time configuration
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/TimeConfig'
+
+  /system/time/timezone:
+    put:
+      tags: [System]
+      summary: Set timezone
+      operationId: setTimezone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetTimezoneRequest'
+      responses:
+        '200':
+          description: Timezone updated
+
+  /system/time/ntp:
+    put:
+      tags: [System]
+      summary: Configure NTP settings
+      operationId: setNTPConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NTPConfigRequest'
+      responses:
+        '200':
+          description: NTP configuration updated
+
+  /system/time/ntp/sync:
+    post:
+      tags: [System]
+      summary: Trigger NTP time synchronization
+      operationId: syncNTP
+      responses:
+        '200':
+          description: NTP sync triggered
+
+  /system/time/timezones:
+    get:
+      tags: [System]
+      summary: List available timezones
+      operationId: getTimezones
+      responses:
+        '200':
+          description: Timezone list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: array
+                      items:
+                        type: string
+
+  # ==================== Event Logs ====================
+  /event-logs:
+    get:
+      tags: [Event Logs]
+      summary: List event logs
+      description: Query event logs with filtering and pagination
+      operationId: listEventLogs
+      parameters:
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: level
+          in: query
+          schema:
+            type: string
+        - name: start_time
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: end_time
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Event log entries
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        total:
+                          type: integer
+                          format: int64
+                        limit:
+                          type: integer
+                        offset:
+                          type: integer
+                        entries:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/EventLog'
+    post:
+      tags: [Event Logs]
+      summary: Create an event log entry
+      operationId: createEventLog
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventLogCreateRequest'
+      responses:
+        '200':
+          description: Event log created
+    delete:
+      tags: [Event Logs]
+      summary: Cleanup old event logs
+      operationId: cleanupEventLogs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [days]
+              properties:
+                days:
+                  type: integer
+                  minimum: 1
+                  maximum: 365
+                  description: Number of days to retain
+      responses:
+        '200':
+          description: Cleanup result
+
+  /event-logs/statistics:
+    get:
+      tags: [Event Logs]
+      summary: Get event log statistics
+      operationId: getEventLogStatistics
+      responses:
+        '200':
+          description: Event log statistics
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      additionalProperties: true
+
+  # ==================== Debug Logs ====================
+  /debug-logs/export:
+    post:
+      tags: [Debug Logs]
+      summary: Export debug logs as tar.gz
+      operationId: exportDebugLogs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DebugLogExportRequest'
+      responses:
+        '200':
+          description: tar.gz archive of debug logs
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+  /debug-logs/services:
+    get:
+      tags: [Debug Logs]
+      summary: List available systemd services for log export
+      operationId: getDebugLogServices
+      responses:
+        '200':
+          description: Service list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          name:
+                            type: string
+
+  /debug-logs/files:
+    get:
+      tags: [Debug Logs]
+      summary: List available log files
+      operationId: getDebugLogFiles
+      responses:
+        '200':
+          description: Log file list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          path:
+                            type: string
+                          name:
+                            type: string
+                          size:
+                            type: integer
+                            format: int64
+                          modified_time:
+                            type: string
+
+  # ==================== App Manager Extended ====================
+  /apps/{app_id}/restart:
+    post:
+      tags: [App Manager]
+      summary: Restart an application
+      operationId: restartApp
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Application restarted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
+
+  # ==================== Network ====================
+  /network/config:
+    get:
+      tags: [Network]
+      summary: Get network configuration
+      operationId: getNetworkConfig
+      responses:
+        '200':
+          description: Network configuration
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/NetworkConfig'
+    post:
+      tags: [Network]
+      summary: Update network configuration
+      description: Switch between DHCP and static IP mode. Changing network config may cause temporary connectivity loss.
+      operationId: updateNetworkConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NetworkConfig'
+      responses:
+        '200':
+          description: Network configuration updated
+
+  /network/interfaces:
+    get:
+      tags: [Network]
+      summary: List all network interfaces
+      operationId: getNetworkInterfaces
+      responses:
+        '200':
+          description: Network interfaces
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        interfaces:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/NetworkInterfaceInfo'
+
+  # ==================== Device Info ====================
+  /device-info:
+    get:
+      tags: [Device Info]
+      summary: Get device information
+      operationId: getDeviceInfo
+      responses:
+        '200':
+          description: Device information
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/DeviceInfo'
+    put:
+      tags: [Device Info]
+      summary: Update device name
+      operationId: updateDeviceName
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_name]
+              properties:
+                device_name:
+                  type: string
+                  pattern: '^[a-zA-Z0-9_-]+$'
+                  description: Alphanumeric, underscore, hyphen only
+      responses:
+        '200':
+          description: Device name updated
+
+  # ==================== Media Extended ====================
+  /media/image:
+    put:
+      tags: [Media]
+      summary: Update ISP image parameters
+      operationId: updateImageConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MediaImageConfig'
+      responses:
+        '200':
+          description: Image parameters updated
+
+  /media/encoder:
+    put:
+      tags: [Media]
+      summary: Update encoder parameters for a stream
+      operationId: updateEncoderConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MediaEncoderConfig'
+      responses:
+        '200':
+          description: Encoder parameters updated
+
+  /media/rtsp:
+    put:
+      tags: [Media]
+      summary: Enable or disable RTSP server
+      operationId: setRtspEnabled
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        '200':
+          description: RTSP state updated
+
+  /media/ai-overlay:
+    put:
+      tags: [Media]
+      summary: Update AI overlay configuration
+      operationId: updateAiOverlay
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MediaAiOverlayConfig'
+      responses:
+        '200':
+          description: AI overlay updated
+
+  /media/osd:
+    put:
+      tags: [Media]
+      summary: Update OSD (On-Screen Display) configuration
+      operationId: updateOsdConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MediaOsdConfig'
+      responses:
+        '200':
+          description: OSD configuration updated
+
+  /media/encoder/reconfig:
+    put:
+      tags: [Media]
+      summary: Reconfigure encoder (full reinit)
+      description: Fully reconfigure encoder parameters. Causes brief stream interruption.
+      operationId: reconfigureEncoder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MediaReconfigRequest'
+      responses:
+        '200':
+          description: Encoder reconfigured
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        message:
+                          type: string
+                        interrupt_ms:
+                          type: integer
+
+  # ==================== Files Extended ====================
+  /files/batch-download:
+    post:
+      tags: [Files]
+      summary: Batch download files as ZIP
+      operationId: batchDownloadFiles
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FileBatchRequest'
+      responses:
+        '200':
+          description: ZIP archive
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+
+  /files/batch-delete:
+    post:
+      tags: [Files]
+      summary: Batch delete files
+      operationId: batchDeleteFiles
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FileBatchRequest'
+      responses:
+        '200':
+          description: Deletion result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        deleted:
+                          type: array
+                          items:
+                            type: string
+                        count:
+                          type: integer
+                        failed:
+                          type: array
+                          items:
+                            type: object
+                        failed_count:
+                          type: integer
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token authentication
+  schemas:
+    APIResponse:
+      type: object
+      properties:
+        code:
+          type: integer
+          example: 0
+        message:
+          type: string
+          example: Success
+        data:
+          type: object
+          description: Response payload
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
+    TensorSpec:
+      type: object
+      properties:
+        name:
+          type: string
+        shape:
+          type: array
+          items:
+            type: integer
+        dtype:
+          type: string
+          enum:
+          - UINT8
+          - INT8
+          - UINT16
+          - INT16
+          - FLOAT16
+          - FLOAT32
+          - INT32
+          - UINT32
+    ModelInfo:
+      type: object
+      properties:
+        model_id:
+          type: string
+        model_path:
+          type: string
+        version:
+          type: string
+        inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/TensorSpec'
+        outputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/TensorSpec'
+        estimated_tops:
+          type: number
+        estimated_memory:
+          type: integer
+        load_timestamp:
+          type: integer
+          format: int64
+    ModelListResponse:
+      type: object
+      properties:
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelInfo'
+    ModelRegisterResponse:
+      type: object
+      properties:
+        model_id:
+          type: string
+        status:
+          type: object
+          description: Empty data
+    InferenceStats:
+      type: object
+      properties:
+        model_id:
+          type: string
+        total_inferences:
+          type: integer
+          format: int64
+        total_errors:
+          type: integer
+          format: int64
+        avg_latency_us:
+          type: integer
+          format: int64
+        current_qps:
+          type: number
+        queue_depth:
+          type: integer
+    SystemStats:
+      type: object
+      properties:
+        model_stats:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceStats'
+        device_utilization:
+          type: number
+        device_temperature:
+          type: number
+        total_memory_bytes:
+          type: integer
+          format: int64
+        used_memory_bytes:
+          type: integer
+          format: int64
+    TopicInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        subscriber_count:
+          type: integer
+    DeviceStatus:
+      type: object
+      properties:
+        white_light_level:
+          type: integer
+        ir_led_on:
+          type: boolean
+        ircut_mode:
+          type: integer
+        soc_temp_c:
+          type: number
+        mcu_temp_c:
+          type: number
+        light_sensor:
+          type: integer
+        ptz_pan_pos:
+          type: number
+        ptz_tilt_pos:
+          type: number
+        zoom_pos:
+          type: integer
+        focus_pos:
+          type: integer
+        autofocus_enabled:
+          type: boolean
+        mcu_version:
+          type: string
+        mcu_uptime_ms:
+          type: integer
+          format: int64
+        gpio_states:
+          type: object
+          additionalProperties:
+            type: boolean
+    AppInfo:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        version:
+          type: string
+        status:
+          type: string
+          enum:
+          - unknown
+          - installing
+          - stopped
+          - starting
+          - running
+          - stopping
+          - error
+        image:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+        stats:
+          $ref: '#/components/schemas/AppStats'
+    AppStats:
+      type: object
+      properties:
+        cpu_usage_percent:
+          type: number
+        memory_usage_bytes:
+          type: integer
+          format: int64
+        memory_limit_bytes:
+          type: integer
+          format: int64
+        network_rx_bytes:
+          type: integer
+          format: int64
+        network_tx_bytes:
+          type: integer
+          format: int64
+        pids:
+          type: integer
+        uptime_seconds:
+          type: integer
+          format: int64
+    AppPermissions:
+      type: object
+      properties:
+        video:
+          type: array
+          items:
+            type: string
+          description: List of video streams the app can access
+        inference:
+          type: object
+          properties:
+            models:
+              type: array
+              items:
+                type: string
+              description: List of AI models the app can use
+            max_qps:
+              type: integer
+              description: Maximum queries per second
+            max_concurrent:
+              type: integer
+              description: Maximum concurrent inferences
+            allow_register_model:
+              type: boolean
+              description: Whether app can register new models
+        events:
+          type: object
+          properties:
+            publish:
+              type: array
+              items:
+                type: string
+              description: List of event topics the app can publish to
+            subscribe:
+              type: array
+              items:
+                type: string
+              description: List of event topics the app can subscribe to
+        device:
+          type: object
+          properties:
+            light:
+              type: boolean
+              description: Access to light control
+            ir_cut:
+              type: boolean
+              description: Access to IR cut filter
+            ptz:
+              type: boolean
+              description: Access to PTZ control
+            lens:
+              type: boolean
+              description: Access to lens control
+        network:
+          type: object
+          properties:
+            mode:
+              type: string
+              description: Network mode (isolated, host, etc.)
+            outbound:
+              type: array
+              items:
+                type: string
+              description: Allowed outbound connections
+            inbound:
+              type: array
+              items:
+                type: integer
+              description: Allowed inbound ports
+    AppListResponse:
+      type: object
+      properties:
+        apps:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppInfo'
+    InstallResponse:
+      type: object
+      properties:
+        status:
+          type: object
+          description: Empty data
+        app_id:
+          type: string
+    StreamInfo:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+        width:
+          type: integer
+        height:
+          type: integer
+        fps:
+          type: integer
+        codec:
+          type: string
+        bitrate:
+          type: integer
+    StreamListResponse:
+      type: object
+      properties:
+        streams:
+          type: array
+          items:
+            $ref: '#/components/schemas/StreamInfo'
+
+    ErrorDetail:
+      type: object
+      properties:
+        type:
+          type: string
+        detail:
+          type: string
+
+    # ==================== Store Schemas ====================
+    StoreApp:
+      type: object
+      properties:
+        id:
+          type: integer
+        key:
+          type: string
+        name:
+          type: string
+        name_zh:
+          type: string
+        icon:
+          type: string
+        short_desc:
+          type: string
+        short_desc_zh:
+          type: string
+        description:
+          type: string
+        category:
+          type: string
+        author:
+          type: string
+        website:
+          type: string
+        document:
+          type: string
+        architectures:
+          type: string
+        min_memory:
+          type: integer
+        gpu_required:
+          type: boolean
+        soc_support:
+          type: string
+        source:
+          type: string
+        status:
+          type: string
+        featured:
+          type: boolean
+        sort_order:
+          type: integer
+        downloads:
+          type: integer
+        rating:
+          type: number
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    StoreAppDetail:
+      type: object
+      properties:
+        id:
+          type: integer
+        app_id:
+          type: integer
+        version:
+          type: string
+        image:
+          type: string
+        default_config:
+          type: string
+        changelog:
+          type: string
+        status:
+          type: string
+        release_date:
+          type: string
+          format: date-time
+
+    StoreCategory:
+      type: object
+      properties:
+        id:
+          type: integer
+        key:
+          type: string
+        name:
+          type: string
+        name_zh:
+          type: string
+        icon:
+          type: string
+        sort:
+          type: integer
+
+    StoreTag:
+      type: object
+      properties:
+        id:
+          type: integer
+        key:
+          type: string
+        name:
+          type: string
+        name_zh:
+          type: string
+        sort:
+          type: integer
+
+    AppInstall:
+      type: object
+      properties:
+        id:
+          type: integer
+        store_app_id:
+          type: integer
+        app_detail_id:
+          type: integer
+        app_id:
+          type: string
+        name:
+          type: string
+        version:
+          type: string
+        description:
+          type: string
+        image:
+          type: string
+        status:
+          type: string
+        container_id:
+          type: string
+        pid:
+          type: integer
+        message:
+          type: string
+        manifest_path:
+          type: string
+        config:
+          type: string
+        installed_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+        stopped_at:
+          type: string
+          format: date-time
+
+    # ==================== Dev Schemas ====================
+    BaseImage:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        tag:
+          type: string
+        image:
+          type: string
+        language:
+          type: string
+        description:
+          type: string
+        desc_zh:
+          type: string
+        sdk_version:
+          type: string
+        features:
+          type: string
+        build_cmd:
+          type: string
+        entry_point:
+          type: string
+        status:
+          type: string
+
+    AppProject:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        key:
+          type: string
+        description:
+          type: string
+        base_image_id:
+          type: integer
+        language:
+          type: string
+        source_path:
+          type: string
+        entry_file:
+          type: string
+        build_config:
+          type: string
+        app_config:
+          type: string
+        volumes:
+          type: string
+        status:
+          type: string
+        build_image:
+          type: string
+        message:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    AppBuild:
+      type: object
+      properties:
+        id:
+          type: integer
+        project_id:
+          type: integer
+        version:
+          type: string
+        status:
+          type: string
+        log:
+          type: string
+        image:
+          type: string
+        image_size:
+          type: integer
+          format: int64
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    # ==================== Container Schemas ====================
+    Container:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        image:
+          type: string
+        state:
+          type: string
+        created:
+          type: string
+          format: date-time
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+
+    ContainerStats:
+      type: object
+      properties:
+        cpu_percent:
+          type: number
+        memory_usage:
+          type: integer
+          format: int64
+        memory_limit:
+          type: integer
+          format: int64
+        memory_percent:
+          type: number
+        network_rx:
+          type: integer
+          format: int64
+        network_tx:
+          type: integer
+          format: int64
+        pids:
+          type: integer
+
+    ContainerImage:
+      type: object
+      properties:
+        name:
+          type: string
+        size:
+          type: integer
+          format: int64
+        created:
+          type: string
+          format: date-time
+
+    # ==================== New Schemas ====================
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+
+    LoginResponse:
+      type: object
+      properties:
+        token:
+          type: string
+        username:
+          type: string
+
+    PasswordUpdateRequest:
+      type: object
+      required: [new_password]
+      properties:
+        old_password:
+          type: string
+        new_password:
+          type: string
+
+    OTAStatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [idle, downloading, installing, completed, failed]
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        current_version:
+          type: string
+        target_version:
+          type: string
+        message:
+          type: string
+
+    OTAParseResponse:
+      type: object
+      properties:
+        current_version:
+          type: string
+        target_version:
+          type: string
+        build_date:
+          type: string
+        git_commit:
+          type: string
+        firmware_path:
+          type: string
+        firmware_size:
+          type: integer
+          format: int64
+
+    OTAInstallFromPathRequest:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+          description: Absolute path to firmware file
+
+    SetTimeRequest:
+      type: object
+      required: [datetime]
+      properties:
+        datetime:
+          type: string
+          description: RFC3339 formatted timestamp
+          example: "2024-01-01T12:00:00Z"
+
+    SetTimezoneRequest:
+      type: object
+      required: [timezone]
+      properties:
+        timezone:
+          type: string
+          example: "Asia/Shanghai"
+
+    NTPConfigRequest:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        server:
+          type: string
+
+    TimeConfig:
+      type: object
+      properties:
+        ntp_enabled:
+          type: boolean
+        ntp_server:
+          type: string
+        timezone:
+          type: string
+
+    EventLog:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: uint
+        event_type:
+          type: string
+        level:
+          type: string
+        category:
+          type: string
+        source:
+          type: string
+        user:
+          type: string
+        message:
+          type: string
+        data:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+
+    EventLogCreateRequest:
+      type: object
+      required: [event_type, source, message]
+      properties:
+        event_type:
+          type: string
+        level:
+          type: string
+        category:
+          type: string
+        source:
+          type: string
+        user:
+          type: string
+        message:
+          type: string
+        data:
+          type: object
+          additionalProperties: true
+
+    DebugLogExportRequest:
+      type: object
+      properties:
+        services:
+          type: array
+          items:
+            type: string
+          description: Systemd services to include
+        files:
+          type: array
+          items:
+            type: string
+          description: Log file paths to include
+        lines:
+          type: integer
+          minimum: 1
+          maximum: 50000
+          default: 10000
+          description: Number of lines per service log
+
+    NetworkConfig:
+      type: object
+      properties:
+        interface:
+          type: string
+          example: eth0
+        mode:
+          type: string
+          enum: [dhcp, static]
+        ip_address:
+          type: string
+          example: "192.168.1.100"
+        subnet_mask:
+          type: string
+          example: "255.255.255.0"
+        gateway:
+          type: string
+          example: "192.168.1.1"
+        dns1:
+          type: string
+          example: "8.8.8.8"
+        dns2:
+          type: string
+          example: "8.8.4.4"
+        mac_address:
+          type: string
+          readOnly: true
+
+    NetworkInterfaceInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        ip_address:
+          type: string
+        subnet_mask:
+          type: string
+        mac_address:
+          type: string
+        status:
+          type: string
+          enum: [up, down]
+        is_default:
+          type: boolean
+        gateway:
+          type: string
+        dns:
+          type: array
+          items:
+            type: string
+
+    DeviceInfo:
+      type: object
+      properties:
+        device_name:
+          type: string
+        model:
+          type: string
+        serial:
+          type: string
+        firmware_version:
+          type: string
+        hardware_version:
+          type: string
+        mac_address:
+          type: string
+        ip_address:
+          type: string
+
+    MediaImageConfig:
+      type: object
+      properties:
+        brightness:
+          type: integer
+          minimum: -100
+          maximum: 100
+        contrast:
+          type: integer
+          minimum: -100
+          maximum: 100
+        saturation:
+          type: integer
+          minimum: -100
+          maximum: 100
+        sharpness:
+          type: integer
+          minimum: -100
+          maximum: 100
+
+    MediaEncoderConfig:
+      type: object
+      required: [stream_name]
+      properties:
+        stream_name:
+          type: string
+        bitrate_bps:
+          type: integer
+          format: uint32
+        framerate:
+          type: integer
+          format: uint32
+        gop:
+          type: integer
+          format: uint32
+
+    MediaAiOverlayConfig:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        show_label:
+          type: boolean
+        show_confidence:
+          type: boolean
+        line_thickness:
+          type: integer
+          format: uint32
+
+    MediaOsdConfig:
+      type: object
+      properties:
+        streams:
+          type: array
+          items:
+            type: object
+            required: [stream_name]
+            properties:
+              stream_name:
+                type: string
+              text_overlays:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    text:
+                      type: string
+                    x:
+                      type: number
+                      format: float
+                    y:
+                      type: number
+                      format: float
+                    font_size:
+                      type: number
+                      format: float
+                    text_color:
+                      type: integer
+                      format: uint32
+                    enabled:
+                      type: boolean
+              datetime_overlays:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    x:
+                      type: number
+                      format: float
+                    y:
+                      type: number
+                      format: float
+                    format:
+                      type: string
+                    font_size:
+                      type: number
+                      format: float
+                    text_color:
+                      type: integer
+                      format: uint32
+                    enabled:
+                      type: boolean
+
+    MediaReconfigRequest:
+      type: object
+      required: [stream_name]
+      properties:
+        stream_name:
+          type: string
+        width:
+          type: integer
+          format: uint32
+          minimum: 64
+          maximum: 4096
+        height:
+          type: integer
+          format: uint32
+          minimum: 64
+          maximum: 2160
+        codec:
+          type: string
+          enum: [h264, h265]
+        bitrate_bps:
+          type: integer
+          format: uint32
+        fps:
+          type: integer
+          format: uint32
+        gop:
+          type: integer
+          format: uint32
+
+    SSHConfigRequest:
+      type: object
+      properties:
+        port:
+          type: string
+          example: "22"
+        permit_root_login:
+          type: string
+          enum: [yes, "no", prohibit-password]
+        password_authentication:
+          type: string
+          enum: [yes, "no"]
+        pubkey_authentication:
+          type: string
+          enum: [yes, "no"]
+        max_auth_tries:
+          type: string
+        restart_service:
+          type: boolean
+
+    OSUpgradeJobRequest:
+      type: object
+      required: [job_id]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+
+    StoreInstallCreate:
+      type: object
+      required: [app_id, name]
+      properties:
+        store_app_id:
+          type: integer
+          format: uint
+        app_detail_id:
+          type: integer
+          format: uint
+        app_id:
+          type: string
+        name:
+          type: string
+        version:
+          type: string
+        description:
+          type: string
+        image:
+          type: string
+        config:
+          type: string
+          description: JSON configuration string
+
+    StoreInstallUpdate:
+      type: object
+      properties:
+        status:
+          type: string
+        container_id:
+          type: string
+        pid:
+          type: integer
+        message:
+          type: string
+        config:
+          type: string
+
+    DevProjectCreate:
+      type: object
+      required: [name, key, base_image_id]
+      properties:
+        name:
+          type: string
+        key:
+          type: string
+        description:
+          type: string
+        base_image_id:
+          type: integer
+          format: uint
+        language:
+          type: string
+        entry_file:
+          type: string
+
+    DevProjectUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        entry_file:
+          type: string
+        app_config:
+          type: string
+
+    DevFileSave:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+        content:
+          type: string
+
+    FileContentWrite:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+        content:
+          type: string
+
+    FileBatchRequest:
+      type: object
+      required: [paths]
+      properties:
+        paths:
+          type: array
+          items:
+            type: string

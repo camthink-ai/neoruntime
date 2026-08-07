@@ -1,0 +1,139 @@
+# camera-daemon configuration (Hailo-15)
+# Usage: camera-daemon -c /data/aipc/etc/camera-daemon.yaml
+#
+# Note: The 'streams' section has been removed — it was redundant with 'encoders'.
+# In FROM_MEDIA mode, video contexts are auto-discovered from the pipeline.
+# In standalone mode, camera-daemon derives stream configs from 'encoders'.
+
+hal:
+  video_library: /data/aipc/lib/hal/libaipc_hal.so
+  codec_library: /data/aipc/lib/hal/libaipc_hal.so
+  lens_library: /data/aipc/lib/hal/libhal-lens-bridge.so
+  # led_library: optional, monolithic libaipc_hal.so includes HAL_LED_OPS
+  # overlay_library: same libaipc_hal.so (monolithic, auto-detected)
+
+# Media pipeline configuration (Hailo15 v2: required for FROM_MEDIA mode)
+media:
+  # config_path is intentionally omitted: the platform no longer maintains a
+  # module-specific medialib config_path. camera-daemon falls back to the HAL
+  # compiled-in default medialib config (see CameraDaemon::init_media). Set
+  # config_path here only to force an explicit medialib profile override.
+  backup_path: /data/aipc/data/media-backup
+
+video:
+  device_path: /dev/video0
+
+watchdog:
+  scan_interval_ms: 100
+  frame_timeout_ms: 5000
+  warn_threshold_ms: 3000
+
+rtsp:
+  enabled: true
+
+audio:
+  enabled: true
+  capture_device: "default"
+  sample_rate: 48000
+  channels: 1
+  codec: pcm
+  bitrate: 128000
+  volume: 1.0
+  mute: false
+  # audio_library: optional, monolithic libaipc_hal.so includes HAL_AUDIO_OPS
+
+autofocus:
+  enabled: true
+  startup_af: true
+  stream_name: main
+  # Empty means use the measured fixed compensation compiled into AF_demo/core.
+  calibration_path: ""
+  # Seed startup AF from the AF0832 optical table instead of linearly mapping
+  # focus distance across the complete motor range.
+  startup_zoom_ratio: 1.0
+  startup_focus_distance_m: 3.0
+  startup_wait_frames: 15
+  # One Balanced retry around the first candidate when startup Fast AF is weak.
+  startup_recovery_span: 320
+  startup_ready_timeout_ms: 120000
+  frame_wait_timeout_ms: 900
+  move_timeout_ms: 10000
+  pps: 1600
+  # MCU V0.1.7: start zoom/focus on the same VD_FZ edge for every path segment.
+  follow_sync_motion: true
+  follow_sync_fallback_sequential: true
+  follow_sync_zoom_max_pps: 1600
+  follow_sync_focus_max_pps: 1600
+  follow_sync_min_pps: 1600
+  follow_sync_zoom_tolerance: 4
+  follow_sync_focus_tolerance: 4
+  # Keep the mid/tele path constraints continuous across the 2.25x boundary.
+  follow_path_zoom_step_wide: 240
+  follow_path_zoom_step_mid: 160
+  follow_path_zoom_step_tele: 160
+  follow_path_focus_step_wide: 24
+  follow_path_focus_step_mid: 50
+  follow_path_focus_step_tele: 50
+  # Split a synchronized segment if its linear focus path departs too far
+  # from the compensated zoom-focus reference curve.
+  follow_curve_error_enable: true
+  follow_curve_error_wide: 16
+  follow_curve_error_mid: 8
+  follow_curve_error_tele: 8
+  min_focus_pos: -844
+  max_focus_pos: 592
+  coarse_step: 40
+  coarse_span: 160
+  fine_step: 8
+  fine_span: 24
+  max_moves: 200
+  balanced_retry: 1
+  confidence_accept: 0.80
+  confidence_recovery: 0.65
+
+ai_overlay:
+  enabled: true
+  event_bus_endpoint: "unix:///run/aipc/event-bus.sock"
+  topic_prefix: "inference/"
+  draw_labels: true
+  draw_confidence: true
+  draw_landmarks: true
+  enable_face_blur: false
+  box_thickness: 2
+  # Stream mapping: inference_stream_id → display_encoder_stream
+  stream_map: "third:main,sub:main"
+
+# Encoders is the single source of truth for all stream configurations.
+# 'enabled' controls whether the stream is active in the pipeline (persisted across restarts).
+# main stream cannot be disabled.
+# Use POST /api/v1/media/streams/:name/enable and DELETE /api/v1/media/streams/:name/disable
+# to enable/disable sub and third streams at runtime (triggers ReconfigurePipeline).
+encoders:
+  - stream_name: main
+    codec: h264
+    width: 1920
+    height: 1080
+    fps: 30
+    bitrate: 4000000
+    gop: 30
+    enabled: true
+  - stream_name: sub
+    codec: h264
+    width: 1280
+    height: 720
+    fps: 30
+    bitrate: 2000000
+    gop: 60
+    enabled: true
+  - stream_name: third
+    codec: h264
+    width: 640
+    height: 384
+    fps: 15
+    bitrate: 512000
+    gop: 30
+    enabled: true
+
+service:
+  log_level: debug
+  log_file: /var/log/aipc/camera-daemon.log

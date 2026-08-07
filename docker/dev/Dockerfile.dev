@@ -1,0 +1,104 @@
+# NE503 Platform Development Environment
+# Standalone dev container with all tools. Mount the Hailo SDK at runtime.
+#
+# User flow:
+#   docker pull <org>/ne503-dev-env
+#   docker run -it ne503-dev-env
+#   # Inside container:
+#   git clone <repo-url> ~/ne503
+#   cd ~/ne503 && make pack-release
+#
+# Build:
+#   docker/dev/build.sh
+
+FROM ubuntu:24.04
+
+ARG GO_VERSION=1.25.0
+ARG NODE_MAJOR=24
+ARG PNPM_VERSION=10.34.5
+ARG GOPROXY=https://goproxy.cn,direct
+ARG SDK_PATH=
+
+LABEL maintainer="NE503 Platform"
+LABEL description="Standalone development environment for AIPC Platform"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai
+
+# ── System packages ──────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git openssh-client wget curl ca-certificates \
+    python3 python3-pip python3-venv \
+    protobuf-compiler protobuf-compiler-grpc \
+    build-essential cmake pkg-config \
+    libgrpc++-dev libgrpc-dev libprotobuf-dev \
+    qemu-user-static \
+    gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi \
+    clang-format vim nano bash-completion rsync jq sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Sphinx (for SDK Python docs generation) ──────────────────────────────────
+RUN pip3 install --break-system-packages sphinx sphinx_rtd_theme grpcio-tools
+
+# ── Go ────────────────────────────────────────────────────────────────────────
+# Detect host arch; Go uses "amd64" / "arm64" naming
+RUN set -e; BUILDARCH="$(dpkg --print-architecture)"; \
+    case "$BUILDARCH" in \
+      arm64) GOARCH=arm64 ;; \
+      *)     GOARCH=amd64 ;; \
+    esac; \
+    wget -q "https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz" && \
+    tar -C /usr/local -xzf "go${GO_VERSION}.linux-${GOARCH}.tar.gz" && \
+    rm "go${GO_VERSION}.linux-${GOARCH}.tar.gz"
+ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
+ENV GOPROXY=${GOPROXY}
+
+# ── Go proto plugins ──────────────────────────────────────────────────────────
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest && \
+    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest && \
+    go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@latest
+
+# ── Node.js + pnpm ───────────────────────────────────────────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+RUN npm install -g "pnpm@${PNPM_VERSION}"
+
+# ── golangci-lint ─────────────────────────────────────────────────────────────
+RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+    | sh -s -- -b /usr/local/bin v2.1.0
+
+# ── Hailo SDK (runtime mount, not baked in) ──────────────────────────────────
+# SDK is mounted at runtime via -v /opt/poky/4.0.23:/opt/hailo-sdk
+# This keeps the image small enough for Docker Hub push (<2GB per layer).
+ARG POKY_VERSION=4.0.23
+ENV HAILO_SDK_PATH=/opt/hailo-sdk
+ENV SDK_PATH=/opt/hailo-sdk
+ENV HAL_PLATFORM=hailo15
+RUN mkdir -p /opt/hailo-sdk /opt/poky && \
+    ln -sf /opt/hailo-sdk /opt/poky/${POKY_VERSION}
+
+# ── Developer user (use existing ubuntu user, UID 1000) ───────────────────────
+RUN echo "ubuntu ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# ── Copy Go proto plugins to shared location ──────────────────────────────────
+RUN cp -r /root/go/bin/* /usr/local/bin/ && \
+    mkdir -p /home/ubuntu/go && \
+    chown -R ubuntu:ubuntu /home/ubuntu/go
+
+USER ubuntu
+WORKDIR /home/ubuntu
+
+ENV GOPATH=/home/ubuntu/go
+ENV PNPM_HOME="/home/ubuntu/.local/share/pnpm"
+ENV CI=true
+ENV PATH="/home/ubuntu/go/bin:/usr/local/go/bin:/usr/local/bin:${PNPM_HOME}:${PATH}"
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+COPY --chown=ubuntu:ubuntu entrypoint.dev.sh /entrypoint.sh
+USER root
+RUN chmod +x /entrypoint.sh
+USER ubuntu
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]

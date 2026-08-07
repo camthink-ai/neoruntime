@@ -1,0 +1,16 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import './globals.css';
+@import './theme-colors.css';
+@import './terminal.css';
+
+@keyframes tabs-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(var(--tw-slide-x, 0));
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}

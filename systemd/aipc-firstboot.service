@@ -1,0 +1,26 @@
+[Unit]
+Description=AIPC Platform Boot Initialization
+Documentation=https://github.com/yourorg/ne503
+Wants=aipc-restore.service
+After=aipc-restore.service network.target local-fs.target
+Before=containerd.service
+# Note: no Before= on business services here. Each AIPC service unit declares
+# Requires=aipc-firstboot.service + After=aipc-firstboot.service itself, so the
+# ordering is already guaranteed and this file stays free of service names.
+# containerd is ordered after firstboot because firstboot owns its persistent
+# root configuration.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/aipc-firstboot
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+SyslogIdentifier=aipc-firstboot
+
+# This service only prepares infrastructure (kernel modules, directories,
+# device permissions, HAL libs). It does NOT start/stop AIPC services.
+# Service lifecycle is managed by systemd (enable/disable) and aipc-cli.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,353 @@
+syntax = "proto3";
+
+package appmanager;
+
+option go_package = "aipc/platform/app-manager/proto";
+
+import "google/protobuf/empty.proto";
+
+// AppManager service for managing application containers
+service AppManager {
+  // Install an application from manifest and image
+  rpc InstallApp(InstallRequest) returns (InstallResponse);
+
+  // Async install — returns task_id immediately, poll GetInstallProgress for status
+  rpc AsyncInstallApp(AsyncInstallRequest) returns (AsyncInstallResponse);
+  rpc GetInstallProgress(InstallProgressRequest) returns (InstallProgressResponse);
+
+  // Start a stopped application
+  rpc StartApp(StartRequest) returns (Status);
+
+  // Stop a running application
+  rpc StopApp(StopRequest) returns (Status);
+
+  // Uninstall an application
+  rpc UninstallApp(UninstallRequest) returns (Status);
+
+  // List all installed applications
+  rpc ListApps(google.protobuf.Empty) returns (AppList);
+
+  // Get application information
+  rpc GetApp(GetAppRequest) returns (AppInfo);
+
+  // Get application statistics
+  rpc GetAppStats(GetAppRequest) returns (AppStats);
+
+  // Get application logs
+  rpc GetAppLogs(GetLogsRequest) returns (stream LogLine);
+
+  // High priority RPCs
+  // Get disk usage statistics
+  rpc GetDiskUsage(google.protobuf.Empty) returns (DiskUsageResponse);
+
+  // Prune unused resources (containers, images, snapshots)
+  rpc PruneResources(PruneRequest) returns (PruneResponse);
+
+  // Execute command in container (interactive shell)
+  rpc ExecContainer(stream ExecInput) returns (stream ExecOutput);
+
+  // Send a signal to a running container (for dev mode reload)
+  rpc SendSignal(SendSignalRequest) returns (Status);
+
+  // Medium priority RPCs
+  // List all images
+  rpc ListImages(google.protobuf.Empty) returns (ImageList);
+
+  // Remove an image
+  rpc RemoveImage(RemoveImageRequest) returns (Status);
+
+  // Inspect container details
+  rpc InspectApp(GetAppRequest) returns (InspectResponse);
+
+  // Batch operations on multiple apps
+  rpc BatchOperation(BatchRequest) returns (BatchResponse);
+
+  // Register web URL for an app (called by app via SDK)
+  rpc RegisterWebUrl(RegisterWebUrlRequest) returns (RegisterWebUrlResponse);
+
+  // Raw container operations (Direct containerd access)
+  rpc ListContainers(ListContainersRequest) returns (ContainerList);
+  rpc GetContainer(GetContainerRequest) returns (ContainerDetail);
+  rpc GetContainerStats(GetContainerRequest) returns (ContainerStats);
+  rpc GetContainerLogs(GetContainerLogsRequest) returns (stream LogLine);
+  rpc StartContainer(ContainerRequest) returns (Status);
+  rpc StopContainer(ContainerRequest) returns (Status);
+  rpc RestartContainer(ContainerRequest) returns (Status);
+  rpc RemoveContainer(RemoveContainerRequest) returns (Status);
+}
+
+message InstallRequest {
+  string manifest_path = 1;  // Path to app.yaml
+  string image_path = 2;      // Path to container image tar
+  bool force = 3;              // Overwrite existing app
+}
+
+message InstallResponse {
+  Status status = 1;
+  string app_id = 2;
+  string message = 3;
+  bool updated = 4;            // true if this was an update (force overwrite)
+}
+
+// Async install
+message AsyncInstallRequest {
+  string manifest_path = 1;
+  string image_path = 2;
+  bool force = 3;              // Overwrite existing app
+}
+
+message AsyncInstallResponse {
+  string task_id = 1;
+}
+
+message InstallProgressRequest {
+  string task_id = 1;
+}
+
+message InstallProgressResponse {
+  string task_id = 1;
+  string phase = 2;     // validating, pulling, unpacking, registering, complete, error
+  double percent = 3;   // 0-100
+  string message = 4;
+  string app_id = 5;    // set when phase == complete
+  string error = 6;     // set when phase == error
+}
+
+message StartRequest {
+  string app_id = 1;
+}
+
+message StopRequest {
+  string app_id = 1;
+  int32 timeout_seconds = 2;  // Graceful shutdown timeout
+}
+
+message UninstallRequest {
+  string app_id = 1;
+  bool keep_logs = 2;  // Whether to keep logs after uninstall
+}
+
+message GetAppRequest {
+  string app_id = 1;
+}
+
+message AppList {
+  repeated AppInfo apps = 1;
+}
+
+message AppInfo {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  string state = 4;  // installed, running, stopped, failed
+  string container_id = 5;
+  int32 pid = 6;
+  int64 installed_at = 7;  // Unix timestamp
+  int64 started_at = 8;     // Unix timestamp
+  int64 stopped_at = 9;      // Unix timestamp
+  int32 restart_count = 10;
+  string manifest_path = 11;
+  string instance_path = 12;
+  string web_url = 13;  // SDK registered web path
+}
+
+message AppStats {
+  string app_id = 1;
+  double cpu_usage_percent = 2;  // CPU usage percentage
+  int64 memory_usage_bytes = 3;  // Memory usage in bytes
+  int64 memory_limit_bytes = 4;  // Memory limit in bytes
+  int32 thread_count = 5;
+  int64 uptime_seconds = 6;
+}
+
+message GetLogsRequest {
+  string app_id = 1;
+  int32 max_lines = 2;  // Maximum number of lines to return
+  bool follow = 3;      // Stream logs continuously
+}
+
+message LogLine {
+  int64 timestamp = 1;  // Unix timestamp in nanoseconds
+  string level = 2;     // info, warn, error, debug
+  string message = 3;
+}
+
+message Status {
+  bool success = 1;
+  string message = 2;
+  int32 code = 3;  // Error code if success is false
+}
+
+// Disk usage statistics
+message DiskUsageResponse {
+  int64 images_size = 1;
+  int64 containers_size = 2;
+  int64 snapshots_size = 3;
+  int64 total_size = 4;
+  int64 reclaimable_size = 5;
+}
+
+// Prune request
+message PruneRequest {
+  bool prune_containers = 1;  // Clean stopped containers
+  bool prune_images = 2;      // Clean unused images
+  bool prune_snapshots = 3;   // Clean orphan snapshots
+}
+
+// Prune response
+message PruneResponse {
+  Status status = 1;
+  int64 space_reclaimed = 2;
+  repeated string deleted_items = 3;
+}
+
+// Exec input for interactive shell
+message ExecInput {
+  string app_id = 1;      // Specify on first message
+  string command = 2;     // Specify on first message (e.g., /bin/sh)
+  bytes stdin = 3;        // User input for subsequent messages
+  int32 cols = 4;         // Terminal width
+  int32 rows = 5;         // Terminal height
+  bool resize = 6;        // Whether this is a resize event
+  bool tty = 7;           // Whether to allocate TTY (PTY)
+}
+
+// Exec output from container
+message ExecOutput {
+  bytes stdout = 1;
+  bytes stderr = 2;
+  int32 exit_code = 3;    // Set when process exits
+  bool exited = 4;
+}
+
+// Image information
+message ImageInfo {
+  string id = 1;
+  string name = 2;
+  repeated string tags = 3;
+  int64 size = 4;
+  int64 created_at = 5;
+  bool in_use = 6;
+}
+
+// Image list
+message ImageList {
+  repeated ImageInfo images = 1;
+}
+
+// Remove image request
+message RemoveImageRequest {
+  string image_id = 1;
+  bool force = 2;
+}
+
+// Inspect response with full container details
+message InspectResponse {
+  string json_data = 1;  // Full container inspect JSON
+}
+
+// Batch operation request
+message BatchRequest {
+  repeated string app_ids = 1;
+  string operation = 2;  // "start", "stop", "restart", "uninstall"
+  int32 timeout_seconds = 3;
+}
+
+// Batch operation response
+message BatchResponse {
+  Status status = 1;
+  map<string, string> results = 2;  // app_id -> result message
+  int32 success_count = 3;
+  int32 failed_count = 4;
+}
+
+// ==== Raw Container Operation Messages ====
+
+message ContainerRequest {
+  string id = 1;
+}
+
+message ListContainersRequest {
+  string state = 1;
+  string search = 2;
+}
+
+message GetContainerRequest {
+  string id = 1;
+}
+
+message GetContainerLogsRequest {
+  string id = 1;
+  int32 tail = 2;
+  bool follow = 3;
+}
+
+message RemoveContainerRequest {
+  string id = 1;
+  bool force = 2;
+}
+
+message ContainerInfo {
+  string id = 1;
+  string name = 2;
+  string image = 3;
+  string runtime = 4;
+  string status = 5;
+  string state = 6;
+  int32 pid = 7;
+  string created_at = 8;
+  map<string, string> labels = 9;
+  // Resource usage (populated from stats)
+  double cpu_percent = 10;   // CPU usage percentage (0-100+)
+  int64 memory_usage = 11;   // Memory usage in bytes
+}
+
+message ContainerList {
+  repeated ContainerInfo containers = 1;
+}
+
+message MountPoint {
+  string type = 1;
+  string source = 2;
+  string destination = 3;
+  string options = 4;
+}
+
+message ContainerDetail {
+  ContainerInfo info = 1;
+  string spec_json = 2; 
+  string rootfs = 3;
+  string snapshotter = 4;
+  repeated MountPoint mounts = 5;
+  repeated string env = 6;
+}
+
+message ContainerStats {
+  double cpu_usage = 1;
+  double cpu_percent = 2;
+  int64 memory_usage = 3;
+  int64 memory_limit = 4;
+  double memory_percent = 5;
+  int64 network_rx = 6;
+  int64 network_tx = 7;
+  int64 block_read = 8;
+  int64 block_write = 9;
+  int32 pids = 10;
+}
+
+// RegisterWebUrl messages
+message RegisterWebUrlRequest {
+  string app_id = 1;
+  string path = 2;   // e.g. "/" or "/ui"
+}
+
+message RegisterWebUrlResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// SendSignal messages
+message SendSignalRequest {
+  string app_id = 1;
+  int32 signal = 2;  // e.g. 1=SIGHUP, 15=SIGTERM
+}

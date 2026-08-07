@@ -1,0 +1,13 @@
+; Minimal SDP for hal-udp-stream-test (H.265/HEVC, RTP PT 97, clock 90 kHz).
+; Edit the port in "m=video <port>" to match the port you pass to hal-udp-stream-test.
+;
+; Receiver (PC), from this directory (hal_v2/examples/udp_stream_test):
+;   ffplay -protocol_whitelist file,rtp,udp -fflags nobuffer -flags low_delay -i receive_h265_rtp.sdp
+;
+v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=hal H265 RTP
+c=IN IP4 0.0.0.0
+t=0 0
+m=video 5555 RTP/AVP 97
+a=rtpmap:97 H265/90000

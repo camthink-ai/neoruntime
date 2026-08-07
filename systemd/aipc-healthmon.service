@@ -1,0 +1,29 @@
+[Unit]
+Description=AIPC Health Monitor (black-box sampler)
+Documentation=https://github.com/yourorg/ne503
+# No network dependency: the whole point is to keep sampling even when the
+# network is dead. Only wait for local filesystems and firstboot (which
+# creates /data/* and applies sysctl).
+After=local-fs.target aipc-firstboot.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /data/health
+ExecStart=/data/aipc/scripts/aipc-healthmon.sh
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aipc-healthmon
+
+# Sampling tunables (see aipc-healthmon.sh)
+Environment=HEALTHMON_INTERVAL=5
+Environment=HEALTHMON_MAX_BYTES=5242880
+
+# Stay out of the way of real work: low CPU/IO priority so the monitor
+# never aggravates an already-stressed (or about-to-hang) system.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

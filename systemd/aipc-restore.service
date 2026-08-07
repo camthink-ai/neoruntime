@@ -1,0 +1,21 @@
+[Unit]
+Description=Restore AIPC runtime from persistent OS-upgrade backup
+Documentation=https://github.com/yourorg/ne503
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target aipc-firstboot.service
+Wants=network-pre.target
+RequiresMountsFor=/data
+ConditionPathExists=/data/backups/aipc-os-upgrade/current
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/aipc-restore
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+SyslogIdentifier=aipc-restore
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

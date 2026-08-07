@@ -1,0 +1,377 @@
+syntax = "proto3";
+
+package aipc.inference;
+
+option go_package = "aipc/platform/ai-runtime/proto;inference";
+option cc_enable_arenas = true;
+
+// ============ Common types ============
+
+message Empty {}
+
+message Status {
+  bool success = 1;
+  string message = 2;
+  int32 code = 3;
+}
+
+// ============ Tensor definitions ============
+
+enum DataType {
+  UINT8 = 0;
+  INT8 = 1;
+  UINT16 = 2;
+  INT16 = 3;
+  FLOAT16 = 4;
+  FLOAT32 = 5;
+  INT32 = 6;
+  UINT32 = 7;
+}
+
+message TensorSpec {
+  repeated int32 shape = 1;
+  DataType dtype = 2;
+  string name = 3;
+  string layout = 4;  // "NHWC", "NCHW", "HWC", "CHW", "NC", "HW", etc.
+}
+
+message Tensor {
+  repeated int32 shape = 1;
+  DataType dtype = 2;
+  bytes data = 3;
+  
+  // Optional: DMA-BUF (zero-copy)
+  int32 dma_fd = 4;
+}
+
+// ============ Model management ============
+
+message ModelRegisterRequest {
+  string model_path = 1;
+  string model_id = 2;          // Optional: specify model ID
+  repeated TensorSpec inputs = 3;
+  repeated TensorSpec outputs = 4;
+
+  // Resource requirement estimates
+  float estimated_tops = 10;
+  uint32 estimated_memory = 11;
+
+  string owner_id = 12;         // Optional: app_id that owns this model registration
+
+  // Post-process configuration
+  string model_type = 13;       // Model type: detection, landmarks, segmentation, classification
+  string model_variant = 14;    // Variant: yolov8n, yolov8s, etc. (for detection models)
+}
+
+message ModelRegisterResponse {
+  string model_id = 1;
+  Status status = 2;
+}
+
+message ModelInfo {
+  string model_id = 1;
+  string name = 2;              // Display name for the model
+  string model_path = 3;
+  string version = 4;
+
+  repeated TensorSpec inputs = 5;
+  repeated TensorSpec outputs = 6;
+
+  float estimated_tops = 10;
+  uint32 estimated_memory = 11;
+  uint64 load_timestamp = 12;
+  string owner_id = 13;         // Used during UnregisterModel to specify the caller's identity
+}
+
+message ModelListResponse {
+  repeated ModelInfo models = 1;
+}
+
+// ============ Inference request ============
+
+message InferRequest {
+  string model_id = 1;
+  repeated Tensor inputs = 2;
+  
+  // Configuration
+  uint32 timeout_ms = 10;
+  uint32 priority = 11;       // 0-7, 7 is highest
+  string session_id = 12;     // Session ID (for tracking)
+}
+
+message InferResponse {
+  repeated Tensor outputs = 1;
+  Status status = 2;
+
+  // Structured post-processed results
+  PostResult post_result = 5;
+
+  // Performance statistics
+  uint64 infer_time_us = 10;  // Inference time (microseconds)
+  uint64 queue_time_us = 11;  // Queue time
+  uint64 hw_infer_time_us = 12;  // Pure NPU hardware latency (microseconds), 0 if unavailable
+}
+
+// ============ Structured detection results ============
+
+message BBox {
+  float x = 1;   // [0,1] normalized
+  float y = 2;
+  float w = 3;
+  float h = 4;
+}
+
+message Detection {
+  BBox   bbox       = 1;
+  float  confidence = 2;
+  int32  class_id   = 3;
+  string label      = 4;
+}
+
+message Point2D {
+  float x = 1;
+  float y = 2;
+  float confidence = 3;
+}
+
+message LandmarkSet {
+  string type = 1;           // e.g. "face_landmarks", "pose"
+  repeated Point2D points = 2;
+}
+
+message Classification {
+  string type       = 1;     // e.g. "age", "gender", "clip"
+  int32  class_id   = 2;
+  string label      = 3;
+  float  confidence = 4;
+}
+
+message SegmentationMask {
+  int32  class_id    = 1;
+  string label       = 2;
+  float  confidence  = 3;
+  BBox   bbox        = 4;         // Normalized bbox of the mask region
+  bytes  mask_rle    = 5;         // RLE-encoded binary mask
+  int32  mask_width  = 6;
+  int32  mask_height = 7;
+}
+
+message OcrLine {
+  BBox   bbox       = 1;
+  string text       = 2;
+  float  confidence = 3;
+}
+
+message Embedding {
+  repeated float data = 1;
+  uint32         dim  = 2;
+}
+
+message PostResult {
+  repeated Detection       detections      = 1;
+  repeated Classification  classifications = 2;
+  repeated LandmarkSet     landmarks       = 3;
+  repeated SegmentationMask masks          = 4;
+  repeated OcrLine         ocr_lines       = 5;
+  repeated Embedding       embeddings      = 6;
+  repeated DepthMap        depth_maps      = 7;
+}
+
+// ============ Batch inference ============
+
+message InferBatchRequest {
+  repeated InferRequest requests = 1;
+  uint32 timeout_ms = 2;       // Overall wall-clock timeout for the entire batch
+}
+
+message InferBatchResponse {
+  repeated InferResponse responses = 1;  // One response per request, same order
+  Status status = 2;
+  uint64 total_time_us = 3;    // Total wall-clock time for the batch
+}
+
+// ============ Stream inference ============
+
+message StreamInferRequest {
+  string model_id = 1;
+  string stream_id = 2;       // Video stream ID (e.g., "cam0_main")
+  uint32 fps_limit = 3;       // Maximum frame rate limit
+  string session_id = 4;
+  bool   raw_output_only = 5;      // Set true to skip post-processing, return raw tensors
+}
+
+message StreamInferResponse {
+  uint64 frame_sequence = 1;
+  uint64 timestamp_ns = 2;
+  repeated Tensor outputs = 3;    // Raw tensors (when post-process disabled)
+  Status status = 4;
+  PostResult post_result = 5;     // Structured results (when post-process enabled)
+}
+
+// ============ Session management ============
+
+message SessionConfig {
+  string session_id = 1;
+  string app_id = 2;
+  
+  repeated string allowed_models = 10;
+  uint32 max_qps = 11;
+  uint32 max_concurrent = 12;
+  uint32 priority = 13;
+}
+
+message SessionCreateResponse {
+  string session_id = 1;
+  Status status = 2;
+}
+
+// ============ Statistics ============
+
+message InferenceStats {
+  string model_id = 1;
+  uint64 total_inferences = 2;
+  uint64 total_errors = 3;
+  uint64 avg_latency_us = 4;
+  float current_qps = 5;
+  uint32 queue_depth = 6;
+  float hw_fps = 7;  // Hardware FPS from HAL latency measurement, 0 if unavailable
+}
+
+message SystemStats {
+  repeated InferenceStats model_stats = 1;
+  float device_utilization = 2;  // 0.0 - 1.0
+  float device_temperature = 3;
+  uint64 total_memory_bytes = 4;
+  uint64 used_memory_bytes = 5;
+
+  // Extended perf stats from HalInferencePerfStats
+  float cpu_utilization = 10;    // Host CPU 0.0-1.0, -1 if unknown
+  float dsp_utilization = 11;    // DSP/secondary accelerator 0.0-1.0, -1 if N/A
+  int64 ram_total_kib = 12;      // Total RAM in KiB, -1 if unknown
+  int64 ram_used_kib = 13;       // Used RAM in KiB, -1 if unknown
+}
+
+// ============ Dynamic postprocess config ============
+
+message UpdatePostprocessConfigRequest {
+  string model_id = 1;
+  string config_json = 2;   // JSON: {"prompts":["a cat","a dog"], "score_threshold":0.3}
+}
+
+message UpdatePostprocessConfigResponse {
+  Status status = 1;
+}
+
+// ============ Inference Service ============
+
+service InferenceService {
+  // Model management
+  rpc RegisterModel(ModelRegisterRequest) returns (ModelRegisterResponse);
+  rpc UnregisterModel(ModelInfo) returns (Status);
+  rpc ListModels(Empty) returns (ModelListResponse);
+  rpc GetModelInfo(ModelInfo) returns (ModelInfo);
+  
+  // Single inference
+  rpc Infer(InferRequest) returns (InferResponse);
+
+  // Batch inference — submit multiple model inferences in one RPC.
+  // ai-runtime runs them in parallel and returns all results together.
+  rpc InferBatch(InferBatchRequest) returns (InferBatchResponse);
+
+  // Stream inference
+  rpc StreamInfer(StreamInferRequest) returns (stream StreamInferResponse);
+  
+  // Session management
+  rpc CreateSession(SessionConfig) returns (SessionCreateResponse);
+  rpc DestroySession(SessionConfig) returns (Status);
+  
+  // Statistics
+  rpc GetStats(Empty) returns (SystemStats);
+
+  // Dynamic postprocess configuration
+  rpc UpdatePostprocessConfig(UpdatePostprocessConfigRequest) returns (UpdatePostprocessConfigResponse);
+
+  // CLIP text encoding — encode a text string to a CLIP embedding via NPU
+  rpc EncodeText(EncodeTextRequest) returns (EncodeTextResponse);
+
+  // GenAI (LLM/VLM) streaming generation
+  rpc GenaiCreateSession(GenaiCreateSessionRequest) returns (GenaiCreateSessionResponse);
+  rpc GenaiDestroySession(GenaiCreateSessionRequest) returns (Status);
+  rpc GenaiGenerate(GenaiGenerateRequest) returns (stream GenaiGenerateResponse);
+  rpc GenaiAbort(GenaiAbortRequest) returns (Status);
+}
+
+// ============ CLIP text encoding ============
+
+message EncodeTextRequest {
+  string text = 1;
+}
+
+message EncodeTextResponse {
+  Embedding embedding = 1;
+  Status status = 2;
+}
+
+// ============ Depth estimation ============
+
+message DepthMap {
+  uint32 width = 1;
+  uint32 height = 2;
+  bytes depth_data = 3;     // float32 array, W*H floats, row-major (meters)
+}
+
+// ============ GenAI (LLM/VLM) ============
+
+enum GenaiKind {
+  GENAI_KIND_LLM = 0;
+  GENAI_KIND_VLM = 1;
+}
+
+message GenaiGeneratorParams {
+  float temperature = 1;
+  float top_p = 2;
+  uint32 top_k = 3;
+  float frequency_penalty = 4;
+  uint32 max_generated_tokens = 5;
+  bool do_sample = 6;
+}
+
+message GenaiCreateSessionRequest {
+  string hef_path = 1;
+  GenaiKind kind = 2;
+  string lora_name = 3;
+  bool optimize_memory = 4;
+  string session_id = 5;
+}
+
+message GenaiCreateSessionResponse {
+  string session_id = 1;
+  Status status = 2;
+}
+
+message GenaiGenerateRequest {
+  string session_id = 1;
+  repeated string messages_json = 2;   // Chat template JSON strings
+  GenaiGeneratorParams params = 3;     // Optional; server uses defaults if omitted
+  repeated bytes image_frames = 4;     // RGB pixel data for VLM
+  repeated string stop_tokens = 5;     // Optional stop sequences
+}
+
+enum GenaiFinishReason {
+  GENAI_FINISH_DONE = 0;
+  GENAI_FINISH_ABORTED = 1;
+  GENAI_FINISH_MAX_TOKENS = 2;
+  GENAI_FINISH_ERROR = 3;
+}
+
+message GenaiGenerateResponse {
+  oneof event {
+    string token = 1;
+    GenaiFinishReason finish = 2;
+  }
+}
+
+message GenaiAbortRequest {
+  string session_id = 1;
+}
+

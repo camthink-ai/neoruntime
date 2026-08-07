@@ -1,0 +1,64 @@
+name: Release Package
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version used in package names. Defaults to the selected ref name.
+        required: false
+        type: string
+      build_mcu_fw:
+        description: Build and stage MCU firmware before packaging.
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hailo-firmware:
+    name: Build Hailo-15 release package
+    runs-on: [self-hosted, linux, x64, docker]
+    env:
+      DOCKER_RELEASE_IMAGE: zerobot/ne503-dev-env-full:4.0.23
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build release package in Docker
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BUILD_MCU_FW_INPUT: ${{ inputs.build_mcu_fw }}
+        run: |
+          VERSION_INPUT="${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}"
+          VERSION="${VERSION_INPUT:-${GITHUB_REF_NAME}}"
+          BUILD_MCU_FW=1
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$BUILD_MCU_FW_INPUT" != "true" ]; then
+            BUILD_MCU_FW=0
+          fi
+
+          make docker-pack-release \
+            DOCKER_RELEASE_IMAGE="$DOCKER_RELEASE_IMAGE" \
+            VERSION="$VERSION" \
+            BUILD_MCU_FW="$BUILD_MCU_FW"
+
+      - name: Upload firmware package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hailo-firmware
+          path: build/release/aipc-hailo15-*.tar.gz
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: build/release/aipc-hailo15-*.tar.gz

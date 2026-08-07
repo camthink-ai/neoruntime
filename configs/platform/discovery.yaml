@@ -1,0 +1,22 @@
+service:
+  name: device-discovery
+  listen: unix:///run/aipc/device-discovery.sock
+  log_level: info
+
+discovery:
+  multicast_addr: 239.255.255.250
+  multicast_port: 19850
+  timeout: 30
+  interface: ""
+
+announce:
+  enabled: true
+  product: "NE503"
+  version_file: "/data/aipc/VERSION"
+  port: 8080
+  interval: 5
+  caps:
+    - ai
+    - camera
+    - http
+    - mqtt

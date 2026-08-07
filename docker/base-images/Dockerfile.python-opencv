@@ -1,0 +1,41 @@
+# AIPC Python OpenCV 镜像
+# 预装 AIPC SDK、OpenCV 和图像处理依赖
+#
+# 构建命令:
+#   docker build -f Dockerfile.python-opencv -t aipc/python-opencv:1.0 .
+#
+# 使用方法:
+#   FROM aipc/python-opencv:1.0
+
+FROM python:3.9-slim
+
+LABEL maintainer="AIPC Team"
+LABEL description="AIPC Python image with SDK and OpenCV"
+LABEL version="1.0"
+
+# 安装 OpenCV 系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制并安装 SDK
+COPY sdk/aipc_sdk-*.whl /tmp/
+RUN pip install --no-cache-dir /tmp/aipc_sdk-*.whl \
+    && rm -f /tmp/aipc_sdk-*.whl
+
+# 安装 OpenCV 和图像处理库
+RUN pip install --no-cache-dir \
+    opencv-python-headless>=4.5.0 \
+    Pillow>=9.0.0
+
+# 创建非 root 用户
+RUN useradd -m -u 1000 appuser
+
+WORKDIR /app
+USER appuser
+
+ENV PYTHONUNBUFFERED=1

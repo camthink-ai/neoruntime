@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package aipc.discovery;
+
+option go_package = "aipc/platform/device-discovery/proto;discovery";
+
+// ============ Common types ============
+
+enum DeviceStatus {
+  DEVICE_ONLINE = 0;
+  DEVICE_OFFLINE = 1;
+  DEVICE_UNREACHABLE = 2;
+}
+
+enum EventType {
+  EVENT_ONLINE = 0;
+  EVENT_OFFLINE = 1;
+  EVENT_UPDATED = 2;
+}
+
+message DiscoveredDevice {
+  string product = 1;
+  string serial_number = 2;
+  string mac_address = 3;
+  string ip_address = 4;
+  int32 api_port = 5;
+  string firmware_version = 6;
+  string hardware_platform = 7;
+  repeated string capabilities = 8;
+  DeviceStatus status = 9;
+  int64 first_seen = 10;
+  int64 last_seen = 11;
+}
+
+// ============ Request/Response ============
+
+message ListDevicesRequest {
+  string product = 1;
+  DeviceStatus status = 2;
+}
+
+message ListDevicesResponse {
+  repeated DiscoveredDevice devices = 1;
+}
+
+message GetDeviceRequest {
+  string serial_number = 1;
+  string mac_address = 2;
+}
+
+message TriggerScanRequest {
+  int32 timeout_seconds = 1;
+}
+
+message TriggerScanResponse {
+  int32 found_count = 1;
+  repeated DiscoveredDevice new_devices = 2;
+}
+
+message WatchDevicesRequest {}
+
+message DeviceEvent {
+  EventType type = 1;
+  DiscoveredDevice device = 2;
+}
+
+// ============ Service ============
+
+service DiscoveryService {
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+  rpc GetDevice(GetDeviceRequest) returns (DiscoveredDevice);
+  rpc TriggerScan(TriggerScanRequest) returns (TriggerScanResponse);
+  rpc WatchDevices(WatchDevicesRequest) returns (stream DeviceEvent);
+}

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+coverage/
+*.min.js
+*.bundle.js
+public/
+*.d.ts
+src/locales/*/messages.js 

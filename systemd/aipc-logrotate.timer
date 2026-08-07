@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic AIPC Go-service log rotation
+Documentation=https://github.com/yourorg/ne503
+
+[Timer]
+# First pass a few minutes after boot (let services warm up), then every 10 min.
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

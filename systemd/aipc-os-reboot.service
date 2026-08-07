@@ -1,0 +1,12 @@
+[Unit]
+Description=Reboot AIPC into newly installed OS copy
+After=aipc-os-updater.service
+RequiresMountsFor=/data
+ConditionPathExists=/data/aipc-os-upgrade/active-job
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/aipc-os-updater reboot
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aipc-os-reboot

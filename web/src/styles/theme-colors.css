@@ -1,0 +1,473 @@
+@custom-variant dark (&:is(.dark *));
+
+/* ============================================
+   NE503 色彩系统 - Warm Earth 暖石大地
+   ============================================ */
+
+/* Shared variables */
+:root {
+  --font-sans: Inter, system-ui, sans-serif;
+  --font-serif: Georgia, serif;
+  --font-mono: JetBrains Mono, monospace;
+  --tracking-normal: -0.01em;
+  --spacing: 0.25rem;
+}
+
+/* ============================================
+   Light Mode - 亮色模式
+   ============================================ */
+:root[data-color-theme='color2'] {
+  /* 基础颜色 */
+  --background: #fafafa;
+  --surface: #f7f8fa;
+  --foreground: #2b2a29;
+  --card: #ffffff;
+  --card-foreground: #2b2a29;
+  --popover: #ffffff;
+  --popover-foreground: #2b2a29;
+
+  /* 语义颜色 */
+  --primary: #f24a00;
+  --primary-foreground: #ffffff;
+  --secondary: #f4f1ef;
+  --secondary-foreground: #7c442c;
+  --muted: #f4f1ef;
+  --muted-foreground: #6e6e6e;
+  --accent: #fbece6;
+  --accent-foreground: #d14100;
+  --destructive: #ef4444;
+  --destructive-foreground: #fafafa;
+
+  /* UI 颜色 */
+  --border: #e7e5e4;
+  --input: #e7e5e4;
+  --ring: #f24a00;
+  --switch-thumb: #ffffff;
+  --carbon: #0d0d0d;
+  --carbon-foreground: #ffffff;
+
+  /* 状态颜色 */
+  --success: #22c55e;
+  --success-foreground: #ffffff;
+  --success-subtle: #f0fdf4;
+  --warning: #f59e0b;
+  --warning-foreground: #ffffff;
+  --warning-subtle: #fffbeb;
+  --info: #3b82f6;
+  --info-foreground: #ffffff;
+  --info-subtle: #eff6ff;
+  --error: #ef4444;
+  --error-foreground: #ffffff;
+  --error-subtle: #fef2f2;
+
+  /* 链接颜色 */
+  --link: #f24a00;
+  --link-hover: #d14100;
+  --link-visited: #7c442c;
+  --link-active: #f24a00;
+
+  /* 代码颜色 */
+  --code-bg: #f4f1ef;
+  --code-fg: #7c442c;
+  --code-block-bg: #fafaf9;
+  --code-block-border: #e7e5e4;
+
+  /* 表格颜色 */
+  --table-header-bg: #f4f1ef;
+  --table-header-fg: #44403c;
+  --table-row-hover: #fbece6;
+  --table-row-stripe: #f9f9f8;
+  --table-border: #e7e5e4;
+
+  /* 禁用状态 */
+  --disabled-bg: #e7e5e4;
+  --disabled-fg: #a8a29e;
+  --disabled-border: #d6d3d1;
+  --disabled-opacity: 0.5;
+
+  /* 加载状态 */
+  --skeleton-base: #f4f1ef;
+  --skeleton-shine: #e7e5e4;
+  --loading-spinner: #f24a00;
+
+  /* 遮罩层 */
+  --overlay: rgba(43, 42, 41, 0.5);
+  --backdrop: rgba(0, 0, 0, 0.3);
+  --modal-overlay: rgba(43, 42, 41, 0.75);
+
+  /* 选中/高亮 */
+  --selection-bg: #fbece6;
+  --selection-fg: #2b2a29;
+  --highlight: #fef3c7;
+
+  /* 滚动条 */
+  --scrollbar-track: #fafafa;
+  --scrollbar-thumb: #d6d3d1;
+  --scrollbar-thumb-hover: #a8a29e;
+
+  /* 分隔线 */
+  --divider: #e7e5e4;
+  --divider-strong: #d6d3d1;
+
+  /* 徽章 */
+  --badge-default: #f4f1ef;
+  --badge-default-foreground: #7c442c;
+  --badge-outline: transparent;
+  --badge-outline-foreground: #2b2a29;
+
+  /* 图表颜色 */
+  --chart-1: #f24a00;
+  --chart-2: #8e8682;
+  --chart-3: #bc7a5c;
+  --chart-4: #e0a58a;
+  --chart-5: #f7dcd0;
+
+  /* 侧边栏颜色 */
+  --sidebar: #fdfcfb;
+  --sidebar-foreground: #44403c;
+  --sidebar-primary: #f24a00;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f4f1ef;
+  --sidebar-accent-foreground: #f24a00;
+  --sidebar-border: #e7e5e4;
+  --sidebar-ring: #f24a00;
+
+  /* 圆角 */
+  --radius: 0.6rem;
+
+  /* 阴影 */
+  --shadow-x: 0px;
+  --shadow-y: 4px;
+  --shadow-blur: 15px;
+  --shadow-spread: 0px;
+  --shadow-opacity: 0.05;
+  --shadow-color: 0 0 0;
+  --shadow-2xs: 0px 4px 15px 0px hsl(0 0 0 / 0.03);
+  --shadow-xs: 0px 4px 15px 0px hsl(0 0 0 / 0.03);
+  --shadow-sm:
+    0px 4px 15px 0px hsl(0 0 0 / 0.05), 0px 1px 2px -1px hsl(0 0 0 / 0.05);
+  --shadow:
+    0px 4px 15px 0px hsl(0 0 0 / 0.05), 0px 1px 2px -1px hsl(0 0 0 / 0.05);
+  --shadow-md:
+    0px 4px 15px 0px hsl(0 0 0 / 0.05), 0px 2px 4px -1px hsl(0 0 0 / 0.05);
+  --shadow-lg:
+    0px 4px 15px 0px hsl(0 0 0 / 0.05), 0px 4px 6px -1px hsl(0 0 0 / 0.05);
+  --shadow-xl:
+    0px 4px 15px 0px hsl(0 0 0 / 0.05), 0px 8px 10px -1px hsl(0 0 0 / 0.05);
+  --shadow-2xl: 0px 4px 15px 0px hsl(0 0 0 / 0.13);
+}
+
+/* ============================================
+   Dark Mode - 暗色模式
+   ============================================ */
+:root[data-color-theme='color2'].dark {
+  /* 基础颜色 */
+  --background: #1a1a1a;
+  --foreground: #fdfcfb;
+  --surface: #201d1b;
+  --card: #1f1f1f;
+  --card-foreground: #fdfcfb;
+  --popover: #24211f;
+  --popover-foreground: #fdfcfb;
+
+  /* 语义颜色 */
+  --primary: #f24a00;
+  --primary-foreground: #ffffff;
+  --secondary: #2e2a28;
+  --secondary-foreground: #e0a58a;
+  --muted: #2e2a28;
+  --muted-foreground: #a8a8a8;
+  /* Used by bg-accent (menu hover/active backgrounds) */
+  --accent: #4a4a4a;
+  --accent-foreground: #ffa07a;
+  --destructive: #b91c1c;
+  --destructive-foreground: #fef2f2;
+
+  /* UI 颜色 */
+  --border: #3a3634;
+  --input: #57534e;
+  --ring: #f24a00;
+  --switch-thumb: #ffffff;
+  --carbon: #e8e8e8;
+  --carbon-foreground: #0d0d0d;
+
+  /* 状态颜色 */
+  --success: #166534;
+  --success-foreground: #dcfce7;
+  --success-subtle: #14532d;
+  --warning: #d97706;
+  --warning-foreground: #fef3c7;
+  --warning-subtle: #78350f;
+  --info: #2563eb;
+  --info-foreground: #dbeafe;
+  --info-subtle: #1e3a8a;
+  --error: #dc2626;
+  --error-foreground: #fee2e2;
+  --error-subtle: #7f1d1d;
+
+  /* 链接颜色 */
+  --link: #ffa07a;
+  --link-hover: #ff8c66;
+  --link-visited: #bc7a5c;
+  --link-active: #ffa07a;
+
+  /* 代码颜色 */
+  --code-bg: #2e2a28;
+  --code-fg: #e0a58a;
+  --code-block-bg: #1c1917;
+  --code-block-border: #2e2a28;
+
+  /* 表格颜色 */
+  --table-header-bg: #2e2a28;
+  --table-header-fg: #e7e5e4;
+  --table-row-hover: #3a2a22;
+  --table-row-stripe: #221f1d;
+  --table-border: #2e2a28;
+
+  /* 禁用状态 */
+  --disabled-bg: #2e2a28;
+  --disabled-fg: #78716c;
+  --disabled-border: #3a3634;
+  --disabled-opacity: 0.5;
+
+  /* 加载状态 */
+  --skeleton-base: #2e2a28;
+  --skeleton-shine: #3a3634;
+  --loading-spinner: #f24a00;
+
+  /* 遮罩层 */
+  --overlay: rgba(0, 0, 0, 0.7);
+  --backdrop: rgba(0, 0, 0, 0.6);
+  --modal-overlay: rgba(0, 0, 0, 0.85);
+
+  /* 选中/高亮 */
+  --selection-bg: #3a2a22;
+  --selection-fg: #fdfcfb;
+  --highlight: #78350f;
+
+  /* 滚动条 */
+  --scrollbar-track: #1c1917;
+  --scrollbar-thumb: #44403c;
+  --scrollbar-thumb-hover: #57534e;
+
+  /* 分隔线 */
+  --divider: #2e2a28;
+  --divider-strong: #44403c;
+
+  /* 徽章 */
+  --badge-default: #2e2a28;
+  --badge-default-foreground: #e0a58a;
+  --badge-outline: transparent;
+  --badge-outline-foreground: #fdfcfb;
+
+  /* 图表颜色 */
+  --chart-1: #f24a00;
+  --chart-2: #7c442c;
+  --chart-3: #bc7a5c;
+  --chart-4: #e0a58a;
+  --chart-5: #8e8682;
+
+  /* 侧边栏颜色 */
+  --sidebar: #1c1917;
+  --sidebar-foreground: #e7e5e4;
+  --sidebar-primary: #f24a00;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #2e2a28;
+  --sidebar-accent-foreground: #f24a00;
+  --sidebar-border: #2e2a28;
+  --sidebar-ring: #f24a00;
+
+  /* 圆角 */
+  --radius: 0.6rem;
+
+  /* 阴影 */
+  --shadow-x: 0px;
+  --shadow-y: 10px;
+  --shadow-blur: 20px;
+  --shadow-spread: 0px;
+  --shadow-opacity: 0.3;
+  --shadow-color: 0 0 0;
+  --shadow-2xs: 0px 10px 20px 0px hsl(0 0 0 / 0.15);
+  --shadow-xs: 0px 10px 20px 0px hsl(0 0 0 / 0.15);
+  --shadow-sm:
+    0px 10px 20px 0px hsl(0 0 0 / 0.3), 0px 1px 2px -1px hsl(0 0 0 / 0.3);
+  --shadow:
+    0px 10px 20px 0px hsl(0 0 0 / 0.3), 0px 1px 2px -1px hsl(0 0 0 / 0.3);
+  --shadow-md:
+    0px 10px 20px 0px hsl(0 0 0 / 0.3), 0px 2px 4px -1px hsl(0 0 0 / 0.3);
+  --shadow-lg:
+    0px 10px 20px 0px hsl(0 0 0 / 0.3), 0px 4px 6px -1px hsl(0 0 0 / 0.3);
+  --shadow-xl:
+    0px 10px 20px 0px hsl(0 0 0 / 0.3), 0px 8px 10px -1px hsl(0 0 0 / 0.3);
+  --shadow-2xl: 0px 10px 20px 0px hsl(0 0 0 / 0.75);
+}
+
+/* ============================================
+   Tailwind Theme Mapping
+   ============================================ */
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-switch-thumb: var(--switch-thumb);
+  --color-carbon: var(--carbon);
+  --color-carbon-foreground: var(--carbon-foreground);
+
+  /* 状态颜色 */
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-success-subtle: var(--success-subtle);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning-subtle: var(--warning-subtle);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-info-subtle: var(--info-subtle);
+  --color-error: var(--error);
+  --color-error-foreground: var(--error-foreground);
+  --color-error-subtle: var(--error-subtle);
+
+  /* 链接颜色 */
+  --color-link: var(--link);
+  --color-link-hover: var(--link-hover);
+  --color-link-visited: var(--link-visited);
+  --color-link-active: var(--link-active);
+
+  /* 图表颜色 */
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  /* 侧边栏颜色 */
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* 字体 */
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+  --font-serif: var(--font-serif);
+
+  /* 圆角 */
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* 阴影 */
+  --shadow-2xs: var(--shadow-2xs);
+  --shadow-xs: var(--shadow-xs);
+  --shadow-sm: var(--shadow-sm);
+  --shadow: var(--shadow);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+  --shadow-xl: var(--shadow-xl);
+  --shadow-2xl: var(--shadow-2xl);
+
+  /* 字间距 */
+  --tracking-tighter: calc(var(--tracking-normal) - 0.05em);
+  --tracking-tight: calc(var(--tracking-normal) - 0.025em);
+  --tracking-normal: var(--tracking-normal);
+  --tracking-wide: calc(var(--tracking-normal) + 0.025em);
+  --tracking-wider: calc(var(--tracking-normal) + 0.05em);
+  --tracking-widest: calc(var(--tracking-normal) + 0.1em);
+}
+
+/* ============================================
+   Base Styles
+   ============================================ */
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  input {
+    overflow: visible;
+  }
+  body {
+    @apply bg-background text-foreground;
+    letter-spacing: var(--tracking-normal);
+  }
+
+  /* 滚动条样式 */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--scrollbar-thumb-hover);
+  }
+
+  /* 链接样式 */
+  a {
+    color: var(--link);
+  }
+  a:hover {
+    color: var(--link-hover);
+  }
+  a:visited {
+    color: var(--link-visited);
+  }
+
+  /* 代码样式 */
+  code {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 0.125rem 0.375rem;
+    border-radius: 0.25rem;
+    font-size: 0.875em;
+  }
+  pre {
+    background: var(--code-block-bg);
+    border: 1px solid var(--code-block-border);
+    border-radius: 0.5rem;
+    padding: 1rem;
+    overflow-x: auto;
+  }
+  pre code {
+    background: transparent;
+    padding: 0;
+  }
+
+  /* 禁用状态 */
+  .disabled,
+  [disabled] {
+    opacity: var(--disabled-opacity);
+    cursor: not-allowed;
+  }
+
+  /* 分隔线 */
+  hr {
+    border-color: var(--divider);
+  }
+}

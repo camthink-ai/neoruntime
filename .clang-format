@@ -1,0 +1,16 @@
+# Clang-format for HAL (C) and hal_v2/camera-daemon (C++) sources.
+# Invoked by `make fmt` alongside gofmt.
+BasedOnStyle: LLVM
+Language: Cpp
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+BreakBeforeBraces: Attach
+NamespaceIndentation: None
+PointerAlignment: Left
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup

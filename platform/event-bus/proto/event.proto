@@ -1,0 +1,114 @@
+syntax = "proto3";
+
+package aipc.event;
+
+option go_package = "aipc/platform/event-bus/proto;event";
+
+// ============ Common types ============
+
+message Empty {}
+
+message Status {
+  bool success = 1;
+  string message = 2;
+}
+
+// ============ Event structure ============
+
+message Event {
+  string topic = 1;           // Event topic (e.g., "model/person_v1/detections")
+  uint64 timestamp_ns = 2;    // Timestamp
+  string source = 3;          // Event source (app_id / service_name)
+  string event_id = 4;        // Event ID (optional)
+  
+  // Event data (JSON or protobuf any)
+  bytes payload = 10;
+  string payload_type = 11;   // "json" / "protobuf"
+  
+  // Metadata
+  map<string, string> metadata = 20;
+}
+
+// ============ Subscribe configuration ============
+
+message SubscribeRequest {
+  string topic = 1;           // Supports wildcards (e.g., "model/*/detections")
+  string subscriber_id = 2;   // Subscriber ID
+  
+  // Optional: Filter conditions
+  map<string, string> filters = 10;
+  
+  // Optional: QoS
+  uint32 queue_size = 20;     // Queue size
+  bool drop_old = 21;         // Drop old messages when queue is full
+}
+
+// ============ Publish configuration ============
+
+message PublishRequest {
+  Event event = 1;
+  
+  // Optional: Publish options
+  bool persistent = 10;       // Whether to persist
+  uint32 ttl_ms = 11;         // Time to live in milliseconds
+}
+
+message PublishResponse {
+  Status status = 1;
+  string event_id = 2;
+}
+
+// ============ Topic management ============
+
+message TopicInfo {
+  string topic = 1;
+  uint32 subscriber_count = 2;
+  uint64 total_messages = 3;
+  uint64 last_message_ts = 4;
+}
+
+message TopicListResponse {
+  repeated TopicInfo topics = 1;
+}
+
+// ============ Statistics ============
+
+message EventStats {
+  string topic = 1;
+  uint64 published_count = 2;
+  uint64 delivered_count = 3;
+  uint64 dropped_count = 4;
+  float avg_latency_us = 5;
+}
+
+message SystemStats {
+  repeated EventStats topic_stats = 1;
+  uint32 total_subscribers = 2;
+  uint32 total_topics = 3;
+  uint64 uptime_ms = 4;
+}
+
+// ============ Event Bus Service ============
+
+service EventBus {
+  // Publish event
+  rpc Publish(PublishRequest) returns (PublishResponse);
+  
+  // Batch publish
+  rpc PublishBatch(stream PublishRequest) returns (Status);
+  
+  // Subscribe to events
+  rpc Subscribe(SubscribeRequest) returns (stream Event);
+  
+  // Unsubscribe
+  rpc Unsubscribe(SubscribeRequest) returns (Status);
+  
+  // Topic management
+  rpc ListTopics(Empty) returns (TopicListResponse);
+  rpc GetTopicInfo(TopicInfo) returns (TopicInfo);
+  
+  // Statistics
+  rpc GetStats(Empty) returns (SystemStats);
+  rpc GetTopicStats(TopicInfo) returns (EventStats);
+}
+

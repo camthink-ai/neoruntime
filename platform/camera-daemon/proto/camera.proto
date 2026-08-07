@@ -1,0 +1,696 @@
+syntax = "proto3";
+
+package aipc.camera;
+
+option go_package = "aipc/platform/camera-daemon/proto;camera";
+
+// Common types
+message Empty {}
+
+message Status {
+  bool success = 1;
+  string message = 2;
+}
+
+// Structured HAL error for error propagation to upper layers
+message HalError {
+  int32 code = 1;          // HalErrorCode numeric value (negative)
+  string name = 2;         // e.g. "HAL_ERR_INVALID_SIZE"
+  string description = 3;  // Human-readable error description
+}
+
+// ISP Control Request
+// All fields are optional: absent = no change, present (even if value=0) = apply.
+message ISPUpdateRequest {
+  // Manual tuning (HalIspManualConfig)
+  optional bool manual_mode = 1;
+  optional int32 brightness = 2;        // [0..100], absent = no change
+  optional int32 contrast = 3;          // [0..100]
+  optional int32 saturation = 4;        // [0..100]
+  optional int32 sharpness = 5;         // [0..100]
+
+  // Exposure (HalIspExposureConfig)
+  optional bool auto_exposure = 10;
+  optional int32 backlight = 11;        // [0..100] only when AE on
+  optional int32 exposure_time_us = 12;
+  optional int32 gain = 13;
+
+  // Other ISP
+  optional int32 noise_reduction = 20;  // [0..100]
+  optional int32 wdr_value = 21;        // [0..100]
+  optional int32 powerline_freq = 22;   // 0=off, 1=50Hz, 2=60Hz
+  optional int32 awb_index = 23;
+}
+
+message ISPUpdateResponse {
+  Status status = 1;
+}
+
+message ISPConfigResponse {
+  bool success = 1;
+  string message = 2;
+  ISPUpdateRequest current = 3;
+}
+
+// Transform controls (via HAL_MEDIA_OPS.dynamic_change_image_config)
+message TransformConfig {
+  uint32 rotation = 1;     // 0/1/2/3 → 0°/90°/180°/270°
+  uint32 flip = 2;         // 0=none, 1=H, 2=V, 3=both
+  bool dewarp = 3;
+  bool grayscale = 4;
+  bool dis = 5;            // enable Digital Image Stabilization
+  bool eis = 6;            // enable Electronic Image Stabilization (requires gyro)
+}
+
+// Encoder Configuration (for hot reload)
+message EncoderConfigRequest {
+  // Stream name ("main", "sub", "third")
+  string stream_name = 1;
+  // Bitrate in bits per second (0 = no change)
+  uint32 bitrate_bps = 2;
+  // Framerate in frames per second (0 = no change)
+  uint32 framerate = 3;
+  // GOP size / keyframe interval (0 = no change)
+  uint32 gop = 4;
+}
+
+// RTSP Enable/Disable Request
+message RtspEnabledRequest {
+  bool enabled = 1;
+}
+
+// AI Overlay Configuration (for hot reload)
+message AiOverlayConfig {
+  bool enabled = 1;
+  // Box color in ARGB format
+  uint32 box_color = 2;
+  // Label color in ARGB format
+  uint32 label_color = 3;
+  // Font size (8-72)
+  uint32 font_size = 4;
+  // Line thickness (1-10)
+  uint32 line_thickness = 5;
+  // Show confidence score
+  bool show_confidence = 6;
+  // Show label
+  bool show_label = 7;
+}
+
+// OSD Text Overlay Configuration
+message OsdTextOverlayConfig {
+  string id = 1;              // Overlay ID (e.g., "res_0", "fps_0")
+  string text = 2;            // Display text (empty for dynamic overlays)
+  float x = 3;                // Normalized X position (0.0-1.0)
+  float y = 4;                // Normalized Y position (0.0-1.0)
+  float font_size = 5;        // Font size (default: 32)
+  uint32 text_color = 6;      // RGBA color as uint32
+  bool enabled = 7;           // Overlay visibility
+  // Horizontal alignment relative to x: 0=LEFT,1=CENTER,2=RIGHT (HalOsdHorizontalAlignment)
+  int32 h_align = 8;
+  // Vertical alignment relative to y: 0=TOP,1=CENTER,2=BOTTOM (HalOsdVerticalAlignment)
+  int32 v_align = 9;
+}
+
+// OSD DateTime Overlay Configuration
+message OsdDateTimeOverlayConfig {
+  string id = 1;              // Overlay ID
+  float x = 2;                // Normalized X position (0.0-1.0)
+  float y = 3;                // Normalized Y position (0.0-1.0)
+  string format = 4;          // strftime format (e.g., "%Y-%m-%d %H:%M:%S")
+  float font_size = 5;        // Font size
+  uint32 text_color = 6;      // RGBA color
+  bool enabled = 7;           // Visibility
+  // Horizontal alignment relative to x: 0=LEFT,1=CENTER,2=RIGHT
+  int32 h_align = 8;
+  // Vertical alignment relative to y: 0=TOP,1=CENTER,2=BOTTOM
+  int32 v_align = 9;
+}
+
+// OSD Image Overlay Configuration (logo)
+message OsdImageOverlayConfig {
+  string id = 1;              // Overlay ID
+  string image_path = 2;      // Filesystem path to PNG/BMP
+  float x = 3;                // Normalized X position (0.0-1.0)
+  float y = 4;                // Normalized Y position (0.0-1.0)
+  float width = 5;            // Normalized width (0.0-1.0)
+  float height = 6;           // Normalized height (0.0-1.0)
+  bool enabled = 7;           // Visibility
+  // Horizontal alignment relative to x: 0=LEFT,1=CENTER,2=RIGHT
+  int32 h_align = 8;
+  // Vertical alignment relative to y: 0=TOP,1=CENTER,2=BOTTOM
+  int32 v_align = 9;
+}
+
+// Per-stream OSD Configuration
+message StreamOsdConfig {
+  string stream_name = 1;     // "main", "sub", "third"
+  repeated OsdTextOverlayConfig text_overlays = 2;
+  repeated OsdDateTimeOverlayConfig datetime_overlays = 3;
+  repeated OsdImageOverlayConfig image_overlays = 4;
+}
+
+// OSD Configuration Request (supports single or all streams)
+message OsdConfigRequest {
+  repeated StreamOsdConfig streams = 1;
+  // Editor edit-mode: when true the daemon clears but bakes NO text overlays,
+  // so the live stream is clean and only the web HTML text proxies show (single
+  // layer, no baked/proxy ghosting while dragging). The full config (real
+  // enabled flags) is still cached for the GET round-trip; the frontend flips
+  // this back to false on editor exit so the real overlays re-bake.
+  bool suppress_bake = 2;
+}
+
+// OSD Configuration Response (for GET)
+message OsdConfigResponse {
+  repeated StreamOsdConfig streams = 1;
+}
+
+// Encoder Full Reconfiguration (requires brief encoder restart)
+message EncoderReconfigRequest {
+  string stream_name = 1;              // "main", "sub", "third"
+
+  // Resolution (0 = no change)
+  uint32 width = 2;
+  uint32 height = 3;
+
+  // Codec format (empty = no change)
+  string codec = 4;                // "h264" or "h265"
+
+  // Other params (0 = no change)
+  uint32 bitrate_bps = 5;
+  uint32 fps = 6;
+  uint32 gop = 7;
+}
+
+message EncoderReconfigResponse {
+  bool success = 1;
+  string message = 2;
+  uint32 interrupt_ms = 3;        // Actual interruption duration in ms
+  HalError hal_error = 4;         // Structured HAL error if failed
+}
+
+// Profile Management
+message GetProfileResponse {
+  string profile_name = 1;
+}
+
+message ListProfilesResponse {
+  repeated string profiles = 1;
+  string current_profile = 2;
+}
+
+message SwitchProfileRequest {
+  string profile_name = 1;
+}
+
+message BackupProfileRequest {
+  string path = 1;  // Optional: backup directory (empty = use configured default)
+}
+
+message BackupProfileResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Pipeline reconfiguration (stream count change, ~2s interruption)
+message PipelineStreamConfig {
+  string stream_id = 1;           // pipeline stream id, e.g. "sink0"
+  uint32 input_width = 2;
+  uint32 input_height = 3;
+  uint32 input_framerate = 4;
+  string codec = 5;               // "h264" or "h265"
+  uint32 encoder_width = 6;
+  uint32 encoder_height = 7;
+  uint32 encoder_framerate = 8;
+  uint32 encoder_bitrate = 9;
+  uint32 encoder_gop = 10;
+}
+
+message ReconfigurePipelineRequest {
+  repeated PipelineStreamConfig streams = 1;
+}
+
+message ReconfigurePipelineResponse {
+  bool success = 1;
+  string message = 2;
+  uint32 interrupt_ms = 3;
+  HalError hal_error = 4;                       // Structured HAL error if failed
+  repeated PipelineStreamConfig applied_streams = 5;  // Actual applied config after reconfigure
+}
+
+// Sensor Module Information
+message GetSensorInfoRequest {
+  uint32 sensor_index = 1;  // 0 = primary, 1 = secondary (dual-sensor)
+}
+
+message SensorInfoResponse {
+  bool   available      = 1;  // Whether sensor was detected
+  string sensor_model   = 2;  // e.g. "IMX678"
+  int32  i2c_bus        = 3;  // I2C bus number, -1 if unknown
+  string i2c_address    = 4;  // e.g. "001a"
+  int32  pixel_format   = 5;  // V4L2 pixel format fourcc, -1 if unknown
+}
+
+// Stream Status
+message GetStreamStatusRequest {}
+
+message StreamStatusInfo {
+  string stream_id = 1;       // "main", "sub", "third"
+  string status = 2;          // "active", "starting", "stalled", "stopped", "error", "unknown"
+  bool has_encoder = 3;       // Whether encoder is running
+  string codec = 4;           // Current codec
+  uint32 width = 5;           // Current width
+  uint32 height = 6;          // Current height
+  uint32 fps = 7;             // Current framerate
+  uint32 bitrate_bps = 8;    // Current bitrate
+  uint32 gop = 9;             // Current GOP size / keyframe interval
+  // Real frame-health telemetry. ms_since_last_frame uses UINT64_MAX as the
+  // "never / unknown" sentinel (rendered as JSON null by platform-api); this
+  // is what lets status reflect truth instead of just map membership.
+  uint64 ms_since_last_frame = 10;  // ms since last encoded frame (UINT64_MAX = never/unknown)
+  uint32 measured_fps = 11;         // observed output fps (0 = unknown)
+  string status_detail = 12;        // human-readable context, e.g. stall reason
+}
+
+message GetStreamStatusResponse {
+  repeated StreamStatusInfo streams = 1;
+}
+
+// Dynamic stream add
+message AddStreamRequest {
+  string stream_id = 1;       // e.g. "third"
+  uint32 width = 2;
+  uint32 height = 3;
+  uint32 fps = 4;
+  string codec = 5;           // "h264" or "h265"
+  uint32 bitrate = 6;
+  uint32 gop = 7;
+}
+
+// Dynamic stream remove
+message RemoveStreamRequest {
+  string stream_name = 1;     // "main", "sub", "third"
+}
+
+message StreamOperationResponse {
+  bool success = 1;
+  string message = 2;
+  HalError hal_error = 3;
+}
+
+// IR-Cut control
+message SetIrCutRequest {
+  uint32 mode = 1; // 0=day, 1=night
+}
+
+message SetIrCutResponse {
+  bool success = 1;
+  string message = 2;
+  uint32 current_mode = 3; // 0=day, 1=night
+}
+
+// LED control
+message SetLedDutyRequest {
+  uint32 led_id = 1;      // 0=white light, 1=IR LED
+  uint32 duty_percent = 2; // 0-100
+}
+
+message GetLedDutyRequest {
+  uint32 led_id = 1;
+}
+
+message LedStatus {
+  bool success = 1;
+  string message = 2;
+  uint32 duty_percent = 3;
+}
+
+// Device hardware status (sensor readings, MCU version, LED states)
+message DeviceHardwareStatus {
+  bool success = 1;
+  string message = 2;
+
+  // Sensor readings
+  uint32 light_sensor_mv = 3;      // milli-volts from PD sensor
+  int32  light_sensor_lux = 4;     // scaled lux value
+  int32  mcu_temp_millic = 5;      // MCU temperature (degC * 1000)
+  int32  ain_mv = 6;               // AIN ADC milli-volts
+
+  // MCU info
+  string mcu_version = 7;
+
+  // LED states
+  uint32 white_light_duty = 8;
+  uint32 ir_led_duty = 9;
+  uint32 ircut_mode = 10;          // 0=day, 1=night
+}
+
+// Environment control (fan/heater/radar)
+message EnvCtrlRequest {
+  bool enable = 1;
+}
+
+message EnvCtrlStatus {
+  bool success = 1;
+  string message = 2;
+  bool enabled = 3;
+}
+
+// Alarm I/O
+message AlarmOutRequest {
+  uint32 channel = 1;
+  bool enable = 2;
+}
+
+message AlarmOutStatus {
+  bool success = 1;
+  string message = 2;
+  bool enabled = 3;
+}
+
+message WiegandOutRequest {
+  uint32 channel = 1;
+  bool enable = 2;
+}
+
+message AlarmOutputsState {
+  bool success = 1;
+  string message = 2;
+  bool alarm_out0 = 3;
+  bool alarm_out1 = 4;
+  bool wiegand0 = 5;
+  bool wiegand1 = 6;
+}
+
+// RS485
+message Rs485InitRequest {
+  uint32 baudrate = 1;
+  string config = 2;
+}
+
+message Rs485TxRequest {
+  bytes data = 1;
+}
+
+// MCU raw request (for PTZ, GPIO, etc.)
+message McuRawRequestMessage {
+  uint32 cmd = 1;
+  bytes  payload = 2;
+}
+
+message McuRawResponseMessage {
+  bool   success = 1;
+  string message = 2;
+  bytes  payload = 3;
+  int32  hal_code = 4;
+}
+
+// Product autofocus jobs are asynchronous so video and Web startup are never
+// blocked by lens movement or ISP frame collection.
+message AutofocusJobResponse {
+  bool accepted = 1;
+  uint64 job_id = 2;
+  string message = 3;
+}
+
+message AutofocusZoomFollowRequest {
+  float ratio = 1;
+}
+
+message AutofocusJobRequest {
+  uint64 job_id = 1;  // 0 cancels the active job
+}
+
+message AutofocusInvalidateRequest {
+  string reason = 1;
+}
+
+message AutofocusStatusResponse {
+  uint64 job_id = 1;
+  string operation = 2;
+  string state = 3;
+  double progress = 4;
+  bool busy = 5;
+  bool anchor_valid = 6;
+  float requested_ratio = 7;
+  float effective_ratio = 8;
+  int32 zoom_pos = 9;
+  int32 focus_pos = 10;
+  int32 best_focus = 11;
+  double metric = 12;
+  double confidence = 13;
+  double reproducibility = 14;
+  float estimated_distance_m = 15;
+  uint64 elapsed_ms = 16;
+  int32 error_code = 17;
+  string message = 18;
+}
+
+// ===== Config-field patching (platform-owned scalar runtime knobs) =====
+//
+// set_config_field / get_config_field expose individual scalar fields of the
+// active media-library profile at runtime (HAL_MEDIA_OPS.set_config_field /
+// get_config_field). This is the platform-owned config layer: structured config
+// (streams / OSD / privacy polygons / ISP) still goes through its typed RPCs;
+// config_field is only for scalar knobs with no typed RPC (allow-listed by the
+// daemon), e.g. frontend.hailort.use-hailort-service. Mirrors HAL
+// HalConfigFieldType (hal_v2/include/media/hal_media.h).
+enum ConfigFieldType {
+  CONFIG_FIELD_BOOL = 0;
+  CONFIG_FIELD_INT32 = 1;
+  CONFIG_FIELD_UINT32 = 2;
+  CONFIG_FIELD_FLOAT64 = 3;
+  CONFIG_FIELD_STRING = 4;
+}
+
+message SetConfigFieldRequest {
+  string field_path = 1;          // dotted path, e.g. "frontend.hailort.use-hailort-service"
+  ConfigFieldType type = 2;       // how to interpret value
+  string value = 3;               // value encoded as a string (parsed per type)
+}
+
+message GetConfigFieldRequest {
+  string field_path = 1;
+}
+
+message GetConfigFieldResponse {
+  bool success = 1;
+  string message = 2;
+  ConfigFieldType type = 3;
+  string value = 4;               // current value encoded as a string
+}
+
+// Persisted scalar-config mirror (/data/aipc/etc/media_config_fields.json).
+// The platform layer owns the truth source; on boot each entry is replayed via
+// SetConfigField so it overrides the HAL profile default (replay-on-boot wins
+// over HAL's own profile persistence — resolves the two-writer ambiguity).
+message ConfigFieldValue {
+  ConfigFieldType type = 1;
+  string value = 2;
+}
+
+message MediaConfigFields {
+  map<string, ConfigFieldValue> fields = 1;
+}
+
+// Camera Control Service
+service CameraControl {
+  rpc StartOneShotAutofocus(Empty) returns (AutofocusJobResponse);
+  rpc StartZoomFollow(AutofocusZoomFollowRequest) returns (AutofocusJobResponse);
+  rpc GetAutofocusStatus(Empty) returns (AutofocusStatusResponse);
+  rpc CancelAutofocus(AutofocusJobRequest) returns (Status);
+  rpc InvalidateAutofocusAnchor(AutofocusInvalidateRequest) returns (Status);
+
+  // Update ISP image pipeline settings (brightness, contrast, saturation, sharpness)
+  rpc UpdateISPSettings(ISPUpdateRequest) returns (ISPUpdateResponse);
+
+  // Get current ISP configuration
+  rpc GetISPConfig(Empty) returns (ISPConfigResponse);
+
+  // Get current transform configuration (rotation, flip, dewarp, grayscale)
+  rpc GetTransformConfig(Empty) returns (TransformConfig);
+
+  // Update transform configuration
+  rpc SetTransformConfig(TransformConfig) returns (Status);
+
+  // Dynamic encoder configuration (no restart required)
+  rpc UpdateEncoderConfig(EncoderConfigRequest) returns (Status);
+
+  // Enable/disable RTSP server (no restart required)
+  rpc SetRtspEnabled(RtspEnabledRequest) returns (Status);
+
+  // Update AI overlay configuration (no restart required)
+  rpc UpdateAiOverlay(AiOverlayConfig) returns (Status);
+
+  // Update OSD configuration (no restart required)
+  rpc UpdateOsdConfig(OsdConfigRequest) returns (Status);
+
+  // Get current OSD configuration
+  rpc GetOsdConfig(Empty) returns (OsdConfigResponse);
+
+  // Full encoder reconfiguration (brief restart required, ~100ms)
+  // Use this for resolution/codec changes that require encoder restart
+  rpc ReconfigureEncoder(EncoderReconfigRequest) returns (EncoderReconfigResponse);
+
+  // Profile management
+  rpc GetProfile(Empty) returns (GetProfileResponse);
+  rpc ListProfiles(Empty) returns (ListProfilesResponse);
+  rpc SwitchProfile(SwitchProfileRequest) returns (EncoderReconfigResponse);
+  rpc BackupProfile(BackupProfileRequest) returns (BackupProfileResponse);
+
+  // Full pipeline reconfiguration (stream count change, ~2s interruption)
+  rpc ReconfigurePipeline(ReconfigurePipelineRequest) returns (ReconfigurePipelineResponse);
+
+  // Get sensor module information (model, I2C, pixel format)
+  rpc GetSensorInfo(GetSensorInfoRequest) returns (SensorInfoResponse);
+
+  // Get real-time stream status (encoder health, active/idle/error)
+  rpc GetStreamStatus(GetStreamStatusRequest) returns (GetStreamStatusResponse);
+
+  // Dynamic stream add/remove (incremental, ~100-500ms)
+  rpc AddStream(AddStreamRequest) returns (StreamOperationResponse);
+  rpc RemoveStream(RemoveStreamRequest) returns (StreamOperationResponse);
+
+  // IR-Cut filter control (day/night mode)
+  rpc SetIrCut(SetIrCutRequest) returns (SetIrCutResponse);
+  rpc GetIrCut(Empty) returns (SetIrCutResponse);
+
+  // LED / White Light / IR LED control
+  rpc SetLedDuty(SetLedDutyRequest) returns (LedStatus);
+  rpc GetLedDuty(GetLedDutyRequest) returns (LedStatus);
+
+  // Device status (sensors, MCU version, LED state)
+  rpc GetDeviceHardwareStatus(Empty) returns (DeviceHardwareStatus);
+
+  // MCU raw request (PTZ, GPIO, etc.)
+  rpc McuRawRequest(McuRawRequestMessage) returns (McuRawResponseMessage);
+
+  // Environment control
+  rpc SetFan(EnvCtrlRequest) returns (EnvCtrlStatus);
+  rpc GetFan(Empty) returns (EnvCtrlStatus);
+  rpc SetHeat(EnvCtrlRequest) returns (EnvCtrlStatus);
+  rpc GetHeat(Empty) returns (EnvCtrlStatus);
+  rpc SetRadar(EnvCtrlRequest) returns (EnvCtrlStatus);
+  rpc GetRadar(Empty) returns (EnvCtrlStatus);
+
+  // Alarm I/O
+  rpc SetAlarmOut(AlarmOutRequest) returns (AlarmOutStatus);
+  rpc GetAlarmOut(AlarmOutRequest) returns (AlarmOutStatus);
+  rpc SetWiegandOut(WiegandOutRequest) returns (AlarmOutStatus);
+  rpc GetWiegandOut(WiegandOutRequest) returns (AlarmOutStatus);
+  rpc GetAlarmOutputs(Empty) returns (AlarmOutputsState);
+
+  // RS485
+  rpc Rs485Init(Rs485InitRequest) returns (Status);
+  rpc Rs485Deinit(Empty) returns (Status);
+  rpc Rs485Tx(Rs485TxRequest) returns (Status);
+
+  // Capabilities (auto-detected from HAL)
+  rpc GetCapabilities(Empty) returns (CapabilitiesResponse);
+
+  // Audio capture
+  rpc ListAudioCaptureDevices(Empty) returns (ListAudioDevicesResponse);
+  rpc ListAudioPlaybackDevices(Empty) returns (ListAudioDevicesResponse);
+  rpc StartAudioCapture(AudioConfigRequest) returns (Status);
+  rpc StopAudioCapture(Empty) returns (Status);
+  rpc GetAudioStatus(Empty) returns (AudioStatusResponse);
+  rpc SetAudioConfig(AudioConfigRequest) returns (Status);
+
+  // Audio playback (two-way talk)
+  rpc StartAudioPlayback(AudioConfigRequest) returns (Status);
+  rpc StreamAudioPcm(stream AudioPcmChunk) returns (Status);
+  rpc StopAudioPlayback(Empty) returns (Status);
+
+  // Privacy mask
+  rpc GetPrivacyMaskConfig(Empty) returns (PrivacyMaskConfig);
+  rpc SetPrivacyMaskConfig(PrivacyMaskConfig) returns (Status);
+
+  // Scalar profile-field runtime knobs (platform-owned config layer; allow-listed).
+  rpc SetConfigField(SetConfigFieldRequest) returns (Status);
+  rpc GetConfigField(GetConfigFieldRequest) returns (GetConfigFieldResponse);
+}
+
+// Device capabilities auto-detected from loaded HAL modules
+message CapabilitiesResponse {
+  bool has_video = 1;
+  bool has_codec = 2;
+  bool has_led = 3;
+  bool has_sensor = 4;
+  bool has_mcu = 5;
+  bool has_env_ctrl = 6;
+  bool has_alarm = 7;
+  bool has_rs485 = 8;
+  bool has_osd = 9;
+  bool has_draw = 10;
+  bool has_audio = 11;
+}
+
+// ===== Privacy Mask =====
+
+// A single privacy mask region (polygon with up to 8 vertices)
+message PrivacyMaskRegion {
+  string id = 1;                // unique identifier
+  string name = 2;              // human-readable label
+  bool enabled = 3;             // whether this region is active
+  repeated float points_x = 4;  // normalized X coords [0.0-1.0], up to 8
+  repeated float points_y = 5;  // normalized Y coords [0.0-1.0], up to 8
+}
+
+// Privacy mask configuration
+message PrivacyMaskConfig {
+  uint32 color = 1;                     // 0x00RRGGBB fill color (when blur_radius=0)
+  int32 blur_radius = 2;                // pixelation block size [2-64]; 0=solid color
+  bool enabled = 3;                     // global on/off
+  repeated PrivacyMaskRegion regions = 4;
+  bool dpm_enabled = 5;                 // dynamic (AI) privacy mask on/off
+  string dpm_labels = 6;                // DPM detection labels, e.g., "person,vehicle"
+  string dpm_mode = 7;                  // "mosaic", "blur", or "overlay"
+  uint32 dpm_color = 8;                 // 0x00RRGGBB DPM overlay color (independent of static color)
+}
+
+// ===== Audio =====
+
+message AudioDeviceInfo {
+  string name = 1;
+  string description = 2;
+}
+
+message ListAudioDevicesResponse {
+  bool success = 1;
+  string message = 2;
+  repeated AudioDeviceInfo devices = 3;
+}
+
+message AudioConfigRequest {
+  string device = 1;
+  uint32 sample_rate = 2;
+  uint32 channels = 3;
+  string codec = 4;       // pcm / aac / g711a / g711u
+  uint32 bitrate = 5;
+  // proto3 optional → presence-tracked. Absent = no change (lets the caller
+  // touch volume without clobbering mute, and vice versa). Without optional,
+  // a missing volume (default 0.0) is indistinguishable from "set volume to 0"
+  // and a missing mute (default false) cannot express "unmute".
+  optional float volume = 6;       // 0.0 - 2.0, only applied when present
+  optional bool mute = 7;          // true=mute, false=unmute, only applied when present
+}
+
+message AudioStatusResponse {
+  bool success = 1;
+  string message = 2;
+  bool capturing = 3;
+  bool playing = 4;
+  string device = 5;
+  uint32 sample_rate = 6;
+  uint32 channels = 7;
+  string codec = 8;
+  float volume = 9;
+  bool mute = 10;
+}
+
+message AudioPcmChunk {
+  bytes data = 1;
+  uint32 sample_rate = 2;
+  uint32 channels = 3;
+  string format = 4;     // S16LE / S32LE / F32LE
+}

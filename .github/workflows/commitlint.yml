@@ -1,0 +1,17 @@
+name: Commitlint
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  commitlint:
+    name: Commit message policy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Validate commits on the PR
+        run: npx -y @commitlint/cli@20 --from origin/${{ github.base_ref }} --to HEAD

@@ -1,0 +1,5 @@
+app/build/
+app/Debug/
+boot/build/
+boot/Debug/
+tools/__pycache__/

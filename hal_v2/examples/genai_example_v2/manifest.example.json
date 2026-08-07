@@ -1,0 +1,19 @@
+{
+    "comment": "Example for hal-genai-example-v2; copy beside your .hef or point --manifest at hailo_model_zoo_genai/models/manifests/qwen2-vl/2b/manifest.json",
+    "type": "vlm",
+    "hef_path": "/opt/aipc/bin/Qwen2-VL-2B-Instruct.hef",
+    "host": "0.0.0.0",
+    "port": 9000,
+    "vlm_params": {
+        "frame_width": 336,
+        "frame_height": 336
+    },
+    "generation_params": {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "max_tokens": 256,
+        "do_sample": true,
+        "stop_tokens": ["<\u007c\u0069\u006d\u005f\u0065\u006e\u0064\u007c\u003e", "<\u007c\u0065\u006e\u0064\u006f\u0066\u0074\u0065\u0078\u0074\u007c\u003e"]
+    }
+}

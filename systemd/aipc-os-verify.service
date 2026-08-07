@@ -1,0 +1,25 @@
+[Unit]
+Description=Verify AIPC after an OS A/B upgrade
+After=aipc-autostart.service aipc-platform.target
+Wants=aipc-autostart.service aipc-platform.target
+RequiresMountsFor=/data
+ConditionPathExists=/data/aipc-os-upgrade/active-job
+
+[Service]
+Type=oneshot
+Environment=AIPC_FILESYSTEM_DEVICE=mmcblk1
+Environment=AIPC_COPY_A_VALUE=a
+Environment=AIPC_COPY_B_VALUE=b
+Environment=AIPC_RECOVERY_DIR=/data/aipc/recovery
+Environment=AIPC_BACKUP_ROOT=/data/backups/aipc-os-upgrade
+Environment=AIPC_APP_MANIFEST=/data/aipc/app-manifest.json
+Environment=AIPC_DATA_SCHEMA_FILE=/data/aipc-data/schema-version
+Environment=AIPC_OS_COMPATIBILITY_FILE=/etc/aipc-os-release
+ExecStart=/usr/libexec/aipc-os-updater verify
+StandardOutput=journal+console
+StandardError=journal+console
+SyslogIdentifier=aipc-os-verify
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

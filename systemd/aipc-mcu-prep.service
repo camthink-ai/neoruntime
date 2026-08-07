@@ -1,0 +1,34 @@
+[Unit]
+Description=AIPC baseboard MCU boot prep (RTC sync + firmware OTA)
+Documentation=file:///data/aipc/docs/baseboard-mcu-rtc-ota.md
+# Runs AFTER aipc-firstboot (so the host clock is already sane, set from the
+# battery-backed RTC / NTP) and BEFORE aipc-autostart. aipc-autostart is the
+# single chokepoint that enable+starts every runtime daemon, so ordering ahead
+# of it guarantees /dev/ttyS0 — exclusive-use, owned at runtime by the camera
+# and device daemons — is still free when MCU prep runs. The matching
+# ordering vs those two daemons is declared on their own units
+# (After=aipc-mcu-prep.service), keeping this file free of business service
+# names so AIPC and the OS image stay independently maintainable.
+# Within boot_prep the RTC step runs first, then version check + OTA.
+After=aipc-firstboot.service
+Before=aipc-autostart.service
+ConditionPathExists=/data/aipc/bin/ne503_boot_prep
+ConditionPathExists=!/run/aipc/mcu-prep/attempted
+
+[Service]
+Type=oneshot
+Environment=HOME=/run/aipc/mcu-prep
+ExecStartPre=/bin/mkdir -p /run/aipc/mcu-prep/.hailo
+ExecStartPre=/bin/chmod 0700 /run/aipc/mcu-prep /run/aipc/mcu-prep/.hailo
+ExecStart=/data/aipc/bin/aipc-mcu-prep.sh
+User=root
+TimeoutStartSec=120
+StandardOutput=journal+console
+StandardError=journal+console
+# Never block boot: the wrapper always exits 0 and maps every boot_prep
+# failure to a log line. RemainAfterExit=no so each boot re-runs prep
+# (RTC re-push + version check) idempotently.
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
