@@ -3,7 +3,7 @@
 .PHONY: all build-go build-native build-web build-ci clean distclean test test-unit test-basic test-smoke test-verify verify test-integration proto \
   proto-inference proto-device proto-event proto-camera proto-app proto-lens proto-discovery \
   hal-v2 platform ai-runtime device-control event-bus app-manager platform-api \
-  device-discovery os-updater camera-daemon web aipc-cli tools mcu-firmware pack pack-release \
+  device-discovery os-updater onvif-device camera-daemon web aipc-cli tools mcu-firmware pack pack-release \
   ensure-mcu-toolchain docker-pack-release _pack-stage _pack-internal fmt lint help
 
 -include Makefile.local
@@ -142,7 +142,7 @@ hal-v2:
 	@mkdir -p $(BUILD_DIR)/hal/$(HAL_PLATFORM)
 	@cp -P $(HAL_V2_BUILD_DIR)/libaipc_hal*.so* $(HAL_V2_BUILD_DIR)/libhal-*.so* $(BUILD_DIR)/hal/$(HAL_PLATFORM)/ 2>/dev/null || true
 
-platform: device-control event-bus app-manager platform-api device-discovery os-updater
+platform: device-control event-bus app-manager platform-api device-discovery os-updater onvif-device
 
 ai-runtime: proto
 	@echo "==> Building ai-runtime"
@@ -178,6 +178,10 @@ platform-api: proto
 device-discovery: proto
 	@mkdir -p $(BUILD_DIR)
 	cd platform/device-discovery/server && $(AIPC_GO_ENV) $(GO) build $(GO_BUILD_FLAGS) -o $(CURDIR)/$(BUILD_DIR)/device-discovery .
+
+onvif-device:
+	@mkdir -p $(BUILD_DIR)
+	cd platform/onvif-device/server && $(AIPC_GO_ENV) $(GO) build $(GO_BUILD_FLAGS) -o $(CURDIR)/$(BUILD_DIR)/onvif-device .
 
 os-updater:
 	@mkdir -p $(BUILD_DIR)

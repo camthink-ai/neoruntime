@@ -1,0 +1,286 @@
+// Command onvif-device exposes the NE503 AIPC as an ONVIF Profile S device.
+//
+// It is a thin signalling service: it answers WS-Discovery (UDP multicast) so
+// NVR/VMS clients can find it on the LAN, and serves the ONVIF Device and Media
+// SOAP services over HTTP. GetStreamURI hands out the RTSP URIs served by
+// camera-daemon (rtsp://<device-ip>:8554/<stream>); video never flows through
+// this process.
+//
+// Usage:
+//
+//	onvif-device [--config /data/aipc/etc/onvif.yaml] [--iface eth0]
+//
+// On IP change (DHCP renewal) it rewrites the advertised RTSP URIs and XAddrs
+// and re-announces via WS-Discovery. SIGUSR1 forces a re-announce.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	onvifserver "github.com/0x524a/onvif-go/server"
+
+	"aipc/platform/onvif-device/config"
+	"aipc/platform/onvif-device/identity"
+	"aipc/platform/onvif-device/wsdiscovery"
+)
+
+var (
+	configFile = flag.String("config", "/data/aipc/etc/onvif.yaml", "config file path")
+	ifaceFlag  = flag.String("iface", "", "override the LAN interface for multicast + IP discovery")
+)
+
+const (
+	soapTimeout       = 30 * time.Second
+	ipStartupTries    = 10 // number of 1s attempts to resolve the LAN IP before giving up
+	ipWatchInterval   = 10 * time.Second
+	defaultVideoQ     = 80.0
+	endpointURNPrefix = "urn:uuid:"
+)
+
+func main() {
+	flag.Parse()
+
+	cfg, err := config.Load(*configFile)
+	if err != nil {
+		log.Fatalf("[onvif] config load failed: %v", err)
+	}
+	if *ifaceFlag != "" {
+		cfg.Network.Interface = *ifaceFlag
+	}
+	if !cfg.Service.Enabled {
+		log.Printf("[onvif] service disabled by config; exiting")
+		return
+	}
+
+	// Device identity: serial + firmware from factory EEPROM / VERSION file,
+	// and a stable endpoint UUID derived from the serial.
+	sn := identity.ResolveSN(cfg.Device.SerialNumber, cfg.VersionFile)
+	fw := cfg.Device.FirmwareVersion
+	if fw == "" {
+		fw = identity.ReadFirmwareVersion(cfg.VersionFile)
+	}
+	endpointUUID := endpointURNPrefix + identity.DeviceUUID(sn)
+	log.Printf("[onvif] device sn=%s fw=%s endpoint=%s", sn, fw, endpointUUID)
+
+	// rp_filter must be 0 or multicast from a different subnet is dropped.
+	identity.DisableRpFilter(cfg.Network.Interface)
+
+	// Resolve the LAN IP (retry briefly while the interface comes up).
+	ip := resolveIPWithRetries(cfg.Network.Interface)
+
+	// Build and start the ONVIF SOAP server (Device + Media services).
+	srv, err := onvifserver.New(buildServerConfig(cfg, sn, fw))
+	if err != nil {
+		log.Fatalf("[onvif] server config failed: %v", err)
+	}
+	if ip != "" {
+		applyStreamURIs(srv, cfg, ip)
+	}
+
+	// WS-Discovery responder (Hello + ProbeMatch). Runs in parallel; failure
+	// is non-fatal so the SOAP service still works without multicast.
+	responder := wsdiscovery.New(buildDiscoveryConfig(cfg, endpointUUID, ip))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var ipMu sync.Mutex
+	lastIP := ip
+	refresh := func() {
+		newIP, err := identity.ResolveLanIP(cfg.Network.Interface)
+		if err != nil {
+			log.Printf("[onvif] LAN IP resolve failed: %v", err)
+			return
+		}
+		ipMu.Lock()
+		unchanged := newIP == lastIP
+		if !unchanged {
+			lastIP = newIP
+		}
+		ipMu.Unlock()
+		if unchanged {
+			return
+		}
+		log.Printf("[onvif] LAN IP changed -> %s; updating URIs and re-announcing", newIP)
+		applyStreamURIs(srv, cfg, newIP)
+		responder.SetXAddrs([]string{deviceXAddr(newIP, cfg)})
+		if err := responder.SendHello(); err != nil {
+			log.Printf("[onvif] re-announce Hello failed: %v", err)
+		}
+	}
+
+	go func() {
+		if err := responder.Start(ctx); err != nil {
+			log.Printf("[onvif] WS-Discovery responder stopped: %v", err)
+		}
+	}()
+
+	// Periodically re-resolve the IP to catch DHCP renewals.
+	go func() {
+		t := time.NewTicker(ipWatchInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				refresh()
+			}
+		}
+	}()
+
+	// Signal handling: SIGUSR1 forces a re-announce; SIGINT/SIGTERM stops.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1)
+	go func() {
+		for s := range sig {
+			if s == syscall.SIGUSR1 {
+				log.Printf("[onvif] SIGUSR1 received, forcing re-announce")
+				refresh()
+				if err := responder.SendHello(); err != nil {
+					log.Printf("[onvif] forced Hello failed: %v", err)
+				}
+				continue
+			}
+			log.Printf("[onvif] %s received, shutting down", s)
+			cancel()
+			return
+		}
+	}()
+
+	log.Printf("[onvif] SOAP Device/Media service on :%d%s (rtsp=:%d, ip=%s)",
+		cfg.Service.HTTPPort, cfg.Service.BasePath, cfg.RTSP.Port, ip)
+
+	if err := srv.Start(ctx); err != nil {
+		log.Fatalf("[onvif] SOAP server stopped with error: %v", err)
+	}
+	log.Printf("[onvif] shutdown complete")
+}
+
+// buildServerConfig maps the service config onto the onvif-go server Config.
+// PTZ/Imaging are disabled for Phase 1 (Streaming profile only).
+func buildServerConfig(cfg *config.Config, sn, fw string) *onvifserver.Config {
+	profiles := make([]onvifserver.ProfileConfig, 0, len(cfg.Profiles))
+	for _, p := range cfg.Profiles {
+		profiles = append(profiles, onvifserver.ProfileConfig{
+			Token: p.Token,
+			Name:  p.Name,
+			VideoSource: onvifserver.VideoSourceConfig{
+				Token:      "vs_" + p.Token,
+				Name:       p.Name,
+				Resolution: onvifserver.Resolution{Width: p.Width, Height: p.Height},
+				Framerate:  p.FPS,
+				Bounds:     onvifserver.Bounds{Width: p.Width, Height: p.Height},
+			},
+			VideoEncoder: onvifserver.VideoEncoderConfig{
+				Encoding:   p.Codec,
+				Resolution: onvifserver.Resolution{Width: p.Width, Height: p.Height},
+				Quality:    defaultVideoQ,
+				Framerate:  p.FPS,
+				Bitrate:    p.Bitrate,
+				GovLength:  p.FPS,
+			},
+		})
+	}
+
+	user, pass := resolveAuth(cfg)
+	return &onvifserver.Config{
+		Host:     "0.0.0.0", // bind all interfaces; advertise-host is set per-profile below
+		Port:     cfg.Service.HTTPPort,
+		BasePath: cfg.Service.BasePath,
+		Timeout:  soapTimeout,
+		DeviceInfo: onvifserver.DeviceInfo{
+			Manufacturer:    cfg.Device.Manufacturer,
+			Model:           cfg.Device.Model,
+			FirmwareVersion: fw,
+			SerialNumber:    sn,
+			HardwareID:      cfg.Device.HardwareID,
+		},
+		Username:       user,
+		Password:       pass,
+		SupportPTZ:     false, // Phase 3
+		SupportImaging: false, // Phase 2
+		SupportEvents:  false, // Phase 4
+		Profiles:       profiles,
+	}
+}
+
+// buildDiscoveryConfig assembles the WS-Discovery responder configuration.
+func buildDiscoveryConfig(cfg *config.Config, endpointUUID, ip string) wsdiscovery.Config {
+	return wsdiscovery.Config{
+		EndpointUUID:  endpointUUID,
+		Types:         "dp0:NetworkVideoTransmitter",
+		Scopes:        cfg.Device.Scopes,
+		XAddrs:        []string{deviceXAddr(ip, cfg)},
+		Interface:     cfg.Network.Interface,
+		MulticastAddr: cfg.Network.MulticastAddr,
+		MulticastPort: cfg.Network.MulticastPort,
+	}
+}
+
+// resolveAuth returns the WS-Security credentials, or empty for "none" mode.
+// In "digest" mode it prefers AIPC_AUTH_USERNAME/AIPC_AUTH_PASSWORD (shared
+// with platform-api) and falls back to none with a warning if unset.
+func resolveAuth(cfg *config.Config) (string, string) {
+	if strings.ToLower(cfg.Auth.Mode) != "digest" {
+		return "", ""
+	}
+	user := envOr("AIPC_AUTH_USERNAME", cfg.Auth.Username)
+	pass := envOr("AIPC_AUTH_PASSWORD", cfg.Auth.Password)
+	if user == "" || pass == "" {
+		log.Printf("[onvif] auth.mode=digest but credentials missing; running unauthenticated for interop")
+		return "", ""
+	}
+	return user, pass
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// applyStreamURIs overrides each profile's RTSP URI so the advertised address
+// is the real device LAN IP (the library otherwise defaults to localhost).
+func applyStreamURIs(srv *onvifserver.Server, cfg *config.Config, ip string) {
+	for _, p := range cfg.Profiles {
+		uri := rtspURI(ip, cfg, p)
+		if err := srv.UpdateStreamURI(p.Token, uri); err != nil {
+			log.Printf("[onvif] UpdateStreamURI(%s) failed: %v", p.Token, err)
+			continue
+		}
+		log.Printf("[onvif] profile %s -> %s", p.Token, uri)
+	}
+}
+
+func rtspURI(ip string, cfg *config.Config, p config.ProfileConfig) string {
+	return fmt.Sprintf("rtsp://%s:%d/%s", ip, cfg.RTSP.Port, p.Stream)
+}
+
+func deviceXAddr(ip string, cfg *config.Config) string {
+	return fmt.Sprintf("http://%s:%d%s/device_service", ip, cfg.Service.HTTPPort, cfg.Service.BasePath)
+}
+
+// resolveIPWithRetries waits up to ipStartupTries seconds for the interface to
+// acquire an IPv4 address. Returns "" if it never comes up (the watcher keeps
+// trying after start).
+func resolveIPWithRetries(iface string) string {
+	for range ipStartupTries {
+		if ip, err := identity.ResolveLanIP(iface); err == nil {
+			return ip
+		}
+		time.Sleep(time.Second)
+	}
+	log.Printf("[onvif] WARNING: no LAN IP on %s after %d tries; will retry in background", iface, ipStartupTries)
+	return ""
+}
