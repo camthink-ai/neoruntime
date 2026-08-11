@@ -1,7 +1,17 @@
 package main
 
 import (
+	"crypto/sha1" //nolint:gosec // ONVIF digest test fixture
+	"encoding/base64"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+
+	onvifserver "github.com/0x524a/onvif-go/server"
 
 	"aipc/platform/onvif-device/config"
 )
@@ -117,11 +127,11 @@ func TestBuildServerConfig_MapsIdentityAndProfiles(t *testing.T) {
 	cfg := testConfig()
 
 	// Act
-	sc := buildServerConfig(cfg, "CT503-0001", "9.9.9")
+	sc := buildServerConfig(cfg, "CT503-0001", "9.9.9", "10.0.0.5")
 
 	// Assert
-	if sc.Host != "0.0.0.0" {
-		t.Errorf("Host = %q, want 0.0.0.0", sc.Host)
+	if sc.Host != "10.0.0.5" {
+		t.Errorf("Host = %q, want 10.0.0.5 (advertised LAN IP, not 0.0.0.0)", sc.Host)
 	}
 	if sc.Port != 8081 {
 		t.Errorf("Port = %d, want 8081", sc.Port)
@@ -166,5 +176,283 @@ func TestBuildDiscoveryConfig_AssemblesXAddrAndScopes(t *testing.T) {
 	}
 	if len(dc.Scopes) != 1 || dc.Scopes[0] != "onvif://x" {
 		t.Errorf("Scopes = %v", dc.Scopes)
+	}
+}
+
+const (
+	mediaNS  = "http://www.onvif.org/ver10/media/wsdl"
+	deviceNS = "http://www.onvif.org/ver10/device/wsdl"
+)
+
+// soapEnvelope wraps a body element in a minimal SOAP 1.2 envelope for tests.
+func soapEnvelope(action, ns, inner string) string {
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+  <s:Body>
+    <` + action + ` xmlns="` + ns + `">` + inner + `</` + action + `>
+  </s:Body>
+</s:Envelope>`
+}
+
+// TestGetStreamUri_RoundTripReturnsSpecCasingAndURI is the regression test for the
+// library casing bug: previously GetStreamUri faulted with "No handler for
+// action: GetStreamUri". It must now return a GetStreamUriResponse (lowercase
+// Uri) carrying the RTSP URI.
+func TestGetStreamUri_RoundTripReturnsSpecCasingAndURI(t *testing.T) {
+	// Arrange — server with one profile, RTSP URI overridden to the LAN IP.
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "127.0.0.1"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	if err := srv.UpdateStreamURI("main", "rtsp://127.0.0.1:8554/main"); err != nil {
+		t.Fatalf("UpdateStreamURI: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	registerMediaRoutes(mux, srv)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := soapEnvelope("GetStreamUri", mediaNS, "<ProfileToken>main</ProfileToken>")
+
+	// Act
+	resp, err := http.Post(ts.URL+"/onvif/media_service", "application/soap+xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	// Assert
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, respBody)
+	}
+	if strings.Contains(string(respBody), "No handler for action") {
+		t.Fatalf("GetStreamUri not routed (casing bug regressed); body=%s", respBody)
+	}
+	if !strings.Contains(string(respBody), "GetStreamUriResponse") {
+		t.Errorf("response missing spec-correct GetStreamUriResponse element; body=%s", respBody)
+	}
+	if strings.Contains(string(respBody), "GetStreamURIResponse") {
+		t.Errorf("response uses non-conformant capital GetStreamURIResponse; body=%s", respBody)
+	}
+	if !strings.Contains(string(respBody), "rtsp://127.0.0.1:8554/main") {
+		t.Errorf("response missing RTSP URI; body=%s", respBody)
+	}
+}
+
+// TestGetSnapshotUri_UsesSpecCasing asserts the action routes under lowercase
+// "Uri" rather than faulting with "No handler". (Snapshot itself is unsupported
+// in Phase 1, so a handler-error fault is expected and acceptable.)
+func TestGetSnapshotUri_UsesSpecCasing(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "127.0.0.1"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	mux := http.NewServeMux()
+	registerMediaRoutes(mux, srv)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Act
+	body := soapEnvelope("GetSnapshotUri", mediaNS, "<ProfileToken>main</ProfileToken>")
+	resp, err := http.Post(ts.URL+"/onvif/media_service", "application/soap+xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	// Assert — routing under the spec key must succeed; only the snapshot
+	// payload is unsupported.
+	if strings.Contains(string(respBody), "No handler for action") {
+		t.Fatalf("GetSnapshotUri not routed (casing bug regressed); body=%s", respBody)
+	}
+}
+
+// TestGetCapabilities_AdvertisesConfiguredHostNotLocalhost is the regression test
+// for the localhost XAddr bug: with Host set to the LAN IP, GetCapabilities must
+// advertise that IP, never "localhost".
+func TestGetCapabilities_AdvertisesConfiguredHostNotLocalhost(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	mux := http.NewServeMux()
+	registerDeviceRoutes(mux, srv)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Act
+	body := soapEnvelope("GetCapabilities", deviceNS, "<Category>All</Category>")
+	resp, err := http.Post(ts.URL+"/onvif/device_service", "application/soap+xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	// Assert
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, respBody)
+	}
+	if strings.Contains(string(respBody), "localhost") {
+		t.Errorf("GetCapabilities advertises localhost; body=%s", respBody)
+	}
+	if !strings.Contains(string(respBody), "192.168.1.50:8081") {
+		t.Errorf("GetCapabilities does not advertise configured host 192.168.1.50:8081; body=%s", respBody)
+	}
+}
+
+// pongResponse is a minimal response type for dispatcher unit tests.
+type pongResponse struct {
+	XMLName xml.Name `xml:"http://example.com/ping Pong"`
+	OK      bool     `xml:"OK"`
+}
+
+// newTestDispatcher builds a dispatcher with a single "Ping" action for branch
+// tests. creds are empty unless overridden.
+func newTestDispatcher(t *testing.T, user, pass string) *soapDispatcher {
+	t.Helper()
+	d := newSOAPDispatcher(user, pass)
+	d.handle("Ping", func(body interface{}) (interface{}, error) {
+		return &pongResponse{OK: true}, nil
+	})
+	return d
+}
+
+// wsseHeader builds a WS-Security UsernameToken header with a valid ONVIF digest.
+func wsseHeader(user, pass string) string {
+	nonce := []byte("0123456789abcdef") // fixed for deterministic tests
+	created := "2026-08-11T00:00:00Z"
+	h := sha1.New() //nolint:gosec // ONVIF digest fixture
+	h.Write(nonce)
+	h.Write([]byte(created))
+	h.Write([]byte(pass))
+	digest := base64.StdEncoding.EncodeToString(h.Sum(nil))
+	return fmt.Sprintf(`<Security xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+      <UsernameToken>
+        <Username>%s</Username>
+        <Password Type="...PasswordDigest">%s</Password>
+        <Nonce EncodingType="...Base64Binary">%s</Nonce>
+        <Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">%s</Created>
+      </UsernameToken>
+    </Security>`, user, digest, base64.StdEncoding.EncodeToString(nonce), created)
+}
+
+// soapRequestWithHeader builds a SOAP envelope containing an optional header and
+// a body action, for dispatcher tests.
+func soapRequestWithHeader(header, action, inner string) string {
+	hdr := ""
+	if header != "" {
+		hdr = "<s:Header>" + header + "</s:Header>"
+	}
+	return fmt.Sprintf(`<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">%s
+      <s:Body><%s xmlns="http://example.com/ping">%s</%s></s:Body>
+    </s:Envelope>`, hdr, action, inner, action)
+}
+
+func postSOAP(t *testing.T, ts *httptest.Server, path, body string) (int, string) {
+	t.Helper()
+	resp, err := http.Post(ts.URL+path, "application/soap+xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+func TestSOAPDispatcher_MethodNotAllowed(t *testing.T) {
+	ts := httptest.NewServer(newTestDispatcher(t, "", ""))
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/x")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET status = %d, want 405", resp.StatusCode)
+	}
+}
+
+func TestSOAPDispatcher_UnknownActionIsFault(t *testing.T) {
+	ts := httptest.NewServer(newTestDispatcher(t, "", ""))
+	defer ts.Close()
+	status, body := postSOAP(t, ts, "/x", soapRequestWithHeader("", "Bogus", ""))
+	if !strings.Contains(body, "No handler for action") {
+		t.Errorf("expected no-handler fault; body=%s", body)
+	}
+	if status != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", status)
+	}
+}
+
+func TestSOAPDispatcher_NoCredsSkipsAuth(t *testing.T) {
+	ts := httptest.NewServer(newTestDispatcher(t, "", ""))
+	defer ts.Close()
+	status, body := postSOAP(t, ts, "/x", soapRequestWithHeader("", "Ping", ""))
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want 200; body=%s", status, body)
+	}
+	if !strings.Contains(body, "Pong") {
+		t.Errorf("expected Pong response; body=%s", body)
+	}
+}
+
+func TestSOAPDispatcher_CredsRejectMissingToken(t *testing.T) {
+	ts := httptest.NewServer(newTestDispatcher(t, "admin", "secret"))
+	defer ts.Close()
+	status, body := postSOAP(t, ts, "/x", soapRequestWithHeader("", "Ping", ""))
+	if status != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 (auth fault)", status)
+	}
+	if !strings.Contains(body, "Authentication failed") {
+		t.Errorf("expected auth fault; body=%s", body)
+	}
+}
+
+func TestSOAPDispatcher_CredsAcceptValidDigest(t *testing.T) {
+	ts := httptest.NewServer(newTestDispatcher(t, "admin", "secret"))
+	defer ts.Close()
+	req := soapRequestWithHeader(wsseHeader("admin", "secret"), "Ping", "")
+	status, body := postSOAP(t, ts, "/x", req)
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want 200; body=%s", status, body)
+	}
+	if !strings.Contains(body, "Pong") {
+		t.Errorf("expected Pong after valid digest; body=%s", body)
+	}
+}
+
+func TestSOAPDispatcher_CredsRejectBadPassword(t *testing.T) {
+	ts := httptest.NewServer(newTestDispatcher(t, "admin", "secret"))
+	defer ts.Close()
+	req := soapRequestWithHeader(wsseHeader("admin", "wrong"), "Ping", "")
+	status, body := postSOAP(t, ts, "/x", req)
+	if status != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", status)
+	}
+	if !strings.Contains(body, "Authentication failed") {
+		t.Errorf("expected auth fault for bad password; body=%s", body)
+	}
+}
+
+func TestFirstElementName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`<GetStreamUri xmlns="x"><ProfileToken>main</ProfileToken></GetStreamUri>`, "GetStreamUri"},
+		{`  <tns:GetProfiles xmlns:tns="y"/>`, "GetProfiles"},
+		{`   `, ""},
+		{`not xml`, ""},
+	}
+	for _, tc := range cases {
+		if got := firstElementName([]byte(tc.in)); got != tc.want {
+			t.Errorf("firstElementName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

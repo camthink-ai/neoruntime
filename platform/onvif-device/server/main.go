@@ -16,9 +16,12 @@ package main
 
 import (
 	"context"
+	"encoding/xml"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -78,7 +81,7 @@ func main() {
 	ip := resolveIPWithRetries(cfg.Network.Interface)
 
 	// Build and start the ONVIF SOAP server (Device + Media services).
-	srv, err := onvifserver.New(buildServerConfig(cfg, sn, fw))
+	srv, err := onvifserver.New(buildServerConfig(cfg, sn, fw, ip))
 	if err != nil {
 		log.Fatalf("[onvif] server config failed: %v", err)
 	}
@@ -112,6 +115,10 @@ func main() {
 		}
 		log.Printf("[onvif] LAN IP changed -> %s; updating URIs and re-announcing", newIP)
 		applyStreamURIs(srv, cfg, newIP)
+		// Keep the advertised host in sync so GetCapabilities/GetServices XAddrs
+		// resolve to the new IP. A concurrent SOAP read of this field during the
+		// rare IP transition is a benign torn read that self-corrects on retry.
+		srv.GetConfig().Host = newIP
 		responder.SetXAddrs([]string{deviceXAddr(newIP, cfg)})
 		if err := responder.SendHello(); err != nil {
 			log.Printf("[onvif] re-announce Hello failed: %v", err)
@@ -160,15 +167,18 @@ func main() {
 	log.Printf("[onvif] SOAP Device/Media service on :%d%s (rtsp=:%d, ip=%s)",
 		cfg.Service.HTTPPort, cfg.Service.BasePath, cfg.RTSP.Port, ip)
 
-	if err := srv.Start(ctx); err != nil {
+	if err := startSOAPServer(ctx, srv, cfg); err != nil {
 		log.Fatalf("[onvif] SOAP server stopped with error: %v", err)
 	}
 	log.Printf("[onvif] shutdown complete")
 }
 
 // buildServerConfig maps the service config onto the onvif-go server Config.
-// PTZ/Imaging are disabled for Phase 1 (Streaming profile only).
-func buildServerConfig(cfg *config.Config, sn, fw string) *onvifserver.Config {
+// PTZ/Imaging are disabled for Phase 1 (Streaming profile only). Host is the
+// advertised LAN IP used to build XAddrs; the HTTP listener always binds 0.0.0.0
+// (see startSOAPServer), decoupling bind from advertise so GetCapabilities does
+// not fall back to "localhost" like the library does when Host == "0.0.0.0".
+func buildServerConfig(cfg *config.Config, sn, fw, ip string) *onvifserver.Config {
 	profiles := make([]onvifserver.ProfileConfig, 0, len(cfg.Profiles))
 	for _, p := range cfg.Profiles {
 		profiles = append(profiles, onvifserver.ProfileConfig{
@@ -194,7 +204,7 @@ func buildServerConfig(cfg *config.Config, sn, fw string) *onvifserver.Config {
 
 	user, pass := resolveAuth(cfg)
 	return &onvifserver.Config{
-		Host:     "0.0.0.0", // bind all interfaces; advertise-host is set per-profile below
+		Host:     ip, // advertised host for XAddrs; bind is always 0.0.0.0 in startSOAPServer
 		Port:     cfg.Service.HTTPPort,
 		BasePath: cfg.Service.BasePath,
 		Timeout:  soapTimeout,
@@ -283,4 +293,124 @@ func resolveIPWithRetries(iface string) string {
 	}
 	log.Printf("[onvif] WARNING: no LAN IP on %s after %d tries; will retry in background", iface, ipStartupTries)
 	return ""
+}
+
+// startSOAPServer runs the ONVIF Device + Media SOAP services over HTTP.
+//
+// We deliberately do not call onvifserver.Server.Start: it hardcodes the
+// media-service action keys as "GetStreamURI"/"GetSnapshotURI" (capital URI) and
+// tags the responses GetStreamURIResponse. The ONVIF Media WSDL spells these
+// GetStreamUri/GetSnapshotUri (lowercase Uri), so strict clients (ONVIF Device
+// Manager, gSOAP-generated NVR stubs) never match and GetStreamUri faults with
+// "No handler for action". registerMediaRoutes re-registers the handlers under
+// the spec-correct keys and retypes the responses so the wire output conforms.
+//
+// The listener binds 0.0.0.0; Config.Host carries only the advertised host used
+// to build XAddrs (set to the real LAN IP in buildServerConfig/refresh).
+func startSOAPServer(ctx context.Context, srv *onvifserver.Server, cfg *config.Config) error {
+	mux := http.NewServeMux()
+	registerDeviceRoutes(mux, srv)
+	registerMediaRoutes(mux, srv)
+
+	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Service.HTTPPort)
+	httpServer := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  soapTimeout,
+		WriteTimeout: soapTimeout,
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		log.Printf("[onvif] SOAP listening on %s", addr)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errChan <- err
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("[onvif] SOAP shutting down")
+		const shutdownTimeout = 5 * time.Second
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+
+		return httpServer.Shutdown(shutdownCtx)
+	case err := <-errChan:
+		return err
+	}
+}
+
+// registerDeviceRoutes wires the Device service. The action keys here
+// (GetSystemDateAndTime, GetDeviceInformation, GetCapabilities, GetServices)
+// match the ONVIF Device WSDL verbatim, so they are registered as-is.
+func registerDeviceRoutes(mux *http.ServeMux, srv *onvifserver.Server) {
+	c := srv.GetConfig()
+	d := newSOAPDispatcher(c.Username, c.Password)
+	d.handle("GetSystemDateAndTime", srv.HandleGetSystemDateAndTime)
+	d.handle("GetDeviceInformation", srv.HandleGetDeviceInformation)
+	d.handle("GetCapabilities", srv.HandleGetCapabilities)
+	d.handle("GetServices", srv.HandleGetServices)
+	mux.Handle(c.BasePath+"/device_service", d)
+}
+
+// registerMediaRoutes wires the Media service under spec-correct action keys.
+// GetProfiles and GetVideoSources need no correction; GetStreamUri and
+// GetSnapshotUri are registered with lowercase "Uri" (the ONVIF WSDL spelling)
+// and wrapped so their responses use the spec-correct element tags.
+func registerMediaRoutes(mux *http.ServeMux, srv *onvifserver.Server) {
+	c := srv.GetConfig()
+	d := newSOAPDispatcher(c.Username, c.Password)
+	d.handle("GetProfiles", srv.HandleGetProfiles)
+	d.handle("GetVideoSources", srv.HandleGetVideoSources)
+	d.handle("GetStreamUri", streamUriHandler(srv))
+	d.handle("GetSnapshotUri", snapshotUriHandler(srv))
+	mux.Handle(c.BasePath+"/media_service", d)
+}
+
+// streamUriResponse mirrors onvifserver.GetStreamURIResponse but tags the
+// wrapper element GetStreamUriResponse — the spelling every ONVIF client
+// expects (the library's capital-URI tag is non-conformant).
+type streamUriResponse struct {
+	XMLName  xml.Name             `xml:"http://www.onvif.org/ver10/media/wsdl GetStreamUriResponse"`
+	MediaUri onvifserver.MediaURI `xml:"MediaUri"`
+}
+
+// streamUriHandler delegates to the library's GetStreamURI logic (profile
+// lookup + StreamURI override) and retypes the response for wire conformance.
+func streamUriHandler(srv *onvifserver.Server) soapHandlerFunc {
+	return func(body interface{}) (interface{}, error) {
+		resp, err := srv.HandleGetStreamURI(body)
+		if err != nil {
+			return nil, err
+		}
+		lib, ok := resp.(*onvifserver.GetStreamURIResponse)
+		if !ok {
+			return resp, nil
+		}
+
+		return &streamUriResponse{MediaUri: lib.MediaURI}, nil
+	}
+}
+
+// snapshotUriResponse mirrors onvifserver.GetSnapshotURIResponse with the
+// spec-correct GetSnapshotUriResponse wrapper tag.
+type snapshotUriResponse struct {
+	XMLName  xml.Name             `xml:"http://www.onvif.org/ver10/media/wsdl GetSnapshotUriResponse"`
+	MediaUri onvifserver.MediaURI `xml:"MediaUri"`
+}
+
+func snapshotUriHandler(srv *onvifserver.Server) soapHandlerFunc {
+	return func(body interface{}) (interface{}, error) {
+		resp, err := srv.HandleGetSnapshotURI(body)
+		if err != nil {
+			return nil, err
+		}
+		lib, ok := resp.(*onvifserver.GetSnapshotURIResponse)
+		if !ok {
+			return resp, nil
+		}
+
+		return &snapshotUriResponse{MediaUri: lib.MediaURI}, nil
+	}
 }
