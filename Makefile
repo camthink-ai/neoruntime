@@ -111,10 +111,10 @@ proto-app:
 
 proto-lens:
 	@mkdir -p platform/device-control/lens/lenspb
-	$(PROTOC) --proto_path=platform/camera-daemon/proto $(PROTOC_OPT) \
-		--go_out=platform/device-control/lens/lenspb --go_opt=paths=source_relative \
-		--go-grpc_out=platform/device-control/lens/lenspb --go-grpc_opt=paths=source_relative \
-		platform/camera-daemon/proto/lens_hal.proto
+	cd platform/camera-daemon/proto && $(PROTOC) $(PROTOC_OPT) \
+		--go_out=../../device-control/lens/lenspb --go_opt=paths=source_relative \
+		--go-grpc_out=../../device-control/lens/lenspb --go-grpc_opt=paths=source_relative \
+		lens_hal.proto
 
 proto-discovery:
 	cd platform/device-discovery/proto && $(PROTOC) $(PROTO_GO_PLUGIN) discovery.proto
