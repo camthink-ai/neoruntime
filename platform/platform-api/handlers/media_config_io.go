@@ -3,14 +3,16 @@ package handlers
 // Unified media-config import/export (Option B aggregation layer).
 //
 // The device media config is fragmented across one base YAML
-// (camera-daemon.yaml) and six runtime-override JSON files under
-// /data/aipc/etc. No single component holds the full picture, which is the
-// real obstacle for "clone this device's config onto another device".
+// (camera-daemon.yaml) and seven runtime-override JSON files under
+// /data/aipc/etc (osd / privacy_mask / transform / isp / profile /
+// media_config_fields / lens). No single component holds the full picture,
+// which is the real obstacle for "clone this device's config onto another
+// device".
 //
 // Export aggregates all seven sources into one versioned envelope (pure read,
 // zero side effects). Import validates the envelope, snapshots the current
-// files for rollback, atomically writes them back, then restarts camera-daemon
-// whose boot replay (camera_daemon.cpp load_* sequence) is the apply engine.
+// files for rollback, atomically writes them back, then restarts
+// camera-daemon and device-control whose boot replays are the apply engine.
 // camera-daemon's loaders are fault-tolerant (miss/corrupt = WARN+skip, not
 // abort), so even a bad import degrades gracefully instead of bricking boot.
 //
@@ -50,6 +52,7 @@ const (
 	ispCfgPath          = mediaEtcDir + "/isp_config.json"
 	profileCfgPath      = mediaEtcDir + "/profile_config.json"
 	scalarFieldsCfgPath = mediaEtcDir + "/media_config_fields.json"
+	lensCfgPath         = mediaEtcDir + "/lens_config.json"
 	mediaBackupRoot     = mediaEtcDir + "/backup"
 )
 
@@ -62,7 +65,7 @@ type mediaConfigEnvelope struct {
 	Config     mediaConfigPayload `json:"config"`
 }
 
-// mediaConfigPayload holds the seven config sources. The six JSON dimensions
+// mediaConfigPayload holds the eight config sources. The seven JSON dimensions
 // use json.RawMessage so they round-trip verbatim (no float/int coercion);
 // base_yaml is a map to match GetConfig's shape and to let import reuse the
 // YAML marshal/validate helpers. Omitempty means "missing file on export"
@@ -75,6 +78,7 @@ type mediaConfigPayload struct {
 	Isp          json.RawMessage        `json:"isp,omitempty"`
 	Profile      json.RawMessage        `json:"profile,omitempty"`
 	ScalarFields json.RawMessage        `json:"scalar_fields,omitempty"`
+	Lens         json.RawMessage        `json:"lens,omitempty"`
 }
 
 // mediaConfigDim ties a payload field to its on-disk path for the import loop.
@@ -84,7 +88,7 @@ type mediaConfigDim struct {
 	raw  json.RawMessage
 }
 
-// payloadDims returns the six JSON dimensions present in the payload.
+// payloadDims returns the seven JSON dimensions present in the payload.
 func (p mediaConfigPayload) payloadDims() []mediaConfigDim {
 	return []mediaConfigDim{
 		{"osd", osdConfigPath, p.Osd},
@@ -93,6 +97,7 @@ func (p mediaConfigPayload) payloadDims() []mediaConfigDim {
 		{"isp", ispCfgPath, p.Isp},
 		{"profile", profileCfgPath, p.Profile},
 		{"scalar_fields", scalarFieldsCfgPath, p.ScalarFields},
+		{"lens", lensCfgPath, p.Lens},
 	}
 }
 
@@ -126,6 +131,8 @@ func (p *mediaConfigPayload) assignRaw(path string, raw json.RawMessage) {
 		p.Profile = raw
 	case scalarFieldsCfgPath:
 		p.ScalarFields = raw
+	case lensCfgPath:
+		p.Lens = raw
 	}
 }
 
@@ -171,7 +178,7 @@ func (h *MediaHandlers) snapshotMediaConfig(targetDir string) error {
 	}
 	sources := append([]string{h.configPath},
 		osdConfigPath, privacyMaskCfgPath, transformCfgPath,
-		ispCfgPath, profileCfgPath, scalarFieldsCfgPath)
+		ispCfgPath, profileCfgPath, scalarFieldsCfgPath, lensCfgPath)
 	for _, src := range sources {
 		if src == "" {
 			continue
@@ -189,18 +196,29 @@ func (h *MediaHandlers) snapshotMediaConfig(targetDir string) error {
 }
 
 // ExportMediaConfig (GET /api/v1/media/config/export) returns a versioned
-// envelope aggregating the base YAML plus all six runtime-override JSONs.
+// envelope aggregating the base YAML plus all seven runtime-override JSONs.
 // Pure read: no gRPC, no writes, no restart.
 func (h *MediaHandlers) ExportMediaConfig(c *gin.Context) {
+	env, err := h.buildMediaEnvelope()
+	if err != nil {
+		Resp(c).FailMsg(CodeCameraError, "Failed to build media config envelope: "+err.Error())
+		return
+	}
+	Resp(c).OK(env)
+}
+
+// buildMediaEnvelope reads the base YAML and every runtime-override JSON,
+// folding them into one versioned envelope. Shared by the pure-JSON export
+// (ExportMediaConfig) and the OSD-image bundle (ExportMediaBundle) so the two
+// always agree on what "the media config" is. Pure read.
+func (h *MediaHandlers) buildMediaEnvelope() (mediaConfigEnvelope, error) {
 	data, err := os.ReadFile(h.configPath)
 	if err != nil {
-		Resp(c).FailMsg(CodeCameraError, "Failed to read base config: "+err.Error())
-		return
+		return mediaConfigEnvelope{}, fmt.Errorf("read base config: %w", err)
 	}
 	var baseRaw map[string]interface{}
 	if err := yaml.Unmarshal(data, &baseRaw); err != nil {
-		Resp(c).FailMsg(CodeCameraError, "Failed to parse base config: "+err.Error())
-		return
+		return mediaConfigEnvelope{}, fmt.Errorf("parse base config: %w", err)
 	}
 	// cleanMaps normalizes any map[interface{}]interface{} from yaml.v3 into
 	// JSON-friendly map[string]interface{}. Export deliberately does NOT inject
@@ -229,15 +247,42 @@ func (h *MediaHandlers) ExportMediaConfig(c *gin.Context) {
 	if hn, err := os.Hostname(); err == nil && hn != "" {
 		env.Device = map[string]string{"hostname": hn}
 	}
+	return env, nil
+}
 
-	Resp(c).OK(env)
+// validateMediaEnvelope checks schema/version/emptiness and base_yaml shape
+// before any write. Shared by ImportMediaConfig and ImportMediaBundle so both
+// reject bad input identically and at the same point. On success the base_yaml
+// map is normalized in place (ints restored), ready to marshal.
+func validateMediaEnvelope(env *mediaConfigEnvelope) error {
+	if env.Schema != mediaConfigSchema {
+		return fmt.Errorf("unsupported schema %q (expected %q)", env.Schema, mediaConfigSchema)
+	}
+	if env.Version != mediaConfigVersion {
+		return fmt.Errorf("unsupported envelope version %d (expected %d)", env.Version, mediaConfigVersion)
+	}
+	if env.Config.isEmpty() {
+		return fmt.Errorf("envelope carries no config to import")
+	}
+	if len(env.Config.BaseYAML) != 0 {
+		// Normalize JSON-decoded floats (e.g. width 1920.0) back to ints before
+		// validation, exactly as SetConfig does, to avoid the 4.032e+06 emit bug.
+		if err := normalizeMediaConfigNumbers(env.Config.BaseYAML); err != nil {
+			return fmt.Errorf("base_yaml: %w", err)
+		}
+		if err := validateMediaConfigEncoders(env.Config.BaseYAML); err != nil {
+			return fmt.Errorf("base_yaml: %w", err)
+		}
+	}
+	return nil
 }
 
 // ImportMediaConfig (POST /api/v1/media/config/import) applies a previously
 // exported envelope: validate → snapshot current files → atomically write the
 // YAML (via projectMediaConfig) and any present JSONs → restart camera-daemon
-// so its boot replay picks everything up. The original files are preserved in
-// a timestamped backup dir returned in the response for manual rollback.
+// + device-control so their boot replays pick everything up. The original
+// files are preserved in a timestamped backup dir returned in the response for
+// manual rollback.
 func (h *MediaHandlers) ImportMediaConfig(c *gin.Context) {
 	if !requireJSONContentType(c) {
 		return
@@ -248,85 +293,17 @@ func (h *MediaHandlers) ImportMediaConfig(c *gin.Context) {
 		Resp(c).FailMsg(CodeInvalidJSON, "Invalid request body: "+err.Error())
 		return
 	}
-	if env.Schema != mediaConfigSchema {
-		Resp(c).FailTyped(CodeInvalidParameter, "validation",
-			fmt.Sprintf("unsupported schema %q (expected %q)", env.Schema, mediaConfigSchema))
+	if verr := validateMediaEnvelope(&env); verr != nil {
+		Resp(c).FailTyped(CodeInvalidParameter, "validation", verr.Error())
 		return
 	}
-	if env.Version != mediaConfigVersion {
-		Resp(c).FailTyped(CodeInvalidParameter, "validation",
-			fmt.Sprintf("unsupported envelope version %d (expected %d)", env.Version, mediaConfigVersion))
-		return
-	}
-	if env.Config.isEmpty() {
-		Resp(c).FailMsg(CodeInvalidParameter, "envelope carries no config to import")
-		return
-	}
-
-	// Hold the same lock SetConfig uses so a concurrent web edit can't interleave.
-	h.configMu.Lock()
-	defer h.configMu.Unlock()
 
 	actor := getUsernameFromContext(c)
-	backupDir := filepath.Join(mediaBackupRoot,
-		"media-config-"+time.Now().UTC().Format("20060102-150405"))
-	if err := h.snapshotMediaConfig(backupDir); err != nil {
-		Resp(c).FailMsg(CodeCameraError, "Failed to snapshot current config: "+err.Error())
-		return
-	}
-
-	applied := gin.H{}
-	// Partial-failure note: if a later step fails after some files are written,
-	// camera-daemon has NOT been restarted, so the live state is unchanged;
-	// the on-disk edits are recoverable from backupDir (returned in errors and
-	// in the success response).
-	if len(env.Config.BaseYAML) != 0 {
-		cfg := env.Config.BaseYAML
-		// Normalize JSON-decoded floats (e.g. width 1920.0) back to ints before
-		// validation, exactly as SetConfig does, to avoid the 4.032e+06 emit bug.
-		if err := normalizeMediaConfigNumbers(cfg); err != nil {
-			Resp(c).FailTyped(CodeInvalidParameter, "validation", "base_yaml: "+err.Error())
-			return
-		}
-		if err := validateMediaConfigEncoders(cfg); err != nil {
-			Resp(c).FailTyped(CodeInvalidParameter, "validation", "base_yaml: "+err.Error())
-			return
-		}
-		out, err := marshalMediaConfig(cfg) // re-normalizes (idempotent) + marshals
-		if err != nil {
-			Resp(c).FailMsg(CodeCameraError, "Failed to encode base_yaml: "+err.Error())
-			return
-		}
-		if err := h.projectMediaConfig(c.Request.Context(), actor, string(out)); err != nil {
-			Resp(c).FailMsg(CodeCameraError, "Failed to write base_yaml (backup at "+backupDir+"): "+err.Error())
-			return
-		}
-		applied["base_yaml"] = true
-	}
-
-	for _, d := range env.Config.payloadDims() {
-		if len(d.raw) == 0 {
-			continue
-		}
-		if err := atomicWriteJSON(d.path, d.raw); err != nil {
-			Resp(c).FailMsg(CodeCameraError,
-				fmt.Sprintf("Failed to write %s (backup at %s): %s", d.name, backupDir, err.Error()))
-			return
-		}
-		applied[d.name] = true
-	}
-
-	// Apply = restart camera-daemon so its boot replay reloads all six JSONs +
-	// the base YAML. platform-api itself is unaffected; its gRPC connection
-	// reconnects on its own. Blocking (~few seconds); a generous timeout keeps
-	// a slow startup from surfacing as a client disconnect.
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
-	if err := exec.CommandContext(ctx, "systemctl", "restart", "camera-daemon").Run(); err != nil {
-		// Files are written and backed up; only the restart failed. Report it
-		// distinctly so the operator can restart manually rather than re-import.
-		Resp(c).FailTyped(CodeCameraError, "restart",
-			"files written (backup at "+backupDir+") but camera-daemon restart failed: "+err.Error())
+	applied, backupDir, err := h.applyImportedMediaConfig(ctx, actor, env)
+	if err != nil {
+		Resp(c).FailTyped(CodeCameraError, "import", err.Error())
 		return
 	}
 
@@ -338,7 +315,59 @@ func (h *MediaHandlers) ImportMediaConfig(c *gin.Context) {
 	Resp(c).OK(gin.H{
 		"applied":    true,
 		"backup_dir": backupDir,
-		"restart":    "camera-daemon",
+		"restart":    "camera-daemon,device-control",
 		"items":      applied,
 	})
+}
+
+// applyImportedMediaConfig is the write path shared by ImportMediaConfig and
+// ImportMediaBundle. It snapshots the current base YAML + seven JSONs for
+// rollback, writes the envelope (base_yaml via projectMediaConfig so the
+// config Controller sees it; JSONs via atomic tmp+rename), then restarts
+// camera-daemon + device-control whose boot replays are the apply engine.
+// Caller validates the envelope first. Holds configMu. The applied map is
+// returned non-empty even when the restart step fails (files are already on
+// disk and recoverable from backupDir); err is then non-nil too.
+func (h *MediaHandlers) applyImportedMediaConfig(ctx context.Context, actor string, env mediaConfigEnvelope) (gin.H, string, error) {
+	// Hold the same lock SetConfig uses so a concurrent web edit can't interleave.
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+
+	backupDir := filepath.Join(mediaBackupRoot,
+		"media-config-"+time.Now().UTC().Format("20060102-150405"))
+	if err := h.snapshotMediaConfig(backupDir); err != nil {
+		return nil, backupDir, fmt.Errorf("snapshot current config: %w", err)
+	}
+
+	applied := gin.H{}
+	// Partial-failure note: if a later step fails after some files are written,
+	// the services have NOT been restarted, so the live state is unchanged; the
+	// on-disk edits are recoverable from backupDir (returned in the response).
+	if len(env.Config.BaseYAML) != 0 {
+		out, err := marshalMediaConfig(env.Config.BaseYAML) // re-normalizes (idempotent) + marshals
+		if err != nil {
+			return nil, backupDir, fmt.Errorf("encode base_yaml: %w", err)
+		}
+		if err := h.projectMediaConfig(ctx, actor, string(out)); err != nil {
+			return nil, backupDir, fmt.Errorf("write base_yaml (backup at %s): %w", backupDir, err)
+		}
+		applied["base_yaml"] = true
+	}
+
+	for _, d := range env.Config.payloadDims() {
+		if len(d.raw) == 0 {
+			continue
+		}
+		if err := atomicWriteJSON(d.path, d.raw); err != nil {
+			return nil, backupDir, fmt.Errorf("write %s (backup at %s): %w", d.name, backupDir, err)
+		}
+		applied[d.name] = true
+	}
+
+	// Apply = restart camera-daemon (boot replay reloads the six media JSONs +
+	// base YAML) and device-control (replays lens_config.json → iris_target).
+	if err := exec.CommandContext(ctx, "systemctl", "restart", "camera-daemon", "device-control").Run(); err != nil {
+		return applied, backupDir, fmt.Errorf("service restart failed (files written, backup at %s): %w", backupDir, err)
+	}
+	return applied, backupDir, nil
 }
