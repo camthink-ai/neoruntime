@@ -294,6 +294,8 @@
       "reconnected": "Reconnected",
       "invalid_json": "File is not valid JSON",
       "export_failed": "Export failed",
+      "export": "Export backup",
+      "import": "Import / restore",
       "risk": {
         "low": "Low risk",
         "mid": "Medium risk",
@@ -328,7 +330,7 @@
         "models": "AI models",
         "network": "Network identity"
       },
-      "import": {
+      "importTiers": {
         "config": {
           "title": "Import media config",
           "desc": "Select a previously exported .json file"

@@ -114,9 +114,9 @@ export default function BackupMigrate() {
       <ImportFileTransferDialog
         open={importOpen}
         onOpenChange={setImportOpen}
-        title={t('maintenance.backup.import.clone.title', '导入整机克隆')}
+        title={t('maintenance.backup.importTiers.clone.title', '导入整机克隆')}
         description={t(
-          'maintenance.backup.import.clone.desc',
+          'maintenance.backup.importTiers.clone.desc',
           '选择之前导出的 .tar.gz 克隆文件'
         )}
         accept={ACCEPT_GZIP}

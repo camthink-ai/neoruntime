@@ -294,6 +294,8 @@
       "reconnected": "已重连",
       "invalid_json": "文件不是有效的 JSON",
       "export_failed": "导出失败",
+      "export": "导出备份",
+      "import": "导入恢复",
       "risk": {
         "low": "低风险",
         "mid": "中风险",
@@ -328,7 +330,7 @@
         "models": "AI 模型",
         "network": "网络身份"
       },
-      "import": {
+      "importTiers": {
         "config": {
           "title": "导入媒体配置",
           "desc": "选择此前导出的 .json 文件"
