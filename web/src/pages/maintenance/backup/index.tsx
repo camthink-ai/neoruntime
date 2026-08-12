@@ -92,7 +92,7 @@ export default function BackupMigrate() {
                 : t('maintenance.backup.export', '导出备份')}
             </Button>
             <Button
-              variant="outline"
+              variant="secondary"
               className="flex-1 gap-2"
               onClick={() => setImportOpen(true)}
             >
