@@ -292,7 +292,7 @@
       "clone_disconnect_warn": "This restarts core services — the UI will briefly disconnect, then reconnect automatically.",
       "reconnecting": "Applying — reconnecting…",
       "reconnected": "Reconnected",
-      "invalid_json": "File is not valid JSON",
+      "invalid_json": "The backup file is invalid or corrupted. Make sure it's a valid export from a matching device.",
       "export_failed": "Export failed",
       "export": "Export backup",
       "import": "Import / restore",

@@ -292,7 +292,7 @@
       "clone_disconnect_warn": "此操作会重启核心服务 —— 界面将短暂断开，随后自动重连。",
       "reconnecting": "应用中 —— 正在重连…",
       "reconnected": "已重连",
-      "invalid_json": "文件不是有效的 JSON",
+      "invalid_json": "备份文件无效或已损坏，请确认是从同型号设备导出的正确备份文件",
       "export_failed": "导出失败",
       "export": "导出备份",
       "import": "导入恢复",
