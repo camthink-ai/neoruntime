@@ -289,7 +289,7 @@
       "version": "版本",
       "impact": "影响",
       "identity_preserved": "目标机保留",
-      "clone_disconnect_warn": "此操作会重启 platform-api —— 界面将短暂断开，随后自动重连。",
+      "clone_disconnect_warn": "此操作会重启核心服务 —— 界面将短暂断开，随后自动重连。",
       "reconnecting": "应用中 —— 正在重连…",
       "reconnected": "已重连",
       "invalid_json": "文件不是有效的 JSON",
@@ -302,22 +302,22 @@
       "tier": {
         "config": {
           "title": "媒体配置 (JSON)",
-          "desc": "8 维媒体配置，不含图像字节",
-          "effect1": "覆盖 8 维媒体配置（基础 YAML + osd / 隐私遮罩 / 变换 / ISP / 配置档 / 标量字段 / 镜头）",
-          "effect2": "重启 camera-daemon + device-control（约 10 秒）"
+          "desc": "仅相机图像与媒体设置（不含叠加图）",
+          "effect1": "用导入文件替换本机的相机图像与媒体设置",
+          "effect2": "相机服务将重启（约 10 秒），实时画面短暂中断"
         },
         "bundle": {
           "title": "媒体配置 Bundle",
-          "desc": "配置 + OSD 叠加图",
-          "effect1": "覆盖媒体配置和 OSD 叠加图",
-          "effect2": "重启 camera-daemon + device-control（约 10 秒）",
-          "effect3": "包含二进制图像字节（约 25MB）"
+          "desc": "相机设置 + 屏幕叠加图（图标/文字）",
+          "effect1": "替换本机的相机设置与屏幕叠加图",
+          "effect2": "相机服务将重启（约 10 秒），实时画面短暂中断",
+          "effect3": "文件较大（约 25MB，含图像）"
         },
         "clone": {
           "title": "整机克隆",
-          "desc": "整机配置 + 4 张状态表",
-          "effect1": "覆盖整机配置和 4 张状态表（platform / media / device-control / events）",
-          "effect2": "重新生成设备身份并重启多个服务（含 platform-api）"
+          "desc": "整机全部配置",
+          "effect1": "用导入文件替换整机的全部配置（所有设置）",
+          "effect2": "重新生成设备身份证书，并重启核心服务 —— 网页界面会短暂断开，随后自动重连"
         }
       },
       "identity": {
@@ -352,11 +352,11 @@
       },
       "confirm_action": "应用",
       "confirm_low_title": "确认导入",
-      "confirm_low_desc": "此操作将覆盖 8 维媒体配置并重启 camera-daemon + device-control。此操作无法撤销。",
+      "confirm_low_desc": "此操作将替换相机图像与媒体设置，相机服务将重启。此操作无法撤销。",
       "confirm_mid_title": "确认导入",
       "confirm_mid_desc": "此操作将覆盖当前媒体配置和叠加图，并重启相机服务。此操作无法撤销。",
       "confirm_high_title": "确认整机克隆",
-      "confirm_high_desc": "此操作将覆盖目标设备配置和 4 张状态表。身份（密码、证书、设备名、应用、模型）予以保留。此操作无法撤销。"
+      "confirm_high_desc": "此操作将替换目标设备的全部配置，并重新生成设备身份证书；账户信息（密码、设备名、应用、模型）予以保留。此操作无法撤销。"
     }
   }
 }

@@ -289,7 +289,7 @@
       "version": "Version",
       "impact": "Impact",
       "identity_preserved": "Preserved on target",
-      "clone_disconnect_warn": "This restarts platform-api — the UI will briefly disconnect, then reconnect automatically.",
+      "clone_disconnect_warn": "This restarts core services — the UI will briefly disconnect, then reconnect automatically.",
       "reconnecting": "Applying — reconnecting…",
       "reconnected": "Reconnected",
       "invalid_json": "File is not valid JSON",
@@ -302,22 +302,22 @@
       "tier": {
         "config": {
           "title": "Media config (JSON)",
-          "desc": "8-dimension media config, no image bytes",
-          "effect1": "Overwrites the 8-dimension media config (base YAML + osd / privacy mask / transform / ISP / profile / scalar fields / lens)",
-          "effect2": "Restarts camera-daemon + device-control (~10s)"
+          "desc": "Camera image & media settings only (no overlay images)",
+          "effect1": "Replaces this device's camera image and media settings with the imported file's",
+          "effect2": "Camera service restarts (~10s); live view pauses briefly"
         },
         "bundle": {
           "title": "Media config bundle",
-          "desc": "Config + OSD overlay images",
-          "effect1": "Overwrites the media config and OSD overlay images",
-          "effect2": "Restarts camera-daemon + device-control (~10s)",
-          "effect3": "Includes binary image bytes (~25MB)"
+          "desc": "Camera settings + on-screen overlay images (logos/text)",
+          "effect1": "Replaces this device's camera settings and on-screen overlay images",
+          "effect2": "Camera service restarts (~10s); live view pauses briefly",
+          "effect3": "Larger file (~25MB, contains images)"
         },
         "clone": {
           "title": "Full device clone",
-          "desc": "Full device config + 4 state tables",
-          "effect1": "Overwrites the full device config and 4 state tables (platform / media / device-control / events)",
-          "effect2": "Regenerates device identity and restarts several services (including platform-api)"
+          "desc": "Entire device configuration",
+          "effect1": "Replaces the entire device configuration (all settings) with the imported file's",
+          "effect2": "Regenerates the device identity certificate and restarts core services — the web UI will disconnect briefly, then reconnect automatically"
         }
       },
       "identity": {
@@ -352,11 +352,11 @@
       },
       "confirm_action": "Apply",
       "confirm_low_title": "Confirm import",
-      "confirm_low_desc": "This overwrites the 8-dimension media config and restarts camera-daemon + device-control. This action cannot be undone.",
+      "confirm_low_desc": "This replaces the camera image and media settings; the camera service restarts. This action cannot be undone.",
       "confirm_mid_title": "Confirm import",
       "confirm_mid_desc": "This overwrites the current media config and overlay images, then restarts the camera services. This action cannot be undone.",
       "confirm_high_title": "Confirm full-device clone",
-      "confirm_high_desc": "This overwrites the target device config and 4 state tables. Identity (password, certificates, device name, apps, models) is preserved. This action cannot be undone."
+      "confirm_high_desc": "This replaces the target device's entire configuration and regenerates its identity certificate; account info (password, device name, apps, models) is preserved. This action cannot be undone."
     }
   }
 }
