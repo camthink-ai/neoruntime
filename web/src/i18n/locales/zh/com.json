@@ -121,7 +121,9 @@
     "next": "下一步",
     "back": "返回",
     "yes": "是",
-    "no": "否"
+    "no": "否",
+    "export": "导出",
+    "import": "导入"
   },
   "events": {
     "title": "事件中心",
@@ -276,6 +278,85 @@
       "detail_ppid": "父进程 ID",
       "detail_status": "状态",
       "detail_username": "用户"
+    },
+    "backup": {
+      "title": "备份与迁移",
+      "subtitle": "导出/导入设备配置，以在相同型号设备间复制设置或执行整机克隆。",
+      "drop_hint": "将文件拖到此处，或点击选择",
+      "file": "文件",
+      "size": "大小",
+      "schema": "结构",
+      "version": "版本",
+      "impact": "影响",
+      "identity_preserved": "目标机保留",
+      "clone_disconnect_warn": "此操作会重启 platform-api —— 界面将短暂断开，随后自动重连。",
+      "reconnecting": "应用中 —— 正在重连…",
+      "reconnected": "已重连",
+      "invalid_json": "文件不是有效的 JSON",
+      "export_failed": "导出失败",
+      "risk": {
+        "low": "低风险",
+        "mid": "中风险",
+        "high": "高风险"
+      },
+      "tier": {
+        "config": {
+          "title": "媒体配置 (JSON)",
+          "desc": "8 维媒体配置，不含图像字节",
+          "effect1": "覆盖 8 维媒体配置（基础 YAML + osd / 隐私遮罩 / 变换 / ISP / 配置档 / 标量字段 / 镜头）",
+          "effect2": "重启 camera-daemon + device-control（约 10 秒）"
+        },
+        "bundle": {
+          "title": "媒体配置 Bundle",
+          "desc": "配置 + OSD 叠加图",
+          "effect1": "覆盖媒体配置和 OSD 叠加图",
+          "effect2": "重启 camera-daemon + device-control（约 10 秒）",
+          "effect3": "包含二进制图像字节（约 25MB）"
+        },
+        "clone": {
+          "title": "整机克隆",
+          "desc": "整机配置 + 4 张状态表",
+          "effect1": "覆盖整机配置和 4 张状态表（platform / media / device-control / events）",
+          "effect2": "重新生成设备身份并重启多个服务（含 platform-api）"
+        }
+      },
+      "identity": {
+        "password": "管理员密码",
+        "certificates": "TLS 证书",
+        "device_name": "设备名称",
+        "apps": "已安装应用",
+        "models": "AI 模型",
+        "network": "网络身份"
+      },
+      "import": {
+        "config": {
+          "title": "导入媒体配置",
+          "desc": "选择此前导出的 .json 文件"
+        },
+        "bundle": {
+          "title": "导入媒体 Bundle",
+          "desc": "选择此前导出的 .tar.gz 文件"
+        },
+        "clone": {
+          "title": "导入整机克隆",
+          "desc": "选择此前导出的 .tar.gz 文件"
+        }
+      },
+      "toast": {
+        "export_config": "媒体配置已导出",
+        "export_bundle": "媒体 Bundle 已导出",
+        "export_clone": "整机克隆已导出",
+        "import_config": "媒体配置已导入",
+        "import_bundle": "媒体 Bundle 已导入",
+        "import_clone": "整机克隆已导入"
+      },
+      "confirm_action": "应用",
+      "confirm_low_title": "确认导入",
+      "confirm_low_desc": "此操作将覆盖 8 维媒体配置并重启 camera-daemon + device-control。此操作无法撤销。",
+      "confirm_mid_title": "确认导入",
+      "confirm_mid_desc": "此操作将覆盖当前媒体配置和叠加图，并重启相机服务。此操作无法撤销。",
+      "confirm_high_title": "确认整机克隆",
+      "confirm_high_desc": "此操作将覆盖目标设备配置和 4 张状态表。身份（密码、证书、设备名、应用、模型）予以保留。此操作无法撤销。"
     }
   }
 }
