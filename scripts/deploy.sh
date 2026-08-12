@@ -543,20 +543,45 @@ validate_hal_runtime_deps() {
     (( failed == 0 ))
 }
 
+aipc_os_updater_supports_exchange_dirs() {
+    local candidate="$1" probe
+    [[ -x "$candidate" && -s "$candidate" ]] || return 1
+
+    # Probe without OLD/NEW paths: new helpers fail safely with the
+    # command-specific argument error, while legacy helpers reject the command
+    # or only print the old usage string. Keep stderr captured so probing an old
+    # helper does not leak a confusing usage line into deploy logs.
+    probe="$("$candidate" exchange-dirs 2>&1 || true)"
+    case "$probe" in
+        *"exchange-dirs requires OLD and NEW directory paths"*|*"exchange-dirs OLD NEW"*)
+            return 0
+            ;;
+    esac
+
+    # Fallback for future wording changes in the Go helper.
+    command -v strings >/dev/null 2>&1 &&
+        strings "$candidate" 2>/dev/null | grep -q 'exchange-dirs'
+}
+
 exchange_dirs_with_helper() {
-    local left="$1" right="$2" helper candidate
+    local left="$1" right="$2" helper candidate seen="|"
     for candidate in \
+        "${STAGING_DIR:+$STAGING_DIR/libexec/aipc-os-updater}" \
+        "$right/libexec/aipc-os-updater" \
+        "$left/libexec/aipc-os-updater" \
         "$INSTALL_PREFIX/libexec/aipc-os-updater" \
-        "$PREVIOUS_DIR/libexec/aipc-os-updater" \
-        "$STAGING_DIR/libexec/aipc-os-updater" \
+        "${PREVIOUS_DIR:+$PREVIOUS_DIR/libexec/aipc-os-updater}" \
         "/usr/libexec/aipc-os-updater"; do
-        if [[ -x "$candidate" && -s "$candidate" ]]; then
+        [[ -n "$candidate" ]] || continue
+        case "$seen" in *"|$candidate|"*) continue ;; esac
+        seen="${seen}${candidate}|"
+        if aipc_os_updater_supports_exchange_dirs "$candidate"; then
             helper="$candidate"
             break
         fi
     done
     [[ -n "${helper:-}" ]] || {
-        err "No executable aipc-os-updater available for atomic directory exchange"
+        err "No aipc-os-updater with exchange-dirs support is available for atomic directory exchange"
         return 1
     }
     "$helper" exchange-dirs "$left" "$right"
@@ -1098,7 +1123,14 @@ prepare_staging() {
     mkdir -p "$STAGING_DIR"
 
     if [[ -d "$INSTALL_PREFIX" ]]; then
-        cp -a "$INSTALL_PREFIX"/. "$STAGING_DIR"/
+        local entry name
+        shopt -s dotglob nullglob
+        for entry in "$INSTALL_PREFIX"/*; do
+            name="$(basename -- "$entry")"
+            case "$name" in data|models|apps|logs|backups|images) continue ;; esac
+            cp -a "$entry" "$STAGING_DIR"/
+        done
+        shopt -u dotglob nullglob
     fi
 
     local package_root="$SCRIPT_DIR/opt/aipc"
@@ -1353,7 +1385,7 @@ create_backup() {
         shopt -s dotglob nullglob
         for entry in "$INSTALL_PREFIX"/*; do
             name="$(basename -- "$entry")"
-            case "$name" in data|models|apps|logs) continue ;; esac
+            case "$name" in data|models|apps|logs|backups|images) continue ;; esac
             cp -a "$entry" "$backup_dir/release/"
         done
         shopt -u dotglob nullglob
