@@ -169,7 +169,15 @@ type soapFault struct {
 	Detail string `xml:"Detail,omitempty"`
 }
 
+// writeSOAPResponse renders the handler result. A prefixedBody is pre-rendered
+// Body XML using explicit tt:/tds:/trt: prefixes (see onvif_responses.go) and is
+// wrapped in a prefixed envelope that matches real ONVIF devices; any other type
+// is marshaled via encoding/xml (used by tests and faults).
 func writeSOAPResponse(w http.ResponseWriter, resp interface{}) {
+	if pb, ok := resp.(prefixedBody); ok {
+		writePrefixedSOAP(w, string(pb))
+		return
+	}
 	env := soapResponseEnvelope{}
 	env.Body.Content = resp
 	out, err := xml.Marshal(env)
@@ -182,6 +190,21 @@ func writeSOAPResponse(w http.ResponseWriter, resp interface{}) {
 	}
 	w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
 	_, _ = w.Write(out)
+}
+
+// writePrefixedSOAP wraps a pre-rendered inner Body in a SOAP 1.2 envelope that
+// declares the tt/tds/trt prefixes ONVIF clients expect on the Envelope. Real
+// ONVIF devices emit prefixed elements; ODM's .NET proxy is strict, so default-
+// namespace form is avoided on purpose.
+func writePrefixedSOAP(w http.ResponseWriter, inner string) {
+	env := `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"` +
+		` xmlns:tds="http://www.onvif.org/ver10/device/wsdl"` +
+		` xmlns:trt="http://www.onvif.org/ver10/media/wsdl"` +
+		` xmlns:tt="http://www.onvif.org/ver10/schema">` +
+		`<s:Body>` + inner + `</s:Body></s:Envelope>`
+	w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
+	_, _ = w.Write([]byte(env))
 }
 
 func writeSOAPFault(w http.ResponseWriter, code, reason, detail string) {

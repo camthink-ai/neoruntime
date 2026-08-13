@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha1" //nolint:gosec // ONVIF digest test fixture
 	"encoding/base64"
 	"encoding/xml"
@@ -454,5 +455,242 @@ func TestFirstElementName(t *testing.T) {
 		if got := firstElementName([]byte(tc.in)); got != tc.want {
 			t.Errorf("firstElementName(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// ttNS is the ONVIF schema ("tt") namespace that data-layer elements must use.
+const ttNS = "http://www.onvif.org/ver10/schema"
+
+// elemNamespace scans a SOAP response and returns the namespace URI of the
+// first start element whose local name matches. Namespace URI (not prefix) is
+// what strict WSDL proxies such as ONVIF Device Manager resolve against, so it
+// is the correct thing to assert regardless of prefix.
+func elemNamespace(body []byte, local string) string {
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		if se, ok := tok.(xml.StartElement); ok && se.Name.Local == local {
+			return se.Name.Space
+		}
+	}
+}
+
+// postDeviceAction posts an action to the device service and returns the body.
+func postDeviceAction(t *testing.T, srv *onvifserver.Server, action, inner string) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	registerDeviceRoutes(mux, srv)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	body := soapEnvelope(action, deviceNS, inner)
+	resp, err := http.Post(ts.URL+"/onvif/device_service", "application/soap+xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("%s status = %d, want 200; body=%s", action, resp.StatusCode, out)
+	}
+	return string(out)
+}
+
+// TestGetDeviceInformation_NamespaceDepth is the regression test for ODM's
+// "server returned invalid SOAP" on the Identification tab. GetDeviceInformation
+// and all its children (Manufacturer, Model, …) are locally-declared xs:string
+// elements in the device WSDL, so they all belong in device/wsdl — NOT the tt
+// schema namespace. (An earlier fix wrongly pushed them into tt, which broke
+// Maintenance and Identification.) The wrapper and every leaf must resolve to
+// device/wsdl.
+func TestGetDeviceInformation_NamespaceDepth(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+
+	// Act
+	body := postDeviceAction(t, srv, "GetDeviceInformation", "")
+
+	// Assert — wrapper and every leaf in device/wsdl (locally-declared elements).
+	if ns := elemNamespace([]byte(body), "GetDeviceInformationResponse"); ns != deviceNS {
+		t.Errorf("wrapper namespace = %q, want %q (device/wsdl)", ns, deviceNS)
+	}
+	for _, leaf := range []string{"Manufacturer", "Model", "FirmwareVersion", "SerialNumber"} {
+		if ns := elemNamespace([]byte(body), leaf); ns != deviceNS {
+			t.Errorf("%s namespace = %q, want %q (device/wsdl); body=%s", leaf, ns, deviceNS, body)
+		}
+	}
+}
+
+// TestGetCapabilities_NamespaceDepth asserts the correct depth: the response
+// wrapper and the locally-declared Capabilities bridge stay in device/wsdl,
+// while the children defined inside the tt:Capabilities type (Device, Media) and
+// their sub-children (XAddr) emit in the tt schema namespace.
+func TestGetCapabilities_NamespaceDepth(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+
+	// Act
+	body := postDeviceAction(t, srv, "GetCapabilities", "<Category>All</Category>")
+
+	// Assert
+	if ns := elemNamespace([]byte(body), "GetCapabilitiesResponse"); ns != deviceNS {
+		t.Errorf("wrapper namespace = %q, want %q (device/wsdl)", ns, deviceNS)
+	}
+	if ns := elemNamespace([]byte(body), "Capabilities"); ns != deviceNS {
+		t.Errorf("Capabilities bridge namespace = %q, want %q (device/wsdl); body=%s", ns, deviceNS, body)
+	}
+	for _, el := range []string{"Device", "Media", "XAddr"} {
+		if ns := elemNamespace([]byte(body), el); ns != ttNS {
+			t.Errorf("%s namespace = %q, want %q (schema); body=%s", el, ns, ttNS, body)
+		}
+	}
+}
+
+// TestGetProfiles_NamespaceDepth asserts the correct depth for media profiles:
+// the response wrapper and the locally-declared Profiles bridge stay in
+// media/wsdl, while the children defined inside tt:Profile (Name,
+// VideoEncoderConfiguration, Encoding, …) emit in the tt schema namespace —
+// which is what lets ODM decode profiles for live video.
+func TestGetProfiles_NamespaceDepth(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	mux := http.NewServeMux()
+	registerMediaRoutes(mux, srv)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Act
+	body := soapEnvelope("GetProfiles", mediaNS, "")
+	resp, err := http.Post(ts.URL+"/onvif/media_service", "application/soap+xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, out)
+	}
+
+	// Assert — wrapper and Profiles bridge in media/wsdl; tt-typed children in schema.
+	respBody := string(out)
+	if ns := elemNamespace([]byte(respBody), "GetProfilesResponse"); ns != mediaNS {
+		t.Errorf("wrapper namespace = %q, want %q (media/wsdl)", ns, mediaNS)
+	}
+	if ns := elemNamespace([]byte(respBody), "Profiles"); ns != mediaNS {
+		t.Errorf("Profiles bridge namespace = %q, want %q (media/wsdl); body=%s", ns, mediaNS, respBody)
+	}
+	for _, el := range []string{"Name", "VideoEncoderConfiguration", "Encoding"} {
+		if ns := elemNamespace([]byte(respBody), el); ns != ttNS {
+			t.Errorf("%s namespace = %q, want %q (schema); body=%s", el, ns, ttNS, respBody)
+		}
+	}
+}
+
+// TestGetProfile_NamespaceDepth asserts the singular GetProfile response that
+// ODM requests when starting live video: wrapper + trt:Profile bridge in
+// media/wsdl, tt-typed children in schema.
+func TestGetProfile_NamespaceDepth(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	mux := http.NewServeMux()
+	registerMediaRoutes(mux, srv)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Act — request the "main" profile by token (namespaces declared on the
+	// envelope, the way real clients send it).
+	body := soapEnvelope("GetProfile", mediaNS,
+		`<ProfileToken xmlns="`+mediaNS+`">main</ProfileToken>`)
+	resp, err := http.Post(ts.URL+"/onvif/media_service", "application/soap+xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, out)
+	}
+
+	// Assert — wrapper + Profile bridge in media/wsdl; tt-typed children in schema.
+	respBody := string(out)
+	if ns := elemNamespace([]byte(respBody), "GetProfileResponse"); ns != mediaNS {
+		t.Errorf("wrapper namespace = %q, want %q (media/wsdl)", ns, mediaNS)
+	}
+	if ns := elemNamespace([]byte(respBody), "Profile"); ns != mediaNS {
+		t.Errorf("Profile bridge namespace = %q, want %q (media/wsdl); body=%s", ns, mediaNS, respBody)
+	}
+	for _, el := range []string{"Name", "VideoEncoderConfiguration", "Encoding"} {
+		if ns := elemNamespace([]byte(respBody), el); ns != ttNS {
+			t.Errorf("%s namespace = %q, want %q (schema); body=%s", el, ns, ttNS, respBody)
+		}
+	}
+}
+
+// TestGetVideoSourceConfiguration_NamespaceDepth is the regression test for the
+// operation that was blocking ODM live video: ODM sends
+// GetVideoSourceConfiguration(vs_main) and, before this handler existed, it
+// faulted 8x and ODM never reached RTSP. The wrapper stays in media/wsdl; the
+// tt:VideoSourceConfiguration subtree (Name, SourceToken) is in the schema ns.
+func TestGetVideoSourceConfiguration_NamespaceDepth(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	mux := http.NewServeMux()
+	registerMediaRoutes(mux, srv)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Act — request the "main" profile's video-source config by its token (vs_main).
+	body := soapEnvelope("GetVideoSourceConfiguration", mediaNS,
+		`<ConfigurationToken xmlns="`+mediaNS+`">vs_main</ConfigurationToken>`)
+	resp, err := http.Post(ts.URL+"/onvif/media_service", "application/soap+xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, out)
+	}
+	respBody := string(out)
+	if strings.Contains(respBody, "No handler for action") {
+		t.Fatalf("GetVideoSourceConfiguration not routed; body=%s", respBody)
+	}
+
+	// Assert — wrapper in media/wsdl; tt:VideoSourceConfiguration subtree in schema.
+	if ns := elemNamespace([]byte(respBody), "GetVideoSourceConfigurationResponse"); ns != mediaNS {
+		t.Errorf("wrapper namespace = %q, want %q (media/wsdl)", ns, mediaNS)
+	}
+	if ns := elemNamespace([]byte(respBody), "VideoSourceConfiguration"); ns != ttNS {
+		t.Errorf("VideoSourceConfiguration namespace = %q, want %q (schema); body=%s", ns, ttNS, respBody)
+	}
+	for _, el := range []string{"Name", "SourceToken"} {
+		if ns := elemNamespace([]byte(respBody), el); ns != ttNS {
+			t.Errorf("%s namespace = %q, want %q (schema); body=%s", el, ns, ttNS, respBody)
+		}
+	}
+	if !strings.Contains(respBody, "vs_main") {
+		t.Errorf("response missing the requested source token vs_main; body=%s", respBody)
 	}
 }

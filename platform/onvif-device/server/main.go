@@ -16,7 +16,6 @@ package main
 
 import (
 	"context"
-	"encoding/xml"
 	"errors"
 	"flag"
 	"fmt"
@@ -341,76 +340,48 @@ func startSOAPServer(ctx context.Context, srv *onvifserver.Server, cfg *config.C
 	}
 }
 
-// registerDeviceRoutes wires the Device service. The action keys here
-// (GetSystemDateAndTime, GetDeviceInformation, GetCapabilities, GetServices)
-// match the ONVIF Device WSDL verbatim, so they are registered as-is.
+// registerDeviceRoutes wires the Device service. Action keys match the ONVIF
+// Device WSDL verbatim. Every handler renders a prefixed, namespace-correct
+// response via onvif_responses.go: response wrappers and their locally-declared
+// bridge children (Capabilities, SystemDateAndTime, Manufacturer, Service) stay
+// in the device/wsdl namespace, while children defined inside a tt: type
+// (Device/Media/XAddr/…) emit in the schema (tt) namespace.
 func registerDeviceRoutes(mux *http.ServeMux, srv *onvifserver.Server) {
 	c := srv.GetConfig()
 	d := newSOAPDispatcher(c.Username, c.Password)
-	d.handle("GetSystemDateAndTime", srv.HandleGetSystemDateAndTime)
-	d.handle("GetDeviceInformation", srv.HandleGetDeviceInformation)
-	d.handle("GetCapabilities", srv.HandleGetCapabilities)
-	d.handle("GetServices", srv.HandleGetServices)
+	d.handle("GetSystemDateAndTime", asSystemDateAndTime(srv))
+	d.handle("GetDeviceInformation", asDeviceInfo(srv))
+	d.handle("GetCapabilities", asCapabilities(srv))
+	d.handle("GetServices", asServices(srv))
 	mux.Handle(c.BasePath+"/device_service", d)
 }
 
-// registerMediaRoutes wires the Media service under spec-correct action keys.
-// GetProfiles and GetVideoSources need no correction; GetStreamUri and
-// GetSnapshotUri are registered with lowercase "Uri" (the ONVIF WSDL spelling)
-// and wrapped so their responses use the spec-correct element tags.
+// registerMediaRoutes wires the Media service. Responses are rendered with
+// correct namespace depth (Profiles/VideoSources/MediaUri bridges in media/wsdl,
+// their tt-typed children in schema) and GetStreamUri/GetSnapshotUri are
+// registered under lowercase "Uri" — the ONVIF WSDL spelling (the library uses
+// the non-conformant capital "URI").
 func registerMediaRoutes(mux *http.ServeMux, srv *onvifserver.Server) {
 	c := srv.GetConfig()
 	d := newSOAPDispatcher(c.Username, c.Password)
-	d.handle("GetProfiles", srv.HandleGetProfiles)
-	d.handle("GetVideoSources", srv.HandleGetVideoSources)
+	d.handle("GetProfiles", asProfiles(srv))
+	d.handle("GetProfile", asProfile(srv))
+	// Per-configuration queries ODM issues while setting up live video.
+	// Before these existed, GetVideoSourceConfiguration(vs_main) faulted on
+	// every attempt and ODM aborted before opening the RTSP connection.
+	d.handle("GetVideoSourceConfiguration", asVideoSourceConfiguration(srv))
+	d.handle("GetVideoSourceConfigurations", asVideoSourceConfigurations(srv))
+	d.handle("GetVideoEncoderConfiguration", asVideoEncoderConfiguration(srv))
+	d.handle("GetVideoEncoderConfigurations", asVideoEncoderConfigurations(srv))
+	d.handle("GetCompatibleVideoEncoderConfigurations", asCompatibleVideoEncoderConfigurations(srv))
+	d.handle("GetVideoEncoderConfigurationOptions", asVideoEncoderConfigurationOptions(srv))
+	d.handle("GetAudioSourceConfiguration", asAudioSourceConfiguration(srv))
+	d.handle("GetAudioSourceConfigurations", asAudioSourceConfigurations(srv))
+	d.handle("GetMetadataConfigurations", asMetadataConfigurations(srv))
+	d.handle("GetCompatibleMetadataConfigurations", asCompatibleMetadataConfigurations(srv))
+	d.handle("GetVideoSources", asVideoSources(srv))
+	d.handle("GetAudioSources", asAudioSources(srv))
 	d.handle("GetStreamUri", streamUriHandler(srv))
 	d.handle("GetSnapshotUri", snapshotUriHandler(srv))
 	mux.Handle(c.BasePath+"/media_service", d)
-}
-
-// streamUriResponse mirrors onvifserver.GetStreamURIResponse but tags the
-// wrapper element GetStreamUriResponse — the spelling every ONVIF client
-// expects (the library's capital-URI tag is non-conformant).
-type streamUriResponse struct {
-	XMLName  xml.Name             `xml:"http://www.onvif.org/ver10/media/wsdl GetStreamUriResponse"`
-	MediaUri onvifserver.MediaURI `xml:"MediaUri"`
-}
-
-// streamUriHandler delegates to the library's GetStreamURI logic (profile
-// lookup + StreamURI override) and retypes the response for wire conformance.
-func streamUriHandler(srv *onvifserver.Server) soapHandlerFunc {
-	return func(body interface{}) (interface{}, error) {
-		resp, err := srv.HandleGetStreamURI(body)
-		if err != nil {
-			return nil, err
-		}
-		lib, ok := resp.(*onvifserver.GetStreamURIResponse)
-		if !ok {
-			return resp, nil
-		}
-
-		return &streamUriResponse{MediaUri: lib.MediaURI}, nil
-	}
-}
-
-// snapshotUriResponse mirrors onvifserver.GetSnapshotURIResponse with the
-// spec-correct GetSnapshotUriResponse wrapper tag.
-type snapshotUriResponse struct {
-	XMLName  xml.Name             `xml:"http://www.onvif.org/ver10/media/wsdl GetSnapshotUriResponse"`
-	MediaUri onvifserver.MediaURI `xml:"MediaUri"`
-}
-
-func snapshotUriHandler(srv *onvifserver.Server) soapHandlerFunc {
-	return func(body interface{}) (interface{}, error) {
-		resp, err := srv.HandleGetSnapshotURI(body)
-		if err != nil {
-			return nil, err
-		}
-		lib, ok := resp.(*onvifserver.GetSnapshotURIResponse)
-		if !ok {
-			return resp, nil
-		}
-
-		return &snapshotUriResponse{MediaUri: lib.MediaURI}, nil
-	}
 }
