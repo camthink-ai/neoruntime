@@ -23,6 +23,7 @@ endif()
 set(HAL_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/include)
 set(HAL_V2_INC ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/include)
 set(HAL_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/common)
+set(HAL_THIRD_PARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/third_party)
 set(AUTO_AF_CORE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/examples/AF_demo/core)
 set(HAL_COMMON_SOURCES
     ${HAL_COMMON_DIR}/hal_common.c
@@ -219,6 +220,7 @@ target_include_directories(camera-daemon PRIVATE
     ${HAL_V2_INCLUDE_DIRS}
     ${PROTO_GEN_DIR}
     ${CAMERA_PROTO_GEN_ARM_DIR}
+    ${HAL_THIRD_PARTY_DIR}
     ${AUTO_AF_CORE_DIR}
 )
 
