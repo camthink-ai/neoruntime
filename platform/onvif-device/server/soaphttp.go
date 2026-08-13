@@ -91,7 +91,7 @@ func (d *soapDispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	h, ok := d.handlers[action]
 	if !ok {
-		writeSOAPFault(w, "Receiver", "Action not supported", "No handler for action: "+action)
+		writeSOAPFault(w, "Sender", "Action not supported", "No handler for action: "+action)
 		return
 	}
 
@@ -158,17 +158,6 @@ type soapResponseEnvelope struct {
 	} `xml:"http://www.w3.org/2003/05/soap-envelope Body"`
 }
 
-type soapFault struct {
-	XMLName xml.Name `xml:"http://www.w3.org/2003/05/soap-envelope Fault"`
-	Code    struct {
-		Value string `xml:"Value"`
-	} `xml:"Code"`
-	Reason struct {
-		Text string `xml:"Text"`
-	} `xml:"Reason"`
-	Detail string `xml:"Detail,omitempty"`
-}
-
 // writeSOAPResponse renders the handler result. A prefixedBody is pre-rendered
 // Body XML using explicit tt:/tds:/trt: prefixes (see onvif_responses.go) and is
 // wrapped in a prefixed envelope that matches real ONVIF devices; any other type
@@ -208,19 +197,37 @@ func writePrefixedSOAP(w http.ResponseWriter, inner string) {
 }
 
 func writeSOAPFault(w http.ResponseWriter, code, reason, detail string) {
-	f := soapFault{}
-	f.Code.Value = code
-	f.Reason.Text = reason
-	f.Detail = detail
-	env := soapResponseEnvelope{}
-	env.Body.Content = &f
-	out, err := xml.Marshal(env)
-	if err != nil {
-		// Last resort: plain text so the client at least sees an error.
-		http.Error(w, "SOAP fault: "+reason, http.StatusInternalServerError)
-		return
+	// Hand-render a SOAP 1.2 fault in the SAME prefixed envelope as success
+	// responses (writePrefixedSOAP). The previous implementation marshaled via
+	// encoding/xml into the DEFAULT namespace, yielding an un-prefixed envelope
+	// with an unqualified <Value> (e.g. <Value>Receiver</Value>). That is
+	// invalid SOAP 1.2 — Value must be a QName such as s:Receiver — and
+	// inconsistent with the prefixed responses ODM parses successfully. ONVIF
+	// Device Manager's strict .NET/WCF fault deserializer could not match it and
+	// surfaced a NullReferenceException ("未将对象引用到对象的实例") whenever it
+	// hit an unimplemented op (GetScopes/GetDNS/GetNetworkInterfaces/
+	// GetSnapshotUri). Matching real ONVIF devices' prefixed form resolves it.
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
+	b.WriteString(`<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"`)
+	b.WriteString(` xmlns:tds="http://www.onvif.org/ver10/device/wsdl"`)
+	b.WriteString(` xmlns:trt="http://www.onvif.org/ver10/media/wsdl"`)
+	b.WriteString(` xmlns:tt="http://www.onvif.org/ver10/schema">`)
+	b.WriteString(`<s:Body><s:Fault><s:Code><s:Value>s:` + code + `</s:Value></s:Code>`)
+	b.WriteString(`<s:Reason><s:Text xml:lang="en">` + xmlEscape(reason) + `</s:Text></s:Reason>`)
+	if detail != "" {
+		b.WriteString(`<s:Detail>` + xmlEscape(detail) + `</s:Detail>`)
 	}
+	b.WriteString(`</s:Fault></s:Body></s:Envelope>`)
 	w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
 	w.WriteHeader(http.StatusInternalServerError)
-	_, _ = w.Write(out)
+	_, _ = w.Write([]byte(b.String()))
+}
+
+// xmlEscape escapes XML meta-characters in hand-rendered fault text. The SOAP
+// action echoed in fault <Detail> is client-supplied, so the output must stay
+// well-formed.
+func xmlEscape(s string) string {
+	r := strings.NewReplacer(`&`, "&amp;", `<`, "&lt;", `>`, "&gt;", `"`, "&quot;")
+	return r.Replace(s)
 }

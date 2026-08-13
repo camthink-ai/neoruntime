@@ -940,6 +940,48 @@ func TestGetVideoEncoderConfiguration_HasFixedFalse(t *testing.T) {
 	}
 }
 
+// TestSOAPFault_PrefixedSOAP12 guards the fault envelope format. ODM's .NET/WCF
+// fault deserializer raised a NullReferenceException ("未将对象引用到对象的实例")
+// on the old default-namespace fault with an unqualified <Value>Receiver</Value>;
+// the fault must use the same prefixed <s:Envelope> as success responses and a
+// qualified Value QName (s:Sender/s:Receiver). Hitting an unregistered action
+// exercises the no-handler fault path.
+func TestSOAPFault_PrefixedSOAP12(t *testing.T) {
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	body := soapEnvelope("NoSuchAction", mediaNS, "")
+
+	code, respBody := postMediaSOAP(t, srv, body)
+	// SOAP 1.2 faults are HTTP 500.
+	if code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (fault); body=%s", code, respBody)
+	}
+	// Prefixed envelope matching success responses — NOT the default namespace.
+	if !strings.Contains(respBody, "<s:Envelope") {
+		t.Errorf("fault not in prefixed <s:Envelope>; body=%s", respBody)
+	}
+	if strings.Contains(respBody, `<Envelope xmlns=`) {
+		t.Errorf("fault uses default-namespace <Envelope> (breaks ODM); body=%s", respBody)
+	}
+	if !strings.Contains(respBody, "<s:Fault>") {
+		t.Errorf("fault missing <s:Fault>; body=%s", respBody)
+	}
+	// Value MUST be a qualified QName (s:Sender), not bare "Sender".
+	if !strings.Contains(respBody, "<s:Value>s:Sender</s:Value>") {
+		t.Errorf("fault Value not a qualified QName (want s:Sender); body=%s", respBody)
+	}
+	if strings.Contains(respBody, "<Value>Sender</Value>") || strings.Contains(respBody, "<Value>Receiver</Value>") {
+		t.Errorf("fault has unqualified <Value> (invalid SOAP 1.2); body=%s", respBody)
+	}
+	// Must start with an XML declaration, like writePrefixedSOAP.
+	if !strings.HasPrefix(respBody, `<?xml`) {
+		t.Errorf("fault missing <?xml?> declaration; body=%s", respBody)
+	}
+}
+
 // --- SetVideoEncoderConfiguration (write path) ---
 
 // fakeReconfigurer records the last ReconfigureEncoder call so tests can assert
