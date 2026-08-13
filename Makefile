@@ -44,6 +44,7 @@ PROTOC ?= protoc
 
 PROTO_GO_PLUGIN := --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative
 PROTOC_OPT := --experimental_allow_proto3_optional
+PROTOC_GO := $(PROTOC) $(PROTOC_OPT) $(PROTO_GO_PLUGIN)
 CMAKE_TARGET_ARGS := -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE)
 SYSROOT_ENV :=
 HAL_V2_BUILD_DIR := hal_v2/build-$(HAL_PLATFORM)
@@ -91,22 +92,22 @@ ifeq ($(HAL_PLATFORM),hailo15)
 endif
 
 proto-inference:
-	cd platform/ai-runtime/proto && $(PROTOC) $(PROTO_GO_PLUGIN) inference.proto
+	cd platform/ai-runtime/proto && $(PROTOC_GO) inference.proto
 
 proto-device:
-	cd platform/device-control/proto && $(PROTOC) $(PROTO_GO_PLUGIN) device.proto
+	cd platform/device-control/proto && $(PROTOC_GO) device.proto
 
 proto-event:
-	cd platform/event-bus/proto && $(PROTOC) $(PROTO_GO_PLUGIN) event.proto
+	cd platform/event-bus/proto && $(PROTOC_GO) event.proto
 
 proto-camera:
 	@if [ -f platform/camera-daemon/proto/camera.proto ]; then \
-		cd platform/camera-daemon/proto && $(PROTOC) $(PROTOC_OPT) $(PROTO_GO_PLUGIN) camera.proto; \
+		cd platform/camera-daemon/proto && $(PROTOC_GO) camera.proto; \
 	fi
 
 proto-app:
 	@if [ -f platform/app-manager/proto/app.proto ]; then \
-		cd platform/app-manager/proto && $(PROTOC) $(PROTO_GO_PLUGIN) app.proto; \
+		cd platform/app-manager/proto && $(PROTOC_GO) app.proto; \
 	fi
 
 proto-lens:
@@ -117,7 +118,7 @@ proto-lens:
 		platform/camera-daemon/proto/lens_hal.proto
 
 proto-discovery:
-	cd platform/device-discovery/proto && $(PROTOC) $(PROTO_GO_PLUGIN) discovery.proto
+	cd platform/device-discovery/proto && $(PROTOC_GO) discovery.proto
 
 hal-v2:
 	@echo "==> Building HAL v2 [platform=$(HAL_PLATFORM)]"
