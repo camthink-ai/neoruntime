@@ -889,6 +889,44 @@ func TestGetVideoEncoderConfigurationOptions_UsesH264OptionsElement(t *testing.T
 	if strings.Contains(respBody, "<tt:H264>") {
 		t.Errorf("response has bare <tt:H264> options container; want <tt:H264Options>; body=%s", respBody)
 	}
+	// Regression guard: the ver10 VideoEncoderConfigurationOptions type has NO
+	// <Encoding> child — QualityRange is the required first element and the encoding
+	// is implied by which option block (H264Options) is present. An out-of-sequence
+	// <tt:Encoding> breaks ODM's strict .NET deserializer and it then renders the
+	// encoder editor read-only, so Options must not carry it.
+	if strings.Contains(respBody, "<tt:Encoding>") {
+		t.Errorf("response has <tt:Encoding> inside Options; ver10 Options has no such element (breaks ODM editor); body=%s", respBody)
+	}
+}
+
+// TestGetVideoEncoderConfiguration_HasFixedFalse guards the required fixed
+// attribute on the VideoEncoderConfiguration. The ONVIF Configuration base type
+// marks fixed use="required"; a strict client (ODM's .NET proxy) cannot
+// deserialize a config that omits it and renders the editor read-only. We emit
+// fixed="false" (modifiable) since we honour SetVideoEncoderConfiguration.
+func TestGetVideoEncoderConfiguration_HasFixedFalse(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	body := soapEnvelope("GetVideoEncoderConfiguration", mediaNS,
+		`<ConfigurationToken xmlns="`+mediaNS+`">main_encoder</ConfigurationToken>`)
+
+	// Act
+	code, respBody := postMediaSOAP(t, srv, body)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", code, respBody)
+	}
+	if strings.Contains(respBody, "No handler for action") {
+		t.Fatalf("GetVideoEncoderConfiguration not routed; body=%s", respBody)
+	}
+
+	// Assert — the config element carries the required, modifiable fixed="false".
+	if !strings.Contains(respBody, `<tt:VideoEncoderConfiguration token="main_encoder" fixed="false">`) {
+		t.Errorf("response missing required fixed=\"false\" on VideoEncoderConfiguration; body=%s", respBody)
+	}
 }
 
 // --- SetVideoEncoderConfiguration (write path) ---

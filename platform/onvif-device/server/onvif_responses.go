@@ -249,7 +249,7 @@ func renderProfileElement(x *xbuf, tag string, p onvifserver.MediaProfile) {
 // singular/plural Get*Configuration responses so the wire form never drifts). ---
 
 func writeVideoSourceConfiguration(x *xbuf, v *onvifserver.VideoSourceConfiguration) {
-	x.OpenAttr("tt:VideoSourceConfiguration", "token", v.Token)
+	x.OpenAttr("tt:VideoSourceConfiguration", "token", v.Token, "fixed", "false")
 	x.Elem("tt:Name", v.Name)
 	x.Elem("tt:UseCount", itoa(v.UseCount))
 	x.Elem("tt:SourceToken", v.SourceToken)
@@ -259,7 +259,11 @@ func writeVideoSourceConfiguration(x *xbuf, v *onvifserver.VideoSourceConfigurat
 }
 
 func writeVideoEncoderConfiguration(x *xbuf, e *onvifserver.VideoEncoderConfiguration) {
-	x.OpenAttr("tt:VideoEncoderConfiguration", "token", e.Token)
+	// The ONVIF Configuration base type marks fixed as use="required"; a strict
+	// client (ODM's .NET proxy) cannot deserialize a config that omits it and
+	// renders the editor read-only. fixed="false" advertises that this config is
+	// modifiable — which is true, we honour SetVideoEncoderConfiguration.
+	x.OpenAttr("tt:VideoEncoderConfiguration", "token", e.Token, "fixed", "false")
 	x.Elem("tt:Name", e.Name)
 	x.Elem("tt:UseCount", itoa(e.UseCount))
 	x.Elem("tt:Encoding", e.Encoding)
@@ -287,7 +291,7 @@ func writeVideoEncoderConfiguration(x *xbuf, e *onvifserver.VideoEncoderConfigur
 }
 
 func writeAudioSourceConfiguration(x *xbuf, a *onvifserver.AudioSourceConfiguration) {
-	x.OpenAttr("tt:AudioSourceConfiguration", "token", a.Token)
+	x.OpenAttr("tt:AudioSourceConfiguration", "token", a.Token, "fixed", "false")
 	x.Elem("tt:Name", a.Name)
 	x.Elem("tt:UseCount", itoa(a.UseCount))
 	x.Elem("tt:SourceToken", a.SourceToken)
@@ -465,8 +469,13 @@ func renderGetVideoEncoderConfigurations(list []*onvifserver.VideoEncoderConfigu
 func renderGetVideoEncoderConfigurationOptions(profiles []onvifserver.MediaProfile) prefixedBody {
 	var x xbuf
 	x.Open("trt:GetVideoEncoderConfigurationOptionsResponse")
+	// Per the ver10 schema, VideoEncoderConfigurationOptions' sequence is QualityRange
+	// (required, first child), then the encoding-specific choice (H264Options here).
+	// There is NO <Encoding> child — the encoding is implied by which option block is
+	// present. Emitting <tt:Encoding> before QualityRange is out-of-sequence and breaks
+	// strict .NET deserializers (ONVIF Device Manager then renders the config
+	// read-only), so it is deliberately omitted here. Real cameras omit it too.
 	x.Open("tt:Options")
-	x.Elem("tt:Encoding", "H264")
 	x.Open("tt:QualityRange")
 	x.Elem("tt:Min", "1")
 	x.Elem("tt:Max", "100")
