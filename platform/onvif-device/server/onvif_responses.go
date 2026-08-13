@@ -471,7 +471,13 @@ func renderGetVideoEncoderConfigurationOptions(profiles []onvifserver.MediaProfi
 	x.Elem("tt:Min", "1")
 	x.Elem("tt:Max", "100")
 	x.Close("tt:QualityRange")
-	x.Open("tt:H264")
+	// Element name is H264Options (not H264): in the ver10 schema this is the
+	// VideoEncoderConfigurationOptions type, whose H264 sub-element is named
+	// "H264Options" (type H264Options: ResolutionsAvailable/GovLengthRange/…).
+	// The "H264" element name belongs to VideoEncoderConfiguration (the *config*,
+	// rendered elsewhere) — emitting "H264" here makes ver10 clients incl. ONVIF
+	// Device Manager fail to find the options, so they never populate the editor.
+	x.Open("tt:H264Options")
 	seen := make(map[string]bool)
 	maxFR := 30
 	for _, p := range profiles {
@@ -508,7 +514,7 @@ func renderGetVideoEncoderConfigurationOptions(profiles []onvifserver.MediaProfi
 	for _, profile := range []string{"Baseline", "Main", "High"} {
 		x.Elem("tt:H264ProfilesSupported", profile)
 	}
-	x.Close("tt:H264")
+	x.Close("tt:H264Options")
 	x.Close("tt:Options")
 	x.Close("trt:GetVideoEncoderConfigurationOptionsResponse")
 	return prefixedBody(x.String())

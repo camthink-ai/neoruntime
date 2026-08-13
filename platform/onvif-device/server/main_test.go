@@ -847,6 +847,50 @@ func TestGetVideoSourceConfiguration_NamespaceDepth(t *testing.T) {
 	}
 }
 
+// TestGetVideoEncoderConfigurationOptions_UsesH264OptionsElement guards the ver10
+// element name "H264Options" inside the Options response. ODM and other ver10
+// clients look for H264Options to populate the encoder editor's
+// resolution/profile/range dropdowns; emitting the ver20 "H264" name (which is
+// the *config* element name, not the options element name) makes them find
+// nothing and the editor never populates. The Options response must carry
+// H264Options and must NOT carry a bare H264 options container.
+func TestGetVideoEncoderConfigurationOptions_UsesH264OptionsElement(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	body := soapEnvelope("GetVideoEncoderConfigurationOptions", mediaNS,
+		`<ConfigurationToken xmlns="`+mediaNS+`">main_encoder</ConfigurationToken>`)
+
+	// Act
+	code, respBody := postMediaSOAP(t, srv, body)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", code, respBody)
+	}
+	if strings.Contains(respBody, "No handler for action") {
+		t.Fatalf("GetVideoEncoderConfigurationOptions not routed; body=%s", respBody)
+	}
+
+	// Assert — ver10 options element name + its sub-elements.
+	if !strings.Contains(respBody, "<tt:H264Options>") {
+		t.Errorf("response missing <tt:H264Options> (ver10 options element); body=%s", respBody)
+	}
+	if !strings.Contains(respBody, "<tt:ResolutionsAvailable>") {
+		t.Errorf("response missing ResolutionsAvailable under options; body=%s", respBody)
+	}
+	if !strings.Contains(respBody, "<tt:H264ProfilesSupported>High") {
+		t.Errorf("response missing High H264ProfilesSupported; body=%s", respBody)
+	}
+	// Regression guard: a bare <tt:H264> options container (the ver20 name in a
+	// ver10 response) must not appear. <tt:H264> is the config element and has no
+	// place in the Options response — its presence is exactly what broke ODM.
+	if strings.Contains(respBody, "<tt:H264>") {
+		t.Errorf("response has bare <tt:H264> options container; want <tt:H264Options>; body=%s", respBody)
+	}
+}
+
 // --- SetVideoEncoderConfiguration (write path) ---
 
 // fakeReconfigurer records the last ReconfigureEncoder call so tests can assert
