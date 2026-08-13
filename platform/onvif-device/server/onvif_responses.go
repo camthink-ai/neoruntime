@@ -34,6 +34,7 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 
@@ -877,9 +878,13 @@ func asSetVideoEncoderConfiguration(srv *onvifserver.Server) soapHandlerFunc {
 			BitrateKbps: uint32(req.Config.RateControl.BitrateLimit),
 			Gop:         uint32(req.Config.H264.GovLength),
 		}
+		log.Printf("[onvif] SetVideoEncoderConfiguration token=%s -> stream=%s codec=%s %dx%d fps=%d bitrate=%dkbps gop=%d",
+			token, stream, params.Codec, params.Width, params.Height, params.Fps, params.BitrateKbps, params.Gop)
 		if err := reconfigurer.ReconfigureEncoder(stream, params); err != nil {
+			log.Printf("[onvif] ReconfigureEncoder(%s) FAILED: %v", stream, err)
 			return nil, fmt.Errorf("ReconfigureEncoder(%s): %w", stream, err)
 		}
+		log.Printf("[onvif] ReconfigureEncoder(%s) accepted", stream)
 		return prefixedBody("<trt:SetVideoEncoderConfigurationResponse/>"), nil
 	}
 }
