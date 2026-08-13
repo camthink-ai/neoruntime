@@ -36,6 +36,15 @@ device:
 rtsp:
   port: 8554                 # camera-daemon RTSP server port (see media-streaming.md)
 
+camera:
+  # camera-daemon CameraControl gRPC socket. onvif-device queries GetStreamStatus
+  # here so its ONVIF metadata (codec/resolution/bitrate/fps/gop) tracks the LIVE
+  # encoder rather than the static values below — runtime web-UI / profile
+  # switches are reflected to NVRs without an onvif.yaml edit.
+  # If camera-daemon is down or this is unreachable, onvif-device silently falls
+  # back to the static profiles below (ONVIF never breaks). Empty disables it.
+  socket: unix:///run/aipc/camera-control.sock
+
 # ONVIF media profiles, each mapped to a camera-daemon RTSP stream. The
 # advertised stream URI is rtsp://<device-ip>:<rtsp.port>/<stream>.
 profiles:

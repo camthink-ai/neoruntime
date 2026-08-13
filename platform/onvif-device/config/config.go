@@ -23,6 +23,7 @@ type Config struct {
 	Network     NetworkConfig   `yaml:"network"`
 	Device      DeviceConfig    `yaml:"device"`
 	RTSP        RTSPConfig      `yaml:"rtsp"`
+	Camera      CameraConfig    `yaml:"camera"`
 	Profiles    []ProfileConfig `yaml:"profiles"`
 	Auth        AuthConfig      `yaml:"auth"`
 	VersionFile string          `yaml:"version_file"`
@@ -56,6 +57,14 @@ type DeviceConfig struct {
 // RTSPConfig points at the camera-daemon RTSP server.
 type RTSPConfig struct {
 	Port int `yaml:"port"`
+}
+
+// CameraConfig points at camera-daemon's CameraControl gRPC service. onvif-device
+// queries GetStreamStatus over this Unix socket so its advertised ONVIF metadata
+// (codec/resolution/bitrate/fps/gop) tracks the live encoder instead of static
+// onvif.yaml. An empty socket disables the overlay (static fallback).
+type CameraConfig struct {
+	Socket string `yaml:"socket"`
 }
 
 // ProfileConfig maps an ONVIF media profile to a camera-daemon RTSP stream.
@@ -107,7 +116,8 @@ func Default() *Config {
 				"onvif://www.onvif.org/name/CamThink/NE503",
 			},
 		},
-		RTSP: RTSPConfig{Port: 8554},
+		RTSP:   RTSPConfig{Port: 8554},
+		Camera: CameraConfig{Socket: "unix:///run/aipc/camera-control.sock"},
 		Profiles: []ProfileConfig{
 			{Token: "main", Name: "Main Stream", Stream: "main", Width: 1920, Height: 1080, FPS: 30, Codec: "H264", Bitrate: 4096},
 			{Token: "sub", Name: "Sub Stream", Stream: "sub", Width: 1280, Height: 720, FPS: 30, Codec: "H264", Bitrate: 2048},
@@ -158,6 +168,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.RTSP.Port == 0 {
 		cfg.RTSP.Port = 8554
+	}
+	if cfg.Camera.Socket == "" {
+		cfg.Camera.Socket = "unix:///run/aipc/camera-control.sock"
 	}
 	if cfg.VersionFile == "" {
 		cfg.VersionFile = filepath.Join(constants.RootPath(), "VERSION")

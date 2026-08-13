@@ -640,6 +640,118 @@ func TestGetProfiles_H264ProfileIsHigh(t *testing.T) {
 	}
 }
 
+// fakeStreamStatus is a test-only streamStatusProvider returning a fixed param
+// map (nil map simulates "no active stream" → enrichProfiles falls back).
+type fakeStreamStatus struct {
+	params map[string]*streamParams
+}
+
+func (f fakeStreamStatus) RunningParams() map[string]*streamParams { return f.params }
+
+// postMediaAction posts a media-service action and returns the response body.
+func postMediaAction(t *testing.T, srv *onvifserver.Server, action, inner string) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	registerMediaRoutes(mux, srv)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	body := soapEnvelope(action, mediaNS, inner)
+	resp, err := http.Post(ts.URL+"/onvif/media_service", "application/soap+xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("%s status = %d, want 200; body=%s", action, resp.StatusCode, out)
+	}
+	return string(out)
+}
+
+// TestGetProfiles_LiveOverlayReplacesStaticParams locks in the dynamic-metadata
+// feature: with a camera-daemon provider reporting the "main" stream at 4K,
+// GetProfiles must advertise 3840×2160 + the live bitrate — NOT the static
+// onvif.yaml 1920×1080. This is what lets an NVR read the real encoder config
+// after a runtime web-UI resolution change without an onvif.yaml edit.
+func TestGetProfiles_LiveOverlayReplacesStaticParams(t *testing.T) {
+	// Arrange — static config declares main=1920×1080; live provider reports 4K.
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	prev := liveStreams
+	liveStreams = fakeStreamStatus{params: map[string]*streamParams{
+		"main": {Codec: "h264", Width: 3840, Height: 2160, Fps: 30, BitrateKbps: 8000, Gop: 30},
+	}}
+	t.Cleanup(func() { liveStreams = prev })
+
+	// Act
+	respBody := postMediaAction(t, srv, "GetProfiles", "")
+
+	// Assert — live 4K params win over static 1080p.
+	if !strings.Contains(respBody, "Width>3840<") || !strings.Contains(respBody, "Height>2160<") {
+		t.Errorf("live 4K overlay (3840×2160) missing; body=%s", respBody)
+	}
+	if strings.Contains(respBody, "Width>1920<") || strings.Contains(respBody, "Height>1080<") {
+		t.Errorf("static 1080p not overridden by live params; body=%s", respBody)
+	}
+	// Bitrate overlay: 8000 kbps live vs static 4096.
+	if !strings.Contains(respBody, "BitrateLimit>8000<") {
+		t.Errorf("live bitrate overlay (8000) missing; body=%s", respBody)
+	}
+	// H264Profile must stay High under the overlay (f68bc85 must not regress).
+	if !strings.Contains(respBody, "H264Profile>High<") {
+		t.Errorf("H264Profile not High under live overlay; body=%s", respBody)
+	}
+}
+
+// TestGetProfiles_FallsBackToStaticWhenNoLiveProvider asserts the silent-fallback
+// contract: when camera-daemon is unreachable (no provider wired), onvif-device
+// serves the static onvif.yaml params — ONVIF never breaks because of camera-daemon.
+func TestGetProfiles_FallsBackToStaticWhenNoLiveProvider(t *testing.T) {
+	// Arrange — no live provider (initLiveStreams never ran / socket empty).
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	prev := liveStreams
+	liveStreams = nil
+	t.Cleanup(func() { liveStreams = prev })
+
+	// Act
+	respBody := postMediaAction(t, srv, "GetProfiles", "")
+
+	// Assert — static 1080p served intact.
+	if !strings.Contains(respBody, "Width>1920<") || !strings.Contains(respBody, "Height>1080<") {
+		t.Errorf("static fallback (1920×1080) missing with no provider; body=%s", respBody)
+	}
+}
+
+// TestGetProfiles_FallsBackWhenNoActiveStream covers the in-between case: the
+// provider is wired but camera-daemon reports no active encoder (RunningParams
+// returns nil) — e.g. streams stopped. enrichProfiles must fall back to static.
+func TestGetProfiles_FallsBackWhenNoActiveStream(t *testing.T) {
+	// Arrange — provider present but yields no active stream.
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	prev := liveStreams
+	liveStreams = fakeStreamStatus{params: nil}
+	t.Cleanup(func() { liveStreams = prev })
+
+	// Act
+	respBody := postMediaAction(t, srv, "GetProfiles", "")
+
+	// Assert — static 1080p served, not some empty/zero overlay.
+	if !strings.Contains(respBody, "Width>1920<") || !strings.Contains(respBody, "Height>1080<") {
+		t.Errorf("static fallback missing when provider has no active stream; body=%s", respBody)
+	}
+}
+
 // TestGetProfile_NamespaceDepth asserts the singular GetProfile response that
 // ODM requests when starting live video: wrapper + trt:Profile bridge in
 // media/wsdl, tt-typed children in schema.

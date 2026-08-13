@@ -325,23 +325,74 @@ func loadProfiles(srv *onvifserver.Server) ([]onvifserver.MediaProfile, error) {
 	if !ok {
 		return nil, fmt.Errorf("unexpected GetProfiles response type %T", resp)
 	}
-	normalizeProfiles(lib.Profiles)
+	enrichProfiles(lib.Profiles)
 	return lib.Profiles, nil
 }
 
-// normalizeProfiles overrides library defaults that are wrong for this hardware.
-// The onvif-go library hardcodes H264Profile="Main" (server/media.go), but the
-// Hailo encoder emits High profile for both streams (confirmed via live SDP
-// profile-level-id: main High@L5.1, sub High@L3.1). Report the truthful value so
-// NVRs that read H264Profile from the ONVIF config (rather than the in-band SPS)
-// select the correct decoder. Called on every path that renders profiles:
-// GetProfiles/GetProfile (via asProfiles/asProfile) and the configuration ops
-// (via loadProfiles).
-func normalizeProfiles(profiles []onvifserver.MediaProfile) {
+// enrichProfiles overlays live (runtime) encoder parameters from camera-daemon
+// onto each profile, then fixes H264Profile. onvif.yaml is a static declaration
+// and drifts from reality because camera-daemon's codec/resolution/bitrate/fps/
+// gop are runtime-mutable (web UI, ReconfigurePipeline, SwitchProfile). When the
+// package-wide liveStreams provider is armed (initLiveStreams at startup) and
+// camera-daemon reports an active, hardware-backed stream for a profile's token,
+// the live values replace the static ones; otherwise the static values stand.
+//
+// H264Profile is then forced to "High": the onvif-go library hardcodes "Main"
+// (server/media.go) and ignores config, while the Hailo encoder emits High for
+// both streams (live SDP profile-level-id: main High@L5.1, sub High@L3.1).
+// stream status has no profile field, so this stays a deterministic override.
+//
+// Called on every path that renders profiles: GetProfiles/GetProfile (via
+// asProfiles/asProfile) and the configuration ops (via loadProfiles), so all
+// responses agree.
+func enrichProfiles(profiles []onvifserver.MediaProfile) {
+	var live map[string]*streamParams
+	if liveStreams != nil {
+		live = liveStreams.RunningParams()
+	}
 	for i := range profiles {
+		if sp, ok := live[profiles[i].Token]; ok {
+			applyLiveParams(&profiles[i], sp)
+		}
 		if enc := profiles[i].VideoEncoderConfiguration; enc != nil && enc.H264 != nil {
 			enc.H264.H264Profile = "High"
 		}
+	}
+}
+
+// applyLiveParams projects one running stream's parameters onto its ONVIF
+// MediaProfile's encoder/source configuration. Every field is nil-guarded and
+// zero-guarded so a missing live value leaves the static field untouched.
+func applyLiveParams(p *onvifserver.MediaProfile, sp *streamParams) {
+	if sp == nil {
+		return
+	}
+	if enc := p.VideoEncoderConfiguration; enc != nil {
+		if sp.Codec != "" {
+			enc.Encoding = strings.ToUpper(sp.Codec) // camera-daemon "h264"/"h265" → ONVIF "H264"/"H265"
+		}
+		if sp.Width != 0 && sp.Height != 0 {
+			enc.Resolution.Width = int(sp.Width)
+			enc.Resolution.Height = int(sp.Height)
+		}
+		if sp.Fps != 0 || sp.BitrateKbps != 0 {
+			if enc.RateControl == nil {
+				enc.RateControl = &onvifserver.VideoRateControl{EncodingInterval: 1}
+			}
+			if sp.Fps != 0 {
+				enc.RateControl.FrameRateLimit = int(sp.Fps)
+			}
+			if sp.BitrateKbps != 0 {
+				enc.RateControl.BitrateLimit = int(sp.BitrateKbps)
+			}
+		}
+		if enc.H264 != nil && sp.Gop != 0 {
+			enc.H264.GovLength = int(sp.Gop)
+		}
+	}
+	if vsc := p.VideoSourceConfiguration; vsc != nil && sp.Width != 0 && sp.Height != 0 {
+		vsc.Bounds.Width = int(sp.Width)
+		vsc.Bounds.Height = int(sp.Height)
 	}
 }
 
@@ -629,7 +680,7 @@ func asProfiles(srv *onvifserver.Server) soapHandlerFunc {
 		if !ok {
 			return resp, nil
 		}
-		normalizeProfiles(lib.Profiles)
+		enrichProfiles(lib.Profiles)
 		return renderGetProfiles(lib.Profiles), nil
 	}
 }
@@ -648,7 +699,7 @@ func asProfile(srv *onvifserver.Server) soapHandlerFunc {
 		if !ok {
 			return resp, nil
 		}
-		normalizeProfiles(lib.Profiles)
+		enrichProfiles(lib.Profiles)
 		for _, p := range lib.Profiles {
 			if p.Token == token {
 				return renderGetProfile(p), nil
