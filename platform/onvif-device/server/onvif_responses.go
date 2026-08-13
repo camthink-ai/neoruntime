@@ -286,6 +286,21 @@ func writeVideoEncoderConfiguration(x *xbuf, e *onvifserver.VideoEncoderConfigur
 		x.Elem("tt:H264Profile", e.H264.H264Profile)
 		x.Close("tt:H264")
 	}
+	// Multicast is REQUIRED by the ver10 VideoEncoderConfiguration sequence
+	// (no minOccurs=0); it sits between the codec block and SessionTimeout. We
+	// do not multicast-stream, so advertise the inert no-multicast form real
+	// cameras use (0.0.0.0:0, TTL 0, AutoStart=false). Omitting it leaves the
+	// element null in a strict client's proxy — ODM's Video streaming panel
+	// then dereferences it and throws "未将对象引用到对象的实例" (NullRef).
+	x.Open("tt:Multicast")
+	x.Open("tt:Address")
+	x.Elem("tt:Type", "IPv4")
+	x.Elem("tt:IPv4Address", "0.0.0.0")
+	x.Close("tt:Address")
+	x.Elem("tt:Port", "0")
+	x.Elem("tt:TTL", "0")
+	x.Elem("tt:AutoStart", "false")
+	x.Close("tt:Multicast")
 	x.Elem("tt:SessionTimeout", e.SessionTimeout)
 	x.Close("tt:VideoEncoderConfiguration")
 }

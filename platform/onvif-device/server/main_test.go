@@ -927,6 +927,17 @@ func TestGetVideoEncoderConfiguration_HasFixedFalse(t *testing.T) {
 	if !strings.Contains(respBody, `<tt:VideoEncoderConfiguration token="main_encoder" fixed="false">`) {
 		t.Errorf("response missing required fixed=\"false\" on VideoEncoderConfiguration; body=%s", respBody)
 	}
+	// Regression guard: Multicast is a REQUIRED element of
+	// VideoEncoderConfiguration (between the codec block and SessionTimeout).
+	// Omitting it makes ODM's Video streaming panel dereference a null
+	// Multicast → NullReferenceException. The inert no-multicast block must be
+	// present and schema-complete (Address/Type/IPv4Address/Port/TTL/AutoStart).
+	if !strings.Contains(respBody, "<tt:Multicast>") ||
+		!strings.Contains(respBody, "<tt:Type>IPv4</tt:Type>") ||
+		!strings.Contains(respBody, "<tt:IPv4Address>0.0.0.0</tt:IPv4Address>") ||
+		!strings.Contains(respBody, "<tt:AutoStart>false</tt:AutoStart>") {
+		t.Errorf("response missing required/complete <tt:Multicast> block; body=%s", respBody)
+	}
 }
 
 // --- SetVideoEncoderConfiguration (write path) ---
