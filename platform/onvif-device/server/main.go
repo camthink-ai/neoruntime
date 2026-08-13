@@ -381,6 +381,9 @@ func registerMediaRoutes(mux *http.ServeMux, srv *onvifserver.Server) {
 	d.handle("GetVideoEncoderConfigurations", asVideoEncoderConfigurations(srv))
 	d.handle("GetCompatibleVideoEncoderConfigurations", asCompatibleVideoEncoderConfigurations(srv))
 	d.handle("GetVideoEncoderConfigurationOptions", asVideoEncoderConfigurationOptions(srv))
+	// Write path: lets an NVR change resolution/bitrate/fps/gop/codec over ONVIF
+	// via camera-daemon's ReconfigureEncoder. First Set op in this service.
+	d.handle("SetVideoEncoderConfiguration", asSetVideoEncoderConfiguration(srv))
 	d.handle("GetAudioSourceConfiguration", asAudioSourceConfiguration(srv))
 	d.handle("GetAudioSourceConfigurations", asAudioSourceConfigurations(srv))
 	d.handle("GetMetadataConfigurations", asMetadataConfigurations(srv))

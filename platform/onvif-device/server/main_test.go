@@ -846,3 +846,192 @@ func TestGetVideoSourceConfiguration_NamespaceDepth(t *testing.T) {
 		t.Errorf("response missing the requested source token vs_main; body=%s", respBody)
 	}
 }
+
+// --- SetVideoEncoderConfiguration (write path) ---
+
+// fakeReconfigurer records the last ReconfigureEncoder call so tests can assert
+// the ONVIF params were mapped correctly. err is returned to the handler.
+type fakeReconfigurer struct {
+	gotStream string
+	gotParams streamParams
+	called    bool
+	err       error
+}
+
+func (f *fakeReconfigurer) ReconfigureEncoder(stream string, p streamParams) error {
+	f.called = true
+	f.gotStream = stream
+	f.gotParams = p
+	return f.err
+}
+
+// setReconfigurer swaps the package-level reconfigurer for a test and restores
+// it on cleanup.
+func setReconfigurer(t *testing.T, r streamReconfigurer) {
+	t.Helper()
+	prev := reconfigurer
+	reconfigurer = r
+	t.Cleanup(func() { reconfigurer = prev })
+}
+
+// postMediaSOAP posts a raw SOAP body to the media service and returns the HTTP
+// status + body (does not fatal on non-200, so fault paths can be asserted).
+func postMediaSOAP(t *testing.T, srv *onvifserver.Server, body string) (int, string) {
+	t.Helper()
+	mux := http.NewServeMux()
+	registerMediaRoutes(mux, srv)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/onvif/media_service", "application/soap+xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(out)
+}
+
+// setEncoderConfigBody builds a SetVideoEncoderConfiguration envelope carrying a
+// full encoder config (the shape an NVR sends back after a Get, with edits).
+func setEncoderConfigBody(token, encoding string, w, h, fps, bitrate, gop int) string {
+	return fmt.Sprintf(`<?xml version="1.0"?>`+
+		`<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" `+
+		`xmlns:trt="http://www.onvif.org/ver10/media/wsdl" `+
+		`xmlns:tt="http://www.onvif.org/ver10/schema">`+
+		`<s:Body><trt:SetVideoEncoderConfiguration>`+
+		`<trt:Configuration token="%s">`+
+		`<tt:Encoding>%s</tt:Encoding>`+
+		`<tt:Resolution><tt:Width>%d</tt:Width><tt:Height>%d</tt:Height></tt:Resolution>`+
+		`<tt:RateControl><tt:FrameRateLimit>%d</tt:FrameRateLimit>`+
+		`<tt:EncodingInterval>1</tt:EncodingInterval><tt:BitrateLimit>%d</tt:BitrateLimit></tt:RateControl>`+
+		`<tt:H264><tt:GovLength>%d</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>`+
+		`</trt:Configuration><trt:ForcePersistence>true</trt:ForcePersistence>`+
+		`</trt:SetVideoEncoderConfiguration></s:Body></s:Envelope>`,
+		token, encoding, w, h, fps, bitrate, gop)
+}
+
+// TestSetVideoEncoderConfiguration_AppliesParamsToStream is the core write-path
+// test: a valid Set for the main encoder must reach camera-daemon as
+// ReconfigureEncoder("main", …) with the ONVIF fields mapped, and return an
+// empty success response.
+func TestSetVideoEncoderConfiguration_AppliesParamsToStream(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	fake := &fakeReconfigurer{}
+	setReconfigurer(t, fake)
+
+	// Act — NVR drops main to 1280×720, 15 fps, 2048 kbps, GOP 60.
+	body := setEncoderConfigBody("main_encoder", "H264", 1280, 720, 15, 2048, 60)
+	status, respBody := postMediaSOAP(t, srv, body)
+
+	// Assert — success response + the setter received the mapped params.
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, respBody)
+	}
+	if !strings.Contains(respBody, "SetVideoEncoderConfigurationResponse") {
+		t.Errorf("missing success response element; body=%s", respBody)
+	}
+	if !fake.called {
+		t.Fatal("ReconfigureEncoder was not called")
+	}
+	if fake.gotStream != "main" {
+		t.Errorf("stream = %q, want main (stripped from main_encoder)", fake.gotStream)
+	}
+	if fake.gotParams.Width != 1280 || fake.gotParams.Height != 720 {
+		t.Errorf("resolution = %dx%d, want 1280x720", fake.gotParams.Width, fake.gotParams.Height)
+	}
+	if fake.gotParams.Codec != "H264" {
+		t.Errorf("codec = %q, want H264 (lower-cased only inside the client)", fake.gotParams.Codec)
+	}
+	if fake.gotParams.Fps != 15 {
+		t.Errorf("fps = %d, want 15", fake.gotParams.Fps)
+	}
+	if fake.gotParams.BitrateKbps != 2048 {
+		t.Errorf("bitrate = %d kbps, want 2048", fake.gotParams.BitrateKbps)
+	}
+	if fake.gotParams.Gop != 60 {
+		t.Errorf("gop = %d, want 60", fake.gotParams.Gop)
+	}
+}
+
+// TestSetVideoEncoderConfiguration_FaultsWhenNoCameraDaemon asserts the NVR is
+// told (via a SOAP fault) that the change could not be applied when
+// camera-daemon is unavailable — never a silent success.
+func TestSetVideoEncoderConfiguration_FaultsWhenNoCameraDaemon(t *testing.T) {
+	// Arrange — no reconfigurer wired (initLiveStreams never ran).
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	setReconfigurer(t, nil)
+
+	// Act
+	status, respBody := postMediaSOAP(t, srv, setEncoderConfigBody("main_encoder", "H264", 1920, 1080, 30, 4096, 30))
+
+	// Assert — fault, not 200, with a clear reason.
+	if status == http.StatusOK {
+		t.Errorf("status = 200, want 5xx fault when camera-daemon is down; body=%s", respBody)
+	}
+	if !strings.Contains(respBody, "Fault") {
+		t.Errorf("expected a SOAP Fault; body=%s", respBody)
+	}
+	if !strings.Contains(respBody, "camera-daemon not available") {
+		t.Errorf("fault reason missing camera-daemon note; body=%s", respBody)
+	}
+}
+
+// TestSetVideoEncoderConfiguration_FaultsOnSetterFailure asserts a
+// camera-daemon rejection (e.g. unsupported resolution) surfaces as a fault
+// carrying the real reason, rather than success.
+func TestSetVideoEncoderConfiguration_FaultsOnSetterFailure(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	setReconfigurer(t, &fakeReconfigurer{err: fmt.Errorf("unsupported resolution 9999x9999")})
+
+	// Act
+	status, respBody := postMediaSOAP(t, srv, setEncoderConfigBody("main_encoder", "H264", 9999, 9999, 30, 4096, 30))
+
+	// Assert
+	if status == http.StatusOK {
+		t.Errorf("status = 200, want 5xx fault on setter failure; body=%s", respBody)
+	}
+	if !strings.Contains(respBody, "unsupported resolution 9999x9999") {
+		t.Errorf("fault detail missing camera-daemon reason; body=%s", respBody)
+	}
+}
+
+// TestSetVideoEncoderConfiguration_FaultsOnUnknownToken asserts a Set for a
+// non-existent encoder token is rejected before reaching camera-daemon.
+func TestSetVideoEncoderConfiguration_FaultsOnUnknownToken(t *testing.T) {
+	// Arrange — fake present so a token-bypass bug would let the call through.
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	fake := &fakeReconfigurer{}
+	setReconfigurer(t, fake)
+
+	// Act
+	status, respBody := postMediaSOAP(t, srv, setEncoderConfigBody("bogus_encoder", "H264", 1280, 720, 30, 2048, 30))
+
+	// Assert — rejected as unknown, camera-daemon never contacted.
+	if status == http.StatusOK {
+		t.Errorf("status = 200, want 5xx fault for unknown token; body=%s", respBody)
+	}
+	if !strings.Contains(respBody, "not found") {
+		t.Errorf("fault reason missing not-found note; body=%s", respBody)
+	}
+	if fake.called {
+		t.Error("ReconfigureEncoder must not be called for an unknown token")
+	}
+}

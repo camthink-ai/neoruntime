@@ -781,6 +781,109 @@ func asVideoEncoderConfiguration(srv *onvifserver.Server) soapHandlerFunc {
 	}
 }
 
+// --- SetVideoEncoderConfiguration (write path) ---
+//
+// onvif-device is otherwise read-only; this is the first Set operation. An NVR
+// sends the full VideoEncoderConfiguration it previously read via Get (with its
+// own edits) plus ForcePersistence. We project the mutable encoder fields onto
+// camera-daemon's ReconfigureEncoder, where 0/empty means "no change" — so a
+// client that only edits the bitrate does not disturb the resolution. Because
+// enrichProfiles re-reads GetStreamStatus on every request, the next Get
+// reflects the new params immediately (closed loop). ForcePersistence is
+// accepted but not honoured separately: persistence is camera-daemon's
+// responsibility (it owns camera-daemon.yaml); we apply the live change
+// regardless of the flag, matching how the device web UI applies changes.
+
+// onvifSetVideoEncoder parses the incoming SetVideoEncoderConfiguration body.
+// Only the mutable encoder fields are captured; Name/UseCount/Quality/
+// SessionTimeout are accepted and ignored. Local names match regardless of
+// namespace prefix, so both tt:-prefixed and default-namespaced bodies parse.
+type onvifSetVideoEncoder struct {
+	XMLName xml.Name `xml:"SetVideoEncoderConfiguration"`
+	Config  struct {
+		Token      string `xml:"token,attr"`
+		Encoding   string `xml:"Encoding"`
+		Resolution struct {
+			Width  int `xml:"Width"`
+			Height int `xml:"Height"`
+		} `xml:"Resolution"`
+		RateControl struct {
+			FrameRateLimit int `xml:"FrameRateLimit"`
+			BitrateLimit   int `xml:"BitrateLimit"`
+		} `xml:"RateControl"`
+		H264 struct {
+			GovLength int `xml:"GovLength"`
+		} `xml:"H264"`
+	} `xml:"Configuration"`
+}
+
+// streamNameFromEncoderToken maps an encoder configuration token (e.g.
+// "main_encoder", as the library assigns Token+"_encoder") back to the
+// camera-daemon stream name ("main"). Returns "" if the token is not in that
+// form. The stream name equals the profile token in this codebase (onvif.yaml
+// stream == token by default), and camera-daemon's RTSP mounts and
+// ReconfigureEncoder stream_name both use it.
+func streamNameFromEncoderToken(token string) string {
+	if s := strings.TrimSuffix(token, "_encoder"); s != token && s != "" {
+		return s
+	}
+	return ""
+}
+
+// asSetVideoEncoderConfiguration applies an NVR-supplied encoder configuration
+// to the matching camera-daemon stream. It validates the token, maps it to a
+// stream, and calls ReconfigureEncoder; any failure becomes a SOAP fault.
+func asSetVideoEncoderConfiguration(srv *onvifserver.Server) soapHandlerFunc {
+	return func(body interface{}) (interface{}, error) {
+		raw, ok := body.([]byte)
+		if !ok {
+			return nil, fmt.Errorf("empty SetVideoEncoderConfiguration body")
+		}
+		var req onvifSetVideoEncoder
+		if err := xml.Unmarshal(raw, &req); err != nil {
+			return nil, fmt.Errorf("parse SetVideoEncoderConfiguration: %w", err)
+		}
+		token := req.Config.Token
+
+		// Validate the token refers to a known encoder config (clean "not found"
+		// fault without depending on camera-daemon being up).
+		profiles, err := loadProfiles(srv)
+		if err != nil {
+			return nil, err
+		}
+		known := false
+		for _, p := range profiles {
+			if p.VideoEncoderConfiguration != nil && p.VideoEncoderConfiguration.Token == token {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return nil, fmt.Errorf("video encoder configuration not found: %s", token)
+		}
+		stream := streamNameFromEncoderToken(token)
+		if stream == "" {
+			return nil, fmt.Errorf("cannot map encoder token %q to a camera-daemon stream", token)
+		}
+		if reconfigurer == nil {
+			return nil, fmt.Errorf("camera-daemon not available; encoder configuration cannot be changed via ONVIF")
+		}
+
+		params := streamParams{
+			Codec:       req.Config.Encoding,
+			Width:       uint32(req.Config.Resolution.Width),
+			Height:      uint32(req.Config.Resolution.Height),
+			Fps:         uint32(req.Config.RateControl.FrameRateLimit),
+			BitrateKbps: uint32(req.Config.RateControl.BitrateLimit),
+			Gop:         uint32(req.Config.H264.GovLength),
+		}
+		if err := reconfigurer.ReconfigureEncoder(stream, params); err != nil {
+			return nil, fmt.Errorf("ReconfigureEncoder(%s): %w", stream, err)
+		}
+		return prefixedBody("<trt:SetVideoEncoderConfigurationResponse/>"), nil
+	}
+}
+
 func asVideoEncoderConfigurations(srv *onvifserver.Server) soapHandlerFunc {
 	return func(body interface{}) (interface{}, error) {
 		profiles, err := loadProfiles(srv)
