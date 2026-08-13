@@ -284,6 +284,17 @@ func (h *APIHandlers) ImportDeviceConfig(c *gin.Context) {
 		return
 	}
 
+	// From here on we mutate /data/aipc/etc + the config DB and then restart the
+	// services that consume them. Take the shared apply lock so this cannot
+	// overlap a concurrent media write (projectMediaConfig) or media/bundle
+	// import (applyImportedMediaConfig), which rewrite the same etc tree — the
+	// P0 race. Lock order is configApplyMu alone here (clone lives on
+	// APIHandlers, which has no configMu), so it cannot cycle with the media
+	// paths. The deferred unlock releases at return, before the detached
+	// platform-api self-restart fires.
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
+
 	// Snapshot current etc + state for manual rollback (best-effort).
 	ts := time.Now().UTC().Format("20060102-150405")
 	snapDir := filepath.Join(cloneBackupRt, "clone-restore-"+ts)

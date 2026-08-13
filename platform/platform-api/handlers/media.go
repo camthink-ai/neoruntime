@@ -63,16 +63,40 @@ func (h *MediaHandlers) SetEventLogger(logger *eventLoggerPkg.Logger) {
 	h.eventLogger = logger
 }
 
-// projectMediaConfig persists the marshaled camera-daemon.yaml through the
-// Config Controller when available (atomic write + read-back verify +
-// auto-restore + revision/audit), falling back to a direct os.WriteFile when
-// the Manager is nil or the apply fails. yamlStr is the full YAML the handler
-// already produced via yaml.Marshal of its config map — passing it verbatim
-// avoids a YAML→JSON→YAML round-trip that would drift integer formatting.
-// The actor is the HTTP user for entry-point callers and "" for the internal
-// fire-and-forget helpers (which are invoked from goroutines where the gin
-// context is unsafe to capture).
+// projectMediaConfig persists the marshaled camera-daemon.yaml. It is the single
+// write chokepoint for every per-field media edit (SetConfig and the stream
+// hot-reload / RTSP / AI-overlay / add / remove / toggle helpers), all of which
+// hold h.configMu while calling it.
+//
+// It first takes configApplyMu — the shared apply lock that also guards the
+// multi-file media/bundle import (applyImportedMediaConfig) and the device-clone
+// file apply (applyTree). That serialization is what stops a clone restore from
+// overwriting /data/aipc/etc mid-edit while a media write is in flight (or vice
+// versa) — the P0 race. Lock order is configMu → configApplyMu (media edits) and
+// configApplyMu alone (clone); the two never form a cycle.
+//
+// Callers that ALREADY hold configApplyMu (only applyImportedMediaConfig) must
+// call projectMediaConfigLocked instead to avoid reentrant self-deadlock —
+// sync.Mutex is not reentrant.
+//
+// Persist itself routes through the Config Controller when available (atomic
+// write + read-back verify + auto-restore + revision/audit), falling back to a
+// direct os.WriteFile when the Manager is nil or the apply fails. yamlStr is the
+// full YAML the handler already produced via yaml.Marshal of its config map —
+// passing it verbatim avoids a YAML→JSON→YAML round-trip that would drift
+// integer formatting. The actor is the HTTP user for entry-point callers and ""
+// for the internal fire-and-forget helpers (which are invoked from goroutines
+// where the gin context is unsafe to capture).
 func (h *MediaHandlers) projectMediaConfig(ctx context.Context, actor, yamlStr string) error {
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
+	return h.projectMediaConfigLocked(ctx, actor, yamlStr)
+}
+
+// projectMediaConfigLocked is projectMediaConfig without the configApplyMu lock.
+// Precondition: the caller already holds configApplyMu. See projectMediaConfig
+// for the full contract and why this split exists.
+func (h *MediaHandlers) projectMediaConfigLocked(ctx context.Context, actor, yamlStr string) error {
 	if h.configMgr != nil {
 		if _, _, err := h.configMgr.Apply(ctx, "media", "config", yamlStr, actor); err != nil {
 			logger.Warn("media manager apply failed, falling back to direct write: %v", err)

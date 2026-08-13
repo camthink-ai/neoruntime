@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"aipc/platform/platform-api/internal/atomicfile"
 )
@@ -45,6 +46,24 @@ type configManifest struct {
 	Files     []manifestEntry   `json:"files"`
 	Extra     map[string]any    `json:"extra,omitempty"`
 }
+
+// configApplyMu serializes every path that writes /data/aipc/etc config files
+// (and then restarts the services that consume them). Three apply paths touch
+// that tree and must not interleave:
+//
+//   - per-field media edits (media.go's 8 SetConfig/stream helpers) → hold
+//     h.configMu, then projectMediaConfig acquires this lock;
+//   - media/bundle import (applyImportedMediaConfig) → holds h.configMu, then
+//     acquires this lock, then calls projectMediaConfigLocked (NOT the locking
+//     wrapper — it already holds this lock, and sync.Mutex is not reentrant);
+//   - device-clone file apply (ImportDeviceConfig → applyTree here) → acquires
+//     this lock only (clone lives on APIHandlers, which has no configMu).
+//
+// Lock order is therefore configMu → configApplyMu on the media side and
+// configApplyMu alone on the clone side, so the two never form a cycle. Without
+// this lock, a clone restore could overwrite the etc tree mid-edit while a
+// concurrent web media write is in flight (or vice versa) — the P0 race.
+var configApplyMu sync.Mutex
 
 // sha256Sum returns the hex-encoded sha256 of data.
 func sha256Sum(data []byte) string {

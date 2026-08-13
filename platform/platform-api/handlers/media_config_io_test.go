@@ -14,10 +14,17 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 // TestMediaEnvelopeRoundTrip pins transport fidelity: schema, version and all
@@ -188,6 +195,57 @@ func TestReadJSONRawAndAtomicWrite(t *testing.T) {
 	}
 }
 
+// TestProjectMediaConfigHoldsApplyLock pins the P0 fix: projectMediaConfig must
+// acquire the shared configApplyMu — the same lock the device-clone import
+// (ImportDeviceConfig → applyTree) relies on to serialize against media writes.
+// If a future change drops that acquisition, a clone restore could overwrite
+// /data/aipc/etc mid-edit. We pre-hold configApplyMu, assert projectMediaConfig
+// blocks, then release and assert it completes and writes.
+func TestProjectMediaConfigHoldsApplyLock(t *testing.T) {
+	path := writeTempYaml(t, "encoders:\n  width: 1920\n")
+	h := &MediaHandlers{configPath: path} // configMgr nil → direct os.WriteFile
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Pre-hold the shared apply lock so projectMediaConfig must block.
+	configApplyMu.Lock()
+
+	done := make(chan struct{})
+	go func() {
+		// With configApplyMu held by the test, this should block on the lock.
+		_ = h.projectMediaConfig(ctx, "tester", "encoders:\n  width: 1280\n")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		configApplyMu.Unlock()
+		t.Fatal("projectMediaConfig returned while configApplyMu was held by the test — it did not acquire the shared apply lock (P0 regression)")
+	case <-time.After(150 * time.Millisecond):
+		// expected: blocked on configApplyMu
+	}
+
+	// Release → projectMediaConfig should now run to completion.
+	configApplyMu.Unlock()
+
+	select {
+	case <-done:
+		// good
+	case <-time.After(2 * time.Second):
+		t.Fatal("projectMediaConfig did not complete after configApplyMu was released")
+	}
+
+	// Sanity: the write actually happened (proves it ran the real body, not a no-op).
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back written config: %v", err)
+	}
+	if !bytes.Contains(got, []byte("1280")) {
+		t.Errorf("config not written after lock release; got %q", got)
+	}
+}
+
 // mediaCompactRaw canonicalizes a RawMessage to compact JSON so two dimensions
 // compare equal even when MarshalIndent reformats one's whitespace during a
 // marshal→unmarshal round-trip.
@@ -198,4 +256,53 @@ func mediaCompactRaw(t *testing.T, raw json.RawMessage) []byte {
 		t.Fatalf("compact invalid JSON %q: %v", raw, err)
 	}
 	return buf.Bytes()
+}
+
+// TestExportMediaConfigStreamsBareEnvelope pins the export→import transport
+// contract: GET /config/export streams the bare envelope (schema at the top
+// level), NOT an APIResponse {code,data} wrapper. The wrapper would be saved
+// verbatim by the client and arrive at /config/import as `unsupported schema ""`
+// because ShouldBindJSON binds schema from the top level. So the response body
+// must unmarshal directly into mediaConfigEnvelope and then pass the same
+// validation import runs — a clean round-trip with no client transformation.
+func TestExportMediaConfigStreamsBareEnvelope(t *testing.T) {
+	path := writeTempYaml(t, "encoders:\n  width: 1920\n  height: 1080\n")
+	h := &MediaHandlers{configPath: path}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/export", h.ExportMediaConfig)
+
+	req := httptest.NewRequest(http.MethodGet, "/export", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	if cd := w.Header().Get("Content-Disposition"); !strings.Contains(cd, "attachment") {
+		t.Fatalf("Content-Disposition = %q, want an attachment download", cd)
+	}
+
+	// The body must be the bare envelope: unmarshaling directly into
+	// mediaConfigEnvelope yields the schema at the top level. A wrapped
+	// {code,data} response would leave Schema empty here — the original bug.
+	var env mediaConfigEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal export body: %v; body=%s", err, w.Body.String())
+	}
+	if env.Schema != mediaConfigSchema {
+		t.Fatalf("schema = %q, want %q (export wrapped under {code,data}?); body=%s",
+			env.Schema, mediaConfigSchema, w.Body.String())
+	}
+	if env.Version != mediaConfigVersion {
+		t.Errorf("version = %d, want %d", env.Version, mediaConfigVersion)
+	}
+	// The exported body must pass the exact validation import runs.
+	if err := validateMediaEnvelope(&env); err != nil {
+		t.Fatalf("exported envelope fails import validation: %v", err)
+	}
 }
