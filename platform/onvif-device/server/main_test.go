@@ -847,14 +847,17 @@ func TestGetVideoSourceConfiguration_NamespaceDepth(t *testing.T) {
 	}
 }
 
-// TestGetVideoEncoderConfigurationOptions_UsesH264OptionsElement guards the ver10
-// element name "H264Options" inside the Options response. ODM and other ver10
-// clients look for H264Options to populate the encoder editor's
-// resolution/profile/range dropdowns; emitting the ver20 "H264" name (which is
-// the *config* element name, not the options element name) makes them find
-// nothing and the editor never populates. The Options response must carry
-// H264Options and must NOT carry a bare H264 options container.
-func TestGetVideoEncoderConfigurationOptions_UsesH264OptionsElement(t *testing.T) {
+// TestGetVideoEncoderConfigurationOptions_BoschWireFormat guards the element
+// names against a real ODM-compatible camera (Bosch FLEXIDOME indoor 5100i) and
+// the onvif-go client struct. Two names are easy to get wrong and each silently
+// breaks ODM's .NET deserializer → Options null → NullReferenceException when
+// the Video streaming panel renders the encoder editor:
+//   - the Options wrapper is <trt:Options> (locally declared in media.wsdl), NOT
+//     <tt:Options>;
+//   - the codec block is <tt:H264> (the element name), NOT <tt:H264Options>
+//     (that is the TYPE name). An earlier revision misread the schema and emitted
+//     H264Options; real cameras and the onvif-go client both use "H264".
+func TestGetVideoEncoderConfigurationOptions_BoschWireFormat(t *testing.T) {
 	// Arrange
 	cfg := testConfig()
 	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
@@ -873,9 +876,18 @@ func TestGetVideoEncoderConfigurationOptions_UsesH264OptionsElement(t *testing.T
 		t.Fatalf("GetVideoEncoderConfigurationOptions not routed; body=%s", respBody)
 	}
 
-	// Assert — ver10 options element name + its sub-elements.
-	if !strings.Contains(respBody, "<tt:H264Options>") {
-		t.Errorf("response missing <tt:H264Options> (ver10 options element); body=%s", respBody)
+	// Assert — real-camera wire format.
+	if !strings.Contains(respBody, "<trt:Options>") {
+		t.Errorf("response missing <trt:Options> (media/wsdl element); body=%s", respBody)
+	}
+	if strings.Contains(respBody, "<tt:Options>") {
+		t.Errorf("response has <tt:Options> (wrong namespace, breaks ODM); body=%s", respBody)
+	}
+	if !strings.Contains(respBody, "<tt:H264>") {
+		t.Errorf("response missing <tt:H264> (element name, not type name); body=%s", respBody)
+	}
+	if strings.Contains(respBody, "<tt:H264Options>") {
+		t.Errorf("response has <tt:H264Options> (type name used as element; breaks ODM); body=%s", respBody)
 	}
 	if !strings.Contains(respBody, "<tt:ResolutionsAvailable>") {
 		t.Errorf("response missing ResolutionsAvailable under options; body=%s", respBody)
@@ -883,15 +895,9 @@ func TestGetVideoEncoderConfigurationOptions_UsesH264OptionsElement(t *testing.T
 	if !strings.Contains(respBody, "<tt:H264ProfilesSupported>High") {
 		t.Errorf("response missing High H264ProfilesSupported; body=%s", respBody)
 	}
-	// Regression guard: a bare <tt:H264> options container (the ver20 name in a
-	// ver10 response) must not appear. <tt:H264> is the config element and has no
-	// place in the Options response — its presence is exactly what broke ODM.
-	if strings.Contains(respBody, "<tt:H264>") {
-		t.Errorf("response has bare <tt:H264> options container; want <tt:H264Options>; body=%s", respBody)
-	}
 	// Regression guard: the ver10 VideoEncoderConfigurationOptions type has NO
 	// <Encoding> child — QualityRange is the required first element and the encoding
-	// is implied by which option block (H264Options) is present. An out-of-sequence
+	// is implied by which option block (H264) is present. An out-of-sequence
 	// <tt:Encoding> breaks ODM's strict .NET deserializer and it then renders the
 	// encoder editor read-only, so Options must not carry it.
 	if strings.Contains(respBody, "<tt:Encoding>") {

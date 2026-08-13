@@ -485,23 +485,28 @@ func renderGetVideoEncoderConfigurationOptions(profiles []onvifserver.MediaProfi
 	var x xbuf
 	x.Open("trt:GetVideoEncoderConfigurationOptionsResponse")
 	// Per the ver10 schema, VideoEncoderConfigurationOptions' sequence is QualityRange
-	// (required, first child), then the encoding-specific choice (H264Options here).
+	// (required, first child), then the encoding-specific element (H264 here).
 	// There is NO <Encoding> child — the encoding is implied by which option block is
 	// present. Emitting <tt:Encoding> before QualityRange is out-of-sequence and breaks
 	// strict .NET deserializers (ONVIF Device Manager then renders the config
 	// read-only), so it is deliberately omitted here. Real cameras omit it too.
-	x.Open("tt:Options")
+	//
+	// WIRE FORMAT (verified against a real ODM-compatible camera — Bosch FLEXIDOME
+	// indoor 5100i — and the onvif-go client struct): use the element names, NOT the
+	// type names:
+	//   - <trt:Options>  (locally declared in media.wsdl → trt namespace, NOT tt)
+	//   - <tt:H264>      (element name is "H264"; "H264Options" is the TYPE name)
+	// Emitting <tt:Options> or <tt:H264Options> makes ODM's .NET deserializer fail to
+	// match the element → Options null → NullReferenceException ("未将对象引用…") when
+	// the Video streaming panel renders the encoder editor. The earlier "H264Options"
+	// form was a schema-reading mistake; real cameras and the onvif-go client both use
+	// the element name "H264".
+	x.Open("trt:Options")
 	x.Open("tt:QualityRange")
 	x.Elem("tt:Min", "1")
 	x.Elem("tt:Max", "100")
 	x.Close("tt:QualityRange")
-	// Element name is H264Options (not H264): in the ver10 schema this is the
-	// VideoEncoderConfigurationOptions type, whose H264 sub-element is named
-	// "H264Options" (type H264Options: ResolutionsAvailable/GovLengthRange/…).
-	// The "H264" element name belongs to VideoEncoderConfiguration (the *config*,
-	// rendered elsewhere) — emitting "H264" here makes ver10 clients incl. ONVIF
-	// Device Manager fail to find the options, so they never populate the editor.
-	x.Open("tt:H264Options")
+	x.Open("tt:H264")
 	seen := make(map[string]bool)
 	maxFR := 30
 	for _, p := range profiles {
@@ -538,8 +543,8 @@ func renderGetVideoEncoderConfigurationOptions(profiles []onvifserver.MediaProfi
 	for _, profile := range []string{"Baseline", "Main", "High"} {
 		x.Elem("tt:H264ProfilesSupported", profile)
 	}
-	x.Close("tt:H264Options")
-	x.Close("tt:Options")
+	x.Close("tt:H264")
+	x.Close("trt:Options")
 	x.Close("trt:GetVideoEncoderConfigurationOptionsResponse")
 	return prefixedBody(x.String())
 }
