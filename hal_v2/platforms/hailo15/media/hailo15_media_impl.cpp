@@ -4883,7 +4883,14 @@ static int hailo15_media_override_stream_params(void *media_ctx, const HalStream
             HAL_LOG_ERROR("hailo15_media: override_stream_params: failed to generate new config JSON");
             return HAL_ERROR;
         }
-        int rc = reinit_media_library_on_stream_change(static_cast<HalMediaContext *>(media_ctx), priv, new_json);
+        // skip_encoder_overrides=true: generate_config already wrote the requested
+        // dimensions into new_json (encoder files at the existing-stream file-path
+        // branch + application_input_streams). Re-applying priv->encoder_overrides_json
+        // (the static YAML/init override) here would REVERT the caller's requested
+        // resolution/codec — e.g. a 4K->1080p ReconfigureEncoder (ONVIF
+        // SetVideoEncoderConfiguration) was silently forced back to 4K. Mirrors
+        // reconfigure_pipeline (the web-UI path), which passes true for the same reason.
+        int rc = reinit_media_library_on_stream_change(static_cast<HalMediaContext *>(media_ctx), priv, new_json, true);
         if (rc == HAL_OK)
         {
             HAL_LOG_INFO("hailo15_media: override_stream_params: reinit success (%u streams)", batch->stream_count);
