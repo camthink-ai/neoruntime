@@ -600,6 +600,46 @@ func TestGetProfiles_NamespaceDepth(t *testing.T) {
 	}
 }
 
+// TestGetProfiles_H264ProfileIsHigh locks in the blemish fix: the onvif-go
+// library hardcodes H264Profile="Main" (server/media.go), but the Hailo encoder
+// emits High profile for both streams (confirmed via live SDP profile-level-id:
+// main High@L5.1, sub High@L3.1). loadProfiles normalizes the configured value
+// to "High" so NVRs that read H264Profile from the ONVIF config (rather than the
+// in-band SPS) select the correct decoder.
+func TestGetProfiles_H264ProfileIsHigh(t *testing.T) {
+	// Arrange
+	cfg := testConfig()
+	srv, err := onvifserver.New(buildServerConfig(cfg, "SN1", "1.0", "192.168.1.50"))
+	if err != nil {
+		t.Fatalf("onvifserver.New: %v", err)
+	}
+	mux := http.NewServeMux()
+	registerMediaRoutes(mux, srv)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Act
+	body := soapEnvelope("GetProfiles", mediaNS, "")
+	resp, err := http.Post(ts.URL+"/onvif/media_service", "application/soap+xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, out)
+	}
+
+	// Assert — configured H264 profile is High, not the library default Main.
+	respBody := string(out)
+	if !strings.Contains(respBody, "H264Profile>High<") {
+		t.Errorf("H264Profile not High; body=%s", respBody)
+	}
+	if strings.Contains(respBody, "H264Profile>Main<") {
+		t.Errorf("H264Profile still library default Main; body=%s", respBody)
+	}
+}
+
 // TestGetProfile_NamespaceDepth asserts the singular GetProfile response that
 // ODM requests when starting live video: wrapper + trt:Profile bridge in
 // media/wsdl, tt-typed children in schema.

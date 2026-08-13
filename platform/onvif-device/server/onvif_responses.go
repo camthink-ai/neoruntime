@@ -325,7 +325,24 @@ func loadProfiles(srv *onvifserver.Server) ([]onvifserver.MediaProfile, error) {
 	if !ok {
 		return nil, fmt.Errorf("unexpected GetProfiles response type %T", resp)
 	}
+	normalizeProfiles(lib.Profiles)
 	return lib.Profiles, nil
+}
+
+// normalizeProfiles overrides library defaults that are wrong for this hardware.
+// The onvif-go library hardcodes H264Profile="Main" (server/media.go), but the
+// Hailo encoder emits High profile for both streams (confirmed via live SDP
+// profile-level-id: main High@L5.1, sub High@L3.1). Report the truthful value so
+// NVRs that read H264Profile from the ONVIF config (rather than the in-band SPS)
+// select the correct decoder. Called on every path that renders profiles:
+// GetProfiles/GetProfile (via asProfiles/asProfile) and the configuration ops
+// (via loadProfiles).
+func normalizeProfiles(profiles []onvifserver.MediaProfile) {
+	for i := range profiles {
+		if enc := profiles[i].VideoEncoderConfiguration; enc != nil && enc.H264 != nil {
+			enc.H264.H264Profile = "High"
+		}
+	}
 }
 
 // parseConfigToken extracts <…:ConfigurationToken>value</…> from a request body,
@@ -612,6 +629,7 @@ func asProfiles(srv *onvifserver.Server) soapHandlerFunc {
 		if !ok {
 			return resp, nil
 		}
+		normalizeProfiles(lib.Profiles)
 		return renderGetProfiles(lib.Profiles), nil
 	}
 }
@@ -630,6 +648,7 @@ func asProfile(srv *onvifserver.Server) soapHandlerFunc {
 		if !ok {
 			return resp, nil
 		}
+		normalizeProfiles(lib.Profiles)
 		for _, p := range lib.Profiles {
 			if p.Token == token {
 				return renderGetProfile(p), nil
