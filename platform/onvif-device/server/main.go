@@ -91,8 +91,10 @@ func main() {
 	// Arm the live-stream overlay: ONVIF metadata (codec/resolution/bitrate/fps/
 	// gop) tracks camera-daemon's actual running encoder instead of static
 	// onvif.yaml. Non-fatal if the socket is missing/down — enrichProfiles
-	// falls back to the static values, so ONVIF never breaks.
-	initLiveStreams(cfg.Camera.Socket)
+	// falls back to the static values, so ONVIF never breaks. DaemonConfig is
+	// the camera-daemon.yaml path ONVIF SetVideoEncoderConfiguration persists to
+	// (so changes survive reboot and the web settings page reflects them).
+	initLiveStreams(cfg.Camera.Socket, cfg.Camera.DaemonConfig)
 
 	// WS-Discovery responder (Hello + ProbeMatch). Runs in parallel; failure
 	// is non-fatal so the SOAP service still works without multicast.

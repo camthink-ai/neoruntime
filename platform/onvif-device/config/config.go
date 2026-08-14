@@ -63,8 +63,15 @@ type RTSPConfig struct {
 // queries GetStreamStatus over this Unix socket so its advertised ONVIF metadata
 // (codec/resolution/bitrate/fps/gop) tracks the live encoder instead of static
 // onvif.yaml. An empty socket disables the overlay (static fallback).
+//
+// DaemonConfig is the path to camera-daemon.yaml. ONVIF
+// SetVideoEncoderConfiguration persists applied changes here (mirroring the web
+// UI's writeStreamToConfig) so they survive reboot and the web settings page
+// (GET /media/config, which reads this yaml) reflects them. Empty disables
+// persistence (runtime-only changes, reverted on reboot).
 type CameraConfig struct {
-	Socket string `yaml:"socket"`
+	Socket       string `yaml:"socket"`
+	DaemonConfig string `yaml:"daemon_config"`
 }
 
 // ProfileConfig maps an ONVIF media profile to a camera-daemon RTSP stream.
@@ -171,6 +178,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Camera.Socket == "" {
 		cfg.Camera.Socket = "unix:///run/aipc/camera-control.sock"
+	}
+	if cfg.Camera.DaemonConfig == "" {
+		cfg.Camera.DaemonConfig = filepath.Join(constants.RootPath(), "etc", "camera-daemon.yaml")
 	}
 	if cfg.VersionFile == "" {
 		cfg.VersionFile = filepath.Join(constants.RootPath(), "VERSION")

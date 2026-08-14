@@ -19,8 +19,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strings"
+	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	camerapb "aipc/platform/camera-daemon/proto"
 	"google.golang.org/grpc"
@@ -67,8 +71,9 @@ var reconfigurer streamReconfigurer
 // cameraStatusClient is the production streamStatusProvider: a long-lived gRPC
 // connection to camera-daemon queried once per ONVIF request.
 type cameraStatusClient struct {
-	conn    *grpc.ClientConn
-	timeout time.Duration
+	conn       *grpc.ClientConn
+	timeout    time.Duration
+	configPath string // camera-daemon.yaml; "" disables ONVIF-side persistence
 }
 
 // RunningParams implements streamStatusProvider. It never returns an error:
@@ -161,6 +166,16 @@ func (c *cameraStatusClient) ReconfigureEncoder(stream string, p streamParams) e
 		}
 		return fmt.Errorf("%s", msg)
 	}
+	// Runtime apply succeeded — persist to camera-daemon.yaml so the change
+	// survives reboot AND the web settings page (GET /media/config, which reads
+	// the yaml) reflects it. Best-effort: the live encoder is already updated, so
+	// a persistence failure is logged, not returned (mirrors platform-api's
+	// writeStreamToConfig, which also swallows persistence errors).
+	if err := persistStreamConfig(c.configPath, stream, p); err != nil {
+		log.Printf("[onvif] ReconfigureEncoder(%s) applied but NOT persisted: %v", stream, err)
+	} else if c.configPath != "" {
+		log.Printf("[onvif] ReconfigureEncoder(%s) persisted to %s", stream, c.configPath)
+	}
 	return nil
 }
 
@@ -168,8 +183,10 @@ func (c *cameraStatusClient) ReconfigureEncoder(stream string, p streamParams) e
 // package-wide liveStreams provider. The dial is non-blocking, so a missing or
 // down camera-daemon never stalls startup — the first request simply fails and
 // onvif-device serves static metadata until camera-daemon recovers.
-// An empty socket leaves liveStreams nil (feature disabled).
-func initLiveStreams(socket string) {
+// An empty socket leaves liveStreams nil (feature disabled). configPath is the
+// camera-daemon.yaml path used to persist ONVIF encoder changes (empty disables
+// persistence; runtime-only changes then revert on reboot).
+func initLiveStreams(socket, configPath string) {
 	if socket == "" {
 		return
 	}
@@ -179,8 +196,101 @@ func initLiveStreams(socket string) {
 		log.Printf("[onvif] camera-daemon stream-status disabled: dial %s: %v", socket, err)
 		return
 	}
-	client := &cameraStatusClient{conn: conn, timeout: 2 * time.Second}
+	client := &cameraStatusClient{conn: conn, timeout: 2 * time.Second, configPath: configPath}
 	liveStreams = client
 	reconfigurer = client
 	log.Printf("[onvif] camera-daemon stream-status enabled (%s); ONVIF metadata tracks live encoder params", socket)
+}
+
+// persistMu serializes onvif-device's read-modify-write of camera-daemon.yaml so
+// concurrent ONVIF Sets don't clobber each other. platform-api has its own
+// configMu; cross-process races are last-writer-wins on a full-file rewrite,
+// acceptable for these low-frequency human/NVR-driven changes (the same risk the
+// web UI already has with concurrent browser tabs).
+var persistMu sync.Mutex
+
+// persistStreamConfig writes the encoder params into camera-daemon.yaml's
+// encoders[] entry for streamName, mirroring platform-api's writeStreamToConfig.
+// This makes an ONVIF SetVideoEncoderConfiguration survive reboot AND lets the
+// web settings page (GET /media/config, which reads the yaml) reflect the change
+// immediately — closing the gap where ONVIF changed only the runtime encoder
+// while the persisted config (and thus the web UI) still showed the old value.
+//
+// An empty configPath is a no-op (persistence disabled). 0-valued fields are left
+// unchanged (writeStreamToConfig/"0 = no change" semantics), so a partial ONVIF
+// update touches only the fields the client sent. BitrateKbps is converted to
+// bps (the yaml bitrate unit); width/height are canonicalized to landscape (swap
+// when height>width) to match platform-api's canonicalEncoderDims. The write is
+// atomic (temp + rename) so a crash mid-write cannot brick camera-daemon's boot.
+func persistStreamConfig(configPath, streamName string, p streamParams) error {
+	if configPath == "" {
+		return nil
+	}
+	persistMu.Lock()
+	defer persistMu.Unlock()
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read camera-daemon.yaml: %w", err)
+	}
+	var config map[string]interface{}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("parse camera-daemon.yaml: %w", err)
+	}
+	encoders, ok := config["encoders"].([]interface{})
+	if !ok {
+		return fmt.Errorf("camera-daemon.yaml has no encoders[] list")
+	}
+	found := false
+	for _, item := range encoders {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if fmt.Sprint(m["stream_name"]) != streamName {
+			continue
+		}
+		found = true
+		w, h := p.Width, p.Height
+		if w > 0 && h > 0 && h > w {
+			// Canonical landscape: undo a portrait transpose (a rotation-residual
+			// signature) so a stale portrait dim never survives into the next boot.
+			w, h = h, w
+		}
+		if w > 0 {
+			m["width"] = int(w)
+		}
+		if h > 0 {
+			m["height"] = int(h)
+		}
+		if p.Codec != "" {
+			m["codec"] = strings.ToLower(p.Codec)
+		}
+		if p.BitrateKbps > 0 {
+			m["bitrate"] = int(p.BitrateKbps) * 1000 // yaml bitrate is bps
+		}
+		if p.Fps > 0 {
+			m["fps"] = int(p.Fps)
+		}
+		if p.Gop > 0 {
+			m["gop"] = int(p.Gop)
+		}
+		break
+	}
+	if !found {
+		return fmt.Errorf("stream %q not found in camera-daemon.yaml encoders[]", streamName)
+	}
+
+	out, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("marshal camera-daemon.yaml: %w", err)
+	}
+	tmp := configPath + ".onvif-tmp"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := os.Rename(tmp, configPath); err != nil {
+		return fmt.Errorf("replace camera-daemon.yaml: %w", err)
+	}
+	return nil
 }

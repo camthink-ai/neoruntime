@@ -85,8 +85,8 @@ func esc(s string) string {
 	return r.Replace(s)
 }
 
-func btoa(v bool) string { return strconv.FormatBool(v) }
-func itoa(v int) string  { return strconv.Itoa(v) }
+func btoa(v bool) string    { return strconv.FormatBool(v) }
+func itoa(v int) string     { return strconv.Itoa(v) }
 func ftoa(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
 
 // --- Device service renderers ---
