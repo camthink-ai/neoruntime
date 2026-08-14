@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import type { TFunction } from 'i18next';
 import { Loader2, ShieldCheck, AlertTriangle, ArrowLeft } from 'lucide-react';
 import { toast } from 'sonner';
 import FileUpload from '@/components/file-upload';
@@ -17,6 +16,7 @@ import { enterNetworkErrorToastSuppress } from '@/services/request';
 import { startPolling, type PollingHandle } from '@/utils/polling';
 import { systemApi } from '@/services/api/system';
 import { cn } from '@/lib/utils';
+import { resolveImportErrorMessage } from './resolveImportErrorMessage';
 
 export interface ImportFileTransferDialogProps {
   open: boolean;
@@ -29,8 +29,8 @@ export interface ImportFileTransferDialogProps {
   maxSize: number;
   /** Impact disclosure bullets shown before confirm. */
   effects: string[];
-  /** 'mid' = amber confirm, 'high' = destructive red confirm. */
-  risk: 'mid' | 'high';
+  /** 'low' = sky confirm (config), 'mid' = amber, 'high' = destructive red. */
+  risk: 'low' | 'mid' | 'high';
   /** Clone-only: items the target keeps (password / certs / device name / apps / models). */
   identityPreserved?: string[];
   /** Clone-only: platform-api self-restarts → suppress network toasts + health-poll reconnect. */
@@ -44,46 +44,6 @@ function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-// Backend business codes that mean "the uploaded file is not a valid backup".
-// These abort BEFORE any device state is touched (handlers validate
-// multipart → manifest → schema → version → sha256 → inner JSON before
-// applying), so masking their raw detail (e.g. a JSON parse error) with a
-// friendly prompt hides no device-side failure. Apply/DB/network errors keep
-// their real detail.
-const INVALID_BACKUP_CODES = new Set([1001, 1002, 1004]);
-
-type ApiErrorBody = {
-  code?: number;
-  message?: string;
-  error?: { type?: string; detail?: string };
-};
-
-// Map an import error to a user-facing toast message. Bad-backup-file errors
-// (validation / integrity / invalid request·JSON·parameter / extract failure)
-// show the friendly invalid-file prompt; server-side failures surface their
-// specific detail so the real reason isn't masked.
-function resolveImportErrorMessage(err: unknown, t: TFunction): string {
-  const data = (err as { response?: { data?: ApiErrorBody } })?.response?.data;
-  const code = data?.code;
-  const type = data?.error?.type;
-  const isBadBackupFile =    type === 'validation'
-    || type === 'integrity'
-    || (code !== undefined && INVALID_BACKUP_CODES.has(code))
-    || (code === 4003 && !type); // extract/staging (FailMsg) — not apply/import (FailTyped)
-  if (isBadBackupFile) {
-    return t(
-      'maintenance.backup.invalid_json',
-      'The backup file is invalid or corrupted.'
-    );
-  }
-  return (
-    data?.error?.detail
-    || data?.message
-    || (err as Error)?.message
-    || t('common.error')
-  );
 }
 
 // Single-layer dialog: the confirm step is an in-dialog state change, NOT a
@@ -195,6 +155,7 @@ export default function ImportFileTransferDialog({
   };
 
   const isHigh = risk === 'high';
+  const isLow = risk === 'low';
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -252,7 +213,11 @@ export default function ImportFileTransferDialog({
                     <span
                       className={cn(
                         'mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full',
-                        isHigh ? 'bg-destructive' : 'bg-amber-500'
+                        isHigh
+                          ? 'bg-destructive'
+                          : isLow
+                            ? 'bg-sky-500'
+                            : 'bg-amber-500'
                       )}
                     />
                     <span>{e}</span>
@@ -300,7 +265,9 @@ export default function ImportFileTransferDialog({
                 'flex items-start gap-2 rounded-lg p-3 text-sm',
                 isHigh
                   ? 'border border-destructive/30 bg-destructive/5 text-destructive'
-                  : 'border border-amber-500/30 bg-amber-500/[0.04] text-amber-700 dark:text-amber-500'
+                  : isLow
+                    ? 'border border-sky-500/30 bg-sky-500/[0.04] text-sky-700 dark:text-sky-500'
+                    : 'border border-amber-500/30 bg-amber-500/[0.04] text-amber-700 dark:text-amber-500'
               )}
             >
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -310,10 +277,15 @@ export default function ImportFileTransferDialog({
                       'maintenance.backup.confirm_high_desc',
                       'This overwrites the target device config and 4 state tables. Identity (password, certificates, device name, apps, models) is preserved. This action cannot be undone.'
                     )
-                  : t(
-                      'maintenance.backup.confirm_mid_desc',
-                      'This overwrites the current media config and overlay images, then restarts the camera services. This action cannot be undone.'
-                    )}
+                  : isLow
+                    ? t(
+                        'maintenance.backup.confirm_low_desc',
+                        'This replaces the camera image and media settings; the camera service restarts. This action cannot be undone.'
+                      )
+                    : t(
+                        'maintenance.backup.confirm_mid_desc',
+                        'This overwrites the current media config and overlay images, then restarts the camera services. This action cannot be undone.'
+                      )}
               </span>
             </div>
 

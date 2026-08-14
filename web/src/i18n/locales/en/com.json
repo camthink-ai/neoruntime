@@ -283,6 +283,14 @@
       "title": "Backup & Migration",
       "subtitle": "Export/import device configuration to replicate settings across same-model devices or perform a full clone.",
       "drop_hint": "Drag file here, or click to select",
+      "exporting": "Exporting…",
+      "meta": {
+        "format": "Format",
+        "size_limit": "Max size",
+        "restart": "Service restart",
+        "restart_config": "Camera service",
+        "restart_clone": "All services"
+      },
       "file": "File",
       "size": "Size",
       "schema": "Schema",

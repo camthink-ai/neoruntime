@@ -283,6 +283,14 @@
       "title": "备份与迁移",
       "subtitle": "导出/导入设备配置，以在相同型号设备间复制设置或执行整机克隆。",
       "drop_hint": "将文件拖到此处，或点击选择",
+      "exporting": "导出中…",
+      "meta": {
+        "format": "文件格式",
+        "size_limit": "大小上限",
+        "restart": "服务重启",
+        "restart_config": "相机服务",
+        "restart_clone": "全部服务"
+      },
       "file": "文件",
       "size": "大小",
       "schema": "结构",
