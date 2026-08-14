@@ -4340,7 +4340,9 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
             p.iq_settings.dewarp.enabled = cfg->dewarp;
             p.stabilizer_settings.dis.enabled = cfg->dis;
             p.stabilizer_settings.eis.enabled = cfg->eis;
-            p.iq_settings.grayscale.enabled = cfg->grayscale;
+            /* Profile-intrinsic grayscale (IR monochrome) must survive a full reinit:
+             * the toggle may only add grayscale, never remove it (see dynamic_change_image_config). */
+            p.iq_settings.grayscale.enabled = cfg->grayscale || p.iq_settings.grayscale.enabled;
 
             /* Recalculate OSD for new dimensions. */
             HalRotationAngle new_rot = cfg->rotation_angle;
@@ -4532,7 +4534,13 @@ static int hailo15_media_dynamic_change_image_config(void *media_ctx, const HalM
     p.iq_settings.dewarp.enabled = cfg->dewarp;
     p.stabilizer_settings.dis.enabled = cfg->dis;
     p.stabilizer_settings.eis.enabled = cfg->eis;
-    p.iq_settings.grayscale.enabled = cfg->grayscale;
+    /* A profile that mandates monochrome (e.g. Infrared, grayscale=true) must keep
+     * grayscale ON; the transform toggle may only ADD grayscale, never disable a
+     * profile-intrinsic one. Otherwise flipping / resolution-switching in IR mode
+     * clobbers the B&W output into a purple color cast (IR-cut at night + IR LEDs +
+     * AWB on a color path). get_current_profile() returns the profile definition, so
+     * p.iq_settings.grayscale.enabled is the authored value (true for IR). */
+    p.iq_settings.grayscale.enabled = cfg->grayscale || p.iq_settings.grayscale.enabled;
 
     if (cfg->privacy_mask && !cfg->digital_zoom)
     {
