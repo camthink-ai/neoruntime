@@ -903,6 +903,13 @@ func TestGetVideoEncoderConfigurationOptions_BoschWireFormat(t *testing.T) {
 	if strings.Contains(respBody, "<tt:Encoding>") {
 		t.Errorf("response has <tt:Encoding> inside Options; ver10 Options has no such element (breaks ODM editor); body=%s", respBody)
 	}
+	// Regression guard: 1920×1080 MUST be advertised. Deriving Options only from
+	// the live profile resolutions advertised just 4K + 720P, so ODM (which
+	// constrains its resolution dropdown to the advertised set) snapped a "1080P"
+	// choice to 720P. The Hailo encoder supports 1080P end-to-end, so it must be listed.
+	if !strings.Contains(respBody, "<tt:Width>1920</tt:Width>") || !strings.Contains(respBody, "<tt:Height>1080</tt:Height>") {
+		t.Errorf("response missing advertised 1920×1080 (without it ODM cannot select 1080P and snaps to 720P); body=%s", respBody)
+	}
 }
 
 // TestGetVideoEncoderConfiguration_HasFixedFalse guards the required fixed

@@ -477,10 +477,23 @@ func renderGetVideoEncoderConfigurations(list []*onvifserver.VideoEncoderConfigu
 	return prefixedBody(x.String())
 }
 
+// supportedEncoderResolutions is the capability list of H.264 resolutions the
+// Hailo encoder supports, advertised via GetVideoEncoderConfigurationOptions so
+// NVRs can populate their resolution selector. These are encoder capabilities
+// (verified end-to-end: SetVideoEncoderConfiguration → encoder 'sink0' configured
+// <W>x<H>), NOT the currently-running resolutions.
+var supportedEncoderResolutions = []struct{ w, h int }{
+	{3840, 2160}, // 4K UHD
+	{1920, 1080}, // 1080P — was missing, so ODM snapped a "1080P" choice to 720P
+	{1280, 720},  // 720P
+	{640, 480},   // VGA
+}
+
 // renderGetVideoEncoderConfigurationOptions advertises the valid encoder-option
-// ranges (resolutions, framerate, GOV length, H264 profiles). Resolutions and
-// the framerate ceiling are derived from the configured profiles; the rest are
-// sensible defaults that match what camera-daemon actually encodes.
+// ranges (resolutions, framerate, GOV length, H264 profiles). Resolutions are the
+// encoder's supported capability list (plus any currently-running profile
+// resolution so it stays re-selectable); the rest are sensible defaults that
+// match what camera-daemon actually encodes.
 func renderGetVideoEncoderConfigurationOptions(profiles []onvifserver.MediaProfile) prefixedBody {
 	var x xbuf
 	x.Open("trt:GetVideoEncoderConfigurationOptionsResponse")
@@ -507,22 +520,33 @@ func renderGetVideoEncoderConfigurationOptions(profiles []onvifserver.MediaProfi
 	x.Elem("tt:Max", "100")
 	x.Close("tt:QualityRange")
 	x.Open("tt:H264")
+	// Advertise the encoder's SUPPORTED resolutions (fixed capability list), not
+	// merely the resolutions currently running on the profiles. Deriving Options
+	// only from the live profiles advertised just main=4K + sub=720P, so NVRs that
+	// constrain the resolution dropdown to the advertised set (ONVIF Device
+	// Manager) could not select 1920×1080 and snapped a "1080P" choice to 720P.
 	seen := make(map[string]bool)
+	advertise := func(w, h int) {
+		key := strconv.Itoa(w) + "x" + strconv.Itoa(h)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		x.Open("tt:ResolutionsAvailable")
+		x.Elem("tt:Width", itoa(w))
+		x.Elem("tt:Height", itoa(h))
+		x.Close("tt:ResolutionsAvailable")
+	}
+	for _, r := range supportedEncoderResolutions {
+		advertise(r.w, r.h)
+	}
 	maxFR := 30
 	for _, p := range profiles {
 		if p.VideoEncoderConfiguration == nil {
 			continue
 		}
-		w := p.VideoEncoderConfiguration.Resolution.Width
-		h := p.VideoEncoderConfiguration.Resolution.Height
-		key := strconv.Itoa(w) + "x" + strconv.Itoa(h)
-		if !seen[key] {
-			seen[key] = true
-			x.Open("tt:ResolutionsAvailable")
-			x.Elem("tt:Width", itoa(w))
-			x.Elem("tt:Height", itoa(h))
-			x.Close("tt:ResolutionsAvailable")
-		}
+		// A currently-running resolution is always supported; keep it selectable.
+		advertise(p.VideoEncoderConfiguration.Resolution.Width, p.VideoEncoderConfiguration.Resolution.Height)
 		if p.VideoEncoderConfiguration.RateControl != nil &&
 			p.VideoEncoderConfiguration.RateControl.FrameRateLimit > maxFR {
 			maxFR = p.VideoEncoderConfiguration.RateControl.FrameRateLimit
