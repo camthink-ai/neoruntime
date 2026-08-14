@@ -168,6 +168,7 @@ export const usePlatformStats = () => useQuery<PlatformStats>({
       };
     },
     placeholderData: keepPreviousData,
+    refetchInterval: 5000,
   });
 
 export const useNetworkStats = () => useQuery<NetworkStats>({
