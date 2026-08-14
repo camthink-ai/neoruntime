@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -9,7 +9,7 @@ import {
   Package,
   ExternalLink,
 } from 'lucide-react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueryClient, useQueries } from '@tanstack/react-query';
 import { appsApi } from '@/services/api';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
@@ -47,9 +47,6 @@ export default function AppsCard({ stats }: AppsCardProps) {
       state: app.state || app.status || 'stopped',
       web_url: app.web_url,
       permissions: app.permissions,
-      cpu_percent: app.cpu_percent ?? 0,
-      memory_usage: app.memory_usage || 0,
-      memory_limit: app.memory_limit || 0,
       installed_at: app.installed_at,
       started_at: app.started_at,
       container_id: app.container_id,
@@ -61,6 +58,28 @@ export default function AppsCard({ stats }: AppsCardProps) {
     });
 
   const runningApps = apps.filter(app => app.state === 'running');
+
+  // 按应用拉取实时资源占用（与 /apps 列表表格同源：GET /api/v1/apps/{id}/stats，
+  // 返回 cpu_usage_percent / memory_usage_bytes）。列表接口 /api/v1/apps 不含这些字段。
+  const statsQueries = useQueries({
+    queries: runningApps.map(app => ({
+      queryKey: ['apps', app.id, 'stats'],
+      queryFn: async () => {
+        const res = await appsApi.getStats(app.id);
+        return res?.data;
+      },
+      refetchInterval: 5000,
+      retry: false,
+    })),
+  });
+
+  const statsById = useMemo(() => {
+    const map: Record<string, any> = {};
+    runningApps.forEach((app, i) => {
+      map[app.id] = statsQueries[i]?.data;
+    });
+    return map;
+  }, [runningApps, statsQueries]);
 
   const startAppMutation = useMutation({
     mutationFn: (appId: string) => appsApi.start(appId),
@@ -113,10 +132,13 @@ export default function AppsCard({ stats }: AppsCardProps) {
   };
 
   const resourceSummary = runningApps.reduce(
-    (acc, app) => ({
-      totalCpu: acc.totalCpu + app.cpu_percent,
-      totalMemory: acc.totalMemory + app.memory_usage,
-    }),
+    (acc, app) => {
+      const s = statsById[app.id];
+      return {
+        totalCpu: acc.totalCpu + (s?.cpu_usage_percent ?? 0),
+        totalMemory: acc.totalMemory + (s?.memory_usage_bytes ?? 0),
+      };
+    },
     { totalCpu: 0, totalMemory: 0 }
   );
 
@@ -161,15 +183,29 @@ export default function AppsCard({ stats }: AppsCardProps) {
     }
   }
 
-  function AppListItem({ app }: { app: (typeof apps)[number] }) {
+  function AppListItem({
+    app,
+    stats: appStats,
+  }: {
+    app: (typeof apps)[number];
+    stats?: {
+      cpu_usage_percent?: number;
+      memory_usage_bytes?: number;
+      memory_limit_bytes?: number;
+    };
+  }) {
     const isRunning = app.state === 'running';
     const isLoading =      pendingActions.has(`start-${app.id}`)
       || pendingActions.has(`stop-${app.id}`);
     const webUrl = getAppWebUrl(app as any);
 
-    const memoryDisplay =      app.memory_limit > 0
-        ? `${formatMemory(app.memory_usage)} / ${formatMemory(app.memory_limit)}`
-        : formatMemory(app.memory_usage);
+    const cpuPercent = appStats?.cpu_usage_percent ?? 0;
+    const memoryUsage = appStats?.memory_usage_bytes ?? 0;
+    const memoryLimit = appStats?.memory_limit_bytes ?? 0;
+
+    const memoryDisplay =      memoryLimit > 0
+        ? `${formatMemory(memoryUsage)} / ${formatMemory(memoryLimit)}`
+        : formatMemory(memoryUsage);
 
     return (
       <div className="flex items-center py-2 px-3 rounded-lg hover:bg-secondary/50 transition-colors group gap-2">
@@ -190,7 +226,7 @@ export default function AppsCard({ stats }: AppsCardProps) {
         </span>
 
         <span className="hidden 2xl:inline text-[11px] font-medium tabular-nums shrink-0 text-foreground w-10 text-right">
-          {app.cpu_percent.toFixed(1)}%
+          {cpuPercent.toFixed(1)}%
         </span>
 
         <span className="hidden 2xl:inline w-28 md:w-32 shrink-0 text-right text-[11px] tabular-nums text-muted-foreground whitespace-nowrap">
@@ -315,7 +351,7 @@ export default function AppsCard({ stats }: AppsCardProps) {
         ) : (
           <div className="py-1">
             {apps.map(app => (
-              <AppListItem key={app.id} app={app} />
+              <AppListItem key={app.id} app={app} stats={statsById[app.id]} />
             ))}
           </div>
         )}

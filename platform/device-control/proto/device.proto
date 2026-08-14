@@ -33,6 +33,62 @@ message IrCutRequest {
   IrCutMode mode = 1;
 }
 
+message ImagingModeRequest {
+  string mode = 1;
+}
+
+message InfraredSettingsRequest {
+  optional bool auto_follow = 1;
+  optional uint32 near_pwm = 2;
+  optional uint32 far_pwm = 3;
+  optional int32 night_enter = 4;  // light-sensor night threshold (auto mode)
+  optional int32 day_enter = 5;    // light-sensor day threshold (auto mode)
+}
+
+message InfraredStatusResponse {
+  bool success = 1;
+  string message = 2;
+  string mode = 3;
+  string transition = 4;
+  string output_source = 5;
+  bool auto_follow = 6;
+  bool follow_active = 7;
+  bool manual_override = 8;
+  bool degraded = 9;
+  uint32 requested_near_pwm = 10;
+  uint32 requested_far_pwm = 11;
+  uint32 applied_near_pwm = 12;
+  uint32 applied_far_pwm = 13;
+  float zoom_ratio = 14;
+  string active_profile = 15;
+  // Day/night auto (light-sensor) policy
+  string selected_mode = 16;   // operator selection: auto / day / infrared
+  int32 light_percent = 17;    // 0..100, endpoint-normalized
+  uint32 light_mv = 18;        // raw photodiode milli-volts
+  int32 light_milli = 19;      // raw scaled value
+  bool light_valid = 20;
+  int32 night_enter = 21;
+  int32 day_enter = 22;
+}
+
+// IR preset = snapshot of (zoom position + near/far IR intensity) for one-click recall.
+message IrPreset {
+  string name = 1;
+  float zoom_ratio = 2;   // 1.0 ~ 2.88 (optical zoom ratio)
+  uint32 near_pwm = 3;    // 0 ~ 100
+  uint32 far_pwm = 4;     // 0 ~ 100
+}
+
+message IrPresetListResponse {
+  bool success = 1;
+  string message = 2;
+  repeated IrPreset presets = 3;
+}
+
+message DeleteIrPresetRequest {
+  string name = 1;
+}
+
 // ============ PTZ control ============
 
 enum PanDirection {
@@ -323,6 +379,14 @@ service DeviceControl {
   rpc SetWhiteLight(LightLevelRequest) returns (Status);
   rpc SetIrLed(LightLevelRequest) returns (Status);
   rpc SetIrCut(IrCutRequest) returns (Status);
+  rpc SetImagingMode(ImagingModeRequest) returns (InfraredStatusResponse);
+  rpc GetInfraredStatus(Empty) returns (InfraredStatusResponse);
+  rpc SetInfraredSettings(InfraredSettingsRequest) returns (InfraredStatusResponse);
+  rpc ClearInfraredManual(Empty) returns (InfraredStatusResponse);
+  // IR preset save/load (zoom + IR intensity snapshot)
+  rpc ListIrPresets(Empty) returns (IrPresetListResponse);
+  rpc SaveIrPreset(IrPreset) returns (IrPresetListResponse);
+  rpc DeleteIrPreset(DeleteIrPresetRequest) returns (IrPresetListResponse);
   
   // PTZ control
   rpc Pan(PanRequest) returns (Status);
