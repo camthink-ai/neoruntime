@@ -6,7 +6,6 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 
@@ -17,9 +16,6 @@ extern "C" {
 
 class FrameRouter;
 class LensController;
-class IlluminationController;
-
-using AutofocusVideoContextRefreshFn = std::function<void*()>;
 
 enum class AutofocusOperation {
     None,
@@ -129,10 +125,8 @@ class AutofocusController {
 public:
     AutofocusController(HalIspOps* isp_ops, HalVideoOps* video_ops,
                         void* video_ctx, FrameRouter* frame_router,
-                        LensController* lens, IlluminationController* illumination,
-                        const AutofocusConfig& config,
-                        int sensor_native_width = 0, int sensor_native_height = 0,
-                        AutofocusVideoContextRefreshFn refresh_video_context = {});
+                        LensController* lens, const AutofocusConfig& config,
+                        int sensor_native_width = 0, int sensor_native_height = 0);
     ~AutofocusController();
 
     AutofocusController(const AutofocusController&) = delete;

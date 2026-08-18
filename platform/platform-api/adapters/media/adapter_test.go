@@ -30,153 +30,6 @@ func newAdapter(t *testing.T, seed string) (*Adapter, string) {
 
 const sampleYAML = "encoders:\n- stream_name: main\n  width: 1920\n  height: 1080\n  codec: h264\n  bitrate: 4000000\n  fps: 30\n  gop: 60\nrtsp:\n  enabled: true\n"
 
-func writeProductMediaConfig(t *testing.T, dir string) string {
-	t.Helper()
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("create product media directory: %v", err)
-	}
-	path := filepath.Join(dir, "webserver_medialib_config.json")
-	body := `{"profiles":[{"name":"Daylight_Basic"},{"name":"Infrared_Basic"}]}`
-	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
-		t.Fatalf("write product media config: %v", err)
-	}
-	return path
-}
-
-func TestMigrateProductInfraredConfig_PreservesExistingConfig(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "camera-daemon.yaml")
-	productPath := writeProductMediaConfig(t, dir)
-	seed := `media:
-  config_path: /etc/imaging/legacy.json
-  backup_path: /data/custom-backup
-autofocus:
-  pps: 1234
-infrared:
-  auto_follow: false
-  deadband_percent: 7
-custom_device_setting:
-  keep_me: true
-`
-	if err := os.WriteFile(configPath, []byte(seed), 0644); err != nil {
-		t.Fatalf("write camera config: %v", err)
-	}
-
-	migrated, changed, err := migrateProductInfraredConfig(configPath, productPath)
-	if err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	if !changed {
-		t.Fatal("expected migration to report a change")
-	}
-
-	var cfg map[string]interface{}
-	if err := yaml.Unmarshal(migrated, &cfg); err != nil {
-		t.Fatalf("parse migrated config: %v", err)
-	}
-	mediaSection := cfg["media"].(map[string]interface{})
-	if got := mediaSection["config_path"]; got != productPath {
-		t.Fatalf("media.config_path = %v, want %s", got, productPath)
-	}
-	if got := mediaSection["backup_path"]; got != "/data/custom-backup" {
-		t.Fatalf("media.backup_path changed: %v", got)
-	}
-	autofocus := cfg["autofocus"].(map[string]interface{})
-	if got := autofocus["pps"]; got != 1234 {
-		t.Fatalf("autofocus.pps changed: %v", got)
-	}
-	infrared := cfg["infrared"].(map[string]interface{})
-	if got := infrared["auto_follow"]; got != false {
-		t.Fatalf("infrared.auto_follow overwritten: %v", got)
-	}
-	if got := infrared["deadband_percent"]; got != 7 {
-		t.Fatalf("infrared.deadband_percent overwritten: %v", got)
-	}
-	if got := infrared["profile_name"]; got != productInfraredProfile {
-		t.Fatalf("infrared.profile_name = %v", got)
-	}
-	custom := cfg["custom_device_setting"].(map[string]interface{})
-	if got := custom["keep_me"]; got != true {
-		t.Fatalf("custom setting changed: %v", got)
-	}
-}
-
-func TestMigrateProductInfraredConfig_IsIdempotent(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "camera-daemon.yaml")
-	productPath := writeProductMediaConfig(t, dir)
-	seed := `media:
-  config_path: ` + productPath + `
-infrared:
-  enabled: true
-  profile_name: Infrared_Basic
-  default_mode: day
-  near_led_id: 0
-  far_led_id: 1
-  auto_follow: true
-  lut_path: /data/aipc/etc/ir_zoom_lut.csv
-  deadband_percent: 2
-  endpoint_settle_frames: 3
-  mode_settle_frames: 10
-  log_updates: true
-`
-	if err := os.WriteFile(configPath, []byte(seed), 0644); err != nil {
-		t.Fatalf("write camera config: %v", err)
-	}
-	migrated, changed, err := migrateProductInfraredConfig(configPath, productPath)
-	if err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	if changed {
-		t.Fatal("complete product config should not be rewritten")
-	}
-	if string(migrated) != seed {
-		t.Fatal("idempotent migration changed file bytes")
-	}
-}
-
-func TestMigrateProductInfraredConfig_PreservesCompatibleCustomMediaPath(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "camera-daemon.yaml")
-	customMediaPath := writeProductMediaConfig(t, filepath.Join(dir, "custom"))
-	productDir := filepath.Join(dir, "product")
-	productPath := writeProductMediaConfig(t, productDir)
-	seed := "media:\n  config_path: " + customMediaPath + "\n"
-	if err := os.WriteFile(configPath, []byte(seed), 0644); err != nil {
-		t.Fatalf("write camera config: %v", err)
-	}
-
-	migrated, changed, err := migrateProductInfraredConfig(configPath, productPath)
-	if err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	if !changed {
-		t.Fatal("expected missing infrared defaults to be added")
-	}
-
-	var cfg map[string]interface{}
-	if err := yaml.Unmarshal(migrated, &cfg); err != nil {
-		t.Fatalf("parse migrated config: %v", err)
-	}
-	mediaSection := cfg["media"].(map[string]interface{})
-	if got := mediaSection["config_path"]; got != customMediaPath {
-		t.Fatalf("compatible custom media path changed to %v", got)
-	}
-}
-
-func TestMigrateProductInfraredConfig_MissingProductFileIsNoop(t *testing.T) {
-	adapter, configPath := newAdapter(t, sampleYAML)
-	_ = adapter
-	migrated, changed, err := migrateProductInfraredConfig(
-		configPath, filepath.Join(t.TempDir(), "missing.json"))
-	if err != nil {
-		t.Fatalf("migrate missing product file: %v", err)
-	}
-	if changed || migrated != nil {
-		t.Fatalf("missing product file result = (%q, %v), want nil,false", migrated, changed)
-	}
-}
-
 func TestValidate(t *testing.T) {
 	a, _ := newAdapter(t, "")
 	ctx := context.Background()
@@ -257,7 +110,7 @@ func TestRender_UnknownKey(t *testing.T) {
 	}
 }
 
-func TestNormalizeMigratesReleasePathsAndPreservesConfigPathWithoutProductOverlay(t *testing.T) {
+func TestNormalizeMigratesReleasePathsAndDropsConfigPath(t *testing.T) {
 	root := t.TempDir()
 	oldRoot := constants.RootPath()
 	constants.SetRootPath(root)
@@ -297,15 +150,12 @@ media:
 			t.Fatalf("normalized YAML missing %q:\n%s", want, got)
 		}
 	}
-	// Without the installed product overlay, Normalize must not manufacture a
-	// replacement config_path. The HAL and backup release paths are still migrated.
-	for _, forbidden := range []string{"/mnt/old-release", "/opt/vendor", "/legacy", "/mnt/old-data"} {
+	// config_path is dropped entirely (no longer platform-maintained); the HAL and
+	// backup release paths are still migrated to the canonical install root.
+	for _, forbidden := range []string{"/mnt/old-release", "/opt/vendor", "/legacy", "ai_example_medialib_config.json", "/mnt/old-data", "config_path"} {
 		if strings.Contains(got, forbidden) {
 			t.Fatalf("normalized YAML still contains %q:\n%s", forbidden, got)
 		}
-	}
-	if !strings.Contains(got, "/vendor/imaging/ai_example_medialib_config.json") {
-		t.Fatalf("Normalize unexpectedly removed media.config_path:\n%s", got)
 	}
 }
 

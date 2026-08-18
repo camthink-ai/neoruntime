@@ -1231,8 +1231,8 @@ validate_staging() {
     }
     validate_release_integrity "$STAGING_DIR" "$STAGING_DIR/systemd" "staged release" || failed=1
 
-    local staged_updater="$STAGING_DIR/libexec/aipc-os-updater" recovery_error
-    if [[ -x "$staged_updater" && -d "$STAGING_DIR/recovery" ]]; then
+    local staged_updater="$STAGING_DIR/libexec/aipc-os-updater" recovery_manifest="$STAGING_DIR/recovery/manifest.json" recovery_error
+    if [[ -x "$staged_updater" && -s "$recovery_manifest" ]]; then
         if ! recovery_error=$("$staged_updater" -recovery-dir "$STAGING_DIR/recovery" check-recovery 2>&1); then
             recovery_error="${recovery_error:-cannot execute staged updater}"
             err "Validation failed: staged recovery checker: $recovery_error"
