@@ -180,7 +180,7 @@ export default function FileUpload({
                   <div className="flex items-center gap-3 flex-1 min-w-0">
                     <File className="w-5 h-5 text-muted-foreground shrink-0" />
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-foreground truncate">
+                      <p className="text-sm font-medium text-foreground break-all">
                         {file.name}
                       </p>
                       <p className="text-xs text-muted-foreground">
@@ -213,16 +213,20 @@ export default function FileUpload({
           /* 空状态 */
           <>
             <UploadCloud className="w-12 h-12 mb-3 text-muted-foreground" />
-            <p className="text-muted-foreground mb-1">
+            <p className="text-muted-foreground mb-1 text-center break-words">
               {placeholder
                 || t(
                   'sys.file_upload.placeholder',
                   'Drag files here, or click to select'
                 )}
             </p>
-            {hint && <p className="text-sm text-muted-foreground">{hint}</p>}
+            {hint && (
+              <p className="text-sm text-muted-foreground text-center break-words">
+                {hint}
+              </p>
+            )}
             {accept && (
-              <p className="text-xs text-muted-foreground mt-2">
+              <p className="mt-2 text-xs text-muted-foreground text-center break-all">
                 {t('sys.file_management.supported_formats', '支持格式')}:{' '}
                 {typeof accept === 'string'
                   ? accept
@@ -230,7 +234,7 @@ export default function FileUpload({
               </p>
             )}
             {maxSize && (
-              <p className="text-xs text-muted-foreground">
+              <p className="text-xs text-muted-foreground text-center break-words">
                 {t('common.max_file_size', {
                   size: `${(maxSize / 1024 / 1024).toFixed(1)}MB`,
                   defaultValue: '最大文件大小: {{size}}',
