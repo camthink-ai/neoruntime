@@ -17,7 +17,8 @@ import { useRouter } from '@/router/hooks/use-router';
 import { changeLanguage } from '@/i18n/utils';
 import { consumeOTASuccessLoginMessage } from '@/utils/otaLoginRedirect';
 import loginBg from '@/assets/images/login-bg.webp';
-import darkLogo from '@/assets/images/dark_logo.svg';
+import milesightDarkLogo from '@/assets/images/milesight-dark-logo.svg';
+import milesightLightLogo from '@/assets/images/milesight-light-logo.png';
 
 interface LoginFormValues {
   username: string;
@@ -186,7 +187,16 @@ export default function Login() {
 
       {/* Top-left logo */}
       <div className="absolute top-6 left-6 z-10">
-        <img src={darkLogo} alt="CamThink" className="h-10  w-auto" />
+        <img
+          src={milesightLightLogo}
+          alt="Milesight"
+          className="h-10 w-auto object-contain dark:hidden"
+        />
+        <img
+          src={milesightDarkLogo}
+          alt="Milesight"
+          className="hidden h-10 w-auto object-contain dark:block"
+        />
       </div>
 
       {/* Language control */}

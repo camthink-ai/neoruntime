@@ -25,10 +25,10 @@
       "view_all": "查看全部"
     },
     "login": {
-      "login_title": "登录 CamThink",
+      "login_title": "登录 Milesight",
       "welcome_back": "欢迎回来",
       "sign_in_to_device": "登录设备",
-      "brand_product": "NeoRuntime",
+      "brand_product": "Milesight",
       "brand_tagline": "边缘 AI，简单易用",
       "username": "用户名",
       "username_error": "请输入用户名",

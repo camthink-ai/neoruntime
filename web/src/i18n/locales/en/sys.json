@@ -25,10 +25,10 @@
       "view_all": "View All"
     },
     "login": {
-      "login_title": "Login CamThink",
+      "login_title": "Login Milesight",
       "welcome_back": "Welcome back",
       "sign_in_to_device": "Sign in to device",
-      "brand_product": "NeoRuntime",
+      "brand_product": "Milesight",
       "brand_tagline": "Edge AI, Made Easy",
       "username": "Username",
       "username_error": "Please enter username",
