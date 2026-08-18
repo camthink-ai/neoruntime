@@ -444,11 +444,16 @@ yaml_scalar_value() {
 medialib_config_is_available() {
     local path="$1" root="${2:-}"
     [[ -f "$path" ]] && return 0
+    local rel=""
     if [[ "$path" == /etc/imaging/* ]]; then
-        local rel="${path#/etc/imaging/}"
-        [[ -n "$root" && -f "$root/etc/imaging/$rel" ]] && return 0
-        [[ -f "$SCRIPT_DIR/opt/aipc/etc/imaging/$rel" ]] && return 0
+        rel="${path#/etc/imaging/}"
+    elif [[ "$path" == "$INSTALL_PREFIX"/etc/imaging/* ]]; then
+        rel="${path#"$INSTALL_PREFIX"/etc/imaging/}"
+    else
+        return 1
     fi
+    [[ -n "$root" && -f "$root/etc/imaging/$rel" ]] && return 0
+    [[ -f "$SCRIPT_DIR/opt/aipc/etc/imaging/$rel" ]] && return 0
     return 1
 }
 
