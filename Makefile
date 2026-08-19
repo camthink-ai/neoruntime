@@ -44,7 +44,6 @@ PROTOC ?= protoc
 
 PROTO_GO_PLUGIN := --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative
 PROTOC_OPT := --experimental_allow_proto3_optional
-PROTOC_GO := $(PROTOC) $(PROTOC_OPT) $(PROTO_GO_PLUGIN)
 CMAKE_TARGET_ARGS := -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE)
 SYSROOT_ENV :=
 HAL_V2_BUILD_DIR := hal_v2/build-$(HAL_PLATFORM)
@@ -92,33 +91,33 @@ ifeq ($(HAL_PLATFORM),hailo15)
 endif
 
 proto-inference:
-	cd platform/ai-runtime/proto && $(PROTOC_GO) inference.proto
+	cd platform/ai-runtime/proto && $(PROTOC) $(PROTO_GO_PLUGIN) inference.proto
 
 proto-device:
-	cd platform/device-control/proto && $(PROTOC_GO) device.proto
+	cd platform/device-control/proto && $(PROTOC) $(PROTO_GO_PLUGIN) device.proto
 
 proto-event:
-	cd platform/event-bus/proto && $(PROTOC_GO) event.proto
+	cd platform/event-bus/proto && $(PROTOC) $(PROTO_GO_PLUGIN) event.proto
 
 proto-camera:
 	@if [ -f platform/camera-daemon/proto/camera.proto ]; then \
-		cd platform/camera-daemon/proto && $(PROTOC_GO) camera.proto; \
+		cd platform/camera-daemon/proto && $(PROTOC) $(PROTOC_OPT) $(PROTO_GO_PLUGIN) camera.proto; \
 	fi
 
 proto-app:
 	@if [ -f platform/app-manager/proto/app.proto ]; then \
-		cd platform/app-manager/proto && $(PROTOC_GO) app.proto; \
+		cd platform/app-manager/proto && $(PROTOC) $(PROTO_GO_PLUGIN) app.proto; \
 	fi
 
 proto-lens:
 	@mkdir -p platform/device-control/lens/lenspb
-	cd platform/camera-daemon/proto && $(PROTOC) $(PROTOC_OPT) \
-		--go_out=../../device-control/lens/lenspb --go_opt=paths=source_relative \
-		--go-grpc_out=../../device-control/lens/lenspb --go-grpc_opt=paths=source_relative \
-		lens_hal.proto
+	$(PROTOC) --proto_path=platform/camera-daemon/proto $(PROTOC_OPT) \
+		--go_out=platform/device-control/lens/lenspb --go_opt=paths=source_relative \
+		--go-grpc_out=platform/device-control/lens/lenspb --go-grpc_opt=paths=source_relative \
+		platform/camera-daemon/proto/lens_hal.proto
 
 proto-discovery:
-	cd platform/device-discovery/proto && $(PROTOC_GO) discovery.proto
+	cd platform/device-discovery/proto && $(PROTOC) $(PROTO_GO_PLUGIN) discovery.proto
 
 hal-v2:
 	@echo "==> Building HAL v2 [platform=$(HAL_PLATFORM)]"
@@ -469,10 +468,6 @@ _pack-internal: _pack-stage
 	else \
 		echo "  - imaging configs not found at $$IMAGING_BASE"; \
 	fi
-	@mkdir -p "$(STAGE_DIR)/opt/aipc/etc/imaging" \
-		"$(STAGE_DIR)/opt/aipc/etc"
-	@cp -a configs/imaging/. "$(STAGE_DIR)/opt/aipc/etc/imaging/" 2>/dev/null || true
-	@cp -f configs/platform/ir_zoom_lut.csv "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@mkdir -p "$(RELEASE_DIR)"
 	tar czf "$(TARBALL)" -C "$(RELEASE_DIR)" "$(PKG_NAME)"
 	@echo "=== Release Package Ready ==="

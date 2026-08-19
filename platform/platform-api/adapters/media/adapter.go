@@ -46,12 +46,6 @@ import (
 const (
 	// keyConfig is the only key: desired = full camera-daemon.yaml content.
 	keyConfig = "config"
-
-	// ProductMediaConfigPath is the deployed media-library config that includes
-	// both the normal daytime profiles and Infrared_Basic.
-	ProductMediaConfigPath = "/data/aipc/etc/imaging/hailo15h/imx678/theia_sl410m/4k/medialib_configs/webserver_medialib_config.json"
-	productInfraredProfile = "Infrared_Basic"
-	productInfraredLUTPath = "/data/aipc/etc/ir_zoom_lut.csv"
 )
 
 var (
@@ -161,13 +155,16 @@ func normalizeMediaPaths(cfg map[string]interface{}) (bool, error) {
 	if _, ok := media["backup_path"]; ok {
 		changed = setStringIfDifferent(media, "backup_path", filepath.Join(constants.DataPath(), "media-backup")) || changed
 	}
-	// The product media config carries Infrared_Basic in addition to the vendor
-	// daylight profiles. When it is deployed, keep desired state pinned to that
-	// list so a Config Manager reconcile cannot remove infrared support after a
-	// restart. If the product overlay is absent, preserve the current path rather
-	// than replacing it with a potentially invalid fallback.
-	if ok, err := mediaConfigHasProfile(ProductMediaConfigPath, productInfraredProfile); err == nil && ok {
-		changed = setStringIfDifferent(media, "config_path", ProductMediaConfigPath) || changed
+	// config_path is no longer platform-maintained: camera-daemon falls back to the
+	// HAL compiled-in default medialib config when it is absent. Drop any config_path
+	// a prior install or DB blob still carries so devices converge on the default
+	// rather than persisting a stale module-specific path. Normalize is the single
+	// chokepoint covering both the save path (Manager Apply) and the boot DB→YAML
+	// re-project, so a stale config_path in the DB is self-healed on the first boot
+	// after this code ships.
+	if _, ok := media["config_path"]; ok {
+		delete(media, "config_path")
+		changed = true
 	}
 	return changed, nil
 }
@@ -268,114 +265,6 @@ func cleanPath(path string) string {
 func fileExists(path string) bool {
 	st, err := os.Stat(path)
 	return err == nil && !st.IsDir()
-}
-
-// MigrateProductInfraredConfig merges the product-owned infrared defaults into
-// an existing camera-daemon.yaml. Existing device-specific settings are kept;
-// only media.config_path is corrected and missing infrared keys are added.
-// The returned YAML is intended to be applied through Config Manager so its
-// desired-state row is updated together with the live file.
-func MigrateProductInfraredConfig(configPath string) ([]byte, bool, error) {
-	return migrateProductInfraredConfig(configPath, ProductMediaConfigPath)
-}
-
-func migrateProductInfraredConfig(configPath, productMediaPath string) ([]byte, bool, error) {
-	if _, err := os.Stat(productMediaPath); err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("stat product media config: %w", err)
-	}
-	if ok, err := mediaConfigHasProfile(productMediaPath, productInfraredProfile); err != nil {
-		return nil, false, err
-	} else if !ok {
-		return nil, false, fmt.Errorf("product media config does not contain %s", productInfraredProfile)
-	}
-
-	raw, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, false, fmt.Errorf("read camera config: %w", err)
-	}
-	var cfg map[string]interface{}
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
-		return nil, false, fmt.Errorf("parse camera config: %w", err)
-	}
-	if cfg == nil {
-		cfg = make(map[string]interface{})
-	}
-
-	changed := false
-	mediaSection := ensureMap(cfg, "media", &changed)
-	currentMediaPath, _ := mediaSection["config_path"].(string)
-	currentHasInfrared := false
-	if currentMediaPath != "" {
-		currentHasInfrared, _ = mediaConfigHasProfile(currentMediaPath, productInfraredProfile)
-	}
-	if !currentHasInfrared && currentMediaPath != productMediaPath {
-		mediaSection["config_path"] = productMediaPath
-		changed = true
-	}
-
-	infrared := ensureMap(cfg, "infrared", &changed)
-	defaults := map[string]interface{}{
-		"enabled":                true,
-		"profile_name":           productInfraredProfile,
-		"default_mode":           "day",
-		"near_led_id":            0,
-		"far_led_id":             1,
-		"auto_follow":            true,
-		"lut_path":               productInfraredLUTPath,
-		"deadband_percent":       2,
-		"endpoint_settle_frames": 3,
-		"mode_settle_frames":     10,
-		"log_updates":            true,
-	}
-	for key, value := range defaults {
-		if _, exists := infrared[key]; !exists {
-			infrared[key] = value
-			changed = true
-		}
-	}
-
-	if !changed {
-		return raw, false, nil
-	}
-	migrated, err := yaml.Marshal(cfg)
-	if err != nil {
-		return nil, false, fmt.Errorf("encode migrated camera config: %w", err)
-	}
-	return migrated, true, nil
-}
-
-func ensureMap(parent map[string]interface{}, key string, changed *bool) map[string]interface{} {
-	if existing, ok := parent[key].(map[string]interface{}); ok {
-		return existing
-	}
-	section := make(map[string]interface{})
-	parent[key] = section
-	*changed = true
-	return section
-}
-
-func mediaConfigHasProfile(path, profileName string) (bool, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return false, fmt.Errorf("read product media config: %w", err)
-	}
-	var config struct {
-		Profiles []struct {
-			Name string `yaml:"name"`
-		} `yaml:"profiles"`
-	}
-	if err := yaml.Unmarshal(raw, &config); err != nil {
-		return false, fmt.Errorf("parse product media config: %w", err)
-	}
-	for _, profile := range config.Profiles {
-		if profile.Name == profileName {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 // backupState holds the file's pre-Apply bytes. A nil slice means the file did

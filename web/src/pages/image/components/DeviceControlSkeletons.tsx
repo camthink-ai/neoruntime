@@ -64,6 +64,7 @@ export function LightingControlSkeleton() {
     <Card className="bg-background shadow-sm">
       <CardContent className="space-y-5 p-5">
         <Skeleton className="h-4 w-28" />
+        <SwitchRowSkeleton labelWidth="w-20" />
         <MotorAxisRowSkeleton />
         <SwitchRowSkeleton labelWidth="w-20" />
         <MotorAxisRowSkeleton />
@@ -91,6 +92,14 @@ export function LensControlSkeleton() {
 
         <MotorAxisRowSkeleton />
         <MotorAxisRowSkeleton />
+
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-1.5">
+            <Skeleton className="h-4 w-28" />
+            <Skeleton className="h-7 w-7 rounded-md" />
+          </div>
+          <Skeleton className="h-6 w-10 shrink-0 rounded-full" />
+        </div>
       </CardContent>
     </Card>
   );

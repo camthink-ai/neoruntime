@@ -2,11 +2,10 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
-import { Loader2, Moon, Sparkles } from 'lucide-react';
+import { Loader2, Sparkles } from 'lucide-react';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Slider } from '@/components/ui/slider';
-import { Button } from '@/components/ui/button';
 import {
   Select,
   SelectContent,
@@ -27,7 +26,6 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { ImageIcon, RotateCw } from 'lucide-react';
-import { useInfraredStatus, useSetImagingMode, useSetInfraredSettings } from '@/hooks/useDeviceControl';
 import ImageSettingsSkeleton from './ImageSettingsSkeleton';
 import {
   fetchISPConfig,
@@ -101,22 +99,6 @@ export default function ImageSettings() {
   );
 
   const isInSwitchCooldown = () => Date.now() - lastSwitchAtRef.current < SWITCH_COOLDOWN_MS;
-  const { data: infrared } = useInfraredStatus();
-  const setImagingMode = useSetImagingMode();
-  const setInfraredSettings = useSetInfraredSettings();
-  const infraredActive = infrared?.mode === 'infrared';
-  const infraredSwitching = setImagingMode.isPending || infrared?.transition === 'switching';
-  const selectedMode = infrared?.selected_mode ?? (infraredActive ? 'infrared' : 'day');
-  const isAutoMode = selectedMode === 'auto';
-  // Local state drives the sliders (smooth drag); synced from the polled status.
-  const [nightEnter, setNightEnter] = useState(infrared?.night_enter ?? 28);
-  const [dayEnter, setDayEnter] = useState(infrared?.day_enter ?? 82);
-  useEffect(() => {
-    if (infrared) {
-      setNightEnter(infrared.night_enter ?? 28);
-      setDayEnter(infrared.day_enter ?? 82);
-    }
-  }, [infrared]);
 
   // Remembers the last AI ISP Gen profile the user had active so toggling
   // AI ISP off→on restores it instead of always jumping to the default. Set
@@ -232,48 +214,6 @@ export default function ImageSettings() {
     [t]
   );
 
-  const handleSelectMode = useCallback(
-    async (mode: 'auto' | 'day' | 'infrared') => {
-      try {
-        await setImagingMode.mutateAsync(mode);
-        await loadData();
-        window.dispatchEvent(
-          new CustomEvent('aipc:media-profile-changed', { detail: { interrupt_ms: 0 } })
-        );
-        toast.success(t('sys.media_settings.ir_cut_success', 'Imaging mode updated'));
-      } catch {
-        toast.error(t('sys.media_settings.ir_cut_failed', 'Failed to switch imaging mode'));
-      }
-    },
-    [loadData, setImagingMode, t]
-  );
-
-  // Live local update (smooth drag, clamped to keep night < day); commit to backend on release.
-  const onNightEnterChange = useCallback(
-    (v: number) => setNightEnter(Math.min(Math.max(v, 0), dayEnter - 1)),
-    [dayEnter]
-  );
-  const onDayEnterChange = useCallback(
-    (v: number) => setDayEnter(Math.min(Math.max(v, nightEnter + 1), 100)),
-    [nightEnter]
-  );
-  const commitNightEnter = useCallback(
-    (v: number) => {
-      const clamped = Math.min(Math.max(v, 0), dayEnter - 1);
-      setNightEnter(clamped);
-      setInfraredSettings.mutate({ night_enter: clamped, day_enter: dayEnter });
-    },
-    [dayEnter, setInfraredSettings]
-  );
-  const commitDayEnter = useCallback(
-    (v: number) => {
-      const clamped = Math.min(Math.max(v, nightEnter + 1), 100);
-      setDayEnter(clamped);
-      setInfraredSettings.mutate({ night_enter: nightEnter, day_enter: clamped });
-    },
-    [nightEnter, setInfraredSettings]
-  );
-
   const ispDebounceRef = useRef<
     Record<string, { value: number; timer: ReturnType<typeof setTimeout> }>
   >({});
@@ -383,87 +323,6 @@ export default function ImageSettings() {
 
   return (
     <div className="flex flex-col gap-4">
-      <Card className="shadow-sm bg-background">
-        <CardContent className="p-5 space-y-4">
-          <div className="space-y-0.5">
-            <h3 className="flex items-center gap-1.5 text-sm font-bold text-muted-foreground">
-              <Moon className="w-4 h-4" />
-              {t('sys.media_settings.daynight_mode', 'Day / Night Mode')}
-            </h3>
-            <p className="text-xs text-muted-foreground">
-              {selectedMode === 'auto'
-                ? t('sys.media_settings.daynight_auto_hint', 'Auto: switches day/night with the light sensor')
-                : infraredActive
-                  ? t('sys.media_settings.infrared_on_hint', 'Infrared profile and IR illumination are active')
-                  : t('sys.media_settings.infrared_off_hint', 'Use the daylight profile with IR illumination off')}
-            </p>
-          </div>
-          <div className="grid grid-cols-3 gap-2">
-            {(['auto', 'day', 'infrared'] as const).map(m => (
-              <Button
-                key={m}
-                variant={selectedMode === m ? 'default' : 'outline'}
-                size="sm"
-                disabled={infraredSwitching}
-                onClick={() => handleSelectMode(m)}
-              >
-                {m === 'auto'
-                  ? t('sys.media_settings.daynight_auto', 'Auto')
-                  : m === 'day'
-                    ? t('sys.media_settings.daynight_day', 'Day')
-                    : t('sys.media_settings.daynight_night', 'Night')}
-              </Button>
-            ))}
-          </div>
-
-          {/* Light-sensor thresholds (auto mode) */}
-          <div className={`space-y-3 ${isAutoMode ? '' : 'opacity-50 pointer-events-none'}`}>
-            <Label className="text-xs">
-              {t('sys.media_settings.light_thresholds', 'Light thresholds (auto)')}
-            </Label>
-            <div className="space-y-1.5">
-              <Label className="text-xs">
-                {t('sys.media_settings.night_enter', 'Enter night ≤')}
-              </Label>
-              <div className="flex items-center space-x-3">
-                <Slider
-                  value={[nightEnter]}
-                  onValueChange={v => onNightEnterChange(v[0])}
-                  onValueCommit={v => commitNightEnter(v[0])}
-                  min={0}
-                  max={100}
-                  step={1}
-                  className="flex-1"
-                  disabled={!isAutoMode}
-                />
-                <span className="text-xs text-muted-foreground w-8 text-right tabular-nums">
-                  {nightEnter}
-                </span>
-              </div>
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs">
-                {t('sys.media_settings.day_enter', 'Enter day ≥')}
-              </Label>
-              <div className="flex items-center space-x-3">
-                <Slider
-                  value={[dayEnter]}
-                  onValueChange={v => onDayEnterChange(v[0])}
-                  onValueCommit={v => commitDayEnter(v[0])}
-                  min={0}
-                  max={100}
-                  step={1}
-                  className="flex-1"
-                  disabled={!isAutoMode}
-                />
-                <span className="text-xs text-muted-foreground w-8 text-right tabular-nums">
-                  {dayEnter}
-                </span>
-              </div>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
       {/* AI ISP Profile Card */}
         <Card className="shadow-sm bg-background">
           <CardContent className="p-5 space-y-4">
@@ -482,7 +341,7 @@ export default function ImageSettings() {
                 <Switch
                   id="ai-isp-enable"
                   checked={aiEnabled}
-                  disabled={infraredActive || switching || aiProfiles.length === 0}
+                  disabled={switching || aiProfiles.length === 0}
                   onCheckedChange={checked => {
                     if (isInSwitchCooldown()) {
                       toast.warning(
