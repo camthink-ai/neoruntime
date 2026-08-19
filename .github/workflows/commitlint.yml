@@ -2,7 +2,7 @@ name: Commitlint
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 jobs:
   commitlint:
@@ -14,4 +14,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Validate commits on the PR
-        run: npx -y @commitlint/cli@20 --from origin/${{ github.base_ref }} --to HEAD
+        run: |
+          npx -y \
+            -p @commitlint/cli@20 \
+            -p @commitlint/config-conventional@20 \
+            commitlint --from origin/${{ github.base_ref }} --to HEAD

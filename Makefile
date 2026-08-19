@@ -3,7 +3,7 @@
 .PHONY: all build-go build-native build-web build-ci clean distclean test test-unit test-basic test-smoke test-verify verify test-integration proto \
   proto-inference proto-device proto-event proto-camera proto-app proto-lens proto-discovery \
   hal-v2 platform ai-runtime device-control event-bus app-manager platform-api \
-  device-discovery os-updater camera-daemon web aipc-cli tools mcu-firmware pack pack-release \
+  device-discovery os-updater onvif-device camera-daemon web aipc-cli tools mcu-firmware pack pack-release \
   ensure-mcu-toolchain docker-pack-release _pack-stage _pack-internal fmt lint help
 
 -include Makefile.local
@@ -142,7 +142,7 @@ hal-v2:
 	@mkdir -p $(BUILD_DIR)/hal/$(HAL_PLATFORM)
 	@cp -P $(HAL_V2_BUILD_DIR)/libaipc_hal*.so* $(HAL_V2_BUILD_DIR)/libhal-*.so* $(BUILD_DIR)/hal/$(HAL_PLATFORM)/ 2>/dev/null || true
 
-platform: device-control event-bus app-manager platform-api device-discovery os-updater
+platform: device-control event-bus app-manager platform-api device-discovery os-updater onvif-device
 
 ai-runtime: proto
 	@echo "==> Building ai-runtime"
@@ -178,6 +178,10 @@ platform-api: proto
 device-discovery: proto
 	@mkdir -p $(BUILD_DIR)
 	cd platform/device-discovery/server && $(AIPC_GO_ENV) $(GO) build $(GO_BUILD_FLAGS) -o $(CURDIR)/$(BUILD_DIR)/device-discovery .
+
+onvif-device:
+	@mkdir -p $(BUILD_DIR)
+	cd platform/onvif-device/server && $(AIPC_GO_ENV) $(GO) build $(GO_BUILD_FLAGS) -o $(CURDIR)/$(BUILD_DIR)/onvif-device .
 
 os-updater:
 	@mkdir -p $(BUILD_DIR)
@@ -313,7 +317,7 @@ endif
 _pack-stage:
 	@echo "==> Packaging release [$(VERSION), platform=$(HAL_PLATFORM)]"
 	@missing=""; \
-	for b in camera-daemon ai-runtime device-control event-bus platform-api app-manager aipc-cli device-discovery aipc-os-updater; do \
+	for b in camera-daemon ai-runtime device-control event-bus platform-api app-manager aipc-cli device-discovery onvif-device aipc-os-updater; do \
 		[ -x "$(BUILD_DIR)/$$b" ] || missing="$$missing $$b"; \
 	done; \
 	[ -e "$(BUILD_DIR)/hal/$(HAL_PLATFORM)/libaipc_hal.so" ] || missing="$$missing libaipc_hal.so"; \
@@ -340,7 +344,7 @@ _pack-stage:
 		"$(STAGE_DIR)/opt/aipc/swagger-ui" \
 		"$(STAGE_DIR)/opt/aipc/models" \
 		"$(STAGE_DIR)/systemd"
-	@for f in camera-daemon ai-runtime device-control event-bus platform-api app-manager aipc-cli device-discovery; do \
+	@for f in camera-daemon ai-runtime device-control event-bus platform-api app-manager aipc-cli device-discovery onvif-device; do \
 		cp "$(BUILD_DIR)/$$f" "$(STAGE_DIR)/opt/aipc/bin/"; \
 		echo "  + $$f"; \
 	done
@@ -357,6 +361,7 @@ _pack-stage:
 	@cp -f configs/platform/device-control.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@cp -f configs/platform-api.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@cp -f configs/platform/discovery.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
+	@cp -f configs/platform/onvif.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@cp -f configs/security/seccomp-default.json "$(STAGE_DIR)/opt/aipc/etc/security/" 2>/dev/null || true
 	@mkdir -p "$(STAGE_DIR)/opt/aipc/etc/systemd/system.conf.d" \
 		"$(STAGE_DIR)/opt/aipc/etc/systemd/journald.conf.d" \

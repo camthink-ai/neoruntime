@@ -1014,10 +1014,11 @@ static int ms41908m_motor_start_impl(ms41908m_type_t type, uint16_t pps, int32_t
     uint8_t *is_r_zero = NULL;
     int32_t *pos_min = NULL;
     int32_t *pos_max = NULL;
-    if (pps < MS41908M_PPS_MIN || pps > MS41908M_PPS_MAX) {
+    if (pps < MS41908M_RAW_PPS_MIN || pps > MS41908M_RAW_PPS_MAX) {
         return SYS_ERR_INVALID_ARG;
     }
-    if (MS41908M_ABS(micro_steps) < MS41908M_MSTEPS_MIN || MS41908M_ABS(micro_steps) > MS41908M_MSTEPS_MAX) {
+    if (MS41908M_ABS(micro_steps) < MS41908M_RAW_PSUM_MIN ||
+        MS41908M_ABS(micro_steps) > MS41908M_RAW_PSUM_MAX) {
         return SYS_ERR_INVALID_ARG;
     }
 
@@ -1958,9 +1959,9 @@ int ms41908m_zf_sync_run(uint16_t zm_pps, int32_t zm_micro_steps,
 
     /* --- Configure Zoom --- */
     if (zm_micro_steps != 0) {
-        if (zm_pps < MS41908M_PPS_MIN || zm_pps > MS41908M_PPS_MAX ||
-            MS41908M_ABS(zm_micro_steps) < MS41908M_MSTEPS_MIN ||
-            MS41908M_ABS(zm_micro_steps) > MS41908M_MSTEPS_MAX) {
+        if (zm_pps < MS41908M_RAW_PPS_MIN || zm_pps > MS41908M_RAW_PPS_MAX ||
+            MS41908M_ABS(zm_micro_steps) < MS41908M_RAW_PSUM_MIN ||
+            MS41908M_ABS(zm_micro_steps) > MS41908M_RAW_PSUM_MAX) {
             ms41908m_port_unlock();
             return SYS_ERR_INVALID_ARG;
         }
@@ -2002,9 +2003,9 @@ int ms41908m_zf_sync_run(uint16_t zm_pps, int32_t zm_micro_steps,
 
     /* --- Configure Focus --- */
     if (fs_micro_steps != 0) {
-        if (fs_pps < MS41908M_PPS_MIN || fs_pps > MS41908M_PPS_MAX ||
-            MS41908M_ABS(fs_micro_steps) < MS41908M_MSTEPS_MIN ||
-            MS41908M_ABS(fs_micro_steps) > MS41908M_MSTEPS_MAX) {
+        if (fs_pps < MS41908M_RAW_PPS_MIN || fs_pps > MS41908M_RAW_PPS_MAX ||
+            MS41908M_ABS(fs_micro_steps) < MS41908M_RAW_PSUM_MIN ||
+            MS41908M_ABS(fs_micro_steps) > MS41908M_RAW_PSUM_MAX) {
             if (zm_micro_steps != 0) {
                 s_instance.zoom_run_config.is_valid = 0;
                 s_instance.zoom_state = MS41908M_STATE_STOPPED;

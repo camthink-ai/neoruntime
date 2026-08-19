@@ -114,6 +114,85 @@ static int zf_sync_run(void *mcu_ctx, const HalLensZfSync *params)
     return status_only(mcu_ctx, HOST_LINK_CMD_LENS_ZF_SYNC_RUN, &req, sizeof(req));
 }
 
+static int profile_set(void *mcu_ctx, HalLensModel model)
+{
+    host_link_lens_profile_set_t req{.model = static_cast<uint8_t>(model)};
+    return status_only(mcu_ctx, HOST_LINK_CMD_LENS_PROFILE_SET, &req, sizeof(req));
+}
+
+static int profile_get(void *mcu_ctx, HalLensProfileInfo *out_profile)
+{
+    if (out_profile == nullptr) return HAL_ERR_INVALID_ARG;
+    host_link_lens_profile_info_t raw{};
+    uint16_t resp_len = 0;
+    int ret = HAL_MCU_OPS.raw_request(mcu_ctx, HOST_LINK_CMD_LENS_PROFILE_GET, nullptr, 0,
+                                      reinterpret_cast<uint8_t *>(&raw), sizeof(raw), &resp_len);
+    if (ret != HAL_OK) return ret;
+    if (resp_len != sizeof(raw)) return HAL_ERR_INVALID_SIZE;
+
+    memset(out_profile, 0, sizeof(*out_profile));
+    out_profile->model = static_cast<HalLensModel>(raw.model);
+    out_profile->capabilities.relative = (raw.capabilities & HOST_LINK_LENS_CAP_RELATIVE) != 0;
+    out_profile->capabilities.absolute = (raw.capabilities & HOST_LINK_LENS_CAP_ABSOLUTE) != 0;
+    out_profile->capabilities.home = (raw.capabilities & HOST_LINK_LENS_CAP_HOME) != 0;
+    out_profile->capabilities.pi = (raw.capabilities & HOST_LINK_LENS_CAP_PI) != 0;
+    out_profile->capabilities.sync_relative = (raw.capabilities & HOST_LINK_LENS_CAP_SYNC_RELATIVE) != 0;
+    out_profile->capabilities.ircut = (raw.capabilities & HOST_LINK_LENS_CAP_IRCUT) != 0;
+    out_profile->capabilities.iris = (raw.capabilities & HOST_LINK_LENS_CAP_IRIS) != 0;
+    out_profile->zoom = HalLensAxisProfile{
+        .step_scale = raw.zoom_step_scale,
+        .direction_sign = raw.zoom_direction_sign,
+        .min_pps = raw.zoom_min_pps,
+        .max_pps = raw.zoom_max_pps,
+        .default_pps = raw.zoom_default_pps,
+        .travel_steps = raw.zoom_travel_steps,
+        .travel_tolerance_steps = raw.zoom_travel_tolerance_steps,
+    };
+    out_profile->focus = HalLensAxisProfile{
+        .step_scale = raw.focus_step_scale,
+        .direction_sign = raw.focus_direction_sign,
+        .min_pps = raw.focus_min_pps,
+        .max_pps = raw.focus_max_pps,
+        .default_pps = raw.focus_default_pps,
+        .travel_steps = raw.focus_travel_steps,
+        .travel_tolerance_steps = raw.focus_travel_tolerance_steps,
+    };
+    return HAL_OK;
+}
+
+static int physical_motion_cmd(void *mcu_ctx, uint16_t cmd,
+                               const HalLensPhysicalMotion *motion)
+{
+    if (motion == nullptr) return HAL_ERR_INVALID_ARG;
+    host_link_lens_relative_t req{
+        .physical_pps = motion->pps,
+        .physical_steps = motion->steps,
+    };
+    return status_only(mcu_ctx, cmd, &req, sizeof(req));
+}
+
+static int zoom_rel(void *mcu_ctx, const HalLensPhysicalMotion *motion)
+{
+    return physical_motion_cmd(mcu_ctx, HOST_LINK_CMD_LENS_ZOOM_REL, motion);
+}
+
+static int focus_rel(void *mcu_ctx, const HalLensPhysicalMotion *motion)
+{
+    return physical_motion_cmd(mcu_ctx, HOST_LINK_CMD_LENS_FOCUS_REL, motion);
+}
+
+static int dual_rel(void *mcu_ctx, const HalLensDualPhysicalMotion *motion)
+{
+    if (motion == nullptr) return HAL_ERR_INVALID_ARG;
+    host_link_lens_dual_relative_t req{
+        .zoom_pps = motion->zoom.pps,
+        .zoom_steps = motion->zoom.steps,
+        .focus_pps = motion->focus.pps,
+        .focus_steps = motion->focus.steps,
+    };
+    return status_only(mcu_ctx, HOST_LINK_CMD_LENS_DUAL_REL, &req, sizeof(req));
+}
+
 static int subscribe(void *mcu_ctx, HalLensEventCallback cb, void *userdata)
 {
     if (cb == nullptr) return HAL_ERR_INVALID_ARG;
@@ -165,6 +244,11 @@ HalLensOps HAL_LENS_OPS = {
     .subscribe = subscribe,
     .unsubscribe = unsubscribe,
     .get_version = lens_get_version,
+    .profile_set = profile_set,
+    .profile_get = profile_get,
+    .zoom_rel = zoom_rel,
+    .focus_rel = focus_rel,
+    .dual_rel = dual_rel,
 };
 }
 

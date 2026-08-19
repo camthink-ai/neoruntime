@@ -23,6 +23,49 @@ typedef struct {
     int32_t  value; /**< run: micro steps; abs: target position */
 } HalLensMotion;
 
+typedef enum {
+    HAL_LENS_MODEL_AF0832 = 0,
+    HAL_LENS_MODEL_FG2009 = 1,
+} HalLensModel;
+
+typedef struct {
+    bool relative;
+    bool absolute;
+    bool home;
+    bool pi;
+    bool sync_relative;
+    bool ircut;
+    bool iris;
+} HalLensCapabilities;
+
+typedef struct {
+    uint8_t step_scale;
+    int8_t direction_sign;
+    uint16_t min_pps;
+    uint16_t max_pps;
+    uint16_t default_pps;
+    uint16_t travel_steps;
+    uint16_t travel_tolerance_steps;
+} HalLensAxisProfile;
+
+typedef struct {
+    HalLensModel model;
+    HalLensCapabilities capabilities;
+    HalLensAxisProfile zoom;
+    HalLensAxisProfile focus;
+} HalLensProfileInfo;
+
+/** Physical lens units; MCU converts these using the active lens profile. */
+typedef struct {
+    uint16_t pps;
+    int32_t steps;
+} HalLensPhysicalMotion;
+
+typedef struct {
+    HalLensPhysicalMotion zoom;
+    HalLensPhysicalMotion focus;
+} HalLensDualPhysicalMotion;
+
 typedef struct {
     int32_t min_pos;
     int32_t max_pos;
@@ -92,6 +135,13 @@ typedef struct {
     int (*unsubscribe)(void *mcu_ctx);
 
     const char *(*get_version)(void);
+
+    /** Runtime lens selection and profile-aware physical motion APIs. */
+    int (*profile_set)(void *mcu_ctx, HalLensModel model);
+    int (*profile_get)(void *mcu_ctx, HalLensProfileInfo *out_profile);
+    int (*zoom_rel)(void *mcu_ctx, const HalLensPhysicalMotion *motion);
+    int (*focus_rel)(void *mcu_ctx, const HalLensPhysicalMotion *motion);
+    int (*dual_rel)(void *mcu_ctx, const HalLensDualPhysicalMotion *motion);
 } HalLensOps;
 
 extern HalLensOps HAL_LENS_OPS;
