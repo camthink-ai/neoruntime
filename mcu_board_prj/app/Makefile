@@ -7,6 +7,7 @@ rwildcard = $(foreach d,$(wildcard $(1:=/*)),$(call rwildcard,$d,$2) $(filter $(
 
 TARGET ?= ne503_mcu_app
 BUILD_DIR := build
+LENS_PROFILE ?= AF0832
 LDSCRIPT := STM32G0B0RETX_FLASH.ld
 
 ######################################
@@ -84,6 +85,10 @@ C_SOURCES += Custom/Lib/cJSON/cJSON.c
 C_SOURCES += Custom/Components/rs485_driver/rs485_driver.c
 C_SOURCES += Custom/Components/ms41908m/ms41908m.c
 C_SOURCES += Custom/Components/ms41908m/ms41908m_port.c
+C_SOURCES += Custom/Components/lens/lens_profile.c
+C_SOURCES += Custom/Components/lens/lens_profile_af0832.c
+C_SOURCES += Custom/Components/lens/lens_profile_fg2009.c
+C_SOURCES += Custom/Components/lens/lens_controller.c
 C_SOURCES += Custom/Components/host_link/host_link_core.c
 C_SOURCES += Custom/Components/host_link/host_link_port_freertos.c
 C_SOURCES += Custom/Components/cmd_console/cmd_console.c
@@ -105,6 +110,14 @@ C_DEFS += '-DCMSIS_device_header=<stm32g0xx.h>'
 C_DEFS += -DUSE_HAL_DRIVER
 C_DEFS += -DSTM32G0B0xx
 
+ifeq ($(LENS_PROFILE),AF0832)
+C_DEFS += -DCONFIG_LENS_PROFILE_AF0832=1
+else ifeq ($(LENS_PROFILE),FG2009)
+C_DEFS += -DCONFIG_LENS_PROFILE_FG2009=1
+else
+$(error Unsupported LENS_PROFILE '$(LENS_PROFILE)'; use AF0832 or FG2009)
+endif
+
 C_INCLUDES := \
 	-ICore/Inc \
 	-IDrivers/STM32G0xx_HAL_Driver/Inc \
@@ -121,6 +134,7 @@ C_INCLUDES := \
 	-ICustom/Components/bsp_ctrl \
 	-ICustom/Components/an41908a_af \
 	-ICustom/Components/ms41908m \
+	-ICustom/Components/lens \
 	-ICustom/Components/host_link \
 	-ICustom/Components/rs485_driver \
 	-ICustom/Components/ota_host \
@@ -215,7 +229,7 @@ clean:
 	@rm -rf $(BUILD_DIR)
 
 info:
-	@echo "TARGET=$(TARGET) BUILD_DIR=$(BUILD_DIR)"
+	@echo "TARGET=$(TARGET) BUILD_DIR=$(BUILD_DIR) LENS_PROFILE=$(LENS_PROFILE)"
 	@echo "C sources: $(words $(C_SOURCES))  ASM: $(words $(ASM_SOURCES))"
 
 -include $(call rwildcard,$(BUILD_DIR),*.d)
