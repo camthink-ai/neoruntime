@@ -104,6 +104,43 @@ static void hl_reply_status(host_link_handler_t *h, host_link_frame_t *f, int32_
     (void)host_link_response(h, f, &s, sizeof(s));
 }
 
+static uint8_t hl_lens_caps_pack(const lens_capabilities_t *caps)
+{
+    uint8_t value = 0U;
+
+    if (caps->supports_relative) value |= HOST_LINK_LENS_CAP_RELATIVE;
+    if (caps->supports_absolute) value |= HOST_LINK_LENS_CAP_ABSOLUTE;
+    if (caps->supports_home) value |= HOST_LINK_LENS_CAP_HOME;
+    if (caps->supports_pi) value |= HOST_LINK_LENS_CAP_PI;
+    if (caps->supports_sync_relative) value |= HOST_LINK_LENS_CAP_SYNC_RELATIVE;
+    if (caps->supports_ircut) value |= HOST_LINK_LENS_CAP_IRCUT;
+    if (caps->supports_iris) value |= HOST_LINK_LENS_CAP_IRIS;
+    return value;
+}
+
+static void hl_lens_profile_info_fill(host_link_lens_profile_info_t *out)
+{
+    const lens_profile_t *profile = lens_get_active_profile();
+
+    memset(out, 0, sizeof(*out));
+    out->model = (uint8_t)profile->model;
+    out->capabilities = hl_lens_caps_pack(&profile->capabilities);
+    out->zoom_step_scale = profile->zoom.psum_units_per_step;
+    out->zoom_direction_sign = profile->zoom.direction_sign;
+    out->zoom_min_pps = profile->zoom.min_pps;
+    out->zoom_max_pps = profile->zoom.max_pps;
+    out->zoom_default_pps = profile->zoom.default_pps;
+    out->zoom_travel_steps = profile->zoom.nominal_travel_steps;
+    out->zoom_travel_tolerance_steps = profile->zoom.travel_tolerance_steps;
+    out->focus_step_scale = profile->focus.psum_units_per_step;
+    out->focus_direction_sign = profile->focus.direction_sign;
+    out->focus_min_pps = profile->focus.min_pps;
+    out->focus_max_pps = profile->focus.max_pps;
+    out->focus_default_pps = profile->focus.default_pps;
+    out->focus_travel_steps = profile->focus.nominal_travel_steps;
+    out->focus_travel_tolerance_steps = profile->focus.travel_tolerance_steps;
+}
+
 static void host_link_dispatch_request(host_link_handler_t *h, host_link_frame_t *f)
 {
     const uint8_t *p = f->payload;
@@ -407,15 +444,33 @@ static void host_link_dispatch_request(host_link_handler_t *h, host_link_frame_t
         break;
 
     case HOST_LINK_CMD_LENS_INIT:
-        ms41908m_set_event_callback(hl_lens_host_notify);
+        lens_controller_set_event_callback(hl_lens_host_notify);
         hl_reply_status(h, f, lens_controller_init());
         break;
 
     case HOST_LINK_CMD_LENS_DEINIT:
-        ms41908m_set_event_callback(NULL);
+        lens_controller_set_event_callback(NULL);
         lens_controller_deinit();
         hl_reply_status(h, f, SYS_OK);
         break;
+
+    case HOST_LINK_CMD_LENS_PROFILE_GET: {
+        host_link_lens_profile_info_t info;
+        hl_lens_profile_info_fill(&info);
+        (void)host_link_response(h, f, &info, sizeof(info));
+        break;
+    }
+
+    case HOST_LINK_CMD_LENS_PROFILE_SET: {
+        const host_link_lens_profile_set_t *req;
+        if (p == NULL || len != sizeof(host_link_lens_profile_set_t)) {
+            hl_reply_status(h, f, SYS_ERR_INVALID_SIZE);
+            break;
+        }
+        req = (const host_link_lens_profile_set_t *)p;
+        hl_reply_status(h, f, lens_controller_select_profile((lens_model_t)req->model));
+        break;
+    }
 
     case HOST_LINK_CMD_LENS_CFG: {
         uint8_t mode = 0u;
@@ -562,6 +617,42 @@ static void host_link_dispatch_request(host_link_handler_t *h, host_link_frame_t
         req = (const host_link_lens_zf_sync_t *)p;
         hl_reply_status(h, f, lens_dual_run_raw(req->zm_pps, req->zm_micro_steps,
                                                 req->fs_pps, req->fs_micro_steps));
+        break;
+    }
+
+    case HOST_LINK_CMD_LENS_ZOOM_REL: {
+        const host_link_lens_relative_t *req;
+        if (p == NULL || len != sizeof(host_link_lens_relative_t)) {
+            hl_reply_status(h, f, SYS_ERR_INVALID_SIZE);
+            break;
+        }
+        req = (const host_link_lens_relative_t *)p;
+        hl_reply_status(h, f, lens_zoom_move_relative(req->physical_pps,
+                                                       req->physical_steps));
+        break;
+    }
+
+    case HOST_LINK_CMD_LENS_FOCUS_REL: {
+        const host_link_lens_relative_t *req;
+        if (p == NULL || len != sizeof(host_link_lens_relative_t)) {
+            hl_reply_status(h, f, SYS_ERR_INVALID_SIZE);
+            break;
+        }
+        req = (const host_link_lens_relative_t *)p;
+        hl_reply_status(h, f, lens_focus_move_relative(req->physical_pps,
+                                                        req->physical_steps));
+        break;
+    }
+
+    case HOST_LINK_CMD_LENS_DUAL_REL: {
+        const host_link_lens_dual_relative_t *req;
+        if (p == NULL || len != sizeof(host_link_lens_dual_relative_t)) {
+            hl_reply_status(h, f, SYS_ERR_INVALID_SIZE);
+            break;
+        }
+        req = (const host_link_lens_dual_relative_t *)p;
+        hl_reply_status(h, f, lens_dual_move_relative(req->zoom_pps, req->zoom_steps,
+                                                       req->focus_pps, req->focus_steps));
         break;
     }
 

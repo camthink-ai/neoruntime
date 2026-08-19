@@ -99,12 +99,25 @@ typedef enum {
     HOST_LINK_CMD_LENS_FOCUS_LIM_SET = 0x004B,
     HOST_LINK_CMD_EV_LENS = 0x004C,
     HOST_LINK_CMD_LENS_ZF_SYNC_RUN = 0x004D,
+    HOST_LINK_CMD_LENS_PROFILE_GET = 0x004E,
+    HOST_LINK_CMD_LENS_PROFILE_SET = 0x004F,
 
     /* OTA (mcu_board_prj/app/Custom/Components/ota_host): tag + MCU reset; bootloader does Ymodem. */
     HOST_LINK_CMD_OTA_ENTER_BOOT = 0x0050,
     /** MCU NVIC_SystemReset (no Ymodem tag). */
     HOST_LINK_CMD_REBOOT = 0x0051,
+    HOST_LINK_CMD_LENS_ZOOM_REL = 0x0052,
+    HOST_LINK_CMD_LENS_FOCUS_REL = 0x0053,
+    HOST_LINK_CMD_LENS_DUAL_REL = 0x0054,
 } host_link_cmd_t;
+
+#define HOST_LINK_LENS_CAP_RELATIVE      (1u << 0)
+#define HOST_LINK_LENS_CAP_ABSOLUTE      (1u << 1)
+#define HOST_LINK_LENS_CAP_HOME          (1u << 2)
+#define HOST_LINK_LENS_CAP_PI            (1u << 3)
+#define HOST_LINK_LENS_CAP_SYNC_RELATIVE (1u << 4)
+#define HOST_LINK_LENS_CAP_IRCUT         (1u << 5)
+#define HOST_LINK_LENS_CAP_IRIS          (1u << 6)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -197,6 +210,41 @@ typedef struct {
 } host_link_lens_zf_sync_t;
 
 typedef struct {
+    uint8_t model;
+} host_link_lens_profile_set_t;
+
+typedef struct {
+    uint8_t model;
+    uint8_t capabilities;
+    uint8_t zoom_step_scale;
+    int8_t zoom_direction_sign;
+    uint16_t zoom_min_pps;
+    uint16_t zoom_max_pps;
+    uint16_t zoom_default_pps;
+    uint16_t zoom_travel_steps;
+    uint16_t zoom_travel_tolerance_steps;
+    uint8_t focus_step_scale;
+    int8_t focus_direction_sign;
+    uint16_t focus_min_pps;
+    uint16_t focus_max_pps;
+    uint16_t focus_default_pps;
+    uint16_t focus_travel_steps;
+    uint16_t focus_travel_tolerance_steps;
+} host_link_lens_profile_info_t;
+
+typedef struct {
+    uint16_t physical_pps;
+    int32_t physical_steps;
+} host_link_lens_relative_t;
+
+typedef struct {
+    uint16_t zoom_pps;
+    int32_t zoom_steps;
+    uint16_t focus_pps;
+    int32_t focus_steps;
+} host_link_lens_dual_relative_t;
+
+typedef struct {
     uint16_t target;
 } host_link_lens_iris_tgt_t;
 
@@ -239,9 +287,20 @@ _Static_assert(sizeof(host_link_lens_state_t) == 13, "host_link_lens_state_t");
 _Static_assert(sizeof(host_link_lens_motion_t) == 6, "host_link_lens_motion_t");
 _Static_assert(sizeof(host_link_lens_limit_t) == 8, "host_link_lens_limit_t");
 _Static_assert(sizeof(host_link_lens_zf_sync_t) == 12, "host_link_lens_zf_sync_t");
+_Static_assert(sizeof(host_link_lens_profile_set_t) == 1, "host_link_lens_profile_set_t");
+_Static_assert(sizeof(host_link_lens_profile_info_t) == 26, "host_link_lens_profile_info_t");
+_Static_assert(sizeof(host_link_lens_relative_t) == 6, "host_link_lens_relative_t");
+_Static_assert(sizeof(host_link_lens_dual_relative_t) == 12, "host_link_lens_dual_relative_t");
 _Static_assert(sizeof(host_link_lens_iris_tgt_t) == 2, "host_link_lens_iris_tgt_t");
 _Static_assert(sizeof(host_link_lens_iris_adc_t) == 2, "host_link_lens_iris_adc_t");
 _Static_assert(sizeof(host_link_lens_evt_t) == 16, "host_link_lens_evt_t");
 _Static_assert(sizeof(host_link_ota_pkg_hdr_t) == 56, "host_link_ota_pkg_hdr_t");
+#endif
+
+#if defined(__cplusplus)
+static_assert(sizeof(host_link_lens_profile_set_t) == 1, "host_link_lens_profile_set_t");
+static_assert(sizeof(host_link_lens_profile_info_t) == 26, "host_link_lens_profile_info_t");
+static_assert(sizeof(host_link_lens_relative_t) == 6, "host_link_lens_relative_t");
+static_assert(sizeof(host_link_lens_dual_relative_t) == 12, "host_link_lens_dual_relative_t");
 #endif
 
