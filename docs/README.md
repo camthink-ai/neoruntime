@@ -40,7 +40,6 @@
 | [services/device-discovery.md](services/device-discovery.md) | Device discovery service (CT-Disc) |
 | [services/event-bus.md](services/event-bus.md) | Message pub/sub service |
 | [services/media-streaming.md](services/media-streaming.md) | RTSP / media streaming |
-| [services/onvif-device.md](services/onvif-device.md) | ONVIF Profile S device service (NVR/VMS discovery + RTSP) |
 | [services/platform-api.md](services/platform-api.md) | Platform API gateway service |
 | [services/web-console.md](services/web-console.md) | Web console |
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { toast } from 'sonner';
@@ -12,9 +12,11 @@ import {
 } from 'lucide-react';
 import {
   useAutofocusStatus,
+  useDeviceStatus,
   useLensStatus,
   useOneshotAutofocus,
   useSetFocusLevel,
+  useSetIrCut,
   useStartZoomFollow,
 } from '@/hooks/useDeviceControl';
 import type { LensStatus } from '@/services/api/device';
@@ -22,6 +24,7 @@ import { MotorState } from '@/services/api/device';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 // import { Separator } from '@/components/ui/separator';
+import { Switch } from '@/components/ui/switch';
 import { LensControlSkeleton } from './DeviceControlSkeletons';
 import {
   Tooltip,
@@ -84,15 +87,20 @@ export default function LensControl() {
     isLoading: isDeviceLoading,
     refetch: refetchLensStatus,
   } = useLensStatus();
+  const { data: deviceStatus } = useDeviceStatus();
   const { data: autofocusStatus } = useAutofocusStatus();
 
   const oneshotAutofocus = useOneshotAutofocus();
   const startZoomFollow = useStartZoomFollow();
   const setFocusLevel = useSetFocusLevel();
+  const { mutate: setIrCut, isPending: isIrCutPending } = useSetIrCut();
 
   const [zoomPercent, setZoomPercent] = useState(0);
   const [focusPercent, setFocusPercent] = useState(0);
   const previousAfBusy = useRef(false);
+
+  const isNight =    deviceStatus?.ircut_mode === 'IRCUT_NIGHT'
+    || deviceStatus?.ircut_mode === 2;
 
   // ── Derived state ─────────────────────────────────────────────────
 
@@ -183,6 +191,30 @@ export default function LensControl() {
   }, [afBusy, autofocusStatus?.job_id, autofocusStatus?.message, autofocusStatus?.state, refetchLensStatus, t]);
 
   // ── Handlers ──────────────────────────────────────────────────────
+
+  const handleToggleIrCut = useCallback(
+    (night: boolean) => {
+      setIrCut(night ? 'night' : 'day', {
+        onSuccess: () => {
+          toast.success(
+            t(
+              'sys.media_settings.ir_cut_success',
+              night ? 'Switched to night mode' : 'Switched to day mode'
+            )
+          );
+        },
+        onError: () => {
+          toast.error(
+            t(
+              'sys.media_settings.ir_cut_failed',
+              'Failed to switch IR-cut mode'
+            )
+          );
+        },
+      });
+    },
+    [setIrCut, t]
+  );
 
   const handleOneshotAutofocus = async () => {
     try {
@@ -365,6 +397,55 @@ export default function LensControl() {
           canDecrement={canFocusNear}
           canIncrement={canFocusFar}
         />
+
+        {/* <Separator /> */}
+
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+            <span>{t('sys.device.lighting.ircut', 'IR-Cut Filter')}</span>
+            <TooltipProvider delayDuration={200}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                    aria-label={
+                      isNight
+                        ? t(
+                            'sys.media_settings.ir_cut_night_hint',
+                            'IR filter removed, black & white image with IR illumination'
+                          )
+                        : t(
+                            'sys.media_settings.ir_cut_day_hint',
+                            'IR filter active, full color image'
+                          )
+                    }
+                  >
+                    <Info className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="text-xs max-w-[280px]">
+                  {isNight
+                    ? t(
+                        'sys.media_settings.ir_cut_night_hint',
+                        'IR filter removed, black & white image with IR illumination'
+                      )
+                    : t(
+                        'sys.media_settings.ir_cut_day_hint',
+                        'IR filter active, full color image'
+                      )}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </div>
+          <Switch
+            checked={isNight}
+            onCheckedChange={handleToggleIrCut}
+            disabled={isIrCutPending || afBusy}
+          />
+        </div>
       </CardContent>
     </Card>
   );

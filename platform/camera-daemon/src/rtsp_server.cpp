@@ -415,13 +415,15 @@ void RtspServer::reply_setup(Client& c, const RtspRequest& req) {
         c.pkt_count = 0;
         c.octet_count = 0;
 
-        // Audio is NOT auto-bundled on a video-track SETUP. A client that set
-        // up only the video track (e.g. ODM sends SETUP .../trackID=0 with
-        // interleaved=0-1) negotiated exactly two channels and must not receive
-        // interleaved audio on channels it never asked for — strict DirectShow
-        // clients abort the session ("Connection reset by peer" / black screen)
-        // when RTP data arrives on un-negotiated channels. Audio is enabled only
-        // when the client explicitly sets up the audio track (trackID=1) below.
+        // Auto-assign audio channels if multi-track capable
+        if (has_audio_stream_ && !streams_.find(name)->second.info.is_audio) {
+            c.has_audio = true;
+            c.audio_rtp_channel = rtp_ch + 2;
+            c.audio_rtcp_channel = rtp_ch + 3;
+            c.audio_rtp_ssrc = generate_ssrc();
+            c.audio_rtp_seq = 0;
+            c.rtp_audio_sample_count = 0;
+        }
     } else if (track_id == 1) {
         // Audio track (multi-track SETUP)
         c.has_audio = true;
@@ -948,68 +950,6 @@ void RtspServer::remove_client(int client_id) {
  * Packet input (from encoder callback, thread-safe)
  * ================================================================ */
 
-/* ================================================================
- * RTCP Sender Report (SR) — RFC 3550 §6.4.1
- *
- * Many RTSP clients (ONVIF Device Manager, DirectShow filters) run an RTCP
- * liveness watchdog: if no RTCP SR arrives within ~5-10s they declare the
- * stream dead ("no signal" / black screen) even while RTP media keeps flowing.
- * VLC and raw probes do not enforce this, which is why they play fine while
- * ODM does not. We emit one SR every ~5s on the video RTCP channel so the
- * watchdog stays satisfied.
- * Caller must hold c.write_mu (same contract as send_tcp_interleaved).
- * ================================================================ */
-void RtspServer::maybe_send_rtcp_sr(Client& c, uint32_t rtp_ts) {
-    auto now = std::chrono::steady_clock::now();
-    // steady_clock::time_point defaults to the clock epoch, so the first call
-    // after a client starts PLAYING always passes this gate and sends an SR.
-    if (now - c.last_rtcp_send < std::chrono::seconds(5)) return;
-    c.last_rtcp_send = now;
-
-    // NTP timestamp = seconds since 1900-01-01 (unix secs + 2208988800).
-    auto sys_now = std::chrono::system_clock::now();
-    auto dur = sys_now.time_since_epoch();
-    auto secs = std::chrono::duration_cast<std::chrono::seconds>(dur).count();
-    auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(dur).count() % 1000000000;
-    uint32_t ntp_msw = (uint32_t)((uint64_t)secs + 2208988800ULL);
-    uint32_t ntp_lsw = (uint32_t)((double)nanos * (4294967296.0 / 1000000000.0));
-
-    uint8_t sr[28];
-    sr[0] = 0x80;                 // V=2, P=0, RC=0 (no report blocks)
-    sr[1] = 0xC8;                 // PT = SR = 200
-    sr[2] = 0x00; sr[3] = 0x06;   // length = (28 bytes / 4) - 1 = 6 words
-    // SSRC of sender
-    sr[4]  = (c.rtp_ssrc >> 24) & 0xFF;
-    sr[5]  = (c.rtp_ssrc >> 16) & 0xFF;
-    sr[6]  = (c.rtp_ssrc >> 8)  & 0xFF;
-    sr[7]  = c.rtp_ssrc & 0xFF;
-    // NTP timestamp MSW / LSW
-    sr[8]  = (ntp_msw >> 24) & 0xFF;
-    sr[9]  = (ntp_msw >> 16) & 0xFF;
-    sr[10] = (ntp_msw >> 8)  & 0xFF;
-    sr[11] = ntp_msw & 0xFF;
-    sr[12] = (ntp_lsw >> 24) & 0xFF;
-    sr[13] = (ntp_lsw >> 16) & 0xFF;
-    sr[14] = (ntp_lsw >> 8)  & 0xFF;
-    sr[15] = ntp_lsw & 0xFF;
-    // RTP timestamp corresponding to NTP (same 90kHz clock as the media)
-    sr[16] = (rtp_ts >> 24) & 0xFF;
-    sr[17] = (rtp_ts >> 16) & 0xFF;
-    sr[18] = (rtp_ts >> 8)  & 0xFF;
-    sr[19] = rtp_ts & 0xFF;
-    // sender's packet / octet counts
-    sr[20] = (c.pkt_count >> 24) & 0xFF;
-    sr[21] = (c.pkt_count >> 16) & 0xFF;
-    sr[22] = (c.pkt_count >> 8)  & 0xFF;
-    sr[23] = c.pkt_count & 0xFF;
-    sr[24] = (c.octet_count >> 24) & 0xFF;
-    sr[25] = (c.octet_count >> 16) & 0xFF;
-    sr[26] = (c.octet_count >> 8)  & 0xFF;
-    sr[27] = c.octet_count & 0xFF;
-
-    send_tcp_interleaved(c, c.rtcp_channel, sr, sizeof(sr));
-}
-
 void RtspServer::on_packet(const std::string& stream_name,
                             const HalPacketBuffer* packet) {
     if (!running_.load()) return;
@@ -1155,10 +1095,6 @@ void RtspServer::on_packet(const std::string& stream_name,
         c->rtp_frame_count++;
 
         std::lock_guard<std::mutex> wlock(c->write_mu);
-
-        // Keep strict clients' RTCP liveness watchdog satisfied (see
-        // maybe_send_rtcp_sr). Throttled internally to ~1 SR / 5s.
-        maybe_send_rtcp_sr(*c, rel_ts);
 
         for (size_t i = 0; i < nals.size(); i++) {
             if (!c->alive) break;

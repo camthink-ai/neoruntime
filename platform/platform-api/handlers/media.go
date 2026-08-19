@@ -157,10 +157,6 @@ func deepMerge(dst, src map[string]interface{}) {
 }
 
 func (h *MediaHandlers) GetConfig(c *gin.Context) {
-	// Dynamic config: never let the browser serve a stale copy. Without this,
-	// an out-of-band change (e.g. ONVIF SetVideoEncoderConfiguration) is invisible
-	// until a hard refresh — F5 reuses the heuristically-cached JSON.
-	c.Header("Cache-Control", "no-store")
 	data, err := os.ReadFile(h.configPath)
 	if err != nil {
 		Resp(c).FailMsg(CodeCameraError, "Failed to read config: "+err.Error())
@@ -2068,10 +2064,6 @@ func (h *MediaHandlers) ReconfigurePipeline(c *gin.Context) {
 // Falls back to config-derived status if the daemon has not implemented the RPC yet.
 // GET /api/v1/media/status
 func (h *MediaHandlers) GetStreamStatus(c *gin.Context) {
-	// Runtime state: never cache. F5 must always hit the network so an
-	// out-of-band change (ONVIF Set, web save from another tab) is visible
-	// without a hard refresh.
-	c.Header("Cache-Control", "no-store")
 	// Always read YAML config first to get full stream list (including disabled)
 	allParams, _ := h.readAllEncoderParams()
 	yamlMap := make(map[string]streamEncoderParams)

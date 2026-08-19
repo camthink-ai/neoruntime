@@ -6,7 +6,6 @@
 #include "../include/autofocus_controller.h"
 #include "../include/frame_router.h"
 #include "../include/lens_controller.h"
-#include "../include/illumination_controller.h"
 
 #include "af_calibration.h"
 #include "af_follow.h"
@@ -107,13 +106,10 @@ class AutofocusController::Impl {
 public:
     Impl(HalIspOps* isp_ops, HalVideoOps* video_ops, void* video_ctx,
          FrameRouter* frame_router, LensController* lens,
-         IlluminationController* illumination, const AutofocusConfig& config,
-         int sensor_native_width, int sensor_native_height,
-         AutofocusVideoContextRefreshFn refresh_video_context)
+         const AutofocusConfig& config,
+         int sensor_native_width, int sensor_native_height)
         : isp_ops_(isp_ops), video_ops_(video_ops), video_ctx_(video_ctx),
-          frame_router_(frame_router), lens_(lens), illumination_(illumination),
-          refresh_video_context_(std::move(refresh_video_context)),
-          config_(config) {
+          frame_router_(frame_router), lens_(lens), config_(config) {
         // Priority: explicit constructor params > config fields > video_ctx query
         if (sensor_native_width > 0 && sensor_native_height > 0) {
             af_native_width_ = sensor_native_width;
@@ -292,8 +288,6 @@ private:
     std::atomic<void*> video_ctx_{nullptr};
     FrameRouter* frame_router_ = nullptr;
     LensController* lens_ = nullptr;
-    IlluminationController* illumination_ = nullptr;
-    AutofocusVideoContextRefreshFn refresh_video_context_;
     AutofocusConfig config_;
     hal_auto_af::IntegrationDefaults defaults_{};
     hal_auto_af::MetricConfig metric_config_{};
@@ -380,17 +374,12 @@ private:
         return false;
     }
 
-    bool configure_windows_once(void* video_ctx) {
-        if (!isp_ops_) {
-            HAL_LOG_ERROR("Autofocus: AF window setup failed: ISP operations are unavailable");
-            return false;
-        }
-        if (!isp_ops_->set_af_windows_config) {
-            HAL_LOG_ERROR("Autofocus: AF window setup failed: set_af_windows_config is unavailable");
-            return false;
-        }
-        if (!video_ctx) {
-            HAL_LOG_ERROR("Autofocus: AF window setup failed: video context is null");
+    bool configure_windows() {
+        void* video_ctx = video_ctx_.load();
+        if (!isp_ops_ || !isp_ops_->set_af_windows_config || !video_ctx) {
+            HAL_LOG_WARNING("Autofocus: configure_windows skipped — isp=%p set_af=%p ctx=%p",
+                         (void*)isp_ops_, (void*)(isp_ops_ ? isp_ops_->set_af_windows_config : nullptr),
+                         video_ctx);
             return false;
         }
 
@@ -434,33 +423,6 @@ private:
         }
         HAL_LOG_INFO("Autofocus: AF windows configured OK");
         return true;
-    }
-
-    bool configure_windows() {
-        void* video_ctx = video_ctx_.load();
-        if (configure_windows_once(video_ctx)) {
-            return true;
-        }
-
-        // A MediaLibrary/profile rebuild can invalidate HalVideoContext while
-        // the daemon itself remains alive. Refresh the FROM_MEDIA contexts once
-        // and retry with the new primary context instead of requiring a manual
-        // resolution change to rebuild the binding.
-        if (!refresh_video_context_) {
-            return false;
-        }
-
-        HAL_LOG_WARNING("Autofocus: AF window setup failed; refreshing video context and retrying once");
-        void* refreshed_ctx = refresh_video_context_();
-        if (!refreshed_ctx) {
-            HAL_LOG_ERROR("Autofocus: video context refresh returned null");
-            return false;
-        }
-
-        update_video_context(refreshed_ctx);
-        HAL_LOG_INFO("Autofocus: retrying AF window setup with refreshed video_ctx=%p",
-                     refreshed_ctx);
-        return configure_windows_once(refreshed_ctx);
     }
 
     int wait_frames(int count) {
@@ -1055,38 +1017,12 @@ private:
         }
 
         set_state(AutofocusState::PathMoving, 0.05, "moving zoom-focus path");
-        struct IlluminationFollowScope {
-            IlluminationController* controller = nullptr;
-            double ratio = 1.0;
-            ~IlluminationFollowScope() {
-                if (!controller) return;
-                std::string ignored;
-                controller->end_zoom_follow(ratio, &ignored);
-            }
-        } illumination_scope{illumination_, path.front().zoom_ratio};
-        if (illumination_) {
-            std::string ir_error;
-            if (!illumination_->begin_zoom_follow(path.front().zoom_ratio, &ir_error)) {
-                HAL_LOG_WARNING("Autofocus: IR follow start degraded: %s",
-                                ir_error.c_str());
-            }
-        }
         for (size_t i = 1; i < path.size(); ++i) {
             if (cancelled()) {
                 ScanResult cancelled_result;
                 cancelled_result.error = HAL_ERR_INVALID_STATE;
                 cancelled_result.message = "cancelled";
                 return cancelled_result;
-            }
-            if (illumination_) {
-                const double segment_ratio =
-                    (static_cast<double>(path[i - 1].zoom_ratio) +
-                     static_cast<double>(path[i].zoom_ratio)) * 0.5;
-                std::string ir_error;
-                if (!illumination_->apply_follow_ratio(segment_ratio, &ir_error)) {
-                    HAL_LOG_WARNING("Autofocus: IR waypoint update degraded: %s",
-                                    ir_error.c_str());
-                }
             }
             const int ret = move_zoom_focus(
                 path[i].zoom_pos, path[i].focus_pos, "follow segment");
@@ -1107,24 +1043,10 @@ private:
                 status_.focus_pos = path[i].focus_pos;
                 status_.message = "moving zoom-focus path";
             }
-            illumination_scope.ratio = path[i].zoom_ratio;
         }
 
         set_state(AutofocusState::EndpointAf, 0.85, "endpoint autofocus");
         const auto& endpoint_sample = path.back();
-        if (illumination_) {
-            std::string ir_error;
-            if (!illumination_->apply_endpoint_ratio(effective_ratio, &ir_error)) {
-                HAL_LOG_WARNING("Autofocus: IR endpoint update degraded: %s",
-                                ir_error.c_str());
-            }
-            const int extra_settle = std::max(
-                0, illumination_->config().endpoint_settle_frames -
-                       defaults_.exploration_sync_frames);
-            if (extra_settle > 0 && wait_frames(extra_settle) != HAL_OK) {
-                HAL_LOG_WARNING("Autofocus: IR endpoint settle frame wait timed out");
-            }
-        }
         const int endpoint_span = hal_auto_af::refine_span_for_ratio(
             effective_ratio, config_.fine_span, follow_config_);
         return run_one_shot_at(endpoint_sample.focus_pos, endpoint_span, true);
@@ -1214,13 +1136,11 @@ private:
 AutofocusController::AutofocusController(
     HalIspOps* isp_ops, HalVideoOps* video_ops, void* video_ctx,
     FrameRouter* frame_router, LensController* lens,
-    IlluminationController* illumination, const AutofocusConfig& config,
-    int sensor_native_width, int sensor_native_height,
-    AutofocusVideoContextRefreshFn refresh_video_context)
+    const AutofocusConfig& config,
+    int sensor_native_width, int sensor_native_height)
     : impl_(std::make_unique<Impl>(isp_ops, video_ops, video_ctx,
-                                   frame_router, lens, illumination, config,
-                                   sensor_native_width, sensor_native_height,
-                                   std::move(refresh_video_context))) {}
+                                   frame_router, lens, config,
+                                   sensor_native_width, sensor_native_height)) {}
 
 AutofocusController::~AutofocusController() = default;
 void AutofocusController::start() { impl_->start(); }

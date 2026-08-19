@@ -212,7 +212,7 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         # ---- SDK's webserver config for the Basic profiles; references rewritten to a scratch
         # ---- dir so no on-device config path is needed at runtime.
         set(HAL_V2_EMBED_DEFAULT_MEDIALIB ON CACHE BOOL "Embed a self-contained default medialib config in the HAL")
-        set(HAL_V2_DEFAULT_MEDIALIB_PROFILES "Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic,Infrared_Basic" CACHE STRING "Profiles embedded in the default medialib config")
+        set(HAL_V2_DEFAULT_MEDIALIB_PROFILES "Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic" CACHE STRING "Profiles embedded in the default medialib config")
         set(HAL_V2_DEFAULT_MEDIALIB_SCRATCH_ROOT "/var/tmp/hal_medialib_default" CACHE STRING "Runtime scratch dir for the embedded default medialib config")
         set(HAL_V2_DEFAULT_MEDIALIB_WS_CFG "etc/imaging/cfg/medialib_configs/webserver_medialib_config.json" CACHE STRING "Webserver medialib config path (relative to SDK sysroot)")
         get_filename_component(_HAL_SDK_SYSROOT "${HAILO_MEDIALIB_INC_DIR}/../../.." ABSOLUTE)
@@ -226,14 +226,12 @@ if(HAL_PLATFORM STREQUAL "hailo15")
                 COMMAND ${HAL_PYTHON3}
                         ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/gen_default_medialib_bundle.py
                         --sysroot ${_HAL_SDK_SYSROOT}
-                        --overlay ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/default_medialib_overlay
                         --webserver-config ${HAL_V2_DEFAULT_MEDIALIB_WS_CFG}
                         --scratch-root ${HAL_V2_DEFAULT_MEDIALIB_SCRATCH_ROOT}
                         --profiles ${HAL_V2_DEFAULT_MEDIALIB_PROFILES}
                         --out ${_GEN_BUNDLE}
                 DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/gen_default_medialib_bundle.py
-                        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/default_medialib_overlay/etc/imaging/cfg/medialib_configs/webserver_medialib_config.json
-                COMMENT "Generating self-contained default medialib bundle (5 Basic + Infrared profiles)"
+                COMMENT "Generating self-contained default medialib bundle (5 Basic profiles)"
                 VERBATIM
             )
             set(_DEFAULT_MEDIALIB_SOURCES

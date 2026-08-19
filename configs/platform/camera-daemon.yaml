@@ -14,8 +14,10 @@ hal:
 
 # Media pipeline configuration (Hailo15 v2: required for FROM_MEDIA mode)
 media:
-  # Product-owned profile list adds Infrared_Basic while retaining vendor IQ paths.
-  config_path: /data/aipc/etc/imaging/hailo15h/imx678/theia_sl410m/4k/medialib_configs/webserver_medialib_config.json
+  # config_path is intentionally omitted: the platform no longer maintains a
+  # module-specific medialib config_path. camera-daemon falls back to the HAL
+  # compiled-in default medialib config (see CameraDaemon::init_media). Set
+  # config_path here only to force an explicit medialib profile override.
   backup_path: /data/aipc/data/media-backup
 
 video:
@@ -88,29 +90,6 @@ autofocus:
   balanced_retry: 1
   confidence_accept: 0.80
   confidence_recovery: 0.65
-
-infrared:
-  enabled: true
-  profile_name: Infrared_Basic
-  default_mode: day
-  near_led_id: 0
-  far_led_id: 1
-  auto_follow: true
-  lut_path: /data/aipc/etc/ir_zoom_lut.csv
-  deadband_percent: 2
-  endpoint_settle_frames: 3
-  mode_settle_frames: 10
-  log_updates: true
-
-light_sensor:
-  enabled: true
-  auto_on_boot: false        # start in auto mode on boot (else default_mode from infrared)
-  night_enter: 28            # light_percent <= night_enter => switch to night
-  day_enter: 82              # light_percent >= day_enter   => switch to day
-  sample_interval_ms: 500    # photodiode sampling cadence
-  stable_samples: 3          # consecutive qualifying reads before a switch
-  dark_mv: 4                 # measured dark-environment endpoint (calibration)
-  bright_mv: 1909            # measured bright-environment endpoint (calibration)
 
 ai_overlay:
   enabled: true

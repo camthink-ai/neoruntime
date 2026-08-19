@@ -2037,17 +2037,8 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
     using json = nlohmann::json;
     json cfg = json::parse(stored_json);
 
-    std::string prof_name;
-    if (!target_profile.name.empty())
-    {
-        /* A layout reinit is also used while switching profiles.  Select the
-         * requested target profile instead of the previous JSON default. */
-        prof_name = target_profile.name;
-        cfg["default_profile"] = prof_name;
-        HAL_LOG_INFO("hailo15_media: patch_json: selecting target profile '%s'",
-                     prof_name.c_str());
-    }
-    else if (cfg.contains("default_profile"))
+    std::string prof_name = target_profile.name;
+    if (prof_name.empty() && cfg.contains("default_profile"))
         prof_name = cfg["default_profile"].get<std::string>();
     if (!prof_name.empty())
         cfg["default_profile"] = prof_name;
@@ -4340,9 +4331,7 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
             p.iq_settings.dewarp.enabled = cfg->dewarp;
             p.stabilizer_settings.dis.enabled = cfg->dis;
             p.stabilizer_settings.eis.enabled = cfg->eis;
-            /* Profile-intrinsic grayscale (IR monochrome) must survive a full reinit:
-             * the toggle may only add grayscale, never remove it (see dynamic_change_image_config). */
-            p.iq_settings.grayscale.enabled = cfg->grayscale || p.iq_settings.grayscale.enabled;
+            p.iq_settings.grayscale.enabled = cfg->grayscale;
 
             /* Recalculate OSD for new dimensions. */
             HalRotationAngle new_rot = cfg->rotation_angle;
@@ -4534,13 +4523,7 @@ static int hailo15_media_dynamic_change_image_config(void *media_ctx, const HalM
     p.iq_settings.dewarp.enabled = cfg->dewarp;
     p.stabilizer_settings.dis.enabled = cfg->dis;
     p.stabilizer_settings.eis.enabled = cfg->eis;
-    /* A profile that mandates monochrome (e.g. Infrared, grayscale=true) must keep
-     * grayscale ON; the transform toggle may only ADD grayscale, never disable a
-     * profile-intrinsic one. Otherwise flipping / resolution-switching in IR mode
-     * clobbers the B&W output into a purple color cast (IR-cut at night + IR LEDs +
-     * AWB on a color path). get_current_profile() returns the profile definition, so
-     * p.iq_settings.grayscale.enabled is the authored value (true for IR). */
-    p.iq_settings.grayscale.enabled = cfg->grayscale || p.iq_settings.grayscale.enabled;
+    p.iq_settings.grayscale.enabled = cfg->grayscale;
 
     if (cfg->privacy_mask && !cfg->digital_zoom)
     {
@@ -4900,14 +4883,7 @@ static int hailo15_media_override_stream_params(void *media_ctx, const HalStream
             HAL_LOG_ERROR("hailo15_media: override_stream_params: failed to generate new config JSON");
             return HAL_ERROR;
         }
-        // skip_encoder_overrides=true: generate_config already wrote the requested
-        // dimensions into new_json (encoder files at the existing-stream file-path
-        // branch + application_input_streams). Re-applying priv->encoder_overrides_json
-        // (the static YAML/init override) here would REVERT the caller's requested
-        // resolution/codec — e.g. a 4K->1080p ReconfigureEncoder (ONVIF
-        // SetVideoEncoderConfiguration) was silently forced back to 4K. Mirrors
-        // reconfigure_pipeline (the web-UI path), which passes true for the same reason.
-        int rc = reinit_media_library_on_stream_change(static_cast<HalMediaContext *>(media_ctx), priv, new_json, true);
+        int rc = reinit_media_library_on_stream_change(static_cast<HalMediaContext *>(media_ctx), priv, new_json);
         if (rc == HAL_OK)
         {
             HAL_LOG_INFO("hailo15_media: override_stream_params: reinit success (%u streams)", batch->stream_count);
@@ -4941,18 +4917,9 @@ static std::string hailo15_generate_pipeline_config_json(
 
     json cfg = json::parse(stored_json);
 
-    /* Preserve the profile that is active in MediaLibrary.  The stored JSON
-     * commonly declares a daytime default, which would otherwise replace an
-     * active infrared profile during a full stream-layout reinitialization. */
-    std::string prof_name;
-    if (!active_profile_name.empty())
-    {
-        prof_name = active_profile_name;
-        cfg["default_profile"] = prof_name;
-        HAL_LOG_INFO("hailo15_media: generate_config: preserving active profile '%s'",
-                     prof_name.c_str());
-    }
-    else if (cfg.contains("default_profile"))
+    /* Preserve the runtime profile across full MediaLibrary reinit. */
+    std::string prof_name = active_profile_name;
+    if (prof_name.empty() && cfg.contains("default_profile"))
     {
         prof_name = cfg["default_profile"].get<std::string>();
     }

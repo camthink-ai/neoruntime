@@ -28,10 +28,6 @@
 #include <chrono>
 #include <cstdint>
 #include <algorithm>
-#include <cctype>
-#include <fstream>
-#include <cstdio>
-#include <nlohmann/json.hpp>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -488,25 +484,7 @@ bool CameraDaemon::init(const DaemonConfig& config) {
         std::string persisted_profile;
         if (load_profile_config(&persisted_profile)) {
             std::string current = get_current_profile();
-            const bool force_day_on_boot = config_.infrared.enabled &&
-                config_.infrared.default_mode != "infrared";
-            const bool persisted_infrared_profile =
-                persisted_profile == config_.infrared.infrared_profile;
-            if (force_day_on_boot && persisted_infrared_profile) {
-                // Infrared is an operating mode, not a boot profile. Do not
-                // restore a stale night profile when product policy is Day.
-                HAL_LOG_INFO("CameraDaemon: ignoring persisted infrared profile '%s'; default_mode=day",
-                             persisted_profile.c_str());
-                if (current == config_.infrared.infrared_profile) {
-                    std::string msg;
-                    if (!switch_profile("Daylight_Basic", &msg)) {
-                        HAL_LOG_ERROR("CameraDaemon: failed to restore Daylight_Basic from infrared profile: %s",
-                                      msg.c_str());
-                    }
-                    current = get_current_profile();
-                }
-                persist_profile_config(current);
-            } else if (!persisted_profile.empty() && persisted_profile != current) {
+            if (!persisted_profile.empty() && persisted_profile != current) {
                 HAL_LOG_INFO("CameraDaemon: applying persisted profile '%s' (current '%s')",
                              persisted_profile.c_str(), current.c_str());
                 std::string msg;
@@ -2887,53 +2865,11 @@ void CameraDaemon::start_grpc_server() {
         }
     }
 
-    if (config_.infrared.enabled) {
-        illumination_controller_ = std::make_unique<IlluminationController>(
-            config_.infrared,
-            [this](uint32_t led_id, uint32_t duty) {
-                return set_led_duty_raw(led_id, duty);
-            });
-        std::string warning;
-        illumination_controller_->initialize(&warning);
-        illumination_controller_->set_active_profile(get_current_profile());
-        if (!warning.empty()) {
-            HAL_LOG_WARNING("CameraDaemon: %s", warning.c_str());
-        }
-        std::string error;
-        const auto startup_mode = config_.infrared.default_mode == "infrared"
-            ? ImagingMode::Infrared : ImagingMode::Day;
-        if (startup_mode == ImagingMode::Day && !set_ircut(0)) {
-            HAL_LOG_WARNING("CameraDaemon: failed to force IR-cut to day during startup");
-        }
-        if (!illumination_controller_->set_mode(startup_mode, current_zoom_ratio(), &error)) {
-            HAL_LOG_WARNING("CameraDaemon: failed to apply startup illumination mode: %s",
-                            error.c_str());
-        }
-    }
-
-    /* Day/night auto (light-sensor) policy: take a runtime copy of the thresholds
-     * (live-adjustable via set_light_thresholds) and optionally start in auto mode. */
-    {
-        std::lock_guard<std::mutex> lk(daynight_mu_);
-        light_sensor_cfg_ = config_.light_sensor;
-        daynight_state_.mode = LightMode::Day;
-    }
-    if (config_.light_sensor.enabled && config_.light_sensor.auto_on_boot) {
-        (void)set_selected_mode("auto", nullptr);
-    } else {
-        std::lock_guard<std::mutex> lk(daynight_mu_);
-        selected_mode_ = (config_.infrared.default_mode == "infrared")
-                             ? SelectedMode::Infrared : SelectedMode::Day;
-    }
-
     if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
         hal_loader_->has_isp() && video_source_ && frame_router_) {
         autofocus_controller_ = std::make_unique<AutofocusController>(
             hal_loader_->isp(), hal_loader_->video(), video_source_->video_ctx(),
-            frame_router_.get(), lens_controller_, illumination_controller_.get(),
-            config_.autofocus,
-            0, 0,
-            [this]() { return refresh_autofocus_video_context(); });
+            frame_router_.get(), lens_controller_, config_.autofocus, 0, 0);
     } else if (config_.autofocus.enabled) {
         HAL_LOG_WARNING("CameraDaemon: autofocus unavailable (lens/ISP/video missing)");
     }
@@ -2964,7 +2900,6 @@ void CameraDaemon::stop_grpc_server() {
     lens_controller_ = nullptr;
     lens_hal_service_.reset();
     camera_control_service_.reset();
-    illumination_controller_.reset();
 }
 #endif
 
@@ -3184,83 +3119,6 @@ bool CameraDaemon::init_video() {
     }
 
     return true;
-}
-
-void* CameraDaemon::refresh_autofocus_video_context() {
-    // Serialize with a full pipeline reconfigure. The AF worker calls this
-    // only after a window-configuration failure, so a single refresh is enough
-    // and does not restart the media pipeline.
-    std::unique_lock<std::mutex> reconfig_lock(pipeline_reconfig_mu_);
-    std::unique_lock<std::shared_mutex> lock(op_mu_);
-
-    auto* media_ops = hal_loader_ ? hal_loader_->media() : nullptr;
-    if (!media_ops || !media_ctx_ || !media_ops->get_video_list || !video_source_) {
-        HAL_LOG_ERROR("CameraDaemon: cannot refresh AF video context: media/video unavailable");
-        return nullptr;
-    }
-
-    void* video_list = nullptr;
-    uint32_t video_count = 0;
-    const int ret = media_ops->get_video_list(media_ctx_, &video_list, &video_count);
-    if (ret < 0 || !video_list || video_count == 0) {
-        HAL_LOG_ERROR("CameraDaemon: AF video context refresh get_video_list failed: ret=%d list=%p count=%u",
-                      ret, video_list, video_count);
-        return nullptr;
-    }
-
-    void** vlist = static_cast<void**>(video_list);
-    if (!video_source_->init_from_context(vlist, video_count)) {
-        HAL_LOG_ERROR("CameraDaemon: AF video context refresh init_from_context failed");
-        return nullptr;
-    }
-
-    config_.streams.clear();
-    video_name_map_.clear();
-    for (uint32_t i = 0; i < video_count; ++i) {
-        auto* vc = static_cast<HalVideoContext*>(vlist[i]);
-        StreamCfg stream;
-        stream.name = vc->video_name;
-        stream.width = vc->config.width;
-        stream.height = vc->config.height;
-        stream.fps = vc->config.framerate;
-        stream.pool_max_buffers = 8;
-        stream.max_queue_size = 12;
-        config_.streams.push_back(stream);
-
-        std::string display_name;
-        switch (i) {
-            case 0: display_name = "main"; break;
-            case 1: display_name = "sub"; break;
-            case 2: display_name = "third"; break;
-            default: display_name = "stream" + std::to_string(i); break;
-        }
-        video_name_map_[stream.name] = display_name;
-    }
-
-    // init_from_context clears callbacks and running flags. Rebind the frame
-    // router before subscribing to the refreshed contexts.
-    for (auto& slot : video_source_->streams()) {
-        std::string dispatch_name = slot.name;
-        auto it = video_name_map_.find(slot.name);
-        if (it != video_name_map_.end()) dispatch_name = it->second;
-
-        video_source_->set_frame_callback(slot.name,
-            [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
-                frame_router_->on_frame_arrived(dispatch_name, frame);
-            });
-    }
-    for (auto& slot : video_source_->streams()) {
-        if (!video_source_->start_stream(slot.name)) {
-            HAL_LOG_ERROR("CameraDaemon: AF video context refresh failed to start stream '%s'",
-                          slot.name.c_str());
-            return nullptr;
-        }
-    }
-
-    void* refreshed_ctx = video_source_->video_ctx();
-    HAL_LOG_INFO("CameraDaemon: refreshed AF video context primary=%p streams=%u",
-                 refreshed_ctx, video_count);
-    return refreshed_ctx;
 }
 
 bool CameraDaemon::init_encoders() {
@@ -4003,7 +3861,7 @@ bool CameraDaemon::get_ircut(uint32_t& mode) {
     return true;
 }
 
-bool CameraDaemon::set_led_duty_raw(uint32_t led_id, uint32_t duty_percent) {
+bool CameraDaemon::set_led_duty(uint32_t led_id, uint32_t duty_percent) {
     if (!hal_loader_ || !hal_loader_->has_led()) {
         HAL_LOG_ERROR("CameraDaemon: LED HAL not loaded");
         return false;
@@ -4024,488 +3882,6 @@ bool CameraDaemon::set_led_duty_raw(uint32_t led_id, uint32_t duty_percent) {
     }
     HAL_LOG_INFO("CameraDaemon: LED %u duty set to %u%%", led_id, duty_percent);
     return true;
-}
-
-double CameraDaemon::current_zoom_ratio() const {
-#ifdef HAS_GRPC
-    if (lens_controller_) {
-        LensControllerState state{};
-        if (lens_controller_->state_get(&state) == HAL_OK) {
-            return std::clamp(static_cast<double>(lens_controller_->pos_to_ratio(state.zoom_pos)),
-                              1.0, 2.88);
-        }
-    }
-#endif
-    return 1.0;
-}
-
-bool CameraDaemon::set_led_duty(uint32_t led_id, uint32_t duty_percent) {
-    if (!illumination_controller_ ||
-        (led_id != config_.infrared.near_led_id && led_id != config_.infrared.far_led_id)) {
-        return set_led_duty_raw(led_id, duty_percent);
-    }
-    const auto status = illumination_controller_->status();
-    int near_pwm = status.manual_override ? status.requested_near_pwm
-                                          : status.applied_near_pwm;
-    int far_pwm = status.manual_override ? status.requested_far_pwm
-                                         : status.applied_far_pwm;
-    if (led_id == config_.infrared.near_led_id) near_pwm = static_cast<int>(duty_percent);
-    if (led_id == config_.infrared.far_led_id) far_pwm = static_cast<int>(duty_percent);
-    std::string error;
-    return illumination_controller_->set_manual_pwm(
-        near_pwm, far_pwm, current_zoom_ratio(), &error);
-}
-
-bool CameraDaemon::set_imaging_mode(ImagingMode mode, std::string* message) {
-    std::lock_guard<std::mutex> mode_lock(imaging_mode_mu_);
-    if (!illumination_controller_) {
-        if (message) *message = "infrared controller unavailable";
-        return false;
-    }
-
-    const auto before = illumination_controller_->status();
-    if (before.transition == ImagingModeTransition::Switching) {
-        if (message) *message = "imaging mode switch already active";
-        return false;
-    }
-    const std::string active_profile = get_current_profile();
-    const bool profile_matches = mode == ImagingMode::Infrared
-        ? active_profile == config_.infrared.infrared_profile
-        : active_profile != config_.infrared.infrared_profile;
-    uint32_t ircut_mode = 0;
-    const bool ircut_matches = get_ircut(ircut_mode) &&
-        ircut_mode == (mode == ImagingMode::Infrared ? 1u : 0u);
-    if (before.mode == mode && before.transition == ImagingModeTransition::Idle &&
-        profile_matches && ircut_matches) {
-        return true;
-    }
-    if (before.mode == mode && before.transition == ImagingModeTransition::Idle) {
-        HAL_LOG_WARNING("CameraDaemon: reconciling %s mode; controller/profile/IR-cut are inconsistent "
-                        "(profile='%s' profile_matches=%d ircut_matches=%d)",
-                        imaging_mode_name(mode), active_profile.c_str(),
-                        profile_matches, ircut_matches);
-    }
-
-    illumination_controller_->set_transition(ImagingModeTransition::Switching);
-    const std::string previous_profile = get_current_profile();
-    const double ratio = current_zoom_ratio();
-
-#ifdef HAS_GRPC
-    if (autofocus_controller_) {
-        autofocus_controller_->stop();
-        autofocus_controller_->invalidate_anchor("imaging mode changed");
-    }
-#endif
-
-    auto restart_af = [&]() {
-#ifdef HAS_GRPC
-        if (autofocus_controller_) {
-            autofocus_controller_->update_video_context(video_source_->video_ctx());
-            autofocus_controller_->start();
-        }
-#endif
-    };
-    auto wait_stable = [&]() {
-        if (!frame_router_ || config_.infrared.mode_settle_frames <= 0) return true;
-        return frame_router_->wait_next_frames(
-            config_.autofocus.stream_name,
-            static_cast<uint32_t>(config_.infrared.mode_settle_frames),
-            std::chrono::milliseconds(std::max(
-                config_.autofocus.frame_wait_timeout_ms *
-                    config_.infrared.mode_settle_frames,
-                1)));
-    };
-
-    std::string error;
-    bool ok = true;
-    if (mode == ImagingMode::Infrared) {
-        illumination_controller_->set_mode(ImagingMode::Day, ratio, nullptr);
-        ok = switch_profile_internal(config_.infrared.infrared_profile, false, &error);
-        if (ok) ok = set_ircut(1);
-        if (ok) ok = illumination_controller_->set_mode(ImagingMode::Infrared, ratio, &error);
-        if (ok) ok = wait_stable();
-        if (ok) {
-            day_profile_before_infrared_ = previous_profile;
-            // Always boot into the saved daytime/AI profile. Infrared remains
-            // an explicit mode selection and is never replayed after reboot.
-            persist_profile_config(previous_profile);
-        }
-    } else {
-        illumination_controller_->set_mode(ImagingMode::Day, ratio, nullptr);
-        ok = set_ircut(0);
-        const std::string day_profile = day_profile_before_infrared_.empty()
-            ? "Daylight_Basic" : day_profile_before_infrared_;
-        if (ok) ok = switch_profile_internal(day_profile, false, &error);
-        if (ok) ok = wait_stable();
-    }
-
-    if (!ok) {
-        HAL_LOG_ERROR("CameraDaemon: imaging mode switch to %s failed: %s",
-                      imaging_mode_name(mode), error.c_str());
-        illumination_controller_->set_mode(ImagingMode::Day, ratio, nullptr);
-        set_ircut(0);
-        if (!previous_profile.empty() && get_current_profile() != previous_profile) {
-            std::string rollback_error;
-            switch_profile_internal(previous_profile, false, &rollback_error);
-        }
-        illumination_controller_->set_transition(
-            ImagingModeTransition::Failed,
-            error.empty() ? "imaging mode switch failed" : error);
-        restart_af();
-        if (message) *message = error.empty() ? "imaging mode switch failed" : error;
-        return false;
-    }
-
-    illumination_controller_->set_active_profile(get_current_profile());
-    illumination_controller_->set_transition(ImagingModeTransition::Idle);
-    restart_af();
-    HAL_LOG_INFO("CameraDaemon: imaging mode switched to %s", imaging_mode_name(mode));
-    return true;
-}
-
-/* ========== Day/Night auto (light-sensor) policy ========== */
-
-const char* selected_mode_name(SelectedMode mode) {
-    switch (mode) {
-    case SelectedMode::Auto:     return "auto";
-    case SelectedMode::Infrared: return "infrared";
-    case SelectedMode::Day:
-    default:                     return "day";
-    }
-}
-
-SelectedMode parse_selected_mode(const std::string& text) {
-    std::string s;
-    s.reserve(text.size());
-    for (char c : text) {
-        s += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    if (s == "auto") return SelectedMode::Auto;
-    if (s == "infrared" || s == "night") return SelectedMode::Infrared;
-    return SelectedMode::Day;
-}
-
-LightSample CameraDaemon::read_light_sample() {
-    LightSample sample{};
-    auto* ops = hal_loader_ ? hal_loader_->sensor() : nullptr;
-    void* ctx = hal_loader_ ? hal_loader_->mcu_ctx() : nullptr;
-    if (!ops || !ops->pd_get || !ctx) {
-        sample.valid = false;
-        return sample;
-    }
-    HalAdcValue av{};
-    if (ops->pd_get(ctx, &av) != HAL_OK) {
-        sample.valid = false;
-        return sample;
-    }
-    sample.valid = true;
-    sample.mv = av.mv;
-    sample.milli = av.milli;
-    LightSensorConfig cfg;
-    {
-        std::lock_guard<std::mutex> lk(daynight_mu_);
-        cfg = light_sensor_cfg_;
-    }
-    sample.percent = normalize_light_percent(av.mv, av.milli, cfg);
-    return sample;
-}
-
-void CameraDaemon::start_light_monitor() {
-    stop_light_monitor();
-    light_stop_.store(false, std::memory_order_release);
-    light_thread_ = std::thread([this] { light_monitor_loop(); });
-    HAL_LOG_INFO("CameraDaemon: light-sensor auto monitor started");
-}
-
-void CameraDaemon::stop_light_monitor() {
-    light_stop_.store(true, std::memory_order_release);
-    if (light_thread_.joinable()) {
-        light_thread_.join();
-    }
-}
-
-void CameraDaemon::light_monitor_loop() {
-    while (!light_stop_.load(std::memory_order_acquire)) {
-        SelectedMode sel = SelectedMode::Day;
-        {
-            std::lock_guard<std::mutex> lk(daynight_mu_);
-            sel = selected_mode_;
-        }
-
-        if (sel == SelectedMode::Auto) {
-            const LightSample sample = read_light_sample();
-            bool apply = false;
-            LightMode apply_target = LightMode::Day;
-            {
-                std::lock_guard<std::mutex> lk(daynight_mu_);
-                if (selected_mode_ == SelectedMode::Auto) {
-                    const bool lens_active =
-                        (lens_controller_ && lens_controller_->autofocus_operation_active());
-                    const auto decision =
-                        evaluate(daynight_state_, sample, light_sensor_cfg_, lens_active);
-                    if (decision == LightSwitchDecision::ToDay ||
-                        decision == LightSwitchDecision::ToNight) {
-                        apply = true;
-                        apply_target = daynight_state_.mode;
-                    } else if (daynight_state_.has_pending && !lens_active) {
-                        /* apply a switch that was deferred while a lens/AF op was active */
-                        apply = true;
-                        apply_target = daynight_state_.pending_target;
-                        daynight_state_.has_pending = false;
-                        daynight_state_.mode = apply_target;
-                        daynight_state_.stable_count = 0;
-                    }
-                }
-            }
-            if (apply) {
-                HAL_LOG_INFO(
-                    "CameraDaemon: auto day/night -> %s (light percent=%d mv=%u valid=%d)",
-                    light_mode_name(apply_target), sample.percent,
-                    static_cast<unsigned>(sample.mv), sample.valid ? 1 : 0);
-                (void)set_imaging_mode(apply_target == LightMode::Night
-                                           ? ImagingMode::Infrared
-                                           : ImagingMode::Day);
-            }
-        }
-
-        int interval_ms = 500;
-        {
-            std::lock_guard<std::mutex> lk(daynight_mu_);
-            interval_ms = light_sensor_cfg_.sample_interval_ms > 0
-                              ? light_sensor_cfg_.sample_interval_ms
-                              : 500;
-        }
-        for (int waited = 0;
-             waited < interval_ms && !light_stop_.load(std::memory_order_acquire);
-             waited += 20) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(std::min(20, interval_ms - waited)));
-        }
-    }
-}
-
-bool CameraDaemon::set_selected_mode(const std::string& mode, std::string* message) {
-    const SelectedMode sel = parse_selected_mode(mode);
-    if (sel == SelectedMode::Auto) {
-        const bool optical_night =
-            (illumination_controller_ &&
-             illumination_controller_->status().mode == ImagingMode::Infrared);
-        {
-            std::lock_guard<std::mutex> lk(daynight_mu_);
-            selected_mode_ = SelectedMode::Auto;
-            daynight_state_.mode = optical_night ? LightMode::Night : LightMode::Day;
-            daynight_state_.stable_count = 0;
-            daynight_state_.has_pending = false;
-        }
-        start_light_monitor();
-        HAL_LOG_INFO("CameraDaemon: selected mode = auto (light-driven)");
-        return true;
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(daynight_mu_);
-        selected_mode_ = sel;
-        daynight_state_.stable_count = 0;
-        daynight_state_.has_pending = false;
-    }
-    stop_light_monitor();
-    const bool ok = set_imaging_mode(
-        sel == SelectedMode::Infrared ? ImagingMode::Infrared : ImagingMode::Day, message);
-    if (ok) {
-        HAL_LOG_INFO("CameraDaemon: selected mode = %s", selected_mode_name(sel));
-    }
-    return ok;
-}
-
-bool CameraDaemon::set_light_thresholds(int night_enter, int day_enter, std::string* message) {
-    std::string err;
-    if (!validate_light_thresholds(night_enter, day_enter, &err)) {
-        if (message) *message = err;
-        return false;
-    }
-    std::lock_guard<std::mutex> lk(daynight_mu_);
-    light_sensor_cfg_.night_enter = night_enter;
-    light_sensor_cfg_.day_enter = day_enter;
-    daynight_state_.stable_count = 0; /* reset accumulation on threshold change */
-    HAL_LOG_INFO("CameraDaemon: light thresholds updated night_enter=%d day_enter=%d",
-                 night_enter, day_enter);
-    return true;
-}
-
-/* ========== IR preset persistence (zoom + IR intensity snapshots) ========== */
-
-namespace {
-constexpr const char* kIrPresetsPath = "/data/aipc/etc/ir_presets.json";
-} // namespace
-
-void CameraDaemon::load_ir_presets_locked(std::string* error) {
-    ir_presets_cache_.clear();
-    ir_presets_loaded_ = true;
-    std::ifstream in(kIrPresetsPath);
-    if (!in.is_open()) {
-        /* No file yet -> empty preset list (not an error). */
-        return;
-    }
-    try {
-        nlohmann::json j;
-        in >> j;
-        if (!j.is_array()) {
-            if (error) *error = "preset file is not a JSON array";
-            return;
-        }
-        for (const auto& el : j) {
-            IrPresetEntry p;
-            p.name = el.value("name", std::string{});
-            p.zoom_ratio = el.value("zoom_ratio", 1.0f);
-            p.near_pwm = el.value("near_pwm", 0u);
-            p.far_pwm = el.value("far_pwm", 0u);
-            if (!p.name.empty()) {
-                ir_presets_cache_.push_back(std::move(p));
-            }
-        }
-    } catch (const std::exception& e) {
-        if (error) *error = std::string("preset parse failed: ") + e.what();
-        HAL_LOG_WARNING("CameraDaemon: IR preset parse failed: %s", e.what());
-    }
-}
-
-bool CameraDaemon::write_ir_presets_locked(std::string* error) {
-    try {
-        nlohmann::json j = nlohmann::json::array();
-        for (const auto& p : ir_presets_cache_) {
-            j.push_back({{"name", p.name},
-                         {"zoom_ratio", p.zoom_ratio},
-                         {"near_pwm", p.near_pwm},
-                         {"far_pwm", p.far_pwm}});
-        }
-        const std::string tmp = std::string(kIrPresetsPath) + ".tmp";
-        std::ofstream out(tmp);
-        if (!out.is_open()) {
-            if (error) *error = "cannot open preset file for write";
-            return false;
-        }
-        out << j.dump(2);
-        out.close();
-        if (std::rename(tmp.c_str(), kIrPresetsPath) != 0) {
-            if (error) *error = "preset rename failed";
-            return false;
-        }
-    } catch (const std::exception& e) {
-        if (error) *error = std::string("preset write failed: ") + e.what();
-        return false;
-    }
-    return true;
-}
-
-std::vector<IrPresetEntry> CameraDaemon::list_ir_presets(std::string* error) {
-    std::lock_guard<std::mutex> lk(ir_preset_mu_);
-    if (!ir_presets_loaded_) {
-        load_ir_presets_locked(error);
-    }
-    return ir_presets_cache_;
-}
-
-bool CameraDaemon::save_ir_preset(const IrPresetEntry& preset, std::string* error) {
-    if (preset.name.empty()) {
-        if (error) *error = "preset name is empty";
-        return false;
-    }
-    if (preset.zoom_ratio < 1.0f || preset.zoom_ratio > 2.88f ||
-        preset.near_pwm > 100 || preset.far_pwm > 100) {
-        if (error) *error = "invalid preset (zoom 1.0-2.88, pwm 0-100)";
-        return false;
-    }
-    std::lock_guard<std::mutex> lk(ir_preset_mu_);
-    if (!ir_presets_loaded_) {
-        load_ir_presets_locked();
-    }
-    bool found = false;
-    for (auto& p : ir_presets_cache_) {
-        if (p.name == preset.name) {
-            p = preset;
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        ir_presets_cache_.push_back(preset);
-    }
-    if (!write_ir_presets_locked(error)) {
-        return false;
-    }
-    HAL_LOG_INFO("CameraDaemon: IR preset saved '%s' zoom=%.2f near=%u far=%u",
-                 preset.name.c_str(), preset.zoom_ratio, preset.near_pwm, preset.far_pwm);
-    return true;
-}
-
-bool CameraDaemon::delete_ir_preset(const std::string& name, std::string* error) {
-    std::lock_guard<std::mutex> lk(ir_preset_mu_);
-    if (!ir_presets_loaded_) {
-        load_ir_presets_locked();
-    }
-    const size_t before = ir_presets_cache_.size();
-    ir_presets_cache_.erase(
-        std::remove_if(ir_presets_cache_.begin(), ir_presets_cache_.end(),
-                       [&](const IrPresetEntry& p) { return p.name == name; }),
-        ir_presets_cache_.end());
-    if (ir_presets_cache_.size() == before) {
-        if (error) *error = "preset not found";
-        return false;
-    }
-    if (!write_ir_presets_locked(error)) {
-        return false;
-    }
-    HAL_LOG_INFO("CameraDaemon: IR preset deleted '%s'", name.c_str());
-    return true;
-}
-
-bool CameraDaemon::set_infrared_manual(uint32_t near_pwm, uint32_t far_pwm,
-                                       std::string* message) {
-    if (!illumination_controller_) {
-        if (message) *message = "infrared controller unavailable";
-        return false;
-    }
-    return illumination_controller_->set_manual_pwm(
-        static_cast<int>(std::min(near_pwm, 100u)),
-        static_cast<int>(std::min(far_pwm, 100u)),
-        current_zoom_ratio(), message);
-}
-
-bool CameraDaemon::clear_infrared_manual(std::string* message) {
-    if (!illumination_controller_) {
-        if (message) *message = "infrared controller unavailable";
-        return false;
-    }
-    return illumination_controller_->clear_manual(current_zoom_ratio(), message);
-}
-
-bool CameraDaemon::set_infrared_auto_follow(bool enabled, std::string* message) {
-    if (!illumination_controller_) {
-        if (message) *message = "infrared controller unavailable";
-        return false;
-    }
-    return illumination_controller_->set_auto_follow(enabled, current_zoom_ratio(), message);
-}
-
-IlluminationStatus CameraDaemon::get_illumination_status() const {
-    IlluminationStatus status;
-    if (illumination_controller_) {
-        status = illumination_controller_->status();
-    } else {
-        status.error = "infrared controller unavailable";
-    }
-    /* Day/night auto (light-sensor) fields. */
-    {
-        std::lock_guard<std::mutex> lk(daynight_mu_);
-        status.selected_mode = selected_mode_name(selected_mode_);
-        status.light_percent = daynight_state_.last.percent;
-        status.light_mv = daynight_state_.last.mv;
-        status.light_milli = daynight_state_.last.milli;
-        status.light_valid = daynight_state_.last.valid;
-        status.night_enter = light_sensor_cfg_.night_enter;
-        status.day_enter = light_sensor_cfg_.day_enter;
-    }
-    return status;
 }
 
 bool CameraDaemon::get_led_duty(uint32_t led_id, uint32_t& duty_percent) {
@@ -5394,12 +4770,6 @@ bool CameraDaemon::backup_profile(const std::string& path) {
 }
 
 bool CameraDaemon::switch_profile(const std::string& profile_name, std::string* message) {
-    return switch_profile_internal(profile_name, true, message);
-}
-
-bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
-                                           bool restart_af,
-                                           std::string* message) {
     // Throttle gate 1/3 — reject a switch while another is already in flight.
     // op_mu_ is intentionally released around the blocking HAL switch and through
     // the verify/rollback windows below; without this guard a second concurrent
@@ -5469,7 +4839,7 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
                  profile_name.c_str(), prev_profile.c_str());
 
 #ifdef HAS_GRPC
-    if (restart_af && autofocus_controller_) {
+    if (autofocus_controller_) {
         autofocus_controller_->stop();
         autofocus_controller_->invalidate_anchor("media profile changed");
     }
@@ -5500,7 +4870,7 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
             HAL_LOG_ERROR("CameraDaemon: failed to restart FdPublisher after profile switch failure");
         }
 #ifdef HAS_GRPC
-        if (restart_af && autofocus_controller_) {
+        if (autofocus_controller_) {
             autofocus_controller_->update_video_context(video_source_->video_ctx());
             autofocus_controller_->start();
         }
@@ -5554,11 +4924,8 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
         return false;
     }
 
-    // 3. Re-discover stream config from new pipeline contexts.
-    // Profile switching rebuilds the MediaLibrary video contexts. The old
-    // VideoSource primary context may therefore be dangling even when the
-    // stream names and resolutions are unchanged. Rebind VideoSource and its
-    // callbacks before giving a context back to autofocus.
+    // 3. Re-discover stream config from new pipeline contexts
+    // Video contexts may have changed (different stream count/resolution)
     lock.lock();
     {
         void* video_list = nullptr;
@@ -5566,60 +4933,23 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
         ret = media_ops->get_video_list(media_ctx_, &video_list, &video_count);
         if (ret >= 0 && video_list && video_count > 0) {
             void** vlist = static_cast<void**>(video_list);
-            if (!video_source_->init_from_context(vlist, video_count)) {
-                HAL_LOG_ERROR("CameraDaemon: failed to refresh VideoSource contexts after "
-                              "profile switch");
-            } else {
-                config_.streams.clear();
-                video_name_map_.clear();
-
-                for (uint32_t i = 0; i < video_count; ++i) {
-                    auto* vc = static_cast<HalVideoContext*>(vlist[i]);
-                    StreamCfg stream;
-                    stream.name = vc->video_name;
-                    stream.width = vc->config.width;
-                    stream.height = vc->config.height;
-                    stream.fps = vc->config.framerate;
-                    config_.streams.push_back(stream);
-
-                    std::string display_name;
-                    switch (i) {
-                        case 0: display_name = "main"; break;
-                        case 1: display_name = "sub"; break;
-                        case 2: display_name = "third"; break;
-                        default: display_name = "stream" + std::to_string(i); break;
+            // Clear and rebuild config_.streams
+            auto& vs_streams = video_source_->streams();
+            // Update existing entries (matched by order)
+            for (size_t i = 0; i < vs_streams.size(); i++) {
+                auto* vc = static_cast<HalVideoContext*>(vlist[i]);
+                if (i < config_.streams.size()) {
+                    if (video_name_map_.count(vs_streams[i].name)) {
+                        // Already mapped — update params
+                        config_.streams[i].width = vc->config.width;
+                        config_.streams[i].height = vc->config.height;
+                        config_.streams[i].fps = vc->config.framerate;
                     }
-                    video_name_map_[stream.name] = display_name;
-
-                    HAL_LOG_INFO("CameraDaemon: Post-switch video '%s' ctx=%p (%ux%u@%u)",
-                                 stream.name.c_str(), vlist[i], stream.width,
-                                 stream.height, stream.fps);
+                    HAL_LOG_INFO("CameraDaemon: Post-switch video '%s' (%ux%u@%u)",
+                                vs_streams[i].name.c_str(),
+                                vc->config.width, vc->config.height, vc->config.framerate);
                 }
-
-                // init_from_context clears the old stream slots and callbacks.
-                // Rebind them before restarting frame delivery.
-                for (auto& slot : video_source_->streams()) {
-                    std::string dispatch_name = slot.name;
-                    auto vnit = video_name_map_.find(slot.name);
-                    if (vnit != video_name_map_.end()) dispatch_name = vnit->second;
-
-                    video_source_->set_frame_callback(slot.name,
-                        [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
-                            frame_router_->on_frame_arrived(dispatch_name, frame);
-                        });
-                }
-                for (auto& slot : video_source_->streams()) {
-                    video_source_->start_stream(slot.name);
-                }
-
-                HAL_LOG_INFO("CameraDaemon: refreshed VideoSource after profile switch "
-                             "primary_ctx=%p streams=%u",
-                             video_source_->video_ctx(), video_count);
             }
-        } else {
-            HAL_LOG_ERROR("CameraDaemon: failed to refresh VideoSource after profile switch: "
-                          "get_video_list ret=%d list=%p count=%u",
-                          ret, video_list, video_count);
         }
     }
 
@@ -5670,7 +5000,7 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
     if (fd_pub_) fd_pub_->start();
 
 #ifdef HAS_GRPC
-    if (restart_af && autofocus_controller_) {
+    if (autofocus_controller_) {
         autofocus_controller_->update_video_context(video_source_->video_ctx());
         autofocus_controller_->start();
     }
@@ -5781,9 +5111,6 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
     // OS-upgrade. Best-effort: the HAL switch already succeeded; only the
     // restart-survival mirror is at stake (a failure is logged, not fatal).
     persist_profile_config(profile_name);
-    if (illumination_controller_) {
-        illumination_controller_->set_active_profile(profile_name);
-    }
     return true;
 }
 
@@ -6078,10 +5405,6 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
 
 void CameraDaemon::shutdown() {
     HAL_LOG_INFO("CameraDaemon: Shutting down...");
-
-    // Stop the light-sensor auto monitor first so it cannot fire a mode switch
-    // (which touches illumination/media) during teardown.
-    stop_light_monitor();
 
 #ifdef HAS_GRPC
     stop_grpc_server();

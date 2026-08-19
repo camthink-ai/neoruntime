@@ -25,7 +25,6 @@
 #include <atomic>
 #include <mutex>
 #include <shared_mutex>
-#include <thread>
 #include <cstdint>
 #include <ctime>
 #include <chrono>
@@ -49,8 +48,6 @@ class CameraControlServiceImpl;
 class HalLoader;
 #include "audio_service.h"
 #include "autofocus_controller.h"
-#include "illumination_controller.h"
-#include "daynight_policy.h"
 class VideoSource;
 class FrameRouter;
 class FrameWatchdog;
@@ -203,26 +200,6 @@ struct DaemonConfig {
     int32_t     lens_focus_max     = 592;
 
     AutofocusConfig autofocus;
-    IlluminationConfig infrared;
-    LightSensorConfig light_sensor;
-};
-
-/* Operator-selected day/night mode (distinct from the optical ImagingMode):
- * Auto = light-sensor driven; Day/Infrared = forced optical state. */
-enum class SelectedMode {
-    Auto,
-    Day,
-    Infrared,
-};
-const char* selected_mode_name(SelectedMode mode);
-SelectedMode parse_selected_mode(const std::string& text);
-
-/** IR preset = snapshot of (zoom position + near/far IR intensity) for one-click recall. */
-struct IrPresetEntry {
-    std::string name;
-    float zoom_ratio = 1.0f;   // 1.0 ~ 2.88
-    uint32_t near_pwm = 0;     // 0 ~ 100
-    uint32_t far_pwm = 0;      // 0 ~ 100
 };
 
 /* ========== Camera Daemon ========== */
@@ -481,22 +458,6 @@ public:
     bool set_led_duty(uint32_t led_id, uint32_t duty_percent);
     bool get_led_duty(uint32_t led_id, uint32_t& duty_percent);
 
-    bool set_imaging_mode(ImagingMode mode, std::string* message = nullptr);
-    bool set_infrared_manual(uint32_t near_pwm, uint32_t far_pwm,
-                             std::string* message = nullptr);
-    bool clear_infrared_manual(std::string* message = nullptr);
-    bool set_infrared_auto_follow(bool enabled, std::string* message = nullptr);
-    IlluminationStatus get_illumination_status() const;
-
-    // Day/night auto (light-sensor) policy
-    bool set_selected_mode(const std::string& mode, std::string* message = nullptr);
-    bool set_light_thresholds(int night_enter, int day_enter, std::string* message = nullptr);
-
-    // IR preset save/load (zoom + IR intensity snapshot), persisted on the device.
-    std::vector<IrPresetEntry> list_ir_presets(std::string* error = nullptr);
-    bool save_ir_preset(const IrPresetEntry& preset, std::string* error = nullptr);
-    bool delete_ir_preset(const std::string& name, std::string* error = nullptr);
-
     // Device hardware status
     bool get_device_hardware_status(aipc::camera::DeviceHardwareStatus& status);
 
@@ -541,7 +502,6 @@ public:
 private:
     void try_share_lens_mcu_ctx();
     void init_mcu_context();
-    void* refresh_autofocus_video_context();
 
     DaemonConfig config_;
     std::atomic<bool> running_{false};
@@ -610,22 +570,6 @@ private:
     // ~1-2s) happen OUTSIDE the lock so the frontend thread never stalls.
     std::shared_ptr<DpmWorker>           dpm_worker_;
     mutable std::shared_mutex            dpm_mu_;
-    std::unique_ptr<IlluminationController> illumination_controller_;
-    mutable std::mutex imaging_mode_mu_;
-    std::string day_profile_before_infrared_;
-
-    // Day/night auto (light-sensor) policy
-    mutable std::mutex daynight_mu_;
-    mutable DayNightPolicyState daynight_state_;
-    mutable LightSensorConfig light_sensor_cfg_;   // runtime thresholds (adjustable)
-    SelectedMode selected_mode_ = SelectedMode::Day;
-    std::thread light_thread_;
-    std::atomic<bool> light_stop_{true};
-
-    // IR preset persistence (zoom + IR intensity snapshots)
-    mutable std::mutex ir_preset_mu_;
-    std::vector<IrPresetEntry> ir_presets_cache_;
-    bool ir_presets_loaded_ = false;
 
 #ifdef HAS_GRPC
     std::unique_ptr<CameraControlServiceImpl> camera_control_service_;
@@ -636,21 +580,6 @@ private:
     void start_grpc_server();
     void stop_grpc_server();
 #endif
-
-    bool switch_profile_internal(const std::string& profile_name, bool restart_af,
-                                 std::string* message);
-    bool set_led_duty_raw(uint32_t led_id, uint32_t duty_percent);
-    double current_zoom_ratio() const;
-
-    // Day/night auto (light-sensor) policy
-    void start_light_monitor();
-    void stop_light_monitor();
-    void light_monitor_loop();
-    LightSample read_light_sample();
-
-    // IR preset persistence helpers (callers hold ir_preset_mu_)
-    void load_ir_presets_locked(std::string* error = nullptr);
-    bool write_ir_presets_locked(std::string* error = nullptr);
 
     struct FpsTracker {
         uint64_t frame_count = 0;
