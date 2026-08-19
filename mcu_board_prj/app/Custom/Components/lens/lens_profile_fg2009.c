@@ -32,7 +32,7 @@ const lens_profile_t g_lens_profile_fg2009 = {
         .psum_units_per_step = 8,
         .min_pps = 500,
         .max_pps = 900,
-        .default_pps = 800,
+        .default_pps = 600,
         .nominal_travel_steps = 2381,
         .travel_tolerance_steps = 20,
         .direction_sign = 1,
@@ -41,7 +41,7 @@ const lens_profile_t g_lens_profile_fg2009 = {
         .psum_units_per_step = 8,
         .min_pps = 500,
         .max_pps = 900,
-        .default_pps = 800,
+        .default_pps = 600,
         .nominal_travel_steps = 2453,
         .travel_tolerance_steps = 20,
         /* Verified on FG2009 hardware with the current J9 wiring:
