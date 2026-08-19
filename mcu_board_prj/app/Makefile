@@ -7,7 +7,6 @@ rwildcard = $(foreach d,$(wildcard $(1:=/*)),$(call rwildcard,$d,$2) $(filter $(
 
 TARGET ?= ne503_mcu_app
 BUILD_DIR := build
-LENS_PROFILE ?= AF0832
 LDSCRIPT := STM32G0B0RETX_FLASH.ld
 
 ######################################
@@ -109,14 +108,6 @@ C_DEFS := $(APP_DEBUG_DEFS)
 C_DEFS += '-DCMSIS_device_header=<stm32g0xx.h>'
 C_DEFS += -DUSE_HAL_DRIVER
 C_DEFS += -DSTM32G0B0xx
-
-ifeq ($(LENS_PROFILE),AF0832)
-C_DEFS += -DCONFIG_LENS_PROFILE_AF0832=1
-else ifeq ($(LENS_PROFILE),FG2009)
-C_DEFS += -DCONFIG_LENS_PROFILE_FG2009=1
-else
-$(error Unsupported LENS_PROFILE '$(LENS_PROFILE)'; use AF0832 or FG2009)
-endif
 
 C_INCLUDES := \
 	-ICore/Inc \
@@ -229,7 +220,7 @@ clean:
 	@rm -rf $(BUILD_DIR)
 
 info:
-	@echo "TARGET=$(TARGET) BUILD_DIR=$(BUILD_DIR) LENS_PROFILE=$(LENS_PROFILE)"
+	@echo "TARGET=$(TARGET) BUILD_DIR=$(BUILD_DIR) LENS_PROFILES=AF0832,FG2009 DEFAULT=AF0832"
 	@echo "C sources: $(words $(C_SOURCES))  ASM: $(words $(ASM_SOURCES))"
 
 -include $(call rwildcard,$(BUILD_DIR),*.d)

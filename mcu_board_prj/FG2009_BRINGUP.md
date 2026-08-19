@@ -6,19 +6,22 @@ PI reads, and iris operations intentionally return `SYS_ERR_NOT_SUPPORTED`.
 
 ## Build
 
-Select the lens at compile time:
+AF0832 and FG2009 are compiled into one universal firmware. AF0832 remains
+the power-on default for compatibility:
 
 ```text
-make -C mcu_board_prj app-build LENS_PROFILE=AF0832 GCC_PATH=<cubeide-gcc-bin>
-make -C mcu_board_prj app-build LENS_PROFILE=FG2009 GCC_PATH=<cubeide-gcc-bin>
+make -C mcu_board_prj app-build GCC_PATH=<cubeide-gcc-bin>
 ```
 
-Clean between profile builds because compiler defines are not represented in
-the dependency filenames:
+Select FG2009 at runtime before lens initialization:
 
 ```text
-make -C mcu_board_prj clean-app
+lens profile set fg2009
+lens init
+lens cfg motor
 ```
+
+The selection is not persisted in MCU flash. Repeat it after every MCU reset.
 
 ## Wiring assumptions
 

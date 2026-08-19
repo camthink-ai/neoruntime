@@ -19,9 +19,12 @@ typedef enum {
     LENS_IRCUT_NIGHT,
 } lens_ircut_mode_t;
 
+int lens_controller_bootstrap(void);
 int lens_controller_init(void);
 void lens_controller_deinit(void);
 int lens_controller_configure(lens_config_mode_t mode);
+int lens_controller_select_profile(lens_model_t model);
+void lens_controller_set_event_callback(ms41908m_event_callback_t callback);
 
 const lens_profile_t *lens_get_active_profile(void);
 const lens_capabilities_t *lens_get_capabilities(void);

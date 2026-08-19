@@ -11,6 +11,7 @@ extern "C" {
 typedef enum {
     LENS_MODEL_AF0832 = 0,
     LENS_MODEL_FG2009,
+    LENS_MODEL_COUNT,
 } lens_model_t;
 
 typedef enum {
@@ -54,7 +55,10 @@ typedef struct {
 extern const lens_profile_t g_lens_profile_af0832;
 extern const lens_profile_t g_lens_profile_fg2009;
 
+const lens_profile_t *lens_profile_get(lens_model_t model);
 const lens_profile_t *lens_profile_get_active(void);
+lens_model_t lens_profile_get_active_model(void);
+int lens_profile_select(lens_model_t model);
 
 #ifdef __cplusplus
 }

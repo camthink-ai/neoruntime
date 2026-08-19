@@ -452,7 +452,7 @@ static void cmd_lens_usage(void)
 {
     shell_printf("Profile-aware lens test (call init -> cfg -> zoom/focus):\r\n");
     shell_printf("  lens init|deinit\r\n");
-    shell_printf("  lens profile|caps\r\n");
+    shell_printf("  lens profile [list|set af0832|fg2009]|caps\r\n");
     shell_printf("  lens cfg [all|iris|motor]     : load defaults (default: all)\r\n");
     shell_printf("  lens state                    : iris/zoom/focus state + positions\r\n");
     shell_printf("  lens iris run|stop|adc|tgt <0-1023>\r\n");
@@ -521,6 +521,30 @@ int cmd_lens(uint8_t argc, char **argv)
     }
 
     if (strcmp(argv[1], "profile") == 0) {
+        if (argc >= 3U && strcmp(argv[2], "list") == 0) {
+            shell_printf("lens: profiles: af0832(model=%d, default), fg2009(model=%d)\r\n",
+                         (int)LENS_MODEL_AF0832, (int)LENS_MODEL_FG2009);
+            return 0;
+        }
+        if (argc >= 3U && strcmp(argv[2], "set") == 0) {
+            lens_model_t model;
+            if (argc < 4U) {
+                shell_printf("lens: profile set af0832|fg2009\r\n");
+                return -1;
+            }
+            if (strcmp(argv[3], "af0832") == 0 || strcmp(argv[3], "AF0832") == 0) {
+                model = LENS_MODEL_AF0832;
+            } else if (strcmp(argv[3], "fg2009") == 0 || strcmp(argv[3], "FG2009") == 0) {
+                model = LENS_MODEL_FG2009;
+            } else {
+                shell_printf("lens: unknown profile '%s'\r\n", argv[3]);
+                return -1;
+            }
+            ret = lens_controller_select_profile(model);
+            shell_printf("lens: profile set %s ret=%d active=%s\r\n",
+                         argv[3], ret, lens_get_active_profile()->name);
+            return (ret == SYS_OK) ? 0 : -1;
+        }
         const lens_profile_t *profile = lens_get_active_profile();
         shell_printf("lens: profile=%s model=%d zoom[step_scale=%u pps=%u-%u default=%u travel=%u+-%u dir=%d] "
                      "focus[step_scale=%u pps=%u-%u default=%u travel=%u+-%u dir=%d]\r\n",
