@@ -44,7 +44,10 @@ const lens_profile_t g_lens_profile_fg2009 = {
         .default_pps = 800,
         .nominal_travel_steps = 2453,
         .travel_tolerance_steps = 20,
-        /* J9 pins 3/4 are opposite to the 1:1 FG2009 Focus A/A-bar order. */
+        /* Verified on FG2009 hardware with the current J9 wiring:
+         * negative shell steps move Focus from Near to Far, while positive
+         * shell steps move it from Far to Near. The vendor focus-curve
+         * coordinate therefore changes with the opposite sign. */
         .direction_sign = -1,
     },
     .capabilities = {
