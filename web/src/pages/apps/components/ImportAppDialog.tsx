@@ -1857,9 +1857,9 @@ export default function ImportAppDialog({
 
           {/* Step Indicator — scroll on narrow screens */}
           <div className="-mx-1 mt-6 mb-4 overflow-x-auto pb-1 sm:mx-0 sm:mt-0 sm:overflow-visible sm:pb-0">
-            <div className="flex min-w-max items-center justify-center gap-1 px-1 sm:min-w-0 sm:gap-0 sm:space-x-2">
+            <div className="flex min-w-max items-start justify-center gap-1 px-1 sm:min-w-0 sm:gap-0 sm:space-x-2">
               {steps.map((s, i) => (
-                <div key={i} className="flex items-center">
+                <div key={i} className="flex items-start">
                   <div className="flex flex-col items-center">
                     <div
                       className={`mb-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border-2 text-xs transition-all sm:h-8 sm:w-8 sm:text-sm ${
@@ -1877,14 +1877,14 @@ export default function ImportAppDialog({
                       )}
                     </div>
                     <span
-                      className={`max-w-17 truncate px-0.5 text-center text-[10px] sm:max-w-24 sm:text-xs ${i === step ? 'text-primary font-medium' : 'text-muted-foreground'}`}
+                      className={`max-w-17 px-0.5 text-center text-[10px] leading-tight break-words sm:max-w-24 sm:text-xs ${i === step ? 'text-primary font-medium' : 'text-muted-foreground'}`}
                     >
                       {s.title}
                     </span>
                   </div>
                   {i < steps.length - 1 && (
                     <div
-                      className={`-mt-4 h-px w-6 shrink-0 sm:-mt-5 sm:w-12 ${i < step ? 'bg-green-500' : 'bg-border'}`}
+                      className={`mt-3.5 h-px w-6 shrink-0 sm:mt-4 sm:w-12 ${i < step ? 'bg-green-500' : 'bg-border'}`}
                     />
                   )}
                 </div>
@@ -1895,10 +1895,10 @@ export default function ImportAppDialog({
         <div className="flex-1 min-h-0 overflow-y-auto">{renderStep()}</div>
 
         {step < steps.length && (
-          <div className="flex flex-col gap-3 border-t border-border bg-muted/20 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6 sm:py-4">
+          <div className="flex flex-row items-center gap-2 border-t border-border bg-muted/20 px-4 py-3 sm:justify-between sm:px-6 sm:py-4">
             <Button
               variant="outline"
-              className="order-2 w-full text-muted-foreground hover:text-foreground sm:order-1 sm:w-auto"
+              className="flex-1 text-muted-foreground hover:text-foreground sm:flex-none"
               onClick={prevStep}
               disabled={step === 0 || installMutation.isPending}
             >
@@ -1906,10 +1906,10 @@ export default function ImportAppDialog({
               {t('sys.apps.import.previous')}
             </Button>
 
-            <div className="order-1 flex w-full flex-col gap-2 sm:order-2 sm:w-auto sm:flex-row sm:items-center sm:space-x-4 sm:space-y-0">
+            <div className="flex flex-1 items-center gap-2 sm:flex-none sm:gap-4">
               <Button
                 variant="outline"
-                className="w-full text-muted-foreground hover:text-foreground sm:w-auto"
+                className="hidden text-muted-foreground hover:text-foreground sm:inline-flex"
                 onClick={handleCancel}
                 disabled={installMutation.isPending}
               >
@@ -1917,7 +1917,7 @@ export default function ImportAppDialog({
               </Button>
               <Button
                 variant="carbon"
-                className="w-full sm:w-auto"
+                className="flex-1 sm:flex-none"
                 onClick={nextStep}
                 disabled={
                   installMutation.isPending

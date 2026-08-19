@@ -70,6 +70,10 @@ const longTimeTaskMap: Record<string, number> = {
   '/api/v1/apps': 300000, // 5 min — install
   '/api/v1/debug-logs/export': 300000,
   '/api/v1/device/lens/reset-zero': 40000, // 40s — lens calibration
+  '/api/v1/media/config/import-bundle': 60000, // 1 min — bundle import
+  '/api/v1/media/config/bundle': 120000, // 2 min — bundle export (~25MB)
+  '/api/v1/system/clone/import': 120000, // 2 min — clone import + identity regen
+  '/api/v1/system/clone/export': 120000, // 2 min — clone export
 };
 
 const debouncedTimeoutError = debounce(
@@ -93,6 +97,7 @@ const NETWORK_ERROR_SUPPRESS_URL_PATTERNS = [
   '/api/v1/system/restart',
   '/api/v1/system/ota/',
   '/api/v1/system/os-upgrade/',
+  '/api/v1/system/clone/import', // platform-api self-restarts after clone apply
 ];
 
 /** Suppress global request side effects during device restart / upgrade windows. */
