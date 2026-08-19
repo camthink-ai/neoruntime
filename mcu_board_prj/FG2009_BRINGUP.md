@@ -71,8 +71,8 @@ Bench verification established these physical directions:
 
 - positive Zoom steps: Tele to Wide;
 - negative Zoom steps: Wide to Tele;
-- positive Focus steps: Near to Far;
-- negative Focus steps: Far to Near.
+- positive Focus steps: Far to Near;
+- negative Focus steps: Near to Far.
 
 After direction and current are confirmed, repeat at 600, 700, 800, and
 finally 900 physical pps. Coil peak current must remain below 145 mA.
