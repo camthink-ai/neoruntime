@@ -33,7 +33,8 @@ const lens_profile_t g_lens_profile_fg2009 = {
         .min_pps = 500,
         .max_pps = 900,
         .default_pps = 600,
-        .nominal_travel_steps = 2381,
+        /* Confirmed against the vendor focus-curve TELE limit coordinate. */
+        .nominal_travel_steps = 2463,
         .travel_tolerance_steps = 20,
         .direction_sign = 1,
     },

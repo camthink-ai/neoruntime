@@ -23,6 +23,12 @@ lens cfg motor
 
 The selection is not persisted in MCU flash. Repeat it after every MCU reset.
 
+The confirmed open-loop coordinate limits from the vendor focus curve are
+Zoom TELE = 2463 physical steps and Focus FAR = 2453 physical steps. These
+values describe the software travel coordinates; FG2009 still has no PI or
+stall feedback, so reaching a mechanical end remains an assumed hard-stop
+initialization rather than a sensed home operation.
+
 ## Wiring assumptions
 
 - J9 / MS41908M AB channel drives Focus.
