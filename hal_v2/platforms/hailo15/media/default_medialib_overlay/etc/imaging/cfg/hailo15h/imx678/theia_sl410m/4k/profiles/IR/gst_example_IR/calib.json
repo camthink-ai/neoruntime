@@ -2,8 +2,8 @@
     "version": "1.0.0",
     "metadata": {
         "architecture": "hailo15h",
-        "content_hash": "5e9db32410526c04b6633d24836cac94af6279bf297118d984173f4df7f5def5",
-        "generation_timestamp": "2026-08-11T15:57:01.776580+00:00",
+        "content_hash": "bcd85a6e1a0801bc1d82f6fb979dc034a987b22f22c8b59fe15fcc8e814be225",
+        "generation_timestamp": "2026-08-16T03:19:40.463648+00:00",
         "description": ""
     },
     "matfile": {
@@ -423,7 +423,7 @@
                 "tbd": -1.0
             },
             "AEC": {
-                "SetPoint": 50.0,
+                "SetPoint": 35.0,
                 "ClmTolerance": 20.0,
                 "DampOver": 0.7,
                 "DampUnder": 0.7,
@@ -490,7 +490,7 @@
                 {
                     "name": "3840x2160",
                     "resolution": "3840x2160",
-                    "register": [{ "name": "ISP_DPCC_MODE", "value": "0x0004" }, { "name": "ISP_DPCC_OUT_MODE", "value": "0x0003" }, { "name": "ISP_DPCC_SET_USE", "value": "0x0007" }, { "name": "ISP_DPCC_METHODS_SET1", "value": "0x1D1D" }, { "name": "ISP_DPCC_METHODS_SET2", "value": "0x0707" }, { "name": "ISP_DPCC_METHODS_SET3", "value": "0x1F1F" }, { "name": "ISP_DPCC_LINE_THRESH_1", "value": "0x0808" }, { "name": "ISP_DPCC_LINE_MAD_FAC_1", "value": "0x0404" }, { "name": "ISP_DPCC_PG_FAC_1", "value": "0x0403" }, { "name": "ISP_DPCC_RND_THRESH_1", "value": "0x0A0A" }, { "name": "ISP_DPCC_RG_FAC_1", "value": "0x2020" }, { "name": "ISP_DPCC_LINE_THRESH_2", "value": "0x100C" }, { "name": "ISP_DPCC_LINE_MAD_FAC_2", "value": "0x1810" }, { "name": "ISP_DPCC_PG_FAC_2", "value": "0x0403" }, { "name": "ISP_DPCC_RND_THRESH_2", "value": "0x0808" }, { "name": "ISP_DPCC_RG_FAC_2", "value": "0x0808" }, { "name": "ISP_DPCC_LINE_THRESH_3", "value": "0x2020" }, { "name": "ISP_DPCC_LINE_MAD_FAC_3", "value": "0x0404" }, { "name": "ISP_DPCC_PG_FAC_3", "value": "0x0403" }, { "name": "ISP_DPCC_RND_THRESH_3", "value": "0x0806" }, { "name": "ISP_DPCC_RG_FAC_3", "value": "0x0404" }, { "name": "ISP_DPCC_RO_LIMITS", "value": "0x0A0A" }, { "name": "ISP_DPCC_RND_OFFS", "value": "0x0FFF" }]
+                    "register": [{ "name": "ISP_DPCC_MODE", "value": "0x0005" }, { "name": "ISP_DPCC_OUT_MODE", "value": "0x0003" }, { "name": "ISP_DPCC_SET_USE", "value": "0x0003" }, { "name": "ISP_DPCC_METHODS_SET1", "value": "0x1F1F" }, { "name": "ISP_DPCC_METHODS_SET2", "value": "0x0707" }, { "name": "ISP_DPCC_METHODS_SET3", "value": "0x1F1F" }, { "name": "ISP_DPCC_LINE_THRESH_1", "value": "0x0808" }, { "name": "ISP_DPCC_LINE_MAD_FAC_1", "value": "0x0404" }, { "name": "ISP_DPCC_PG_FAC_1", "value": "0x0808" }, { "name": "ISP_DPCC_RND_THRESH_1", "value": "0x0A0A" }, { "name": "ISP_DPCC_RG_FAC_1", "value": "0x2020" }, { "name": "ISP_DPCC_LINE_THRESH_2", "value": "0x2018" }, { "name": "ISP_DPCC_LINE_MAD_FAC_2", "value": "0x1810" }, { "name": "ISP_DPCC_PG_FAC_2", "value": "0x0806" }, { "name": "ISP_DPCC_RND_THRESH_2", "value": "0x0808" }, { "name": "ISP_DPCC_RG_FAC_2", "value": "0x0808" }, { "name": "ISP_DPCC_LINE_THRESH_3", "value": "0x2020" }, { "name": "ISP_DPCC_LINE_MAD_FAC_3", "value": "0x0404" }, { "name": "ISP_DPCC_PG_FAC_3", "value": "0x0A0A" }, { "name": "ISP_DPCC_RND_THRESH_3", "value": "0x0806" }, { "name": "ISP_DPCC_RG_FAC_3", "value": "0x0404" }, { "name": "ISP_DPCC_RO_LIMITS", "value": "0x09A5" }, { "name": "ISP_DPCC_RND_OFFS", "value": "0x0AAA" }]
                 }
             ],
             "WDR": {
