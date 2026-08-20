@@ -597,6 +597,7 @@ func (s *PlatformAPIServer) setupRoutes() {
 	device.PUT("/lens/limits", apiHandlers.SetLensLimits)
 	device.POST("/lens/init", apiHandlers.LensInit)
 	device.POST("/lens/goto", apiHandlers.LensGotoRatioDistance)
+	device.POST("/lens/goto-ratio", apiHandlers.LensGotoZoomRatio)
 	device.POST("/gpio", apiHandlers.GPIOWrite)
 	device.GET("/gpio", apiHandlers.GPIOBatchRead)
 	device.GET("/gpio/:pin", apiHandlers.GPIORead)

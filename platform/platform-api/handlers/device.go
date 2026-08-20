@@ -597,6 +597,36 @@ func (h *APIHandlers) StartZoomFollow(c *gin.Context) {
 	Resp(c).OK(gin.H{"accepted": true, "job_id": resp.GetJobId(), "message": resp.GetMessage()})
 }
 
+// LensGotoZoomRatio moves the FG2009 open-loop zoom to an optical ratio.
+func (h *APIHandlers) LensGotoZoomRatio(c *gin.Context) {
+	if h.grpcClients.DeviceControl == nil {
+		Resp(c).FailMsg(CodeServiceUnavailable, "Device Control not available")
+		return
+	}
+	var req struct {
+		ZoomRatio float32 `json:"zoom_ratio" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.ZoomRatio < 1.0 {
+		Resp(c).FailMsg(CodeInvalidRequest, "zoom_ratio must be >= 1.0")
+		return
+	}
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	// Full open-loop travel takes several seconds; mirror the other
+	// blocking lens moves with a generous deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	resp, err := client.LensGotoZoomRatio(ctx, &devicepb.ZoomRatioRequest{ZoomRatio: req.ZoomRatio})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	if !resp.GetSuccess() {
+		Resp(c).FailMsg(CodeDeviceError, resp.GetMessage())
+		return
+	}
+	Resp(c).OK(gin.H{"success": true, "message": resp.GetMessage()})
+}
+
 func (h *APIHandlers) GetAutofocusStatus(c *gin.Context) {
 	if h.grpcClients.DeviceControl == nil {
 		Resp(c).FailMsg(CodeServiceUnavailable, "Device Control not available")
@@ -787,6 +817,12 @@ func (h *APIHandlers) GetLensStatus(c *gin.Context) {
 		"focus_pos":         resp.GetFocusPos(),
 		"iris_adc":          resp.GetIrisAdc(),
 		"autofocus_enabled": resp.GetAutofocusEnabled(),
+		"lens_model":        resp.GetLensModel(),
+		"zoom_ratio":        resp.GetZoomRatio(),
+		"zoom_ratio_range": gin.H{
+			"min": resp.GetZoomRatioRange().GetMin(),
+			"max": resp.GetZoomRatioRange().GetMax(),
+		},
 		"zoom_limit": gin.H{
 			"min_pos": resp.GetZoomLimit().GetMinPos(),
 			"max_pos": resp.GetZoomLimit().GetMaxPos(),

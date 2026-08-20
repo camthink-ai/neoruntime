@@ -175,12 +175,26 @@ message LensStatusResponse {
   bool autofocus_enabled = 8;
   LensLimit zoom_limit = 9;
   LensLimit focus_limit = 10;
+  string lens_model = 11;   // "af0832" | "fg2009" (empty on old camera-daemon)
+  float zoom_ratio = 12;    // current optical ratio (fg2009 position model)
+  ZoomRatioRange zoom_ratio_range = 13;
+}
+
+// Optical zoom ratio bounds for the factory-fitted lens
+message ZoomRatioRange {
+  float min = 1;
+  float max = 2;
 }
 
 // AF0832 high-level lens positioning
 message GotoRatioDistanceRequest {
   float zoom_ratio = 1;        // 1.0 ~ 2.88 (optical zoom ratio)
   float focus_distance_m = 2;  // focus distance in meters (e.g. 0.5, 1.0, 5.0)
+}
+
+// FG2009 open-loop zoom positioning
+message ZoomRatioRequest {
+  float zoom_ratio = 1;  // target optical ratio (1.0 ~ 2.2416 on fg2009)
 }
 
 message LensInitRequest {
@@ -414,6 +428,9 @@ service DeviceControl {
   // AF0832 high-level API
   rpc LensInit(LensInitRequest) returns (Status);
   rpc LensGotoRatioDistance(GotoRatioDistanceRequest) returns (Status);
+
+  // FG2009 open-loop zoom positioning
+  rpc LensGotoZoomRatio(ZoomRatioRequest) returns (Status);
 
   // AF window / measurement
   rpc SetAfWindows(SetAfWindowsRequest) returns (Status);

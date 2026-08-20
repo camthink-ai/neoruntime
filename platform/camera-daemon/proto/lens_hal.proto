@@ -93,6 +93,7 @@ message LensProfileResponse {
   int32  zoom_travel_steps  = 4;
   int32  focus_travel_steps = 5;
   string message            = 6;
+  float  max_zoom_ratio     = 7;  // wide-end ratio is 1.0
 }
 
 message ZoomGotoRatioRequest {

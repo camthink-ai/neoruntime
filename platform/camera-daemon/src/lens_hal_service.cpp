@@ -789,8 +789,10 @@ public:
                                   aipc::lens::AF0832PosToRatioResponse* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (fg2009_) {
-            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
-                                "af0832_pos_to_ratio not supported on lens fg2009");
+            // The Go layer reports zoom_ratio from this conversion; the input
+            // is the dead-reckoned curve coordinate StateGet overlays.
+            resp->set_ratio(hal_lens_fg2009_steps_to_ratio(req->hal_zoom_pos()));
+            return grpc::Status::OK;
         }
         if (!sym_.af0832_pos_to_ratio) {
             return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
@@ -846,6 +848,7 @@ public:
                 resp->set_ircut(info.capabilities.ircut);
                 resp->set_zoom_travel_steps(info.zoom.travel_steps);
                 resp->set_focus_travel_steps(info.focus.travel_steps);
+                resp->set_max_zoom_ratio(hal_lens_fg2009_max_ratio());
                 return grpc::Status::OK;
             }
         }
@@ -855,6 +858,10 @@ public:
             resp->set_ircut(true);
             resp->set_zoom_travel_steps(HAL_LENS_FG2009_ZOOM_TRAVEL_STEPS);
             resp->set_focus_travel_steps(HAL_LENS_FG2009_FOCUS_TRAVEL_STEPS);
+            resp->set_max_zoom_ratio(hal_lens_fg2009_max_ratio());
+        } else {
+            // Matches the AF0832 zoom-ratio table's tele end.
+            resp->set_max_zoom_ratio(2.88f);
         }
         return grpc::Status::OK;
     }

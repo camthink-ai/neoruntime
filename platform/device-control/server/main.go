@@ -109,6 +109,12 @@ type DeviceControlServer struct {
 	lastLensStatus   lensStatusCache
 	hasLensStatus    bool
 
+	// Factory-fitted lens model and its optical ratio ceiling, learned via
+	// ProfileGet during lens init. Guarded by lensStatusMu. Empty model (or
+	// an old camera-daemon without the RPC) means "assume AF0832".
+	lensModel        string
+	lensMaxZoomRatio float32
+
 	// Camera-daemon gRPC client for IR-Cut control
 	cameraDaemonClient camerapb.CameraControlClient
 	cameraDaemonConn   *grpc.ClientConn
@@ -131,6 +137,8 @@ type lensStatusCache struct {
 	ZoomLimitMax  int32
 	FocusLimitMin int32
 	FocusLimitMax int32
+	ZoomRatio     float32
+	HasZoomRatio  bool
 }
 
 func NewDeviceControlServer(cfg *Config, lensHal hal.LensHAL, cameraDaemonClient camerapb.CameraControlClient, cameraDaemonConn *grpc.ClientConn) *DeviceControlServer {
@@ -365,6 +373,23 @@ func (s *DeviceControlServer) ensureLensBootstrapped() error {
 	if s.halLens == nil {
 		return fmt.Errorf("lens HAL not initialized")
 	}
+	if s.lensIsFg2009() {
+		// Open-loop lens: StateGet reports the dead-reckoning anchor state
+		// as rz-done. An unanchored model is only repaired by the full
+		// profile-push + anchor + park sequence inside ReInit.
+		state, err := s.halLens.StateGet()
+		if err != nil {
+			return fmt.Errorf("state_get failed: %w", err)
+		}
+		if state.ZoomRzDone && state.FocusRzDone {
+			return nil
+		}
+		logger.Warn("fg2009 lens not anchored, running full reinit bootstrap")
+		if err := s.halLens.ReInit(); err != nil {
+			return fmt.Errorf("fg2009 reinit failed: %w", err)
+		}
+		return nil
+	}
 	if !s.halLens.IsAF0832Bootstrapped() {
 		// Flag is absent (post-restart, or a transient IsAF0832Bootstrapped
 		// transport error), but the motors may already be homed. Skip the
@@ -404,6 +429,14 @@ func (s *DeviceControlServer) recoverLensLink() error {
 		return fmt.Errorf("lens HAL not initialized")
 	}
 	_ = s.halLens.StopAndWaitAll(2 * time.Second)
+	if s.lensIsFg2009() {
+		// ReInit re-pushes the MCU profile and re-anchors the open-loop
+		// model; there is no AF0832 zero/bootstrap step to redo.
+		if err := s.halLens.ReInit(); err != nil {
+			return fmt.Errorf("fg2009 reinit failed: %w", err)
+		}
+		return nil
+	}
 	if err := s.halLens.ReInit(); err != nil {
 		return fmt.Errorf("lens reinit failed: %w", err)
 	}
@@ -429,6 +462,15 @@ func (s *DeviceControlServer) lensHomed() (zoomDone, focusDone bool, err error) 
 		return false, false, err
 	}
 	return st.ZoomRzDone, st.FocusRzDone, nil
+}
+
+// lensIsFg2009 reports whether the factory-fitted lens is the FG2009
+// open-loop model. False until ProfileGet succeeds during lens init (or on
+// an old camera-daemon without the RPC), which by default means AF0832.
+func (s *DeviceControlServer) lensIsFg2009() bool {
+	s.lensStatusMu.RLock()
+	defer s.lensStatusMu.RUnlock()
+	return s.lensModel == "fg2009"
 }
 
 // runToZeroAndHome recovers an axis stuck in the "reset-done event fired but home
@@ -1202,6 +1244,18 @@ func (s *DeviceControlServer) SetZoomLevel(ctx context.Context, req *pb.ZoomLeve
 	if s.halLens == nil {
 		return &pb.Status{Success: false, Message: "Lens HAL not initialized"}, nil
 	}
+	if s.lensIsFg2009() {
+		// Level is normalized full travel; map it onto the optical-ratio
+		// model instead of the AF0832 step limits.
+		s.lensStatusMu.RLock()
+		maxRatio := s.lensMaxZoomRatio
+		s.lensStatusMu.RUnlock()
+		if maxRatio <= 1 {
+			maxRatio = 2.88
+		}
+		ratio := 1.0 + req.Level*(maxRatio-1.0)
+		return s.LensGotoZoomRatio(ctx, &pb.ZoomRatioRequest{ZoomRatio: ratio})
+	}
 	state, err := s.ensureZoomReady()
 	if err != nil {
 		return &pb.Status{Success: false, Message: err.Error()}, nil
@@ -1238,11 +1292,28 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 
 	zlim := s.halLens.ZoomLimits()
 	flim := s.halLens.FocusLimits()
+	// Lens identity is server-level state (learned at init), so it stays
+	// available even when the live HAL poll below fails.
+	s.lensStatusMu.RLock()
+	lensModel := s.lensModel
+	maxRatio := s.lensMaxZoomRatio
+	cached := s.lastLensStatus
+	hasCached := s.hasLensStatus
+	s.lensStatusMu.RUnlock()
+	fillLensIdentity := func(resp *pb.LensStatusResponse, ratio float32, hasRatio bool) {
+		if lensModel == "" {
+			return
+		}
+		resp.LensModel = lensModel
+		if maxRatio > 1 {
+			resp.ZoomRatioRange = &pb.ZoomRatioRange{Min: 1.0, Max: maxRatio}
+		}
+		if hasRatio {
+			resp.ZoomRatio = ratio
+		}
+	}
 	fallbackStatus := func() *pb.LensStatusResponse {
-		s.lensStatusMu.RLock()
-		defer s.lensStatusMu.RUnlock()
-		if s.hasLensStatus {
-			cached := s.lastLensStatus
+		if hasCached {
 			// Clamp motor states to Stopped(1) — cached Running(2)/ResetZero(3)
 			// would cause the frontend to show "initializing" indefinitely when
 			// the lens HAL link is down.
@@ -1254,7 +1325,7 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 			if focusState != 1 && focusState != 4 {
 				focusState = 1
 			}
-			return &pb.LensStatusResponse{
+			resp := &pb.LensStatusResponse{
 				ZoomState:        zoomState,
 				FocusState:       focusState,
 				ZoomRzDone:       cached.ZoomRzDone,
@@ -1266,12 +1337,16 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 				ZoomLimit:        &pb.LensLimit{MinPos: cached.ZoomLimitMin, MaxPos: cached.ZoomLimitMax},
 				FocusLimit:       &pb.LensLimit{MinPos: cached.FocusLimitMin, MaxPos: cached.FocusLimitMax},
 			}
+			fillLensIdentity(resp, cached.ZoomRatio, cached.HasZoomRatio)
+			return resp
 		}
-		return &pb.LensStatusResponse{
+		resp := &pb.LensStatusResponse{
 			AutofocusEnabled: s.autofocusEnabled,
 			ZoomLimit:        &pb.LensLimit{MinPos: zlim.MinPos, MaxPos: zlim.MaxPos},
 			FocusLimit:       &pb.LensLimit{MinPos: flim.MinPos, MaxPos: flim.MaxPos},
 		}
+		fillLensIdentity(resp, 0, false)
+		return resp
 	}
 
 	state, err := s.halLens.StateGetTry()
@@ -1287,6 +1362,11 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 		irisADC = uint32(adc)
 	}
 
+	// Ratio conversion covers both lenses: the lens HAL maps the FG2009
+	// curve coordinate through the position model and the AF0832 position
+	// through its ratio table.
+	zoomRatio := s.halLens.AF0832PosToRatio(state.ZoomPos)
+
 	resp := &pb.LensStatusResponse{
 		ZoomState:        uint32(state.ZoomState),
 		FocusState:       uint32(state.FocusState),
@@ -1299,6 +1379,7 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 		ZoomLimit:        &pb.LensLimit{MinPos: zlim.MinPos, MaxPos: zlim.MaxPos},
 		FocusLimit:       &pb.LensLimit{MinPos: flim.MinPos, MaxPos: flim.MaxPos},
 	}
+	fillLensIdentity(resp, zoomRatio, true)
 	s.lensStatusMu.Lock()
 	s.lastLensStatus = lensStatusCache{
 		ZoomState:     resp.ZoomState,
@@ -1312,6 +1393,8 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 		ZoomLimitMax:  resp.ZoomLimit.GetMaxPos(),
 		FocusLimitMin: resp.FocusLimit.GetMinPos(),
 		FocusLimitMax: resp.FocusLimit.GetMaxPos(),
+		ZoomRatio:     zoomRatio,
+		HasZoomRatio:  true,
 	}
 	s.hasLensStatus = true
 	s.lensStatusMu.Unlock()
@@ -1329,6 +1412,25 @@ func (s *DeviceControlServer) SetFocusLevel(ctx context.Context, req *pb.FocusLe
 	}
 	if s.autofocusEnabled {
 		return &pb.Status{Success: false, Message: "manual focus disabled while autofocus is enabled"}, nil
+	}
+	if s.lensIsFg2009() {
+		// Level 0..1 maps to NEAR..FAR on the open-loop focus curve inside
+		// the lens HAL; the AF0832 step limits do not apply.
+		if err := s.halLens.StopAndWaitAll(2 * time.Second); err != nil {
+			return &pb.Status{Success: false, Message: "stop motors before focus goto: " + err.Error()}, nil
+		}
+		if err := s.retryWithRecover("focus_goto_level", func() error {
+			return s.halLens.FocusGotoLevel(req.Level, 0)
+		}); err != nil {
+			return &pb.Status{Success: false, Message: err.Error()}, nil
+		}
+		if err := s.retryWithRecover("wait_focus_stopped", func() error {
+			return s.halLens.WaitFocusStopped(15 * time.Second)
+		}); err != nil {
+			return &pb.Status{Success: false, Message: err.Error()}, nil
+		}
+		s.publishEvent("lens_focus", map[string]interface{}{"level": req.Level})
+		return &pb.Status{Success: true}, nil
 	}
 	state, err := s.ensureFocusReady()
 	if err != nil {
@@ -1546,6 +1648,16 @@ func (s *DeviceControlServer) LensInit(ctx context.Context, req *pb.LensInitRequ
 		return &pb.Status{Success: false, Message: "Lens HAL not initialized"}, nil
 	}
 
+	if s.lensIsFg2009() {
+		// Full open-loop sequence: profile push, hard-stop anchor, park.
+		// There is no AF0832 bootstrap for this lens.
+		if err := s.halLens.Init(); err != nil {
+			return &pb.Status{Success: false, Message: "lens init failed: " + err.Error()}, nil
+		}
+		logger.Info("LensInit: fg2009 profile + bootstrap completed")
+		return &pb.Status{Success: true}, nil
+	}
+
 	// Full bootstrap: init + af0832 create + reset-zero via C event polling
 	if err := s.halLens.AF0832Bootstrap(); err != nil {
 		return &pb.Status{Success: false, Message: "lens init failed: " + err.Error()}, nil
@@ -1600,6 +1712,52 @@ func (s *DeviceControlServer) LensGotoRatioDistance(ctx context.Context, req *pb
 	}
 
 	s.invalidateAutofocusAnchor("absolute zoom-focus goto")
+	return &pb.Status{Success: true}, nil
+}
+
+// LensGotoZoomRatio moves the FG2009 open-loop zoom axis to an optical
+// ratio target. The ratio→steps conversion and the virtual-absolute move
+// (relative step delta against the dead-reckoned model) live in the lens
+// HAL, so no AF0832 step limits are consulted here.
+func (s *DeviceControlServer) LensGotoZoomRatio(ctx context.Context, req *pb.ZoomRatioRequest) (*pb.Status, error) {
+	logger.Info("LensGotoZoomRatio: zoom_ratio=%.4f", req.ZoomRatio)
+
+	if s.halLens == nil {
+		return &pb.Status{Success: false, Message: "Lens HAL not initialized"}, nil
+	}
+	if !s.lensIsFg2009() {
+		return &pb.Status{Success: false, Message: "LensGotoZoomRatio requires lens fg2009"}, nil
+	}
+	if req.ZoomRatio < 1.0 {
+		return &pb.Status{Success: false, Message: "zoom_ratio must be >= 1.0"}, nil
+	}
+	s.lensStatusMu.RLock()
+	maxRatio := s.lensMaxZoomRatio
+	s.lensStatusMu.RUnlock()
+	if maxRatio > 1 && req.ZoomRatio > maxRatio {
+		return &pb.Status{Success: false, Message: fmt.Sprintf("zoom_ratio must be <= %.4f", maxRatio)}, nil
+	}
+
+	// Stop all axes before the move to avoid MCU BUSY rejection.
+	if err := s.halLens.StopAndWaitAll(2 * time.Second); err != nil {
+		return &pb.Status{Success: false, Message: "stop motors before goto: " + err.Error()}, nil
+	}
+	if err := s.ensureLensBootstrapped(); err != nil {
+		return &pb.Status{Success: false, Message: err.Error()}, nil
+	}
+	if err := s.retryWithRecover("zoom_goto_ratio", func() error {
+		return s.halLens.ZoomGotoRatio(req.ZoomRatio, 0)
+	}); err != nil {
+		return &pb.Status{Success: false, Message: err.Error()}, nil
+	}
+	if err := s.retryWithRecover("wait_zoom_stopped", func() error {
+		return s.halLens.WaitZoomStopped(15 * time.Second)
+	}); err != nil {
+		return &pb.Status{Success: false, Message: err.Error()}, nil
+	}
+
+	s.publishEvent("lens_zoom", map[string]interface{}{"zoom_ratio": req.ZoomRatio})
+	s.invalidateAutofocusAnchor("absolute zoom movement")
 	return &pb.Status{Success: true}, nil
 }
 
@@ -2045,6 +2203,27 @@ func initializeRemoteLens(s *DeviceControlServer, client *lens.LensClient) error
 	if err := client.Init(); err != nil {
 		return fmt.Errorf("remote Init: %w", err)
 	}
+
+	// Learn the factory-fitted lens. ProfileGet is additive: an older
+	// camera-daemon fails the RPC and we fall through to the AF0832 path.
+	if profile, err := client.ProfileGet(); err == nil {
+		s.lensStatusMu.Lock()
+		s.lensModel = profile.Model
+		s.lensMaxZoomRatio = profile.MaxZoomRatio
+		s.lensStatusMu.Unlock()
+		if profile.Model == "fg2009" {
+			// Init already pushed the MCU profile, anchored the open-loop
+			// model against the hard stops and parked it. No AF0832
+			// bootstrap and no startup goto — the lens stays at park.
+			client.ReplayPersistedConfig()
+			logger.Info("Lens HAL initialized via camera-daemon (fg2009 open-loop, max zoom ratio %.4f)",
+				profile.MaxZoomRatio)
+			return nil
+		}
+	} else {
+		logger.Warn("Lens ProfileGet failed (%v); assuming af0832", err)
+	}
+
 	if err := client.AF0832Bootstrap(); err != nil {
 		return fmt.Errorf("AF0832 bootstrap: %w", err)
 	}

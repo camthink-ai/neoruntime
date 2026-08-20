@@ -285,6 +285,55 @@ func (c *LensClient) IsAF0832Bootstrapped() bool {
 	return resp.Bootstrapped
 }
 
+// ── Lens profile & FG2009 open-loop helpers ─────────────────────────────
+
+func (c *LensClient) ProfileGet() (hal.LensProfile, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := c.client.ProfileGet(ctx, &pb.Empty{})
+	if err != nil {
+		return hal.LensProfile{}, err
+	}
+	return hal.LensProfile{
+		Model:            resp.Model,
+		Relative:         resp.Relative,
+		Ircut:            resp.Ircut,
+		ZoomTravelSteps:  resp.ZoomTravelSteps,
+		FocusTravelSteps: resp.FocusTravelSteps,
+		MaxZoomRatio:     resp.MaxZoomRatio,
+	}, nil
+}
+
+func (c *LensClient) ZoomGotoRatio(zoomRatio float32, pps uint16) error {
+	return c.simple(func(ctx context.Context) (*pb.HalStatus, error) {
+		return c.client.ZoomGotoRatio(ctx, &pb.ZoomGotoRatioRequest{
+			Ratio: zoomRatio,
+			Pps:   uint32(pps),
+		})
+	})
+}
+
+func (c *LensClient) FocusGotoLevel(level float32, pps uint16) error {
+	return c.simple(func(ctx context.Context) (*pb.HalStatus, error) {
+		return c.client.FocusGotoLevel(ctx, &pb.FocusGotoLevelRequest{
+			Level: level,
+			Pps:   uint32(pps),
+		})
+	})
+}
+
+func (c *LensClient) ZoomMoveRel(pps uint16, steps int32) error {
+	return c.simple(func(ctx context.Context) (*pb.HalStatus, error) {
+		return c.client.ZoomMoveRel(ctx, &pb.MotorRunRequest{Pps: uint32(pps), Steps: steps})
+	})
+}
+
+func (c *LensClient) FocusMoveRel(pps uint16, steps int32) error {
+	return c.simple(func(ctx context.Context) (*pb.HalStatus, error) {
+		return c.client.FocusMoveRel(ctx, &pb.MotorRunRequest{Pps: uint32(pps), Steps: steps})
+	})
+}
+
 func (c *LensClient) SetAfWindows(config hal.AfWindowsConfig) error {
 	return fmt.Errorf("SetAfWindows: not yet supported by lens HAL bridge")
 }
