@@ -112,10 +112,10 @@ type DeviceControlServer struct {
 	// Factory-fitted lens model and its optical ratio ceiling, learned via
 	// ProfileGet during lens init. Guarded by lensStatusMu. Empty model (or
 	// an old camera-daemon without the RPC) means "assume AF0832".
-	lensModel             string
-	lensMaxZoomRatio      float32
-	lensZoomTravelSteps   int32
-	lensFocusTravelSteps  int32
+	lensModel            string
+	lensMaxZoomRatio     float32
+	lensZoomTravelSteps  int32
+	lensFocusTravelSteps int32
 
 	// Camera-daemon gRPC client for IR-Cut control
 	cameraDaemonClient camerapb.CameraControlClient

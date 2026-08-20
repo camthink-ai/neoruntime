@@ -25,6 +25,9 @@ AIPC_COMPAT_LEVEL ?= 1
 AIPC_DATA_SCHEMA ?= 1
 AIPC_MACHINE ?= hailo15-ne503
 AIPC_PRODUCT ?= ne503
+# Factory-fitted lens baked into product.yaml at pack time: af0832 | fg2009.
+# camera-daemon fail-fasts on any other value, so validate here too.
+LENS_PRODUCT ?= af0832
 SKIP_STAGE_TARBALL ?= 0
 AIPC_NGINX_DIR ?= deploy/nginx
 AIPC_NGINX_RUNTIME_ENABLED ?= $(if $(filter hailo15,$(HAL_PLATFORM)),1,0)
@@ -269,7 +272,7 @@ docker-pack-release:
 			corepack enable; \
 			corepack prepare "pnpm@$$DOCKER_RELEASE_PNPM_VERSION" --activate; \
 			pnpm -v; \
-			make pack-release SDK_PATH="$$SDK_PATH" HAILO_SDK_PATH="$$HAILO_SDK_PATH" VERSION="$(VERSION)" BUILD_MCU_FW="$$BUILD_MCU_FW"'
+			make pack-release SDK_PATH="$$SDK_PATH" HAILO_SDK_PATH="$$HAILO_SDK_PATH" VERSION="$(VERSION)" BUILD_MCU_FW="$$BUILD_MCU_FW" LENS_PRODUCT="$(LENS_PRODUCT)"'
 
 ensure-mcu-toolchain:
 	@if ! command -v arm-none-eabi-gcc >/dev/null 2>&1; then \
@@ -338,6 +341,10 @@ _pack-stage:
 			exit 1; \
 		fi; \
 	done
+	@if [ "$(LENS_PRODUCT)" != "af0832" ] && [ "$(LENS_PRODUCT)" != "fg2009" ]; then \
+		echo "ERROR: LENS_PRODUCT must be af0832 or fg2009 (got '$(LENS_PRODUCT)')"; \
+		exit 1; \
+	fi
 	@rm -rf "$(STAGE_DIR)" "$(TARBALL)"
 	@mkdir -p "$(STAGE_DIR)/opt/aipc/bin" \
 		"$(STAGE_DIR)/opt/aipc/libexec" \
@@ -368,6 +375,10 @@ _pack-stage:
 	@cp -f configs/platform-api.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@cp -f configs/platform/discovery.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@cp -f configs/platform/onvif.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
+	@printf '%s\n' \
+		'lens:' \
+		'  model: $(LENS_PRODUCT)' > "$(STAGE_DIR)/opt/aipc/etc/product.yaml" \
+		&& echo "  + product.yaml (lens=$(LENS_PRODUCT))"
 	@cp -f configs/security/seccomp-default.json "$(STAGE_DIR)/opt/aipc/etc/security/" 2>/dev/null || true
 	@mkdir -p "$(STAGE_DIR)/opt/aipc/etc/systemd/system.conf.d" \
 		"$(STAGE_DIR)/opt/aipc/etc/systemd/journald.conf.d" \
@@ -477,7 +488,7 @@ _pack-internal: _pack-stage
 	@mkdir -p "$(STAGE_DIR)/opt/aipc/etc/imaging" \
 		"$(STAGE_DIR)/opt/aipc/etc"
 	@cp -a configs/imaging/. "$(STAGE_DIR)/opt/aipc/etc/imaging/" 2>/dev/null || true
-	@cp -f configs/platform/ir_zoom_lut.csv "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
+	@cp -f configs/platform/ir_zoom_lut.csv configs/platform/ir_zoom_lut_fg2009.csv "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@mkdir -p "$(RELEASE_DIR)"
 	tar czf "$(TARBALL)" -C "$(RELEASE_DIR)" "$(PKG_NAME)"
 	@echo "=== Release Package Ready ==="

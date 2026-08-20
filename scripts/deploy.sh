@@ -409,7 +409,7 @@ validate_release_integrity() {
 
     require_nonempty_file "$context" "$root/app-manifest.json" || failed=1
     require_nonempty_file "$context" "$metadata_root/VERSION" || failed=1
-    for item in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml; do
+    for item in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml product.yaml; do
         require_nonempty_file "$context" "$root/etc/$item" || failed=1
     done
     validate_camera_daemon_config_paths "$context" "$root" || failed=1
@@ -919,7 +919,7 @@ validate_package_preflight() {
         err "Preflight failed: missing $SCRIPT_DIR/VERSION"
         failed=1
     }
-    for cfg in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml; do
+    for cfg in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml product.yaml; do
         [[ -s "$package_root/etc/$cfg" ]] || {
             err "Preflight failed: missing config $package_root/etc/$cfg"
             failed=1
@@ -1163,6 +1163,15 @@ prepare_staging() {
             [[ -f "$cfg" ]] || continue
             cp -f "$cfg" "$STAGING_DIR/etc/"
         done
+        # The IR zoom LUTs and the factory lens identity are release content
+        # too: stage them with the yaml set so fresh installs land them (the
+        # LUT previously never reached a clean /data/aipc/etc).
+        rm -f "$STAGING_DIR"/etc/*.csv "$STAGING_DIR/etc/product.yaml"
+        local extra
+        for extra in "$package_root"/etc/*.csv "$package_root"/etc/product.yaml; do
+            [[ -f "$extra" ]] || continue
+            cp -f "$extra" "$STAGING_DIR/etc/"
+        done
     fi
     # Package-owned rootfs configuration (journald/systemd/sysctl/security) is
     # part of the current-root contract. Keep it under /data/aipc/etc so a hot
@@ -1227,7 +1236,7 @@ validate_staging() {
         err "Validation failed: staged HAL symlink chain is broken"
         failed=1
     }
-    for cfg in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml; do
+    for cfg in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml product.yaml; do
         [[ -s "$STAGING_DIR/etc/$cfg" ]] || {
             err "Validation failed: missing config $STAGING_DIR/etc/$cfg"
             failed=1
