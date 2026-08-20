@@ -49,6 +49,9 @@ LOG_NAMES=(
 #                     non-SetRootPath services (event-bus/device-control/ai-runtime),
 #                     and SetRootPath services running under the default prefix
 #                     /data land here too. Always covered.
+#   /data/aipc/logs — common persistent install prefix used by field devices.
+#                     Include it unconditionally so timer units that do not
+#                     export AIPC_PREFIX still cover VC8000/media logs there.
 #   /opt/aipc/logs  — legacy default-prefix writer (root partition); bounded until
 #                     it migrates to /data.
 # If a custom install prefix is ever used (deploy.sh --prefix /data/aipc), the
@@ -56,7 +59,7 @@ LOG_NAMES=(
 # while the rest stay on /data/logs. Export AIPC_PREFIX (or INSTALL_PREFIX) so the
 # prefixed dir is also covered — e.g. Environment=AIPC_PREFIX=/data/aipc in the
 # timer's service unit. With the default prefix this block is a no-op.
-LOG_DIRS=(/data/logs /opt/aipc/logs)
+LOG_DIRS=(/data/logs /data/aipc/logs /opt/aipc/logs)
 for _p in "${AIPC_PREFIX:-}" "${INSTALL_PREFIX:-}"; do
     [[ -n "$_p" && " ${LOG_DIRS[*]} " != *" ${_p}/logs "* ]] && LOG_DIRS+=("$_p/logs")
 done

@@ -14,6 +14,7 @@ import Logs from '@/pages/maintenance/logs'
 import FileManagement from '@/pages/maintenance/files'
 import Terminal from '@/pages/maintenance/terminal'
 import Processes from '@/pages/maintenance/processes'
+import BackupMigrate from '@/pages/maintenance/backup'
 import Events from '@/pages/events'
 import Layout from '@/layout'
 import AuthGuard from './components/auth-guard'
@@ -93,6 +94,10 @@ const baseRoutes: RouteObject[] = [
   {
     path: '/maintenance/processes',
     element: <Processes />,
+  },
+  {
+    path: '/maintenance/backup',
+    element: <BackupMigrate />,
   },
 ];
 

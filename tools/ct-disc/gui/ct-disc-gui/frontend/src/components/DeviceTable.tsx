@@ -1,4 +1,4 @@
-import type { Device } from '../hooks/useDevices'
+import { deviceKey, type Device } from '../hooks/useDevices'
 
 interface Props {
   devices: Device[]
@@ -20,8 +20,8 @@ const COL_WIDTHS = {
 }
 
 export function DeviceTable({ devices, selectedMac, onSelect, selectedMacs, onToggleSelect, onSelectAll }: Props) {
-  const online = devices.filter(d => d.online)
-  const allSelected = online.length > 0 && online.every(d => d.mac && selectedMacs.has(d.mac))
+  const onlineKeys = devices.filter(d => d.online).map(deviceKey).filter(Boolean)
+  const allSelected = onlineKeys.length > 0 && onlineKeys.every(key => selectedMacs.has(key))
 
   if (devices.length === 0) {
     return (
@@ -31,7 +31,7 @@ export function DeviceTable({ devices, selectedMac, onSelect, selectedMacs, onTo
             d="M8.25 3v1.5M4.5 8.25H3m18 0h-1.5M4.5 12H3m18 0h-1.5m-15 3.75H3m18 0h-1.5M8.25 19.5V21M12 3v1.5m0 15V21m3.75-18v1.5m0 15V21m9-9h-1.5M4.5 12H3" />
         </svg>
         <p className="text-sm text-center">No devices found</p>
-        <p className="text-xs text-center text-gray-300">Click "Scan" to discover devices on the network</p>
+        <p className="text-xs text-center text-gray-300">Click "Scan" or add a device manually</p>
       </div>
     )
   }
@@ -78,13 +78,13 @@ export function DeviceTable({ devices, selectedMac, onSelect, selectedMacs, onTo
           </thead>
           <tbody>
             {devices.map(d => {
-              const mac = d.mac || d.sn
-              const checked = d.mac ? selectedMacs.has(d.mac) : false
-              const isRowSelected = selectedMac === d.mac || selectedMac === d.sn
+              const key = deviceKey(d)
+              const checked = selectedMacs.has(key)
+              const isRowSelected = selectedMac === key
               return (
                 <tr
-                  key={mac}
-                  onClick={() => onSelect(mac)}
+                  key={key}
+                  onClick={() => onSelect(key)}
                   className={`device-row cursor-pointer border-b border-gray-50 ${isRowSelected ? 'bg-blue-50' : ''} ${checked ? 'row-selected' : ''}`}
                 >
                   <td className={`${COL_WIDTHS.check} px-2 py-1.5`} onClick={e => e.stopPropagation()}>
@@ -92,7 +92,7 @@ export function DeviceTable({ devices, selectedMac, onSelect, selectedMacs, onTo
                       type="checkbox"
                       checked={checked}
                       disabled={!d.online}
-                      onChange={() => d.mac && onToggleSelect(d.mac)}
+                      onChange={() => onToggleSelect(key)}
                       className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-30"
                     />
                   </td>
@@ -101,7 +101,16 @@ export function DeviceTable({ devices, selectedMac, onSelect, selectedMacs, onTo
                   </td>
                   <td className={`${COL_WIDTHS.ip} px-2 py-1.5 font-mono text-xs text-gray-600 truncate`} title={d.ip}>{d.ip}</td>
                   <td className={`${COL_WIDTHS.fw} px-2 py-1.5 text-xs text-gray-500 truncate`} title={d.fw}>{d.fw}</td>
-                  <td className={`${COL_WIDTHS.product} px-2 py-1.5 text-xs truncate`} title={d.product}>{d.product}</td>
+                  <td className={`${COL_WIDTHS.product} px-2 py-1.5 text-xs truncate`} title={d.product}>
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="truncate">{d.product}</span>
+                      {d.manual && (
+                        <span className="shrink-0 px-1.5 py-0.5 rounded border border-amber-200 bg-amber-50 text-amber-700 text-[10px] leading-none">
+                          Manual
+                        </span>
+                      )}
+                    </div>
+                  </td>
                   <td className={`${COL_WIDTHS.mac} px-2 py-1.5 font-mono text-xs text-gray-600 truncate`} title={d.mac || '-'}>{d.mac || '-'}</td>
                   <td className={`${COL_WIDTHS.sn} px-2 py-1.5 font-mono text-xs truncate`} title={d.sn}>{d.sn}</td>
                 </tr>

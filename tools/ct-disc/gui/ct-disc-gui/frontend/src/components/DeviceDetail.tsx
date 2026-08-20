@@ -7,9 +7,10 @@ interface Props {
   onClose: () => void
   onCommand: () => void
   onNetwork: () => void
+  onRemoveManual: () => void
 }
 
-export function DeviceDetail({ device, show, onClose, onCommand, onNetwork }: Props) {
+export function DeviceDetail({ device, show, onClose, onCommand, onNetwork, onRemoveManual }: Props) {
   if (!show || !device) return null
 
   const fields = [
@@ -37,6 +38,11 @@ export function DeviceDetail({ device, show, onClose, onCommand, onNetwork }: Pr
           <span className={`px-2 py-0.5 text-xs rounded-full font-medium ${device.online ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>
             {device.online ? 'Online' : 'Offline'}
           </span>
+          {device.manual && (
+            <span className="px-2 py-0.5 text-xs rounded-full font-medium bg-amber-50 text-amber-700 border border-amber-200">
+              Manual
+            </span>
+          )}
           <button onClick={onClose} className="ml-2 text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
         </div>
 
@@ -67,6 +73,14 @@ export function DeviceDetail({ device, show, onClose, onCommand, onNetwork }: Pr
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
               Send Command
             </button>
+            {device.manual && (
+              <button
+                onClick={onRemoveManual}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-red-200 text-red-700 rounded-md hover:bg-red-50 transition-colors"
+              >
+                Remove
+              </button>
+            )}
           </div>
 
           {/* Details card */}
