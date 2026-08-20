@@ -846,8 +846,22 @@ public:
                 resp->set_relative(info.capabilities.sync_relative ||
                                    info.capabilities.relative);
                 resp->set_ircut(info.capabilities.ircut);
-                resp->set_zoom_travel_steps(info.zoom.travel_steps);
-                resp->set_focus_travel_steps(info.focus.travel_steps);
+                // The frozen SoC-side geometry is authoritative everywhere
+                // (ratio math, virtual limits); report it, not the MCU's
+                // nominal travel, so a stale firmware table cannot skew the
+                // web limits. Old bench firmware reports zoom travel 2381
+                // while the vendor curve TELE end is 2463.
+                if (info.zoom.travel_steps != HAL_LENS_FG2009_ZOOM_TRAVEL_STEPS ||
+                    info.focus.travel_steps != HAL_LENS_FG2009_FOCUS_TRAVEL_STEPS) {
+                    HAL_LOG_WARNING("LensHAL: MCU fg2009 travel (z=%d f=%d) differs "
+                                 "from frozen curve (z=%d f=%d); using frozen",
+                                 (int)info.zoom.travel_steps,
+                                 (int)info.focus.travel_steps,
+                                 (int)HAL_LENS_FG2009_ZOOM_TRAVEL_STEPS,
+                                 (int)HAL_LENS_FG2009_FOCUS_TRAVEL_STEPS);
+                }
+                resp->set_zoom_travel_steps(HAL_LENS_FG2009_ZOOM_TRAVEL_STEPS);
+                resp->set_focus_travel_steps(HAL_LENS_FG2009_FOCUS_TRAVEL_STEPS);
                 resp->set_max_zoom_ratio(hal_lens_fg2009_max_ratio());
                 return grpc::Status::OK;
             }
@@ -871,7 +885,7 @@ public:
                                aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "zoom_goto_ratio")) return grpc::Status::OK;
-        if (reject_if_fg2009(resp, "zoom_goto_ratio")) return grpc::Status::OK;
+        if (reject_if_not_fg2009(resp, "zoom_goto_ratio")) return grpc::Status::OK;
         const int32_t target = hal_lens_fg2009_ratio_to_steps(req->ratio());
         int ret = fg2009_zoom_abs_locked(req->pps(), target);
         if (ret != 0) {
@@ -889,7 +903,7 @@ public:
                                 aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "focus_goto_level")) return grpc::Status::OK;
-        if (reject_if_fg2009(resp, "focus_goto_level")) return grpc::Status::OK;
+        if (reject_if_not_fg2009(resp, "focus_goto_level")) return grpc::Status::OK;
         const int32_t target = hal_lens_fg2009_focus_level_to_steps(req->level());
         int ret = fg2009_focus_abs_locked(req->pps(), target);
         if (ret != 0) {
@@ -907,7 +921,7 @@ public:
                              aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "zoom_move_rel")) return grpc::Status::OK;
-        if (reject_if_fg2009(resp, "zoom_move_rel")) return grpc::Status::OK;
+        if (reject_if_not_fg2009(resp, "zoom_move_rel")) return grpc::Status::OK;
         int ret = fg2009_zoom_rel_locked(req->pps(), req->steps());
         if (ret != 0) {
             consecutive_errors_++;
@@ -924,7 +938,7 @@ public:
                               aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "focus_move_rel")) return grpc::Status::OK;
-        if (reject_if_fg2009(resp, "focus_move_rel")) return grpc::Status::OK;
+        if (reject_if_not_fg2009(resp, "focus_move_rel")) return grpc::Status::OK;
         int ret = fg2009_focus_rel_locked(req->pps(), req->steps());
         if (ret != 0) {
             consecutive_errors_++;
@@ -1366,6 +1380,16 @@ private:
         if (!fg2009_) return false;
         const std::string message =
             std::string(operation) + ": not supported on lens fg2009";
+        fill_status(status, HAL_ERR_NOT_SUPPORTED, message.c_str());
+        return true;
+    }
+
+    /* FG2009-only RPCs take the inverse guard: they are meaningless on a
+     * closed-loop AF0832 lens. */
+    bool reject_if_not_fg2009(aipc::lens::HalStatus* status, const char* operation) const {
+        if (fg2009_) return false;
+        const std::string message =
+            std::string(operation) + ": requires lens fg2009";
         fill_status(status, HAL_ERR_NOT_SUPPORTED, message.c_str());
         return true;
     }
