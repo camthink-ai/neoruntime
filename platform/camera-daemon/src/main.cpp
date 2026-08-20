@@ -237,6 +237,60 @@ static void select_product_media_config_for_infrared(DaemonConfig& config) {
     config.media_config_path = kProductMediaConfig;
 }
 
+/* Lens product model is baked at pack time into product.yaml; the only
+ * key consumed here is lens.model. Returns "" when the file is absent or
+ * carries no lens model. */
+static std::string parse_product_lens_model(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) return "";
+
+    std::string line;
+    bool in_lens_section = false;
+    while (std::getline(file, line)) {
+        line = strip_inline_comment(line);
+        const std::string trimmed = trim(line);
+        if (trimmed.empty() || trimmed[0] == '#') continue;
+
+        const bool indented = (line[0] == ' ' || line[0] == '\t');
+        if (trimmed.find("lens:") == 0 && !indented) {
+            in_lens_section = true;
+            continue;
+        }
+        if (!indented) {
+            in_lens_section = false;  // any other top-level key ends the section
+            continue;
+        }
+        if (in_lens_section && config_key_is(trimmed, "model"))
+            return get_value(trimmed);
+    }
+    return "";
+}
+
+/* Applies the factory lens model from <prefix>/etc/product.yaml.
+ * Missing file keeps the af0832 default (legacy images); an unknown model
+ * fails fast so a mis-built image cannot drive the wrong lens geometry. */
+static bool apply_product_lens_model(DaemonConfig& config,
+                                     const std::string& config_path) {
+    const std::string product_path =
+        derive_install_prefix(config_path) + "/etc/product.yaml";
+    const std::string model = parse_product_lens_model(product_path);
+
+    if (model.empty()) {
+        HAL_LOG_WARNING("No lens model in '%s'; defaulting to af0832",
+                        product_path.c_str());
+        return true;
+    }
+    if (model != "af0832" && model != "fg2009") {
+        HAL_LOG_ERROR("Unknown lens model '%s' in %s (expected af0832|fg2009)",
+                      model.c_str(), product_path.c_str());
+        return false;
+    }
+    config.lens_model = model;
+    HAL_LOG_INFO("Lens product model: %s (from %s)",
+                 model.c_str(), product_path.c_str());
+    return true;
+}
+
 static DaemonConfig load_config(const std::string& path) {
     DaemonConfig cfg;
 
@@ -263,6 +317,9 @@ static DaemonConfig load_config(const std::string& path) {
     cfg.watchdog_timeout_ms = 5000;
     cfg.watchdog_warn_ms = 3000;
     cfg.log_level = "info";
+
+    // FG2009 open-loop geometry: bench-calibrated bootstrap offsets
+    hal_lens_fg2009_params_init_defaults(&cfg.lens_fg2009);
 
     // Streams derived from encoders after YAML parse (see below)
     cfg.streams = {};
@@ -300,6 +357,7 @@ static DaemonConfig load_config(const std::string& path) {
 
     std::string line;
     std::string section;
+    std::string lens_subsection;
 
     while (std::getline(file, line)) {
         line = strip_inline_comment(line);
@@ -318,6 +376,7 @@ static DaemonConfig load_config(const std::string& path) {
         if (trimmed.find("infrared:") == 0) { section = "infrared"; continue; }
         if (trimmed.find("light_sensor:") == 0) { section = "light_sensor"; continue; }
         if (trimmed.find("service:") == 0) { section = "service"; continue; }
+        if (trimmed.find("lens:") == 0) { section = "lens"; lens_subsection.clear(); continue; }
         if (trimmed.find("streams:") == 0) { section = "streams"; cfg.streams.clear(); continue; }
         if (trimmed.find("encoders:") == 0) { section = "encoders"; cfg.encoders.clear(); continue; }
 
@@ -587,6 +646,21 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.log_level = val;
             else if (trimmed.find("log_file:") != std::string::npos)
                 cfg.log_file = val;
+        } else if (section == "lens") {
+            if (trimmed.find("fg2009:") == 0) {
+                lens_subsection = "fg2009";
+            } else if (lens_subsection == "fg2009") {
+                if (trimmed.find("ram_steps:") != std::string::npos)
+                    cfg.lens_fg2009.ram_steps = (int32_t)parse_u32_config(val, "lens.fg2009.ram_steps");
+                else if (trimmed.find("park_zoom_steps:") != std::string::npos)
+                    cfg.lens_fg2009.park_zoom_steps = (int32_t)parse_u32_config(val, "lens.fg2009.park_zoom_steps");
+                else if (trimmed.find("park_focus_steps:") != std::string::npos)
+                    cfg.lens_fg2009.park_focus_steps = (int32_t)parse_u32_config(val, "lens.fg2009.park_focus_steps");
+                else if (trimmed.find("zoom_pps:") != std::string::npos)
+                    cfg.lens_fg2009.zoom_pps = (uint16_t)parse_u32_config(val, "lens.fg2009.zoom_pps", HAL_LENS_FG2009_MAX_PPS);
+                else if (trimmed.find("focus_pps:") != std::string::npos)
+                    cfg.lens_fg2009.focus_pps = (uint16_t)parse_u32_config(val, "lens.fg2009.focus_pps", HAL_LENS_FG2009_MAX_PPS);
+            }
         }
     }
 
@@ -683,6 +757,9 @@ int main(int argc, char** argv) {
     DaemonConfig config = load_config(config_path);
     setup_logging(config.log_level, config.log_file, config_path);
     select_product_media_config_for_infrared(config);
+    if (!apply_product_lens_model(config, config_path)) {
+        return 1;
+    }
 
     HAL_LOG_INFO("===================================");
     HAL_LOG_INFO("AIPC Camera Daemon v2.0.0");

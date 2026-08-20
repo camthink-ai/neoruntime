@@ -21,6 +21,7 @@
 extern "C" {
     #include "hal_common.h"
     #include "hal_log.h"
+    #include "peripheral/devices/hal_lens.h"
 }
 
 /* ── Lens state C struct layout (24 bytes, matches Go bridge) ────────── */
@@ -55,7 +56,12 @@ public:
     using Config = LensHalConfig;
 
     explicit LensHalServiceImpl(const Config& cfg)
-        : cfg_(cfg) {
+        : cfg_(cfg), fg2009_(cfg.lens_model == "fg2009"),
+          fg2009_params_(cfg.fg2009) {
+        if (fg2009_ && fg2009_params_.ram_steps <= 0) {
+            // Hand-built configs (tests/tools) may skip the yaml defaults.
+            hal_lens_fg2009_params_init_defaults(&fg2009_params_);
+        }
         load_bridge();
     }
 
@@ -104,6 +110,13 @@ public:
         state->focus_rz_done = raw.focus_rz_done != 0;
         state->zoom_pos = raw.zoom_pos;
         state->focus_pos = raw.focus_pos;
+        if (fg2009_) {
+            // Overlay the dead-reckoned model: MCU counters are diagnostics.
+            state->zoom_pos = fg2009_state_.zoom_curve;
+            state->focus_pos = fg2009_state_.focus_curve;
+            state->zoom_rz_done = fg2009_state_.anchored;
+            state->focus_rz_done = fg2009_state_.anchored;
+        }
         return HAL_OK;
     }
 
@@ -114,7 +127,10 @@ public:
             std::lock_guard<std::mutex> lock(mu_);
             // Match auto_af_test timing when the AF0832 helper is available:
             // its completion event avoids the coarse motor-state poll interval.
-            if (initialized_ && af0832_created_ && af0832_bootstrapped_ &&
+            if (initialized_ && fg2009_) {
+                ret = fg2009_zoom_abs_locked(pps, position);
+                event_waited = true;  // fire-and-forget; poll below for stop
+            } else if (initialized_ && af0832_created_ && af0832_bootstrapped_ &&
                 sym_.af0832_zoom_abs) {
                 event_waited = true;
                 ret = sym_.af0832_zoom_abs(
@@ -124,7 +140,7 @@ public:
             }
         }
         if (ret != HAL_OK) return ret;
-        if (event_waited) return HAL_OK;
+        if (event_waited && !fg2009_) return HAL_OK;
         return wait_motor_stopped(true, timeout_ms) ? HAL_OK : HAL_ERR_TIMEOUT;
     }
 
@@ -133,7 +149,10 @@ public:
         bool event_waited = false;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            if (initialized_ && af0832_created_ && af0832_bootstrapped_ &&
+            if (initialized_ && fg2009_) {
+                ret = fg2009_focus_abs_locked(pps, position);
+                event_waited = true;
+            } else if (initialized_ && af0832_created_ && af0832_bootstrapped_ &&
                 sym_.af0832_focus_abs) {
                 event_waited = true;
                 ret = sym_.af0832_focus_abs(
@@ -143,7 +162,7 @@ public:
             }
         }
         if (ret != HAL_OK) return ret;
-        if (event_waited) return HAL_OK;
+        if (event_waited && !fg2009_) return HAL_OK;
         return wait_motor_stopped(false, timeout_ms) ? HAL_OK : HAL_ERR_TIMEOUT;
     }
 
@@ -153,6 +172,11 @@ public:
         decltype(sym_.af0832_zf_sync_abs) sync_abs = nullptr;
         {
             std::lock_guard<std::mutex> lock(mu_);
+            if (fg2009_) {
+                // Only the AF follow path uses synchronized dual-axis moves,
+                // and autofocus is disabled on FG2009.
+                return HAL_ERR_NOT_SUPPORTED;
+            }
             if (!initialized_ || !af0832_created_ || !af0832_bootstrapped_) {
                 return HAL_ERR_NOT_INITIALIZED;
             }
@@ -183,6 +207,7 @@ public:
     int calc_targets(float zoom_ratio, float focus_distance_m,
                      int32_t* zoom_target, int32_t* focus_target) override {
         std::lock_guard<std::mutex> lock(mu_);
+        if (fg2009_) return HAL_ERR_NOT_SUPPORTED;
         if (!sym_.af0832_calc_targets) return HAL_ERR_NOT_SUPPORTED;
         return sym_.af0832_calc_targets(zoom_ratio, focus_distance_m,
                                         zoom_target, focus_target);
@@ -191,12 +216,17 @@ public:
     int estimate_distance(float zoom_ratio, int32_t focus_pos,
                           float* distance_m) override {
         std::lock_guard<std::mutex> lock(mu_);
+        if (fg2009_) return HAL_ERR_NOT_SUPPORTED;
         if (!sym_.af0832_estimate_distance) return HAL_ERR_NOT_SUPPORTED;
         return sym_.af0832_estimate_distance(zoom_ratio, focus_pos, distance_m);
     }
 
     float pos_to_ratio(int32_t zoom_pos) override {
         std::lock_guard<std::mutex> lock(mu_);
+        if (fg2009_) {
+            // Ratio comes from the dead-reckoned model, not the AF0832 table.
+            return hal_lens_fg2009_steps_to_ratio(fg2009_state_.zoom_curve);
+        }
         return sym_.af0832_pos_to_ratio ? sym_.af0832_pos_to_ratio(zoom_pos) : 1.0f;
     }
 
@@ -242,6 +272,18 @@ public:
         if (ret != 0) {
             HAL_LOG_ERROR("LensHAL: lens_config failed: %d", ret);
             fill_status(resp, ret, "lens_config failed");
+            return grpc::Status::OK;
+        }
+
+        if (fg2009_) {
+            // Open-loop lens: re-select the profile (RAM-only on the MCU) and
+            // bootstrap the dead-reckoned position model. No MCU limits.
+            const int fret = finish_init_fg2009_locked();
+            if (fret != HAL_OK) {
+                fill_status(resp, fret, "fg2009 init failed");
+                return grpc::Status::OK;
+            }
+            fill_status(resp, 0, "ok");
             return grpc::Status::OK;
         }
 
@@ -301,6 +343,16 @@ public:
             return grpc::Status::OK;
         }
 
+        if (fg2009_) {
+            const int fret = finish_init_fg2009_locked();
+            if (fret != HAL_OK) {
+                fill_status(resp, fret, "fg2009 reinit failed");
+                return grpc::Status::OK;
+            }
+            fill_status(resp, 0, "ok");
+            return grpc::Status::OK;
+        }
+
         if (sym_.zoom_limit_set) sym_.zoom_limit_set(1, cfg_.zoom_min, cfg_.zoom_max);
         if (sym_.focus_limit_set) sym_.focus_limit_set(1, cfg_.focus_min, cfg_.focus_max);
 
@@ -355,6 +407,15 @@ public:
         resp->set_zoom_pos(raw.zoom_pos);
         resp->set_focus_pos(raw.focus_pos);
 
+        if (fg2009_) {
+            // MCU position counters carry no optical meaning on FG2009;
+            // report the dead-reckoned curve coordinates instead.
+            resp->set_zoom_pos(fg2009_state_.zoom_curve);
+            resp->set_focus_pos(fg2009_state_.focus_curve);
+            resp->set_zoom_rz_done(fg2009_state_.anchored);
+            resp->set_focus_rz_done(fg2009_state_.anchored);
+        }
+
         // Auto-stop any motor stuck in ERROR state — a stopped motor can
         // recover on the next command, while an ERROR-state motor rejects
         // all commands until power-cycled.
@@ -393,6 +454,16 @@ public:
                            aipc::lens::LensLimitsResponse* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
 
+        if (fg2009_) {
+            auto* zoom = resp->mutable_zoom();
+            zoom->set_min_pos(0);
+            zoom->set_max_pos(HAL_LENS_FG2009_ZOOM_TRAVEL_STEPS);
+            auto* focus = resp->mutable_focus();
+            focus->set_min_pos(0);
+            focus->set_max_pos(HAL_LENS_FG2009_FOCUS_TRAVEL_STEPS);
+            return grpc::Status::OK;
+        }
+
         auto* zoom = resp->mutable_zoom();
         zoom->set_min_pos(cfg_.zoom_min);
         zoom->set_max_pos(cfg_.zoom_max);
@@ -410,7 +481,14 @@ public:
                          aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "zoom_run")) return grpc::Status::OK;
-        int ret = sym_.zoom_run(1, req->pps(), req->steps());
+        int ret;
+        if (fg2009_) {
+            // MCU run op is not available on FG2009; relative physical steps
+            // are the native motion unit.
+            ret = fg2009_zoom_rel_locked(req->pps(), req->steps());
+        } else {
+            ret = sym_.zoom_run(1, req->pps(), req->steps());
+        }
         if (ret != 0) {
             consecutive_errors_++;
             if (consecutive_errors_ >= 3) try_auto_reinit();
@@ -426,7 +504,14 @@ public:
                          aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "zoom_abs")) return grpc::Status::OK;
-        int ret = sym_.zoom_abs(1, req->pps(), req->position());
+        int ret;
+        if (fg2009_) {
+            // Virtual absolute: target in curve coordinates, executed as a
+            // relative physical move by the dead-reckoned model.
+            ret = fg2009_zoom_abs_locked(req->pps(), req->position());
+        } else {
+            ret = sym_.zoom_abs(1, req->pps(), req->position());
+        }
         if (ret != 0) {
             consecutive_errors_++;
             if (consecutive_errors_ >= 3) try_auto_reinit();
@@ -452,6 +537,11 @@ public:
                                aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "zoom_rz")) return grpc::Status::OK;
+        if (fg2009_) {
+            fill_status(resp, HAL_ERR_NOT_SUPPORTED,
+                        "zoom_rz not supported on lens fg2009");
+            return grpc::Status::OK;
+        }
         int ret = sym_.zoom_rz(1);
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_rz failed");
         return grpc::Status::OK;
@@ -462,6 +552,12 @@ public:
                               aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "zoom_limit_set")) return grpc::Status::OK;
+        if (fg2009_) {
+            // Travel is fixed by the lens profile; no MCU soft limits.
+            fill_status(resp, HAL_ERR_NOT_SUPPORTED,
+                        "zoom limits fixed by lens profile fg2009");
+            return grpc::Status::OK;
+        }
         int ret = sym_.zoom_limit_set(1, req->min_pos(), req->max_pos());
         if (ret == 0) {
             cfg_.zoom_min = req->min_pos();
@@ -494,7 +590,12 @@ public:
                           aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "focus_run")) return grpc::Status::OK;
-        int ret = sym_.focus_run(1, req->pps(), req->steps());
+        int ret;
+        if (fg2009_) {
+            ret = fg2009_focus_rel_locked(req->pps(), req->steps());
+        } else {
+            ret = sym_.focus_run(1, req->pps(), req->steps());
+        }
         if (ret != 0) {
             consecutive_errors_++;
             if (consecutive_errors_ >= 3) try_auto_reinit();
@@ -510,7 +611,12 @@ public:
                           aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "focus_abs")) return grpc::Status::OK;
-        int ret = sym_.focus_abs(1, req->pps(), req->position());
+        int ret;
+        if (fg2009_) {
+            ret = fg2009_focus_abs_locked(req->pps(), req->position());
+        } else {
+            ret = sym_.focus_abs(1, req->pps(), req->position());
+        }
         if (ret != 0) {
             consecutive_errors_++;
             if (consecutive_errors_ >= 3) try_auto_reinit();
@@ -536,6 +642,11 @@ public:
                                 aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "focus_rz")) return grpc::Status::OK;
+        if (fg2009_) {
+            fill_status(resp, HAL_ERR_NOT_SUPPORTED,
+                        "focus_rz not supported on lens fg2009");
+            return grpc::Status::OK;
+        }
         int ret = sym_.focus_rz(1);
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_rz failed");
         return grpc::Status::OK;
@@ -546,6 +657,11 @@ public:
                                aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "focus_limit_set")) return grpc::Status::OK;
+        if (fg2009_) {
+            fill_status(resp, HAL_ERR_NOT_SUPPORTED,
+                        "focus limits fixed by lens profile fg2009");
+            return grpc::Status::OK;
+        }
         int ret = sym_.focus_limit_set(1, req->min_pos(), req->max_pos());
         if (ret == 0) {
             cfg_.focus_min = req->min_pos();
@@ -619,6 +735,7 @@ public:
                                  aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "af0832_bootstrap")) return grpc::Status::OK;
+        if (reject_if_fg2009(resp, "af0832_bootstrap")) return grpc::Status::OK;
         ensure_af0832_created();
         int ret = sym_.af0832_bootstrap ? sym_.af0832_bootstrap() : -1;
         if (ret == HAL_OK) af0832_bootstrapped_ = true;
@@ -631,6 +748,7 @@ public:
                                         aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "af0832_mark_bootstrapped")) return grpc::Status::OK;
+        if (reject_if_fg2009(resp, "af0832_mark_bootstrapped")) return grpc::Status::OK;
         ensure_af0832_created();
         if (sym_.af0832_mark_bootstrapped) {
             sym_.af0832_mark_bootstrapped();
@@ -645,6 +763,7 @@ public:
                                       aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "af0832_force_reset_zero")) return grpc::Status::OK;
+        if (reject_if_fg2009(resp, "af0832_force_reset_zero")) return grpc::Status::OK;
         ensure_af0832_created();
         int ret = sym_.af0832_force_reset_zero ? sym_.af0832_force_reset_zero() : -1;
         fill_status(resp, ret, ret == 0 ? "ok" : "af0832_force_reset_zero failed");
@@ -656,6 +775,7 @@ public:
                                         aipc::lens::HalStatus* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "af0832_goto")) return grpc::Status::OK;
+        if (reject_if_fg2009(resp, "af0832_goto")) return grpc::Status::OK;
         ensure_af0832_created();
         int ret = sym_.af0832_goto
                   ? sym_.af0832_goto(req->zoom_ratio(), req->focus_distance_m())
@@ -668,6 +788,10 @@ public:
                                   const aipc::lens::AF0832PosToRatioRequest* req,
                                   aipc::lens::AF0832PosToRatioResponse* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
+        if (fg2009_) {
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "af0832_pos_to_ratio not supported on lens fg2009");
+        }
         if (!sym_.af0832_pos_to_ratio) {
             return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
                                 "af0832_pos_to_ratio not available");
@@ -681,7 +805,127 @@ public:
                                       const aipc::lens::Empty* /*req*/,
                                       aipc::lens::AF0832BootstrappedResponse* resp) override {
         std::lock_guard<std::mutex> lock(mu_);
-        resp->set_bootstrapped(af0832_bootstrapped_);
+        resp->set_bootstrapped(fg2009_ ? false : af0832_bootstrapped_);
+        return grpc::Status::OK;
+    }
+
+    /* ── Lens profile & FG2009 helper RPCs ──────────────────────────── */
+
+    grpc::Status ProfileGet(grpc::ServerContext* /*ctx*/,
+                            const aipc::lens::Empty* /*req*/,
+                            aipc::lens::LensProfileResponse* resp) override {
+        std::lock_guard<std::mutex> lock(mu_);
+
+        resp->set_model(fg2009_ ? "fg2009" : "af0832");
+
+        // Query the MCU so callers can verify the RAM-only selection is
+        // still in place (a power glitch reverts it to AF0832).
+        HalLensProfileInfo info{};
+        if (sym_.profile_get && sym_.profile_get(1, &info) == HAL_OK) {
+            const bool mcu_fg2009 = info.model == HAL_LENS_MODEL_FG2009;
+            if (mcu_fg2009 != fg2009_) {
+                HAL_LOG_ERROR("LensHAL: MCU lens profile mismatch (mcu=%s)",
+                              mcu_fg2009 ? "fg2009" : "af0832");
+                // Self-heal the common case: re-push and re-read.
+                const uint32_t want = fg2009_ ? (uint32_t)HAL_LENS_MODEL_FG2009
+                                              : (uint32_t)HAL_LENS_MODEL_AF0832;
+                if (sym_.profile_set && sym_.profile_set(1, want) == HAL_OK &&
+                    sym_.profile_get(1, &info) == HAL_OK) {
+                    const bool healed =
+                        (info.model == HAL_LENS_MODEL_FG2009) == fg2009_;
+                    resp->set_message(healed
+                        ? "profile re-pushed after MCU mismatch"
+                        : "profile mismatch persists after re-push");
+                } else {
+                    resp->set_message("profile mismatch; re-push failed");
+                }
+            }
+            if (fg2009_) {
+                resp->set_relative(info.capabilities.sync_relative ||
+                                   info.capabilities.relative);
+                resp->set_ircut(info.capabilities.ircut);
+                resp->set_zoom_travel_steps(info.zoom.travel_steps);
+                resp->set_focus_travel_steps(info.focus.travel_steps);
+                return grpc::Status::OK;
+            }
+        }
+
+        if (fg2009_) {
+            resp->set_relative(true);
+            resp->set_ircut(true);
+            resp->set_zoom_travel_steps(HAL_LENS_FG2009_ZOOM_TRAVEL_STEPS);
+            resp->set_focus_travel_steps(HAL_LENS_FG2009_FOCUS_TRAVEL_STEPS);
+        }
+        return grpc::Status::OK;
+    }
+
+    grpc::Status ZoomGotoRatio(grpc::ServerContext* /*ctx*/,
+                               const aipc::lens::ZoomGotoRatioRequest* req,
+                               aipc::lens::HalStatus* resp) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (reject_if_af_active(resp, "zoom_goto_ratio")) return grpc::Status::OK;
+        if (reject_if_fg2009(resp, "zoom_goto_ratio")) return grpc::Status::OK;
+        const int32_t target = hal_lens_fg2009_ratio_to_steps(req->ratio());
+        int ret = fg2009_zoom_abs_locked(req->pps(), target);
+        if (ret != 0) {
+            consecutive_errors_++;
+            if (consecutive_errors_ >= 3) try_auto_reinit();
+        } else {
+            consecutive_errors_ = 0;
+        }
+        fill_status(resp, ret, ret == 0 ? "ok" : "zoom_goto_ratio failed");
+        return grpc::Status::OK;
+    }
+
+    grpc::Status FocusGotoLevel(grpc::ServerContext* /*ctx*/,
+                                const aipc::lens::FocusGotoLevelRequest* req,
+                                aipc::lens::HalStatus* resp) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (reject_if_af_active(resp, "focus_goto_level")) return grpc::Status::OK;
+        if (reject_if_fg2009(resp, "focus_goto_level")) return grpc::Status::OK;
+        const int32_t target = hal_lens_fg2009_focus_level_to_steps(req->level());
+        int ret = fg2009_focus_abs_locked(req->pps(), target);
+        if (ret != 0) {
+            consecutive_errors_++;
+            if (consecutive_errors_ >= 3) try_auto_reinit();
+        } else {
+            consecutive_errors_ = 0;
+        }
+        fill_status(resp, ret, ret == 0 ? "ok" : "focus_goto_level failed");
+        return grpc::Status::OK;
+    }
+
+    grpc::Status ZoomMoveRel(grpc::ServerContext* /*ctx*/,
+                             const aipc::lens::MotorRunRequest* req,
+                             aipc::lens::HalStatus* resp) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (reject_if_af_active(resp, "zoom_move_rel")) return grpc::Status::OK;
+        if (reject_if_fg2009(resp, "zoom_move_rel")) return grpc::Status::OK;
+        int ret = fg2009_zoom_rel_locked(req->pps(), req->steps());
+        if (ret != 0) {
+            consecutive_errors_++;
+            if (consecutive_errors_ >= 3) try_auto_reinit();
+        } else {
+            consecutive_errors_ = 0;
+        }
+        fill_status(resp, ret, ret == 0 ? "ok" : "zoom_move_rel failed");
+        return grpc::Status::OK;
+    }
+
+    grpc::Status FocusMoveRel(grpc::ServerContext* /*ctx*/,
+                              const aipc::lens::MotorRunRequest* req,
+                              aipc::lens::HalStatus* resp) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (reject_if_af_active(resp, "focus_move_rel")) return grpc::Status::OK;
+        if (reject_if_fg2009(resp, "focus_move_rel")) return grpc::Status::OK;
+        int ret = fg2009_focus_rel_locked(req->pps(), req->steps());
+        if (ret != 0) {
+            consecutive_errors_++;
+            if (consecutive_errors_ >= 3) try_auto_reinit();
+        } else {
+            consecutive_errors_ = 0;
+        }
+        fill_status(resp, ret, ret == 0 ? "ok" : "focus_move_rel failed");
         return grpc::Status::OK;
     }
 
@@ -720,6 +964,11 @@ private:
     bool            af0832_created_       = false;
     bool            af0832_bootstrapped_  = false;
     int             consecutive_errors_   = 0;    // reset on any success
+
+    // FG2009 open-loop lens: dead-reckoned position model (curve coords).
+    bool                    fg2009_        = false;
+    HalLensFg2009Params     fg2009_params_{};
+    HalLensFg2009State      fg2009_state_{};
 
     /* ── dlopen / dlsym ─────────────────────────────────────────────── */
 
@@ -775,6 +1024,13 @@ private:
         sym_.iris_target_set = resolve<decltype(sym_.iris_target_set)>("hal_bridge_iris_target_set");
         sym_.iris_adc_get  = resolve<decltype(sym_.iris_adc_get)>("hal_bridge_iris_adc_get");
 
+        // Lens profile & physical relative motion (FG2009)
+        sym_.profile_set   = resolve<decltype(sym_.profile_set)>("hal_bridge_profile_set");
+        sym_.profile_get   = resolve<decltype(sym_.profile_get)>("hal_bridge_profile_get");
+        sym_.zoom_rel      = resolve<decltype(sym_.zoom_rel)>("hal_bridge_zoom_rel");
+        sym_.focus_rel     = resolve<decltype(sym_.focus_rel)>("hal_bridge_focus_rel");
+        sym_.dual_rel      = resolve<decltype(sym_.dual_rel)>("hal_bridge_dual_rel");
+
         // AF0832
         sym_.af0832_create = resolve<decltype(sym_.af0832_create)>("hal_bridge_af0832_create");
         sym_.af0832_mark_bootstrapped = resolve<decltype(sym_.af0832_mark_bootstrapped)>("hal_bridge_af0832_mark_bootstrapped");
@@ -800,12 +1056,171 @@ private:
 
         bridge_loaded_ = true;
         HAL_LOG_INFO("LensHAL: bridge library loaded from %s", cfg_.library_path.c_str());
+        if (fg2009_) {
+            if (!sym_.profile_set || !sym_.zoom_rel || !sym_.focus_rel ||
+                !sym_.dual_rel) {
+                HAL_LOG_ERROR("LensHAL: bridge missing FG2009 profile/relative symbols");
+            }
+            HAL_LOG_INFO("LensHAL: FG2009 lens (ram=%d park=(%d,%d) pps=(%u,%u))",
+                         fg2009_params_.ram_steps, fg2009_params_.park_zoom_steps,
+                         fg2009_params_.park_focus_steps, fg2009_params_.zoom_pps,
+                         fg2009_params_.focus_pps);
+        }
         HAL_LOG_INFO("LensHAL: AF0832 event-driven motion %s",
                      sym_.af0832_zoom_abs && sym_.af0832_focus_abs
                          ? "available"
                          : "unavailable; using motor-state polling");
         HAL_LOG_INFO("LensHAL: AF0832 synchronized dual-axis motion %s",
                      sym_.af0832_zf_sync_abs ? "available" : "unavailable");
+    }
+
+    /* ── FG2009 open-loop helpers (mu_ held by callers) ─────────────── */
+
+    /* Push the FG2009 profile and bootstrap the dead-reckoned model:
+     * ram both axes into the TELE/FAR hard stops, anchor the model there,
+     * then park back by the bench-calibrated offsets. Sets initialized_. */
+    int finish_init_fg2009_locked() {
+        initialized_ = false;
+        fg2009_state_ = {};
+
+        // The MCU keeps the lens selection in RAM only (AF0832 power-on
+        // default), so every (re)init must re-select FG2009 before moving.
+        if (!sym_.profile_set) return HAL_ERR_NOT_SUPPORTED;
+        int ret = sym_.profile_set(1, (uint32_t)HAL_LENS_MODEL_FG2009);
+        if (ret != HAL_OK) {
+            HAL_LOG_ERROR("LensHAL: profile_set fg2009 failed: %d", ret);
+            return ret;
+        }
+
+        const uint16_t zpps = hal_lens_fg2009_clamp_pps(fg2009_params_.zoom_pps);
+        const uint16_t fpps = hal_lens_fg2009_clamp_pps(fg2009_params_.focus_pps);
+        const int32_t ram = fg2009_params_.ram_steps;
+        const uint32_t ram_timeout =
+            move_timeout_ms(ram, zpps, fpps);
+        const uint32_t park_timeout = move_timeout_ms(
+            std::max(fg2009_params_.park_zoom_steps,
+                     fg2009_params_.park_focus_steps),
+            zpps, fpps);
+
+        // Physical negative = Tele/Far: ram both hard stops to establish
+        // a repeatable mechanical origin.
+        ret = sym_.dual_rel(1, zpps, -ram, fpps, -ram);
+        if (ret != HAL_OK) {
+            HAL_LOG_ERROR("LensHAL: fg2009 bootstrap ram failed: %d", ret);
+            return ret;
+        }
+        if (!wait_fg2009_motors_locked(ram_timeout)) {
+            HAL_LOG_ERROR("LensHAL: fg2009 bootstrap ram did not stop in %u ms",
+                          ram_timeout);
+            return HAL_ERR_TIMEOUT;
+        }
+        hal_lens_fg2009_anchor(&fg2009_state_);
+
+        // Park back to the stored position (positive physical = Wide/Near).
+        ret = sym_.dual_rel(1, zpps, fg2009_params_.park_zoom_steps,
+                            fpps, fg2009_params_.park_focus_steps);
+        if (ret != HAL_OK) {
+            HAL_LOG_ERROR("LensHAL: fg2009 bootstrap park failed: %d", ret);
+            return ret;
+        }
+        if (!wait_fg2009_motors_locked(park_timeout)) {
+            HAL_LOG_ERROR("LensHAL: fg2009 bootstrap park did not stop in %u ms",
+                          park_timeout);
+            return HAL_ERR_TIMEOUT;
+        }
+        hal_lens_fg2009_park(&fg2009_state_, &fg2009_params_);
+
+        initialized_ = true;
+        HAL_LOG_INFO("LensHAL: FG2009 bootstrapped (zoom=%d focus=%d curve steps)",
+                     fg2009_state_.zoom_curve, fg2009_state_.focus_curve);
+        return HAL_OK;
+    }
+
+    static uint32_t move_timeout_ms(int32_t steps, uint16_t zoom_pps,
+                                    uint16_t focus_pps) {
+        const uint16_t pps = std::min(zoom_pps, focus_pps);
+        const int64_t travel_ms =
+            ((int64_t)(steps < 0 ? -steps : steps) * 1000) / (pps > 0 ? pps : 1);
+        return (uint32_t)travel_ms + 3000;  // acceleration + serial margin
+    }
+
+    /* Poll both motor states without touching mu_ (caller holds it). */
+    bool wait_fg2009_motors_locked(uint32_t timeout_ms) {
+        auto deadline = std::chrono::steady_clock::now()
+                      + std::chrono::milliseconds(
+                            timeout_ms > 0 ? timeout_ms : 10000);
+        while (std::chrono::steady_clock::now() < deadline) {
+            BridgeLensState raw{};
+            if (sym_.lens_state_get(1, &raw) != HAL_OK) return false;
+            if (raw.zoom_state == MOTOR_STATE_ERROR ||
+                raw.focus_state == MOTOR_STATE_ERROR) {
+                return false;
+            }
+            if (raw.zoom_state == MOTOR_STATE_STOPPED &&
+                raw.focus_state == MOTOR_STATE_STOPPED) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+
+    /* Virtual absolute move: rel(target - current) in physical steps, then
+     * fold the completed move into the model. Fire-and-forget like the
+     * AF0832-era ZoomAbs RPC; completion via WaitZoomStopped. */
+    int fg2009_zoom_abs_locked(uint32_t pps, int32_t target_curve) {
+        if (!initialized_ || !fg2009_state_.anchored || !sym_.zoom_rel)
+            return HAL_ERR_NOT_INITIALIZED;
+        const int32_t delta =
+            hal_lens_fg2009_zoom_physical_delta(&fg2009_state_, target_curve);
+        if (delta == 0) return HAL_OK;
+        const int ret = sym_.zoom_rel(1, hal_lens_fg2009_clamp_pps((uint16_t)pps),
+                                      delta);
+        if (ret != HAL_OK) return ret;
+        hal_lens_fg2009_apply_physical(&fg2009_state_, delta, 0);
+        return HAL_OK;
+    }
+
+    int fg2009_focus_abs_locked(uint32_t pps, int32_t target_curve) {
+        if (!initialized_ || !fg2009_state_.anchored || !sym_.focus_rel)
+            return HAL_ERR_NOT_INITIALIZED;
+        const int32_t delta =
+            hal_lens_fg2009_focus_physical_delta(&fg2009_state_, target_curve);
+        if (delta == 0) return HAL_OK;
+        const int ret = sym_.focus_rel(1, hal_lens_fg2009_clamp_pps((uint16_t)pps),
+                                       delta);
+        if (ret != HAL_OK) return ret;
+        hal_lens_fg2009_apply_physical(&fg2009_state_, 0, delta);
+        return HAL_OK;
+    }
+
+    /* Physical relative jog, clamped so the model stays inside travel. */
+    int fg2009_zoom_rel_locked(uint32_t pps, int32_t steps) {
+        if (!initialized_ || !fg2009_state_.anchored || !sym_.zoom_rel)
+            return HAL_ERR_NOT_INITIALIZED;
+        const int32_t target = hal_lens_fg2009_clamp_zoom_curve(
+            fg2009_state_.zoom_curve - steps);
+        const int32_t clamped = fg2009_state_.zoom_curve - target;
+        if (clamped == 0) return HAL_OK;
+        const int ret = sym_.zoom_rel(1, hal_lens_fg2009_clamp_pps((uint16_t)pps),
+                                      clamped);
+        if (ret != HAL_OK) return ret;
+        hal_lens_fg2009_apply_physical(&fg2009_state_, clamped, 0);
+        return HAL_OK;
+    }
+
+    int fg2009_focus_rel_locked(uint32_t pps, int32_t steps) {
+        if (!initialized_ || !fg2009_state_.anchored || !sym_.focus_rel)
+            return HAL_ERR_NOT_INITIALIZED;
+        const int32_t target = hal_lens_fg2009_clamp_focus_curve(
+            fg2009_state_.focus_curve - steps);
+        const int32_t clamped = fg2009_state_.focus_curve - target;
+        if (clamped == 0) return HAL_OK;
+        const int ret = sym_.focus_rel(1, hal_lens_fg2009_clamp_pps((uint16_t)pps),
+                                       clamped);
+        if (ret != HAL_OK) return ret;
+        hal_lens_fg2009_apply_physical(&fg2009_state_, 0, clamped);
+        return HAL_OK;
     }
 
     /* ── Wait helpers ───────────────────────────────────────────────── */
@@ -904,6 +1319,18 @@ private:
             return;
         }
 
+        if (fg2009_) {
+            // Re-push the RAM-only profile and re-anchor the position model.
+            if (finish_init_fg2009_locked() != HAL_OK) {
+                initialized_ = false;
+                consecutive_errors_ = 0;
+                return;
+            }
+            consecutive_errors_ = 0;
+            HAL_LOG_INFO("LensHAL: auto-reinit succeeded (fg2009)");
+            return;
+        }
+
         // Restore limits
         if (sym_.zoom_limit_set)  sym_.zoom_limit_set(1, cfg_.zoom_min, cfg_.zoom_max);
         if (sym_.focus_limit_set) sym_.focus_limit_set(1, cfg_.focus_min, cfg_.focus_max);
@@ -925,6 +1352,14 @@ private:
         if (!af_operation_active_.load()) return false;
         const std::string message = std::string(operation) + ": autofocus operation active";
         fill_status(status, HAL_ERR_INVALID_STATE, message.c_str());
+        return true;
+    }
+
+    bool reject_if_fg2009(aipc::lens::HalStatus* status, const char* operation) const {
+        if (!fg2009_) return false;
+        const std::string message =
+            std::string(operation) + ": not supported on lens fg2009";
+        fill_status(status, HAL_ERR_NOT_SUPPORTED, message.c_str());
         return true;
     }
 

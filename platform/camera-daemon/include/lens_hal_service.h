@@ -18,6 +18,10 @@
 
 #include "lens_controller.h"
 
+extern "C" {
+#include "peripheral/devices/hal_lens_fg2009.h"
+}
+
 // Forward-declare generated proto types to avoid including heavy headers here.
 namespace aipc { namespace lens {
 class Empty;
@@ -34,6 +38,9 @@ class AF0832GotoRequest;
 class AF0832PosToRatioRequest;
 class AF0832PosToRatioResponse;
 class AF0832BootstrappedResponse;
+class LensProfileResponse;
+class ZoomGotoRatioRequest;
+class FocusGotoLevelRequest;
 }}
 
 // Actual base class comes from the generated header; include only in the .cpp.
@@ -50,6 +57,10 @@ struct LensHalConfig {
     int32_t     zoom_max       = 760;
     int32_t     focus_min      = -844;
     int32_t     focus_max      = 592;
+    // Factory lens model ("af0832" | "fg2009"), from product.yaml.
+    std::string lens_model     = "af0832";
+    // FG2009 open-loop bootstrap geometry (camera-daemon.yaml lens.fg2009.*).
+    HalLensFg2009Params fg2009 = {};
 };
 
 /* ── Bridge symbol table ───────────────────────────────────────────────── */
@@ -84,6 +95,14 @@ struct BridgeSymbols {
     int  (*iris_stop)(int handle)                                      = nullptr;
     int  (*iris_target_set)(int handle, int target)                    = nullptr;
     int  (*iris_adc_get)(int handle, void* adc)                        = nullptr;
+
+    // Lens profile & physical relative motion (FG2009)
+    int  (*profile_set)(int handle, uint32_t model)                    = nullptr;
+    int  (*profile_get)(int handle, void* info)                        = nullptr;
+    int  (*zoom_rel)(int handle, uint16_t pps, int32_t steps)          = nullptr;
+    int  (*focus_rel)(int handle, uint16_t pps, int32_t steps)         = nullptr;
+    int  (*dual_rel)(int handle, uint16_t zoom_pps, int32_t zoom_steps,
+                     uint16_t focus_pps, int32_t focus_steps)           = nullptr;
 
     // AF0832
     int   (*af0832_create)(int zoom_min, int zoom_max,

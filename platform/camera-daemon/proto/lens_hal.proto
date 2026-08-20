@@ -84,6 +84,28 @@ message AF0832BootstrappedResponse {
   bool bootstrapped = 1;
 }
 
+// ── FG2009 / lens profile ───────────────────────────────────────────────
+
+message LensProfileResponse {
+  string model              = 1;  // "af0832" | "fg2009" | "unknown"
+  bool   relative           = 2;
+  bool   ircut              = 3;
+  int32  zoom_travel_steps  = 4;
+  int32  focus_travel_steps = 5;
+  string message            = 6;
+}
+
+message ZoomGotoRatioRequest {
+  float  ratio = 1;  // 1.0 .. max optical ratio
+  uint32 pps   = 2;  // 0 = profile default
+}
+
+message FocusGotoLevelRequest {
+  float  level = 1;  // 0.0 (NEAR) .. 1.0 (FAR)
+  uint32 pps   = 2;  // 0 = profile default
+}
+
+
 // ── Service ──────────────────────────────────────────────────────────────
 
 service LensHAL {
@@ -127,6 +149,13 @@ service LensHAL {
   rpc AF0832GotoRatioDistance(AF0832GotoRequest)     returns (HalStatus);
   rpc AF0832PosToRatio(AF0832PosToRatioRequest)     returns (AF0832PosToRatioResponse);
   rpc IsAF0832Bootstrapped(Empty)                   returns (AF0832BootstrappedResponse);
+
+  // Lens profile & FG2009 open-loop helpers
+  rpc ProfileGet(Empty)               returns (LensProfileResponse);
+  rpc ZoomGotoRatio(ZoomGotoRatioRequest) returns (HalStatus);
+  rpc FocusGotoLevel(FocusGotoLevelRequest) returns (HalStatus);
+  rpc ZoomMoveRel(MotorRunRequest)    returns (HalStatus);
+  rpc FocusMoveRel(MotorRunRequest)   returns (HalStatus);
 
   // Compound
   rpc StopAndWaitAll(WaitRequest) returns (HalStatus);

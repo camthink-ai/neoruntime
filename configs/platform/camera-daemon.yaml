@@ -40,6 +40,18 @@ audio:
   mute: false
   # audio_library: optional, monolithic libaipc_hal.so includes HAL_AUDIO_OPS
 
+# Lens geometry overrides. The lens model itself comes from
+# /data/aipc/etc/product.yaml (baked at pack time, LENS_PRODUCT); these
+# fg2009 offsets are bench-calibrated bootstrap values — production units
+# may deviate, retune here rather than in code.
+lens:
+  fg2009:
+    ram_steps: 2500         # overshoot that rams the TELE/FAR hard stops
+    park_zoom_steps: 2400   # physical steps back from the TELE stop
+    park_focus_steps: 2164  # physical steps back from the FAR stop
+    zoom_pps: 600
+    focus_pps: 600
+
 autofocus:
   enabled: true
   startup_af: true

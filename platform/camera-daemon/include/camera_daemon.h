@@ -37,6 +37,7 @@ extern "C" {
 #include "media/hal_media.h"
 #include "peripheral/devices/hal_sensor.h"
 #include "peripheral/hal_mcu.h"
+#include "peripheral/devices/hal_lens_fg2009.h"
 }
 
 #ifdef HAS_GRPC
@@ -201,6 +202,12 @@ struct DaemonConfig {
     int32_t     lens_zoom_max      = 760;
     int32_t     lens_focus_min     = -844;
     int32_t     lens_focus_max     = 592;
+
+    // Lens product model (factory-fixed, from /data/aipc/etc/product.yaml).
+    // "af0832" (legacy default when product.yaml is absent) | "fg2009".
+    std::string lens_model = "af0832";
+    // FG2009 open-loop bootstrap geometry (bench-calibrated, yaml-overridable)
+    HalLensFg2009Params lens_fg2009 = {};
 
     AutofocusConfig autofocus;
     IlluminationConfig infrared;

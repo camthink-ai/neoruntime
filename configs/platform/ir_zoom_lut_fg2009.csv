@@ -1,0 +1,16 @@
+# FG2009 IR zoom-follow LUT.
+# Ratio column spans this lens's optical range (1.0 .. 2.2416, 9 evenly
+# spaced rows); PWM columns are carried over verbatim from the AF0832 LUT
+# (near 100->0, far 0->100 crossover). Selected at runtime when
+# product.yaml lens.model == fg2009 and camera-daemon.yaml still points
+# infrared.lut_path at the AF0832 default.
+zoom_ratio,near_pwm,far_pwm
+1.000,100,0
+1.165,85,0
+1.330,80,0
+1.495,80,5
+1.660,75,10
+1.826,55,25
+1.991,32,50
+2.156,12,80
+2.242,0,100
