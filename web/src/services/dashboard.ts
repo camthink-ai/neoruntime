@@ -195,3 +195,30 @@ export const useNetworkStats = () => useQuery<NetworkStats>({
     },
     refetchInterval: 5000,
   });
+
+export interface MonitorSnapshot {
+  timestamp: number;
+  cpu: number;
+  memory: number;
+  npu: number;
+  temperatures: {
+    cpu: number;
+    npu: number;
+    board: number;
+  };
+  network?: {
+    bytes_sent: number;
+    bytes_recv: number;
+  };
+}
+
+// 资源快照：dashboard 内多处共享，避免重复轮询 /api/v1/monitor/snapshot
+export const useMonitorSnapshot = () => useQuery<MonitorSnapshot>({
+    queryKey: ['monitorSnapshot'],
+    queryFn: async () => {
+      const response = await monitorApi.getSnapshot();
+      return response?.data as MonitorSnapshot;
+    },
+    refetchInterval: 2000,
+    retry: false,
+  });
