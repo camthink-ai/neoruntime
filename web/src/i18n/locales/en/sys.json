@@ -1733,7 +1733,9 @@
         "set_failed": "Failed to update setting"
       },
       "lens": {
-        "title": "Lens Control"
+        "title": "Lens Control",
+        "model_badge": "Factory-fitted lens model",
+        "manual_only": "Manual zoom & focus"
       },
       "peripheral": {
         "title": "Peripheral Control",

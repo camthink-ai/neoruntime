@@ -175,13 +175,28 @@ export const useStartZoomFollow = () => useMutation({
     },
   });
 
-export const useAutofocusStatus = () => useQuery<AutofocusStatus>({
+// Open-loop zoom goto (fg2009): the move blocks until the motor stops, so
+// refresh lens/device status when it lands.
+export const useLensGotoZoomRatio = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (zoomRatio: number) => {
+      const response = await deviceApi.gotoZoomRatio(zoomRatio);
+      return (response as any).data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['device', 'lens'] }),
+  });
+};
+
+export const useAutofocusStatus = (options?: { enabled?: boolean }) => useQuery<AutofocusStatus>({
     queryKey: ['device', 'lens', 'autofocus'],
     queryFn: async () => {
       const response = await deviceApi.getAutofocusStatus();
       return (response as any).data as AutofocusStatus;
     },
     refetchInterval: 400,
+    // AF-disabled lenses (fg2009) never poll the autofocus status.
+    enabled: options?.enabled ?? true,
   });
 
 export const useCancelAutofocus = () => useMutation<unknown, Error, number | undefined>({

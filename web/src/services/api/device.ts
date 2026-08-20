@@ -7,6 +7,11 @@ export interface LensAxisLimit {
   max_pos: number;
 }
 
+export interface ZoomRatioRange {
+  min: number;
+  max: number;
+}
+
 export const MotorState = {
   NoCfg: 0,
   Stopped: 1,
@@ -27,6 +32,11 @@ export interface LensStatus {
   autofocus_enabled: boolean;
   zoom_limit: LensAxisLimit;
   focus_limit: LensAxisLimit;
+  // Factory-fitted lens identity (empty on old backends → treat as af0832)
+  lens_model?: string;
+  // Current optical zoom ratio (position model on fg2009, AF table on af0832)
+  zoom_ratio?: number;
+  zoom_ratio_range?: ZoomRatioRange;
 }
 
 export interface AutofocusStatus {
@@ -139,6 +149,9 @@ export const deviceApi = {
   oneshotAutofocus: () => request.post('/api/v1/device/lens/oneshot-af'),
 
   startZoomFollow: (ratio: number) => request.post('/api/v1/device/lens/zoom-follow', { ratio }),
+
+  // Open-loop zoom positioning (fg2009): goto an optical ratio directly.
+  gotoZoomRatio: (zoomRatio: number) => request.post('/api/v1/device/lens/goto-ratio', { zoom_ratio: zoomRatio }),
 
   getAutofocusStatus: () => request.get('/api/v1/device/lens/af/status', { silent: true }),
 

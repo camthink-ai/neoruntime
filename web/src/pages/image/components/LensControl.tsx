@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import {
   useAutofocusStatus,
+  useLensGotoZoomRatio,
   useLensStatus,
   useOneshotAutofocus,
   useSetFocusLevel,
@@ -84,10 +85,19 @@ export default function LensControl() {
     isLoading: isDeviceLoading,
     refetch: refetchLensStatus,
   } = useLensStatus();
-  const { data: autofocusStatus } = useAutofocusStatus();
+
+  // FG2009 = open-loop lens: pure manual zoom/focus, no autofocus stack.
+  // An old backend without lens_model reports undefined → AF0832 behavior.
+  const isFg2009 = lensStatus?.lens_model === 'fg2009';
+  const zoomDisplayMax = lensStatus?.zoom_ratio_range?.max && lensStatus.zoom_ratio_range.max > 1
+    ? lensStatus.zoom_ratio_range.max
+    : ZOOM_DISPLAY_MAX;
+
+  const { data: autofocusStatus } = useAutofocusStatus({ enabled: !isFg2009 });
 
   const oneshotAutofocus = useOneshotAutofocus();
   const startZoomFollow = useStartZoomFollow();
+  const lensGotoZoomRatio = useLensGotoZoomRatio();
   const setFocusLevel = useSetFocusLevel();
 
   const [zoomPercent, setZoomPercent] = useState(0);
@@ -97,6 +107,15 @@ export default function LensControl() {
   // ── Derived state ─────────────────────────────────────────────────
 
   const zLevel = useMemo(() => {
+    if (isFg2009) {
+      // Open-loop lens: the reported optical ratio comes straight from the
+      // position model — there is no autofocus anchor to consult.
+      const ratio = lensStatus?.zoom_ratio;
+      if (ratio != null && ratio >= ZOOM_DISPLAY_MIN && ratio <= zoomDisplayMax) {
+        return clamp01((ratio - ZOOM_DISPLAY_MIN) / (zoomDisplayMax - ZOOM_DISPLAY_MIN));
+      }
+      return lensStatus ? zoomLevelFromStatus(lensStatus) : 0;
+    }
     if (
       autofocusStatus?.anchor_valid
       && autofocusStatus.effective_ratio >= ZOOM_DISPLAY_MIN
@@ -108,7 +127,7 @@ export default function LensControl() {
       );
     }
     return lensStatus ? zoomLevelFromStatus(lensStatus) : 0;
-  }, [autofocusStatus?.anchor_valid, autofocusStatus?.effective_ratio, lensStatus]);
+  }, [autofocusStatus?.anchor_valid, autofocusStatus?.effective_ratio, isFg2009, lensStatus, zoomDisplayMax]);
   const fLevel = useMemo(
     () => (lensStatus ? focusLevelFromStatus(lensStatus) : 0),
     [lensStatus]
@@ -127,8 +146,8 @@ export default function LensControl() {
 
   const zoomRatioDisplay = useMemo(() => {
     const level = clamp01(zoomPercent / 100);
-    return ZOOM_DISPLAY_MIN + (ZOOM_DISPLAY_MAX - ZOOM_DISPLAY_MIN) * level;
-  }, [zoomPercent]);
+    return ZOOM_DISPLAY_MIN + (zoomDisplayMax - ZOOM_DISPLAY_MIN) * level;
+  }, [zoomPercent, zoomDisplayMax]);
 
   const focusDisplay = useMemo(() => {
     const dir = focusDirectionLabel(fLevel);
@@ -152,7 +171,8 @@ export default function LensControl() {
       || focusState === MotorState.Running
       || focusState === MotorState.ResetZero);
 
-  const isZoomBusy =    startZoomFollow.isPending || afBusy || isMotorInitializing || hasMotorError;
+  const isZoomBusy =    (isFg2009 ? lensGotoZoomRatio.isPending : startZoomFollow.isPending)
+    || afBusy || isMotorInitializing || hasMotorError;
   const isFocusBusy =    setFocusLevel.isPending || afBusy || isMotorInitializing || hasMotorError;
 
   const canZoomIn =    lensStatus != null && lensStatus.zoom_pos < lensStatus.zoom_limit.max_pos;
@@ -198,6 +218,10 @@ export default function LensControl() {
 
   const handleResetZoom = async () => {
     setZoomPercent(0);
+    if (isFg2009) {
+      await lensGotoZoomRatio.mutateAsync(ZOOM_DISPLAY_MIN);
+      return;
+    }
     await startZoomFollow.mutateAsync(ZOOM_DISPLAY_MIN);
   };
 
@@ -267,36 +291,50 @@ export default function LensControl() {
         <h3 className="flex items-center gap-1.5 text-sm font-bold text-muted-foreground">
           <Aperture className="h-4 w-4" />
           {t('sys.device.lens.title', 'Lens Control')}
+          {isFg2009 && (
+            <span
+              className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-muted-foreground"
+              title={t('sys.device.lens.model_badge', 'Factory-fitted lens model')}
+            >
+              FG2009
+            </span>
+          )}
         </h3>
 
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
-            <span>{t('sys.ptz.oneshot_af', 'One-shot AF')}</span>
-            <TooltipProvider delayDuration={200}>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
-                    aria-label={t(
+          {isFg2009 ? (
+            <span className="text-sm text-muted-foreground">
+              {t('sys.device.lens.manual_only', 'Manual zoom & focus')}
+            </span>
+          ) : (
+            <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+              <span>{t('sys.ptz.oneshot_af', 'One-shot AF')}</span>
+              <TooltipProvider delayDuration={200}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                      aria-label={t(
+                        'sys.ptz.oneshot_af_hint',
+                        'Tap to trigger auto focus at current zoom position'
+                      )}
+                    >
+                      <Info className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" className="text-xs max-w-[280px]">
+                    {t(
                       'sys.ptz.oneshot_af_hint',
                       'Tap to trigger auto focus at current zoom position'
                     )}
-                  >
-                    <Info className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="top" className="text-xs max-w-[280px]">
-                  {t(
-                    'sys.ptz.oneshot_af_hint',
-                    'Tap to trigger auto focus at current zoom position'
-                  )}
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-          </div>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            </div>
+          )}
           <div className="flex items-center gap-1">
             <TooltipProvider delayDuration={200}>
               <Tooltip>
@@ -318,21 +356,23 @@ export default function LensControl() {
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
-            <Button
-              type="button"
-              variant="outline"
-              size="icon"
-              className="h-9 w-9 bg-[#f24a001a] border-transparent hover:bg-[#f24a001a]"
-              disabled={isOneshotAF || isZoomBusy || isFocusBusy}
-              onClick={handleOneshotAutofocus}
-              aria-label={t('sys.ptz.oneshot_af', 'One-shot AF')}
-            >
-              {isOneshotAF ? (
-                <Loader2 className="w-4 h-4 animate-spin text-primary" />
-              ) : (
-                <Crosshair className="w-4 h-4 text-primary" />
-              )}
-            </Button>
+            {!isFg2009 && (
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="h-9 w-9 bg-[#f24a001a] border-transparent hover:bg-[#f24a001a]"
+                disabled={isOneshotAF || isZoomBusy || isFocusBusy}
+                onClick={handleOneshotAutofocus}
+                aria-label={t('sys.ptz.oneshot_af', 'One-shot AF')}
+              >
+                {isOneshotAF ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-primary" />
+                ) : (
+                  <Crosshair className="w-4 h-4 text-primary" />
+                )}
+              </Button>
+            )}
           </div>
         </div>
 
@@ -345,7 +385,11 @@ export default function LensControl() {
           onLevelChange={setZoomPercent}
           onCommit={async level => {
             const ratio = ZOOM_DISPLAY_MIN
-              + (ZOOM_DISPLAY_MAX - ZOOM_DISPLAY_MIN) * clamp01(level);
+              + (zoomDisplayMax - ZOOM_DISPLAY_MIN) * clamp01(level);
+            if (isFg2009) {
+              await lensGotoZoomRatio.mutateAsync(ratio);
+              return;
+            }
             await startZoomFollow.mutateAsync(ratio);
           }}
           busy={isZoomBusy}
