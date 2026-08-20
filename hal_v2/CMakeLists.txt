@@ -220,6 +220,10 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         set(_GEN_BUNDLE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/hailo15_media")
         set(_GEN_BUNDLE "${_GEN_BUNDLE_DIR}/hailo15_default_medialib_bundle.cpp")
         if(HAL_V2_EMBED_DEFAULT_MEDIALIB)
+            # Track every overlay file (not just the container json) so retuned
+            # iq_settings/calib files regenerate the bundle on incremental builds.
+            file(GLOB_RECURSE _HAL_OVERLAY_FILES CONFIGURE_DEPENDS
+                    "${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/default_medialib_overlay/*")
             add_custom_command(
                 OUTPUT ${_GEN_BUNDLE}
                 COMMAND ${CMAKE_COMMAND} -E make_directory ${_GEN_BUNDLE_DIR}
@@ -232,7 +236,7 @@ if(HAL_PLATFORM STREQUAL "hailo15")
                         --profiles ${HAL_V2_DEFAULT_MEDIALIB_PROFILES}
                         --out ${_GEN_BUNDLE}
                 DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/gen_default_medialib_bundle.py
-                        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/default_medialib_overlay/etc/imaging/cfg/medialib_configs/webserver_medialib_config.json
+                        ${_HAL_OVERLAY_FILES}
                 COMMENT "Generating self-contained default medialib bundle (5 Basic + Infrared profiles)"
                 VERBATIM
             )
