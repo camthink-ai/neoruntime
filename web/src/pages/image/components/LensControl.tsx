@@ -38,6 +38,12 @@ import MotorAxisControl from './MotorAxisControl';
 const ZOOM_DISPLAY_MIN = 1.0;
 const ZOOM_DISPLAY_MAX = 2.88;
 
+// Fine-grained +/- and slider steps (percent of range per click). Focus needs
+// the finer step: 0.2% ≈ 5 motor steps on the FG2009, enough to land exactly
+// on a focus peak; zoom 0.5% ≈ 12 steps ≈ 0.006x.
+const ZOOM_STEP_PERCENT = 0.5;
+const FOCUS_STEP_PERCENT = 0.2;
+
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -136,12 +142,12 @@ export default function LensControl() {
   // Sync local percent from server when it changes
   const prevZ = useMemo(() => zLevel, [zLevel]);
   useEffect(() => {
-    setZoomPercent(Math.round(prevZ * 100));
+    setZoomPercent(prevZ * 100);
   }, [prevZ]);
 
   const prevF = useMemo(() => fLevel, [fLevel]);
   useEffect(() => {
-    setFocusPercent(Math.round(prevF * 100));
+    setFocusPercent(prevF * 100);
   }, [prevF]);
 
   const zoomRatioDisplay = useMemo(() => {
@@ -151,7 +157,7 @@ export default function LensControl() {
 
   const focusDisplay = useMemo(() => {
     const dir = focusDirectionLabel(fLevel);
-    return `${Math.round(fLevel * 100)}% · ${dir}`;
+    return `${(fLevel * 100).toFixed(1)}% · ${dir}`;
   }, [fLevel]);
 
   const afBusy = autofocusStatus?.busy ?? false;
@@ -380,8 +386,9 @@ export default function LensControl() {
 
         <MotorAxisControl
           label={t('sys.ptz.zoom', 'Zoom')}
-          displayValue={`${zoomRatioDisplay.toFixed(1)}x`}
+          displayValue={`${zoomRatioDisplay.toFixed(2)}x`}
           level={zoomPercent}
+          stepPercent={ZOOM_STEP_PERCENT}
           onLevelChange={setZoomPercent}
           onCommit={async level => {
             const ratio = ZOOM_DISPLAY_MIN
@@ -401,6 +408,7 @@ export default function LensControl() {
           label={t('sys.ptz.focus', 'Focus')}
           displayValue={focusDisplay}
           level={focusPercent}
+          stepPercent={FOCUS_STEP_PERCENT}
           onLevelChange={setFocusPercent}
           onCommit={async level => {
             await setFocusLevel.mutateAsync(level);
