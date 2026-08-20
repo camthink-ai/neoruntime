@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import ReactECharts from 'echarts-for-react';
 import { useTranslation } from 'react-i18next';
 import { Activity } from 'lucide-react';
@@ -9,10 +9,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { monitorApi } from '@/services/api/system';
+import { useMonitorSnapshot } from '@/services/dashboard';
 
 const MAX_DATA_POINTS = 30;
-const POLL_INTERVAL = 2000; // 2 seconds
 
 type ChartType = 'usage' | 'temp' | 'network';
 
@@ -87,63 +86,54 @@ export default function ResourceTrendCard({
     };
   }, []);
 
-  const fetchData = useCallback(async () => {
-    try {
-      const response = await monitorApi.getSnapshot();
-      const d = response.data;
-      if (!d) return;
+  const { data: snapshot } = useMonitorSnapshot();
 
-      const now = new Date();
-      let networkUp = 0;
-      let networkDown = 0;
-
-      if (d.network && prevNetworkRef.current) {
-        const dt = (d.timestamp - prevNetworkRef.current.timestamp) / 1000;
-        if (dt > 0) {
-          // 字节数 ×8 → 比特，单位 Mb/s（小 b = bit）
-          networkUp =            ((d.network.bytes_sent - prevNetworkRef.current.bytesSent)
-              / dt
-              / (1024 * 1024))
-            * 8;
-          networkDown =            ((d.network.bytes_recv - prevNetworkRef.current.bytesRecv)
-              / dt
-              / (1024 * 1024))
-            * 8;
-        }
-      }
-
-      if (d.network) {
-        prevNetworkRef.current = {
-          bytesSent: d.network.bytes_sent,
-          bytesRecv: d.network.bytes_recv,
-          timestamp: d.timestamp,
-        };
-      }
-
-      const point: DataPoint = {
-        time: formatTime(now),
-        cpu: d.cpu || 0,
-        memory: d.memory || 0,
-        npu: d.npu || 0,
-        tempSoc: d.temperatures?.cpu || 0,
-        tempBoard: d.temperatures?.board || 0,
-        networkUp: Math.max(0, networkUp),
-        networkDown: Math.max(0, networkDown),
-        networkTotal: Math.max(0, networkUp + networkDown),
-      };
-
-      setDataHistory(prev => [...prev, point].slice(-MAX_DATA_POINTS));
-    } catch {
-      // Silently ignore fetch errors to avoid chart disruption
-    }
-  }, []);
-
-  // Polling
+  // Append each new snapshot to the history
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, POLL_INTERVAL);
-    return () => clearInterval(interval);
-  }, [fetchData]);
+    if (!snapshot) return;
+    const d = snapshot;
+
+    const now = new Date();
+    let networkUp = 0;
+    let networkDown = 0;
+
+    if (d.network && prevNetworkRef.current) {
+      const dt = (d.timestamp - prevNetworkRef.current.timestamp) / 1000;
+      if (dt > 0) {
+        // 字节数 ×8 → 比特，单位 Mb/s（小 b = bit）
+        networkUp =            ((d.network.bytes_sent - prevNetworkRef.current.bytesSent)
+            / dt
+            / (1024 * 1024))
+          * 8;
+        networkDown =            ((d.network.bytes_recv - prevNetworkRef.current.bytesRecv)
+            / dt
+            / (1024 * 1024))
+          * 8;
+      }
+    }
+
+    if (d.network) {
+      prevNetworkRef.current = {
+        bytesSent: d.network.bytes_sent,
+        bytesRecv: d.network.bytes_recv,
+        timestamp: d.timestamp,
+      };
+    }
+
+    const point: DataPoint = {
+      time: formatTime(now),
+      cpu: d.cpu || 0,
+      memory: d.memory || 0,
+      npu: d.npu || 0,
+      tempSoc: d.temperatures?.cpu || 0,
+      tempBoard: d.temperatures?.board || 0,
+      networkUp: Math.max(0, networkUp),
+      networkDown: Math.max(0, networkDown),
+      networkTotal: Math.max(0, networkUp + networkDown),
+    };
+
+    setDataHistory(prev => [...prev, point].slice(-MAX_DATA_POINTS));
+  }, [snapshot]);
 
   const timeLabels = useMemo(() => dataHistory.map(d => d.time), [dataHistory]);
 
