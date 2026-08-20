@@ -112,8 +112,10 @@ type DeviceControlServer struct {
 	// Factory-fitted lens model and its optical ratio ceiling, learned via
 	// ProfileGet during lens init. Guarded by lensStatusMu. Empty model (or
 	// an old camera-daemon without the RPC) means "assume AF0832".
-	lensModel        string
-	lensMaxZoomRatio float32
+	lensModel             string
+	lensMaxZoomRatio      float32
+	lensZoomTravelSteps   int32
+	lensFocusTravelSteps  int32
 
 	// Camera-daemon gRPC client for IR-Cut control
 	cameraDaemonClient camerapb.CameraControlClient
@@ -1297,6 +1299,8 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 	s.lensStatusMu.RLock()
 	lensModel := s.lensModel
 	maxRatio := s.lensMaxZoomRatio
+	zoomTravel := s.lensZoomTravelSteps
+	focusTravel := s.lensFocusTravelSteps
 	cached := s.lastLensStatus
 	hasCached := s.hasLensStatus
 	s.lensStatusMu.RUnlock()
@@ -1310,6 +1314,13 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 		}
 		if hasRatio {
 			resp.ZoomRatio = ratio
+		}
+		// The open-loop model reports positions in curve coordinates; pair
+		// them with the profile's travel limits instead of the AF0832 step
+		// limits this service was configured with.
+		if lensModel == "fg2009" && zoomTravel > 0 && focusTravel > 0 {
+			resp.ZoomLimit = &pb.LensLimit{MinPos: 0, MaxPos: zoomTravel}
+			resp.FocusLimit = &pb.LensLimit{MinPos: 0, MaxPos: focusTravel}
 		}
 	}
 	fallbackStatus := func() *pb.LensStatusResponse {
@@ -2210,6 +2221,8 @@ func initializeRemoteLens(s *DeviceControlServer, client *lens.LensClient) error
 		s.lensStatusMu.Lock()
 		s.lensModel = profile.Model
 		s.lensMaxZoomRatio = profile.MaxZoomRatio
+		s.lensZoomTravelSteps = profile.ZoomTravelSteps
+		s.lensFocusTravelSteps = profile.FocusTravelSteps
 		s.lensStatusMu.Unlock()
 		if profile.Model == "fg2009" {
 			// Init already pushed the MCU profile, anchored the open-loop
