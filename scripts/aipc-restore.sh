@@ -304,7 +304,6 @@ SERVICES_ORDERED=(
     app-manager
     device-control
     device-discovery
-    onvif-device
 )
 if [[ -d /data/aipc/bin ]]; then
     for bin in "${SERVICES_ORDERED[@]}" aipc-cli; do

@@ -20,7 +20,6 @@
 #include <functional>
 #include <cstdint>
 #include <memory>
-#include <chrono>
 
 extern "C" {
     #include "hal_buffer.h"
@@ -107,10 +106,6 @@ private:
         uint32_t pkt_count   = 0;
         uint32_t octet_count = 0;
 
-        // Last time an RTCP Sender Report was emitted for this client
-        // (throttles SR to ~once per 5s — see maybe_send_rtcp_sr).
-        std::chrono::steady_clock::time_point last_rtcp_send;
-
         // Audio track (multi-track: video stream with embedded audio)
         bool     has_audio = false;
         uint8_t audio_rtp_channel  = 2;
@@ -162,12 +157,6 @@ private:
                       bool marker, uint32_t ts);
     void send_tcp_interleaved(Client& c, uint8_t channel,
                               const uint8_t* data, size_t len);
-
-    // Emit a throttled RTCP Sender Report on the video RTCP channel so that
-    // strict RTSP clients (ONVIF Device Manager and its RTCP liveness
-    // watchdog) do not declare the stream dead ("no signal") while media
-    // keeps flowing. Caller must hold c.write_mu.
-    void maybe_send_rtcp_sr(Client& c, uint32_t rtp_ts);
 
     void server_loop();
     void handle_client_data(int client_id);

@@ -27,10 +27,15 @@ make camera-daemon
 
 ## Branch Policy
 
-- Start every contribution from the latest `main`.
+- `develop` is the integration branch: start every contribution from the latest
+  `develop` and open PRs against `develop`.
+- `main` is the stable release branch: it only receives changes through release
+  PRs from `develop`, or short-lived hotfix branches cut from `main`.
 - Functional changes must be developed on a separate branch and submitted by PR.
   Do not commit feature, bug-fix, refactor, performance, build, or runtime
-  behavior changes directly to `main`.
+  behavior changes directly to `main` or `develop`.
+- After a hotfix merges into `main`, merge `main` back into `develop` so the
+  two branches do not drift.
 - Use short, descriptive branch names:
   - `feat/<area>-<summary>` for new functionality.
   - `fix/<area>-<summary>` for bug fixes.
@@ -44,8 +49,8 @@ Example:
 
 ```bash
 git fetch origin
-git switch main
-git pull --ff-only origin main
+git switch develop
+git pull --ff-only origin develop
 git switch -c feat/media-config-export
 ```
 

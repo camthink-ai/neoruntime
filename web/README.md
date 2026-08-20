@@ -23,27 +23,12 @@ pnpm dev
 
 ## Environment Variables
 
-A committed template lives at [`web/.env.example`](./.env.example). Copy it to a gitignored `web/.env` and adjust the values for your setup:
+Prefer `web/.env` (repo includes a template). You can also create `web/.env.local` to override local settings.
 
 ```bash
-cp web/.env.example web/.env
+VITE_API_TARGET=http://127.0.0.1:8080
+VITE_APP_BASE=/
 ```
-
-You can also create `web/.env.local` to override individual settings without touching `web/.env` (also gitignored).
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `VITE_API_TARGET` | `http://localhost:8080` | Backend target for the Vite dev proxy (`/api/*`). |
-| `VITE_WS_URL` | — | WebSocket endpoint (LOCAL/REMOTE templates in `.env.example`). |
-| `VITE_VIDEO_STREAM_URL` | — | H.264 video stream WebSocket endpoint. |
-| `VITE_API_BASE_URL` | `/api/v1` | Relative API base path used by the frontend. |
-| `VITE_API_TOKEN` | — | API token, if your backend requires one. |
-| `VITE_USE_MOCK_DATA` | `false` | `true` serves mock data instead of calling the API. |
-| `VITE_ENABLE_AUTH` | `true` | `false` disables the login/auth flow. |
-| `VITE_APP_BASE` | `/` | Public path the app is served from. |
-| `VITE_HTTPS` | off | `true` serves dev over HTTPS via a trusted self-signed cert (mkcert). |
-
-See [`web/.env.example`](./.env.example) for the LOCAL/REMOTE backend templates and full comments.
 
 ---
 

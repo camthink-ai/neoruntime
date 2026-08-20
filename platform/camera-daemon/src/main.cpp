@@ -199,44 +199,6 @@ static std::string derive_install_prefix(const std::string& config_path) {
     return "/opt/aipc";
 }
 
-static bool media_config_contains_profile(const std::string& path,
-                                          const std::string& profile_name) {
-    if (path.empty() || profile_name.empty()) return false;
-
-    std::ifstream file(path);
-    if (!file.is_open()) return false;
-
-    std::ostringstream contents;
-    contents << file.rdbuf();
-    const std::string json = contents.str();
-    const std::string quoted_name = "\"" + profile_name + "\"";
-    return json.find("\"name\"") != std::string::npos &&
-           json.find(quoted_name) != std::string::npos;
-}
-
-static void select_product_media_config_for_infrared(DaemonConfig& config) {
-    static constexpr const char* kProductMediaConfig =
-        "/data/aipc/etc/imaging/hailo15h/imx678/theia_sl410m/4k/"
-        "medialib_configs/webserver_medialib_config.json";
-
-    if (!config.infrared.enabled ||
-        media_config_contains_profile(config.media_config_path,
-                                      config.infrared.infrared_profile)) {
-        return;
-    }
-    if (!media_config_contains_profile(kProductMediaConfig,
-                                       config.infrared.infrared_profile)) {
-        return;
-    }
-
-    HAL_LOG_WARNING("Configured media file '%s' does not provide profile '%s'; "
-                    "using product media file '%s'",
-                    config.media_config_path.c_str(),
-                    config.infrared.infrared_profile.c_str(),
-                    kProductMediaConfig);
-    config.media_config_path = kProductMediaConfig;
-}
-
 static DaemonConfig load_config(const std::string& path) {
     DaemonConfig cfg;
 
@@ -315,8 +277,6 @@ static DaemonConfig load_config(const std::string& path) {
         if (trimmed.find("ai_overlay:") == 0) { section = "ai_overlay"; continue; }
         if (trimmed.find("audio:") == 0) { section = "audio"; continue; }
         if (trimmed.find("autofocus:") == 0) { section = "autofocus"; continue; }
-        if (trimmed.find("infrared:") == 0) { section = "infrared"; continue; }
-        if (trimmed.find("light_sensor:") == 0) { section = "light_sensor"; continue; }
         if (trimmed.find("service:") == 0) { section = "service"; continue; }
         if (trimmed.find("streams:") == 0) { section = "streams"; cfg.streams.clear(); continue; }
         if (trimmed.find("encoders:") == 0) { section = "encoders"; cfg.encoders.clear(); continue; }
@@ -542,46 +502,6 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.autofocus.sensor_native_width = static_cast<int>(parse_u32_config(val, "autofocus.sensor_native_width"));
             else if (trimmed.find("sensor_native_height:") != std::string::npos)
                 cfg.autofocus.sensor_native_height = static_cast<int>(parse_u32_config(val, "autofocus.sensor_native_height"));
-        } else if (section == "infrared") {
-            if (trimmed.find("enabled:") != std::string::npos)
-                cfg.infrared.enabled = (val == "true" || val == "1");
-            else if (trimmed.find("profile_name:") != std::string::npos)
-                cfg.infrared.infrared_profile = val;
-            else if (trimmed.find("default_mode:") != std::string::npos)
-                cfg.infrared.default_mode = val;
-            else if (trimmed.find("near_led_id:") != std::string::npos)
-                cfg.infrared.near_led_id = parse_u32_config(val, "infrared.near_led_id", 255);
-            else if (trimmed.find("far_led_id:") != std::string::npos)
-                cfg.infrared.far_led_id = parse_u32_config(val, "infrared.far_led_id", 255);
-            else if (trimmed.find("auto_follow:") != std::string::npos)
-                cfg.infrared.auto_follow = (val == "true" || val == "1");
-            else if (trimmed.find("lut_path:") != std::string::npos)
-                cfg.infrared.lut_path = val;
-            else if (trimmed.find("deadband_percent:") != std::string::npos)
-                cfg.infrared.deadband_percent = static_cast<int>(parse_u32_config(val, "infrared.deadband_percent", 100));
-            else if (trimmed.find("endpoint_settle_frames:") != std::string::npos)
-                cfg.infrared.endpoint_settle_frames = static_cast<int>(parse_u32_config(val, "infrared.endpoint_settle_frames"));
-            else if (trimmed.find("mode_settle_frames:") != std::string::npos)
-                cfg.infrared.mode_settle_frames = static_cast<int>(parse_u32_config(val, "infrared.mode_settle_frames"));
-            else if (trimmed.find("log_updates:") != std::string::npos)
-                cfg.infrared.log_updates = (val == "true" || val == "1");
-        } else if (section == "light_sensor") {
-            if (trimmed.find("enabled:") != std::string::npos)
-                cfg.light_sensor.enabled = (val == "true" || val == "1");
-            else if (trimmed.find("auto_on_boot:") != std::string::npos)
-                cfg.light_sensor.auto_on_boot = (val == "true" || val == "1");
-            else if (trimmed.find("night_enter:") != std::string::npos)
-                cfg.light_sensor.night_enter = static_cast<int>(parse_u32_config(val, "light_sensor.night_enter", 100));
-            else if (trimmed.find("day_enter:") != std::string::npos)
-                cfg.light_sensor.day_enter = static_cast<int>(parse_u32_config(val, "light_sensor.day_enter", 100));
-            else if (trimmed.find("sample_interval_ms:") != std::string::npos)
-                cfg.light_sensor.sample_interval_ms = static_cast<int>(parse_u32_config(val, "light_sensor.sample_interval_ms", 60000));
-            else if (trimmed.find("stable_samples:") != std::string::npos)
-                cfg.light_sensor.stable_samples = static_cast<int>(parse_u32_config(val, "light_sensor.stable_samples", 100));
-            else if (trimmed.find("dark_mv:") != std::string::npos)
-                cfg.light_sensor.dark_mv = static_cast<int>(parse_u32_config(val, "light_sensor.dark_mv", 3300));
-            else if (trimmed.find("bright_mv:") != std::string::npos)
-                cfg.light_sensor.bright_mv = static_cast<int>(parse_u32_config(val, "light_sensor.bright_mv", 3300));
         } else if (section == "service") {
             if (trimmed.find("log_level:") != std::string::npos)
                 cfg.log_level = val;
@@ -682,7 +602,6 @@ int main(int argc, char** argv) {
     // Load configuration
     DaemonConfig config = load_config(config_path);
     setup_logging(config.log_level, config.log_file, config_path);
-    select_product_media_config_for_infrared(config);
 
     HAL_LOG_INFO("===================================");
     HAL_LOG_INFO("AIPC Camera Daemon v2.0.0");

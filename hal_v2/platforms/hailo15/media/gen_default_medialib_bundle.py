@@ -23,10 +23,9 @@ self-contained (no dependency on /etc/imaging/cfg/...), this script:
 Usage:
   gen_default_medialib_bundle.py \
       --sysroot <SDK sysroot> \
-      --overlay <repo overlay root, optional; same layout as sysroot, searched first> \
-      --webserver-config <rel path, default etc/imaging/cfg/medialib_configs/webserver_medialib_config.json> \
+      --webserver-config <rel path under sysroot, default etc/imaging/cfg/medialib_configs/webserver_medialib_config.json> \
       --scratch-root <runtime scratch dir, default /var/tmp/hal_medialib_default> \
-      --profiles Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic,Infrared_Basic \
+      --profiles Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic \
       --out <generated .cpp path>
 """
 import argparse
@@ -116,64 +115,48 @@ def _load_json(abs_path):
         return None
 
 
-def _resolve(rel, search_roots):
-    """Return the first existing absolute path for `rel` across `search_roots`, or None.
-
-    `rel` may be absolute (leading '/' stripped) or already relative. Roots are searched in
-    list order, so an overlay root placed before the sysroot wins — this is how an
-    out-of-SDK profile (e.g. Infrared) is supplied without touching the SDK sysroot."""
-    rel = rel.lstrip("/")
-    for root in search_roots:
-        cand = os.path.join(root, rel)
-        if os.path.isfile(cand):
-            return cand
-    return None
-
-
-def _follow_ref(v, files, search_roots):
-    """If v is a .json path that resolves under a search root, load + register + recurse."""
-    if isinstance(v, str) and v.endswith(".json") and v not in files:
-        abs_path = _resolve(v, search_roots)
-        if abs_path:
+def _follow_ref(v, files, sysroot):
+    """If v is a .json path that exists in the sysroot, load + register + recurse into it."""
+    if isinstance(v, str) and v.endswith(".json"):
+        abs_path = os.path.join(sysroot, v.lstrip("/"))
+        if v not in files and os.path.isfile(abs_path):
             content = _load_json(abs_path)
             if isinstance(content, (dict, list)):
                 files[v] = content
-                _walk_and_collect(content, files, search_roots)
+                _walk_and_collect(content, files, sysroot)
 
 
-def _walk_and_collect(obj, files, search_roots):
-    """Recursively follow .json string refs that resolve under a search root, registering them
-    in `files` (keyed by original path). Shared files are naturally deduped."""
+def _walk_and_collect(obj, files, sysroot):
+    """Recursively follow .json string refs that exist in the sysroot, registering them in
+    `files` (keyed by original path). Shared files are naturally deduped."""
     if isinstance(obj, dict):
         for v in obj.values():
             if isinstance(v, str):
-                _follow_ref(v, files, search_roots)
+                _follow_ref(v, files, sysroot)
             elif isinstance(v, (dict, list)):
-                _walk_and_collect(v, files, search_roots)
+                _walk_and_collect(v, files, sysroot)
     elif isinstance(obj, list):
         for it in obj:
             if isinstance(it, str):
-                _follow_ref(it, files, search_roots)
+                _follow_ref(it, files, sysroot)
             elif isinstance(it, (dict, list)):
-                _walk_and_collect(it, files, search_roots)
+                _walk_and_collect(it, files, sysroot)
 
 
-def gather_files(search_roots, container, wanted_names):
-    """Return {orig_path: parsed_json} for every .json config file reachable from the
-    wanted profiles (resolved overlay-first across search_roots)."""
+def gather_files(sysroot, container, wanted_names):
+    """Return {orig_abs_path: parsed_json} for every .json config file reachable from the
+    wanted profiles."""
     files = {}
     for p in container.get("profiles", []):
         if p.get("name") in wanted_names:
             cf = p.get("config_file")
             if isinstance(cf, str) and cf not in files:
-                abs_path = _resolve(cf, search_roots)
-                if abs_path is None:
-                    sys.exit(f"gen_default_medialib_bundle: profile '{p['name']}' config_file not readable: {cf}")
+                abs_path = os.path.join(sysroot, cf.lstrip("/"))
                 content = _load_json(abs_path)
                 if content is None:
                     sys.exit(f"gen_default_medialib_bundle: profile '{p['name']}' config_file not readable: {cf}")
                 files[cf] = content
-                _walk_and_collect(content, files, search_roots)
+                _walk_and_collect(content, files, sysroot)
     return files
 
 
@@ -340,22 +323,14 @@ def main():
     ap.add_argument("--profiles",
                     default="Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--overlay", default="",
-                    help="Optional overlay root searched BEFORE the sysroot (same relative "
-                         "layout as the sysroot). Supplies out-of-SDK profiles such as "
-                         "Infrared — both their config files and an overriding "
-                         "webserver_medialib_config.json that lists them.")
     args = ap.parse_args()
 
     sysroot = args.sysroot.rstrip("/")
-    overlay = args.overlay.strip().rstrip("/") if args.overlay.strip() else ""
-    # overlay first so repository-provided overrides win over the SDK factory templates.
-    search_roots = [overlay, sysroot] if overlay else [sysroot]
     wanted = set(p.strip() for p in args.profiles.split(",") if p.strip())
 
-    wc_path = _resolve(args.webserver_config, search_roots)
-    if wc_path is None:
-        sys.exit(f"gen_default_medialib_bundle: webserver config not found: {args.webserver_config}")
+    wc_path = os.path.join(sysroot, args.webserver_config.lstrip("/"))
+    if not os.path.isfile(wc_path):
+        sys.exit(f"gen_default_medialib_bundle: webserver config not found: {wc_path}")
     with open(wc_path, "r") as f:
         container = json.load(f)
 
@@ -369,7 +344,7 @@ def main():
     if container.get("default_profile") not in wanted:
         container["default_profile"] = sorted(wanted)[0]
 
-    files = gather_files(search_roots, container, wanted)
+    files = gather_files(sysroot, container, wanted)
 
     # Normalize every profile to the fixed 3-stream layout (1080P / 720P / 640x384, pool 8,
     # 30fps). This mutates each profile + its application_settings and registers cloned
@@ -379,7 +354,7 @@ def main():
 
     # Re-walk newly added cloned files in case they reference further .json files.
     for content in list(files.values()):
-        _walk_and_collect(content, files, search_roots)
+        _walk_and_collect(content, files, sysroot)
 
     # Strip demo OSD overlays + static privacy masks so the compiled-in default starts clean
     # (the SDK's Basic profiles ship with example OSD text/images and may carry static masks).
