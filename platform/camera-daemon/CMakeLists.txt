@@ -33,6 +33,7 @@ set(HAL_COMMON_SOURCES
     ${HAL_COMMON_DIR}/hal_postprocess_common.c
     ${HAL_COMMON_DIR}/hal_draw_cpu.cpp
     ${HAL_COMMON_DIR}/hal_draw_ops_cpu.cpp
+    ${HAL_COMMON_DIR}/devices/hal_lens_fg2009.c
 )
 # v2 headers are in subdirectories: media/, common/, model/, peripheral/
 # Each header uses relative includes (e.g. "../common/hal_common.h")
@@ -284,4 +285,13 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     )
     target_link_libraries(daynight-policy-test PRIVATE pthread)
     add_test(NAME daynight-policy-test COMMAND daynight-policy-test)
+
+    add_executable(fg2009-position-test
+        tests/fg2009_position_test.cpp
+        ${HAL_COMMON_DIR}/devices/hal_lens_fg2009.c
+    )
+    target_include_directories(fg2009-position-test PRIVATE
+        ${HAL_V2_INC}
+    )
+    add_test(NAME fg2009-position-test COMMAND fg2009-position-test)
 endif()
