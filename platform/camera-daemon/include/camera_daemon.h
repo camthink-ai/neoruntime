@@ -651,6 +651,13 @@ private:
     bool set_led_duty_raw(uint32_t led_id, uint32_t duty_percent);
     double current_zoom_ratio() const;
 
+    // FG2009: zoom-motion observer target — replays the IR zoom-follow LUT
+    // at the new ratio (the AF0832 path gets this for free from the AF
+    // zoom-follow job; the open-loop lens has no AF, so the LensHAL service
+    // notifies us instead). Runs on the caller's thread with the lens mutex
+    // held: must not call back into the lens controller.
+    void on_fg2009_zoom_moved(double zoom_ratio);
+
     // Day/night auto (light-sensor) policy
     void start_light_monitor();
     void stop_light_monitor();

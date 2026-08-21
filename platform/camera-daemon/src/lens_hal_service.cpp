@@ -88,6 +88,11 @@ public:
         af_operation_active_.store(false);
     }
 
+    void set_zoom_motion_observer(std::function<void(float)> obs) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        zoom_motion_observer_ = std::move(obs);
+    }
+
     bool autofocus_operation_active() const override {
         return af_operation_active_.load();
     }
@@ -1010,6 +1015,10 @@ private:
     std::vector<std::pair<int32_t, int32_t>> fg2009_curve_;
     bool                    fg2009_curve_loaded_ = false;
 
+    // Fired after every issued FG2009 zoom move (new optical ratio, computed
+    // from the model while mu_ is held — receivers must not call back).
+    std::function<void(float)> zoom_motion_observer_;
+
     /* ── dlopen / dlsym ─────────────────────────────────────────────── */
 
     template<typename Fn>
@@ -1298,6 +1307,7 @@ private:
                                       delta);
         if (ret != HAL_OK) return ret;
         hal_lens_fg2009_apply_physical(&fg2009_state_, delta, 0);
+        notify_zoom_moved_locked();
         return HAL_OK;
     }
 
@@ -1331,7 +1341,20 @@ private:
             hal_lens_fg2009_clamp_pps((uint16_t)focus_pps), fdelta);
         if (ret != HAL_OK) return ret;
         hal_lens_fg2009_apply_physical(&fg2009_state_, zdelta, fdelta);
+        if (zdelta != 0) notify_zoom_moved_locked();
         return HAL_OK;
+    }
+
+    /* Fans out the new optical ratio (from the dead-reckoned model) to the
+     * zoom-motion observer, e.g. CameraDaemon's IR zoom-follow reapply.
+     * mu_ is held here: the observer must not call back into this service. */
+    void notify_zoom_moved_locked() {
+        if (!zoom_motion_observer_) return;
+        const float ratio =
+            hal_lens_fg2009_steps_to_ratio(fg2009_state_.zoom_curve);
+        HAL_LOG_INFO("LensHAL: zoom moved (curve %d, ratio %.3f); notifying "
+                     "observer", fg2009_state_.zoom_curve, ratio);
+        zoom_motion_observer_(ratio);
     }
 
     /* Physical relative jog, clamped so the model stays inside travel. */
@@ -1346,6 +1369,7 @@ private:
                                       clamped);
         if (ret != HAL_OK) return ret;
         hal_lens_fg2009_apply_physical(&fg2009_state_, clamped, 0);
+        notify_zoom_moved_locked();
         return HAL_OK;
     }
 

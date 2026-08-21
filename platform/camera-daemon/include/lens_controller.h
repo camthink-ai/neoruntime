@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 struct LensControllerState {
     uint8_t iris_state = 0;
@@ -40,4 +41,10 @@ public:
     virtual int estimate_distance(float zoom_ratio, int32_t focus_pos,
                                   float* distance_m) = 0;
     virtual float pos_to_ratio(int32_t zoom_pos) = 0;
+
+    // FG2009 only: notified right after every issued zoom move, with the new
+    // optical ratio derived from the dead-reckoned model. The default no-op
+    // keeps other builders (tests/tools) source-compatible. Called with the
+    // lens mutex held: implementations must not call back into the controller.
+    virtual void set_zoom_motion_observer(std::function<void(float)> /*obs*/) {}
 };

@@ -2922,6 +2922,14 @@ void CameraDaemon::start_grpc_server() {
             HAL_LOG_WARNING("CameraDaemon: failed to apply startup illumination mode: %s",
                             error.c_str());
         }
+        // FG2009 has no AF zoom-follow job to drive the IR LUT mid-move;
+        // subscribe to the lens service's zoom-motion notifications instead.
+        if (config_.lens_model == "fg2009" && lens_controller_) {
+            lens_controller_->set_zoom_motion_observer(
+                [this](float ratio) { on_fg2009_zoom_moved(ratio); });
+            HAL_LOG_INFO("CameraDaemon: FG2009 IR zoom-follow wired to lens "
+                         "motion observer");
+        }
     }
 
     /* Day/night auto (light-sensor) policy: take a runtime copy of the thresholds
@@ -4048,6 +4056,20 @@ bool CameraDaemon::set_led_duty_raw(uint32_t led_id, uint32_t duty_percent) {
     }
     HAL_LOG_INFO("CameraDaemon: LED %u duty set to %u%%", led_id, duty_percent);
     return true;
+}
+
+void CameraDaemon::on_fg2009_zoom_moved(double zoom_ratio) {
+    if (!illumination_controller_) return;
+    // Mirror the AF0832 zoom-follow cycle in one shot: takeover (drops a
+    // stale manual override), apply the endpoint LUT row, release.
+    std::string error;
+    illumination_controller_->begin_zoom_follow(zoom_ratio, &error);
+    illumination_controller_->apply_endpoint_ratio(zoom_ratio, &error);
+    illumination_controller_->end_zoom_follow(zoom_ratio, &error);
+    if (!error.empty()) {
+        HAL_LOG_WARNING("CameraDaemon: IR zoom-follow reapply at %.3fx: %s",
+                        zoom_ratio, error.c_str());
+    }
 }
 
 double CameraDaemon::current_zoom_ratio() const {
