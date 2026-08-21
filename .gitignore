@@ -294,8 +294,6 @@ mcu_board_prj/app/build/
 mcu_board_prj/app/Debug/
 mcu_board_prj/app/Debug/
 mcu_board_prj/build/
-mcu_board_prj/firmware/ne503_mcu_boot.*
-mcu_board_prj/firmware/ne503_Main_*.hex
 
 # Binary artifacts
 *.tar
