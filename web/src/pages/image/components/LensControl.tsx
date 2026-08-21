@@ -44,6 +44,13 @@ const ZOOM_DISPLAY_MAX = 2.88;
 const ZOOM_STEP_PERCENT = 0.5;
 const FOCUS_STEP_PERCENT = 0.2;
 
+// FG2009 focus window: after each zoom move the daemon drives focus onto the
+// INF tracking curve, and the slider narrows to +/-300 steps around that
+// landing point for comfortable fine-tuning (full travel is 2453 steps).
+// At the travel ends the window shifts inward so the span stays 600.
+const FOCUS_WINDOW_STEPS = 300;
+const FG2009_FOCUS_STEP_PERCENT = 1; // 1% of the 600-step window ≈ 6 steps
+
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -139,13 +146,64 @@ export default function LensControl() {
     [lensStatus]
   );
 
+  // FG2009 focus window: the zoom follow (daemon-side, INF tracking curve)
+  // lands focus on a known point; the slider narrows to +/-300 steps around
+  // it. Re-anchored when zoom_ratio changes (new follow landing), on mount,
+  // or when focus ends up outside the window (e.g. MCU reinit park).
+  const focusPos = lensStatus?.focus_pos;
+  const focusTravel = lensStatus
+    ? lensStatus.focus_limit.max_pos - lensStatus.focus_limit.min_pos
+    : 0;
+  const [focusCenter, setFocusCenter] = useState<number | null>(null);
+  const prevZoomRatio = useRef<number | null>(null);
+  useEffect(() => {
+    if (!isFg2009 || focusPos == null) return;
+    const zr = lensStatus?.zoom_ratio ?? null;
+    const zoomMoved = prevZoomRatio.current != null && zr != null
+      && zr !== prevZoomRatio.current;
+    prevZoomRatio.current = zr;
+    setFocusCenter(prev => {
+      if (prev == null || zoomMoved) return focusPos;
+      return Math.abs(focusPos - prev) > FOCUS_WINDOW_STEPS ? focusPos : prev;
+    });
+  }, [isFg2009, focusPos, lensStatus?.zoom_ratio]);
+
+  const focusWindow = useMemo(() => {
+    if (!isFg2009 || !lensStatus || focusTravel <= 0 || focusCenter == null) {
+      return null;
+    }
+    const { min_pos, max_pos } = lensStatus.focus_limit;
+    let lo = focusCenter - FOCUS_WINDOW_STEPS;
+    let hi = focusCenter + FOCUS_WINDOW_STEPS;
+    // Travel-end bounce: keep the full 600-step span inside [min, max].
+    if (lo < min_pos) {
+      lo = min_pos;
+      hi = Math.min(max_pos, min_pos + 2 * FOCUS_WINDOW_STEPS);
+    }
+    if (hi > max_pos) {
+      hi = max_pos;
+      lo = Math.max(min_pos, max_pos - 2 * FOCUS_WINDOW_STEPS);
+    }
+    return { lo, hi };
+  }, [isFg2009, lensStatus, focusTravel, focusCenter]);
+
+  // Window mode maps the slider onto [lo, hi]; otherwise the full travel.
+  const focusSliderLevel = useMemo(() => {
+    if (!lensStatus) return fLevel;
+    if (focusWindow && focusPos != null) {
+      const span = focusWindow.hi - focusWindow.lo;
+      if (span > 0) return clamp01((focusPos - focusWindow.lo) / span);
+    }
+    return fLevel;
+  }, [lensStatus, fLevel, focusWindow, focusPos]);
+
   // Sync local percent from server when it changes
   const prevZ = useMemo(() => zLevel, [zLevel]);
   useEffect(() => {
     setZoomPercent(prevZ * 100);
   }, [prevZ]);
 
-  const prevF = useMemo(() => fLevel, [fLevel]);
+  const prevF = useMemo(() => focusSliderLevel, [focusSliderLevel]);
   useEffect(() => {
     setFocusPercent(prevF * 100);
   }, [prevF]);
@@ -156,9 +214,15 @@ export default function LensControl() {
   }, [zoomPercent, zoomDisplayMax]);
 
   const focusDisplay = useMemo(() => {
+    // FG2009 window mode: the readout is the window-relative percent — 0% at
+    // the slider's left end, 100% at the right; the +/-300 geometry stays
+    // under the hood. AF0832 keeps the full-travel percent + direction tag.
+    if (isFg2009) {
+      return `${(focusSliderLevel * 100).toFixed(1)}%`;
+    }
     const dir = focusDirectionLabel(fLevel);
     return `${(fLevel * 100).toFixed(1)}% · ${dir}`;
-  }, [fLevel]);
+  }, [fLevel, focusSliderLevel, isFg2009]);
 
   const afBusy = autofocusStatus?.busy ?? false;
   const isOneshotAF = afBusy
@@ -169,32 +233,40 @@ export default function LensControl() {
   const focusState: MotorState = lensStatus?.focus_state ?? MotorState.NoCfg;
 
   const hasMotorError =    zoomState === MotorState.Error || focusState === MotorState.Error;
-  const isMotorInitializing =    !isDeviceLoading
+
+  // AF0832 reports Running/ResetZero while it homes at boot, which deserves
+  // the full "initializing" card below. The FG2009 is open-loop: every
+  // ordinary zoom/focus move reports Running too, so there the same state
+  // only disables the sliders until the motors stop — no card takeover.
+  const motorsRunning =    zoomState === MotorState.Running
+    || focusState === MotorState.Running;
+  const isMotorInitializing =    !isFg2009
+    && !isDeviceLoading
     && !afBusy
     && !hasMotorError
-    && (zoomState === MotorState.Running
+    && (motorsRunning
       || zoomState === MotorState.ResetZero
-      || focusState === MotorState.Running
       || focusState === MotorState.ResetZero);
+  const isMotorMoving = isFg2009 && !hasMotorError && motorsRunning;
 
   const isZoomBusy =    (isFg2009 ? lensGotoZoomRatio.isPending : startZoomFollow.isPending)
-    || afBusy || isMotorInitializing || hasMotorError;
-  const isFocusBusy =    setFocusLevel.isPending || afBusy || isMotorInitializing || hasMotorError;
+    || afBusy || isMotorInitializing || isMotorMoving || hasMotorError;
+  const isFocusBusy =    setFocusLevel.isPending || afBusy || isMotorInitializing || isMotorMoving || hasMotorError;
 
   const canZoomIn =    lensStatus != null && lensStatus.zoom_pos < lensStatus.zoom_limit.max_pos;
   const canZoomOut =    lensStatus != null && lensStatus.zoom_pos > lensStatus.zoom_limit.min_pos;
   const canFocusNear =    lensStatus != null && lensStatus.focus_pos > lensStatus.focus_limit.min_pos;
   const canFocusFar =    lensStatus != null && lensStatus.focus_pos < lensStatus.focus_limit.max_pos;
 
-  // ── Poll while motors initializing ────────────────────────────────
+  // ── Poll while motors are moving ─────────────────────────────────
 
   useEffect(() => {
-    if (!isMotorInitializing) return;
+    if (!isMotorInitializing && !isMotorMoving) return;
     const timer = setInterval(() => {
       refetchLensStatus();
     }, 1000);
     return () => clearInterval(timer);
-  }, [isMotorInitializing, refetchLensStatus]);
+  }, [isMotorInitializing, isMotorMoving, refetchLensStatus]);
 
   useEffect(() => {
     if (previousAfBusy.current && !afBusy && autofocusStatus?.job_id) {
@@ -408,9 +480,16 @@ export default function LensControl() {
           label={t('sys.ptz.focus', 'Focus')}
           displayValue={focusDisplay}
           level={focusPercent}
-          stepPercent={FOCUS_STEP_PERCENT}
+          stepPercent={isFg2009 ? FG2009_FOCUS_STEP_PERCENT : FOCUS_STEP_PERCENT}
           onLevelChange={setFocusPercent}
           onCommit={async level => {
+            if (focusWindow && focusTravel > 0) {
+              // Window mode: map [0,1] back onto the window, then express
+              // the target as an absolute level over the full travel.
+              const steps = focusWindow.lo + level * (focusWindow.hi - focusWindow.lo);
+              await setFocusLevel.mutateAsync(clamp01(steps / focusTravel));
+              return;
+            }
             await setFocusLevel.mutateAsync(level);
           }}
           busy={isFocusBusy}
