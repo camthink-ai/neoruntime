@@ -38,11 +38,10 @@ import MotorAxisControl from './MotorAxisControl';
 const ZOOM_DISPLAY_MIN = 1.0;
 const ZOOM_DISPLAY_MAX = 2.88;
 
-// Fine-grained +/- and slider steps (percent of range per click). Focus needs
-// the finer step: 0.2% ≈ 5 motor steps on the FG2009, enough to land exactly
-// on a focus peak; zoom 0.5% ≈ 12 steps ≈ 0.006x.
+// Fine-grained +/- and slider steps (percent of range per click): zoom 0.5%
+// ≈ 12 steps ≈ 0.006x; focus 1% (FG2009: 1% of the 600-step window ≈ 6 steps).
 const ZOOM_STEP_PERCENT = 0.5;
-const FOCUS_STEP_PERCENT = 0.2;
+const FOCUS_STEP_PERCENT = 1;
 
 // FG2009 focus window: after each zoom move the daemon drives focus onto the
 // INF tracking curve, and the slider narrows to +/-300 steps around that
@@ -67,12 +66,6 @@ function focusLevelFromStatus(s: LensStatus): number {
   const range = focus_limit.max_pos - focus_limit.min_pos;
   if (!Number.isFinite(range) || range <= 0) return 0;
   return clamp01((focus_pos - focus_limit.min_pos) / range);
-}
-
-function focusDirectionLabel(level: number): string {
-  if (level < 0.2) return 'NEAR';
-  if (level > 0.8) return 'FAR';
-  return 'MID';
 }
 
 // Backend autofocus status messages (camera-daemon autofocus_controller.cpp)
@@ -214,14 +207,11 @@ export default function LensControl() {
   }, [zoomPercent, zoomDisplayMax]);
 
   const focusDisplay = useMemo(() => {
-    // FG2009 window mode: the readout is the window-relative percent — 0% at
-    // the slider's left end, 100% at the right; the +/-300 geometry stays
-    // under the hood. AF0832 keeps the full-travel percent + direction tag.
-    if (isFg2009) {
-      return `${(focusSliderLevel * 100).toFixed(1)}%`;
-    }
-    const dir = focusDirectionLabel(fLevel);
-    return `${(fLevel * 100).toFixed(1)}% · ${dir}`;
+    // FG2009 window mode: window-relative percent — 0% at the slider's left
+    // end, 100% at the right; the +/-300 geometry stays under the hood.
+    // AF0832: percent over the full travel. Both are plain percents.
+    const level = isFg2009 ? focusSliderLevel : fLevel;
+    return `${(level * 100).toFixed(1)}%`;
   }, [fLevel, focusSliderLevel, isFg2009]);
 
   const afBusy = autofocusStatus?.busy ?? false;
