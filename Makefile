@@ -300,6 +300,11 @@ mcu-firmware: ensure-mcu-toolchain
 		exit 1; \
 	fi; \
 	echo "==> MCU firmware staged in $(MCU_FW_DIR)"
+	@mkdir -p mcu_board_prj/firmware
+	@rm -f mcu_board_prj/firmware/ne503_ota_package_*.bin mcu_board_prj/firmware/ne503_Main_v*.hex
+	@cp -f "$(MCU_FW_BUILD_DIR)"/ne503_ota_package_*.bin mcu_board_prj/firmware/
+	@cp -f "$(MCU_FW_BUILD_DIR)"/ne503_Main_v*.hex mcu_board_prj/firmware/
+	@echo "==> Latest OTA + HEX copied to mcu_board_prj/firmware"
 
 pack: all
 	$(MAKE) _pack-stage HAL_PLATFORM="$(HAL_PLATFORM)" VERSION="$(VERSION)"
