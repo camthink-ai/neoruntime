@@ -12,11 +12,16 @@
 #include "lens_hal.grpc.pb.h"
 
 #include <dlfcn.h>
+#include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <fstream>
 #include <mutex>
 #include <thread>
 #include <chrono>
 #include <cstring>
+#include <utility>
+#include <vector>
 
 extern "C" {
     #include "hal_common.h"
@@ -63,6 +68,7 @@ public:
             hal_lens_fg2009_params_init_defaults(&fg2009_params_);
         }
         load_bridge();
+        if (fg2009_) load_focus_curve();
     }
 
     ~LensHalServiceImpl() override {
@@ -887,7 +893,14 @@ public:
         if (reject_if_af_active(resp, "zoom_goto_ratio")) return grpc::Status::OK;
         if (reject_if_not_fg2009(resp, "zoom_goto_ratio")) return grpc::Status::OK;
         const int32_t target = hal_lens_fg2009_ratio_to_steps(req->ratio());
-        int ret = fg2009_zoom_abs_locked(req->pps(), target);
+        // Follow the INF tracking curve when available: a single DUAL_REL
+        // drives zoom -> target and focus -> curve(target) atomically. Without
+        // a loaded curve, degrade to a zoom-only move (focus left untouched).
+        const int32_t focus_target = focus_for_zoom(target);
+        int ret = (focus_target >= 0)
+            ? fg2009_dual_abs_locked(req->pps(), target,
+                                     fg2009_params_.focus_pps, focus_target)
+            : fg2009_zoom_abs_locked(req->pps(), target);
         if (ret != 0) {
             consecutive_errors_++;
             if (consecutive_errors_ >= 3) try_auto_reinit();
@@ -991,6 +1004,12 @@ private:
     HalLensFg2009Params     fg2009_params_{};
     HalLensFg2009State      fg2009_state_{};
 
+    // FG2009 focus-tracking curve (INF object distance): sorted
+    // (zoom_step, focus_step) pairs from CSV, linearly interpolated.
+    // Empty + fg2009_curve_loaded_ == false => zoom moves leave focus alone.
+    std::vector<std::pair<int32_t, int32_t>> fg2009_curve_;
+    bool                    fg2009_curve_loaded_ = false;
+
     /* ── dlopen / dlsym ─────────────────────────────────────────────── */
 
     template<typename Fn>
@@ -1000,6 +1019,86 @@ private:
             HAL_LOG_WARNING("LensHAL: symbol '%s' not found: %s", name, dlerror());
         }
         return reinterpret_cast<Fn>(p);
+    }
+
+    /* ── FG2009 focus-tracking curve ─────────────────────────────────── */
+
+    // Loads the (zoom_step, focus_step) CSV used to drive focus along the
+    // vendor INF curve on zoom moves. Missing/unreadable file leaves the
+    // curve empty (zoom-only moves) and logs a warning -- the lens still
+    // works, it just doesn't auto-follow.
+    void load_focus_curve() {
+        std::string path = cfg_.fg2009_focus_curve_path;
+        if (path.empty()) {
+            path = "/data/aipc/etc/focus_curve_fg2009.csv";
+        }
+        std::ifstream in(path);
+        if (!in.is_open()) {
+            HAL_LOG_WARNING("LensHAL: fg2009 focus curve '%s' not readable; "
+                            "zoom moves will not follow focus", path.c_str());
+            return;
+        }
+
+        std::vector<std::pair<int32_t, int32_t>> curve;
+        std::string line;
+        while (std::getline(in, line)) {
+            // Strip comments and surrounding whitespace.
+            const size_t hash = line.find('#');
+            if (hash != std::string::npos) line = line.substr(0, hash);
+            const size_t comma = line.find(',');
+            if (comma == std::string::npos) continue;
+            const std::string a = line.substr(0, comma);
+            const std::string b = line.substr(comma + 1);
+            int32_t zs = 0, fs = 0;
+            try {
+                size_t pos = 0;
+                zs = std::stoi(a, &pos);
+                if (pos != a.size()) continue;   // non-numeric header/token
+                pos = 0;
+                fs = std::stoi(b, &pos);
+                if (pos != b.size()) continue;
+            } catch (...) {
+                continue;
+            }
+            curve.emplace_back(zs, fs);
+        }
+
+        // Require a monotone, non-trivial curve; sort defensively by zoom step.
+        std::sort(curve.begin(), curve.end());
+        if (curve.size() < 2) {
+            HAL_LOG_WARNING("LensHAL: fg2009 focus curve '%s' has <2 points; "
+                            "zoom moves will not follow focus", path.c_str());
+            return;
+        }
+
+        fg2009_curve_ = std::move(curve);
+        fg2009_curve_loaded_ = true;
+        HAL_LOG_INFO("LensHAL: loaded fg2009 focus curve '%s' (%zu points, "
+                     "zoom %d..%d)",
+                     path.c_str(), fg2009_curve_.size(),
+                     fg2009_curve_.front().first, fg2009_curve_.back().first);
+    }
+
+    // Linearly interpolates the INF focus step for a given zoom curve step.
+    // Returns -1 if no curve is loaded (caller should leave focus alone).
+    int32_t focus_for_zoom(int32_t zoom_step) const {
+        if (!fg2009_curve_loaded_ || fg2009_curve_.empty()) return -1;
+        if (zoom_step <= fg2009_curve_.front().first)
+            return fg2009_curve_.front().second;
+        if (zoom_step >= fg2009_curve_.back().first)
+            return fg2009_curve_.back().second;
+        // Linear scan (32 points) is fine; the curve is small and monotone.
+        for (size_t i = 1; i < fg2009_curve_.size(); ++i) {
+            if (fg2009_curve_[i].first < zoom_step) continue;
+            const auto& lo = fg2009_curve_[i - 1];
+            const auto& hi = fg2009_curve_[i];
+            const int32_t dz = hi.first - lo.first;
+            if (dz == 0) return lo.second;
+            const double t = (double)(zoom_step - lo.first) / (double)dz;
+            return (int32_t)std::lround((double)lo.second
+                                        + t * (double)(hi.second - lo.second));
+        }
+        return fg2009_curve_.back().second;
     }
 
     void load_bridge() {
@@ -1212,6 +1311,26 @@ private:
                                        delta);
         if (ret != HAL_OK) return ret;
         hal_lens_fg2009_apply_physical(&fg2009_state_, 0, delta);
+        return HAL_OK;
+    }
+
+    /* One-shot dual-axis move: drives zoom and focus to their curve targets
+     * in a single MCU DUAL_REL command, then folds both into the model. Used
+     * by ZoomGotoRatio so focus rides the INF tracking curve atomically. */
+    int fg2009_dual_abs_locked(uint32_t zoom_pps, int32_t target_zoom,
+                               uint32_t focus_pps, int32_t target_focus) {
+        if (!initialized_ || !fg2009_state_.anchored || !sym_.dual_rel)
+            return HAL_ERR_NOT_INITIALIZED;
+        const int32_t zdelta =
+            hal_lens_fg2009_zoom_physical_delta(&fg2009_state_, target_zoom);
+        const int32_t fdelta =
+            hal_lens_fg2009_focus_physical_delta(&fg2009_state_, target_focus);
+        if (zdelta == 0 && fdelta == 0) return HAL_OK;
+        const int ret = sym_.dual_rel(1,
+            hal_lens_fg2009_clamp_pps((uint16_t)zoom_pps), zdelta,
+            hal_lens_fg2009_clamp_pps((uint16_t)focus_pps), fdelta);
+        if (ret != HAL_OK) return ret;
+        hal_lens_fg2009_apply_physical(&fg2009_state_, zdelta, fdelta);
         return HAL_OK;
     }
 

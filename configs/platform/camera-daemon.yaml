@@ -51,6 +51,11 @@ lens:
     park_focus_steps: 2164  # physical steps back from the FAR stop
     zoom_pps: 600
     focus_pps: 600
+    # Focus-tracking curve (INF): on every zoom move, focus follows this
+    # (zoom_step, focus_step) table via a single DUAL_REL. Leave empty to
+    # use /data/aipc/etc/focus_curve_fg2009.csv. Vendor values are
+    # reference-only; recalibrate per lot by editing the CSV, not the code.
+    focus_curve_path: /data/aipc/etc/focus_curve_fg2009.csv
 
 autofocus:
   enabled: true

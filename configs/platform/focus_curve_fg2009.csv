@@ -1,0 +1,42 @@
+# FG2009 focus-tracking curve (INF object distance).
+# Source: FG20090 tracking curve 20250804, visible-light sheet, INF column
+# (32 evenly spaced points, max linear-interpolation error 2.7 steps).
+# zoom_step: FG2009 zoom curve coordinate (0 = WIDE .. 2463 = TELE).
+# focus_step: FG2009 focus curve coordinate (0 = NEAR .. 2453 = FAR).
+# On every zoom move camera-daemon drives focus to this curve via DUAL_REL;
+# the user then fine-tunes within the +/-300-step web window.
+# Vendor values are reference-only (~50-step bench deviation observed on the
+# first unit) -- recalibrate per lot by editing this file, not the code.
+zoom_step,focus_step
+0,168
+79,381
+159,576
+238,750
+318,910
+397,1054
+477,1185
+556,1304
+636,1412
+715,1510
+795,1600
+874,1681
+953,1754
+1033,1821
+1112,1881
+1192,1936
+1271,1985
+1351,2029
+1430,2068
+1510,2103
+1589,2134
+1668,2161
+1748,2185
+1827,2205
+1907,2222
+1986,2236
+2066,2248
+2145,2257
+2225,2263
+2304,2267
+2384,2269
+2463,2269

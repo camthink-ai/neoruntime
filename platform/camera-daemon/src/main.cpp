@@ -660,6 +660,8 @@ static DaemonConfig load_config(const std::string& path) {
                     cfg.lens_fg2009.zoom_pps = (uint16_t)parse_u32_config(val, "lens.fg2009.zoom_pps", HAL_LENS_FG2009_MAX_PPS);
                 else if (trimmed.find("focus_pps:") != std::string::npos)
                     cfg.lens_fg2009.focus_pps = (uint16_t)parse_u32_config(val, "lens.fg2009.focus_pps", HAL_LENS_FG2009_MAX_PPS);
+                else if (trimmed.find("focus_curve_path:") != std::string::npos)
+                    cfg.lens_fg2009_focus_curve_path = val;
             }
         }
     }

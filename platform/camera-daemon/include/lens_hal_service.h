@@ -61,6 +61,10 @@ struct LensHalConfig {
     std::string lens_model     = "af0832";
     // FG2009 open-loop bootstrap geometry (camera-daemon.yaml lens.fg2009.*).
     HalLensFg2009Params fg2009 = {};
+    // FG2009 focus-tracking curve CSV ("zoom_step,focus_step", INF object
+    // distance). Empty falls back to the installed default; a missing or
+    // unreadable file disables the follow (zoom-only moves) with a WARN.
+    std::string fg2009_focus_curve_path;
 };
 
 /* ── Bridge symbol table ───────────────────────────────────────────────── */

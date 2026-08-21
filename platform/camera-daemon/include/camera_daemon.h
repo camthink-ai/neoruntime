@@ -208,6 +208,8 @@ struct DaemonConfig {
     std::string lens_model = "af0832";
     // FG2009 open-loop bootstrap geometry (bench-calibrated, yaml-overridable)
     HalLensFg2009Params lens_fg2009 = {};
+    // FG2009 focus-tracking curve CSV (zoom_step,focus_step; empty = default)
+    std::string lens_fg2009_focus_curve_path;
 
     AutofocusConfig autofocus;
     IlluminationConfig infrared;

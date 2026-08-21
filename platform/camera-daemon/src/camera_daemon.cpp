@@ -2880,6 +2880,7 @@ void CameraDaemon::start_grpc_server() {
         lens_cfg.focus_max       = config_.lens_focus_max;
         lens_cfg.lens_model      = config_.lens_model;
         lens_cfg.fg2009          = config_.lens_fg2009;
+        lens_cfg.fg2009_focus_curve_path = config_.lens_fg2009_focus_curve_path;
         auto lens_bundle = CreateLensHalService(lens_cfg);
         lens_controller_ = lens_bundle.controller;
         lens_hal_service_ = std::move(lens_bundle.service);
