@@ -393,6 +393,11 @@ type HalError struct {
 	Msg  string
 }
 
+// HAL_ERR_NOT_SUPPORTED from hal_v2/include/common/hal_common.h. A capability
+// rejection is permanent: retry/recovery loops must not fire for it (retrying
+// AF0832-only RPCs on the fg2009 reinitialized the lens per attempt).
+const HalErrNotSupported int32 = -2807
+
 func (e *HalError) Error() string {
 	return fmt.Sprintf("hal error %d: %s", e.Code, e.Msg)
 }

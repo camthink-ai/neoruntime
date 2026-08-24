@@ -15,6 +15,8 @@ import {
   useSaveIrPreset,
   useDeleteIrPreset,
   useLensGoto,
+  useLensGotoZoomRatio,
+  useLensStatus,
   useOneshotAutofocus,
 } from '@/hooks/useDeviceControl';
 import type { IrPreset } from '@/services/api/device';
@@ -90,7 +92,12 @@ export default function LightingControl() {
   const savePreset = useSaveIrPreset();
   const deletePreset = useDeleteIrPreset();
   const lensGoto = useLensGoto();
+  const lensGotoRatio = useLensGotoZoomRatio();
+  const { data: lensStatus } = useLensStatus();
   const oneshotAf = useOneshotAutofocus();
+  // Open-loop lens: no autofocus stack, and the ratio-only goto endpoint is
+  // the one it supports (the AF0832 ratio+distance goto is rejected on it).
+  const isFg2009 = lensStatus?.lens_model === 'fg2009';
   const presets = presetData?.presets ?? [];
 
   const [nearLevel, setNearLevel] = useState(DEFAULT_LEVEL);
@@ -195,9 +202,15 @@ export default function LightingControl() {
 
   const handleLoadPreset = async (p: IrPreset) => {
     try {
-      await lensGoto.mutateAsync({ zoomRatio: p.zoom_ratio });
+      if (isFg2009) {
+        // Ratio-only goto lands focus on the INF tracking curve already;
+        // autofocus is not available on the open-loop lens.
+        await lensGotoRatio.mutateAsync(p.zoom_ratio);
+      } else {
+        await lensGoto.mutateAsync({ zoomRatio: p.zoom_ratio });
+        await oneshotAf.mutateAsync(); // re-focus after the zoom move so the image is sharp
+      }
       await setInfrared.mutateAsync({ near_pwm: p.near_pwm, far_pwm: p.far_pwm });
-      await oneshotAf.mutateAsync(); // re-focus after the zoom move so the image is sharp
       setNearLevel(p.near_pwm);
       setFarLevel(p.far_pwm);
       toast.success(t('sys.device.lighting.preset_loaded', 'Preset loaded'));

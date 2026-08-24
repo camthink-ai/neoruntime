@@ -548,12 +548,14 @@ func isRecoverable(err error) bool {
 		return false
 	}
 
-	// All HAL errors from the lens bridge are potentially recoverable.
-	// Must be checked before status.FromError to prevent gRPC-wrapped
-	// HAL errors from reaching the code-based switch below.
+	// All HAL errors from the lens bridge are potentially recoverable,
+	// except capability rejections: no amount of link recovery makes an
+	// unsupported operation supported. Must be checked before
+	// status.FromError to prevent gRPC-wrapped HAL errors from reaching the
+	// code-based switch below.
 	var halErr *lens.HalError
 	if errors.As(err, &halErr) {
-		return true
+		return halErr.Code != lens.HalErrNotSupported
 	}
 
 	// gRPC transport-layer errors: status.FromError returns ok=true only
@@ -1684,6 +1686,13 @@ func (s *DeviceControlServer) LensGotoRatioDistance(ctx context.Context, req *pb
 
 	if s.halLens == nil {
 		return &pb.Status{Success: false, Message: "Lens HAL not initialized"}, nil
+	}
+	if s.lensIsFg2009() {
+		// Ratio+distance semantics are AF0832-only (closed-loop distance
+		// table). The open-loop lens has LensGotoZoomRatio. Reject before
+		// any motor stop so the AF0832 retry/fallback machinery below never
+		// "recovers" a capability rejection with reinit ram cycles.
+		return &pb.Status{Success: false, Message: "lens goto ratio+distance requires lens af0832; use goto-ratio for fg2009"}, nil
 	}
 
 	// Stop all motors first
