@@ -216,7 +216,10 @@ struct DaemonConfig {
     // shared section so af0832 packages are unaffected).  yaml-overridable
     // via lens.fg2009.af_* keys for bench tuning without a rebuild.
     int lens_fg2009_af_coarse_step = 60;
-    int lens_fg2009_af_coarse_span = 300;
+    // 2453 = full travel: the coarse window clamps to [min,max] from any
+    // center, so the scan is not bounded to a band around the curve landing.
+    int lens_fg2009_af_coarse_span = 2453;
+    int lens_fg2009_af_fine_span = 48;
     int lens_fg2009_af_pps = 900;
     int lens_fg2009_af_move_timeout_ms = 15000;
 

@@ -666,6 +666,8 @@ static DaemonConfig load_config(const std::string& path) {
                     cfg.lens_fg2009_af_coarse_step = (int)parse_u32_config(val, "lens.fg2009.af_coarse_step");
                 else if (trimmed.find("af_coarse_span:") != std::string::npos)
                     cfg.lens_fg2009_af_coarse_span = (int)parse_u32_config(val, "lens.fg2009.af_coarse_span");
+                else if (trimmed.find("af_fine_span:") != std::string::npos)
+                    cfg.lens_fg2009_af_fine_span = (int)parse_u32_config(val, "lens.fg2009.af_fine_span");
                 else if (trimmed.find("af_pps:") != std::string::npos)
                     cfg.lens_fg2009_af_pps = (int)parse_u32_config(val, "lens.fg2009.af_pps", HAL_LENS_FG2009_MAX_PPS);
                 else if (trimmed.find("af_move_timeout_ms:") != std::string::npos)
