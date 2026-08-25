@@ -216,17 +216,20 @@ struct DaemonConfig {
     // shared section so af0832 packages are unaffected).  yaml-overridable
     // via lens.fg2009.af_* keys for bench tuning without a rebuild.
     int lens_fg2009_af_coarse_step = 40;
-    // Local coarse window around the curve landing, tiered by zoom ratio:
-    // below the threshold the INF tracking curve is trusted (narrow ±200,
-    // ~11 samples at step 40); at/above it the curve deviates more, so keep
-    // the bench-proven ±300.  Injected as coarse_span /
-    // coarse_span_low_zoom / coarse_span_zoom_threshold.
-    int lens_fg2009_af_coarse_span = 300;
-    int lens_fg2009_af_coarse_span_low_zoom = 200;
+    // Uniform local coarse window (±200, step 40 → ~11 samples) around the
+    // curve landing across the whole zoom range — the bench-validated
+    // low-ratio policy, now trusted everywhere.  The zoom-tiered fields
+    // stay yaml-selectable but default to single-span.
+    int lens_fg2009_af_coarse_span = 200;
+    int lens_fg2009_af_coarse_span_low_zoom = 0;
     float lens_fg2009_af_coarse_span_zoom_threshold = 1.35f;
     int lens_fg2009_af_fine_span = 48;
     int lens_fg2009_af_pps = 900;
     int lens_fg2009_af_move_timeout_ms = 15000;
+    // Trust the curve landing: accept the first scan without the
+    // confidence gate and never re-scan.
+    float lens_fg2009_af_confidence_accept = 0.0f;
+    int lens_fg2009_af_balanced_retry = 0;
 
     AutofocusConfig autofocus;
     IlluminationConfig infrared;

@@ -92,6 +92,10 @@ struct AutofocusConfig {
     bool trace_scan = false;
     int max_moves = 200;
     int balanced_retry = 1;
+    // Scan-acceptance gate: a scan reports Completed when confidence >=
+    // confidence_accept and the peak is not on the window edge.
+    // confidence_accept == 0 disables the gate — every valid scan is
+    // accepted as-is (no retry, no low-confidence failure).
     double confidence_accept = 0.80;
     double confidence_recovery = 0.65;
 

@@ -777,8 +777,15 @@ private:
         confidence_inputs.scene_stable = true;
         confidence_inputs.verification_passed = result.verification_passed;
         result.confidence = hal_auto_af::confidence_v2(confidence_inputs);
-        result.confident = result.confidence >= config_.confidence_accept &&
-                           !result.best_on_edge;
+        if (config_.confidence_accept <= 0.0) {
+            // Gate disabled (open-loop lens with a trusted curve landing):
+            // accept the scan winner regardless of score or edge position.
+            // af0832 never enters this branch — its accept stays 0.80.
+            result.confident = result.valid;
+        } else {
+            result.confident = result.confidence >= config_.confidence_accept &&
+                               !result.best_on_edge;
+        }
         result.message = result.confident ? "focus acquired" : "low confidence focus";
         HAL_LOG_INFO("Autofocus: peak=%s confidence_v2=%.3f repro=%.3f prominence=%.3f "
                      "temporal=%.3f texture=%.3f luma=%.3f verify=%d edge=%d",

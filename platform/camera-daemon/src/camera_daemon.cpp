@@ -2896,6 +2896,8 @@ static void apply_fg2009_autofocus_overrides(const DaemonConfig& cfg,
     af->coarse_span_low_zoom = cfg.lens_fg2009_af_coarse_span_low_zoom;
     af->coarse_span_zoom_threshold = cfg.lens_fg2009_af_coarse_span_zoom_threshold;
     af->fine_span = cfg.lens_fg2009_af_fine_span;
+    af->confidence_accept = cfg.lens_fg2009_af_confidence_accept;
+    af->balanced_retry = cfg.lens_fg2009_af_balanced_retry;
     af->pps = cfg.lens_fg2009_af_pps;
     af->move_timeout_ms = cfg.lens_fg2009_af_move_timeout_ms;
 }
