@@ -491,6 +491,28 @@ private:
         return observation->valid_mask == 0 ? HAL_ERR_INVALID_STATE : HAL_OK;
     }
 
+    /* Bounded warm-up before a one-shot scan: right after a daemon restart
+     * the ISP AF statistics path can reject its first reads while the media
+     * pipeline is still coming up (fd/ctrl not ready), which used to abort
+     * the very first job with "coarse scan failed".  Each attempt waits a
+     * frame inside read_observation, so a healthy pipeline pays one read. */
+    void warm_up_stats() {
+        const int attempts = config_.stat_warmup_attempts;
+        if (attempts <= 0) return;
+        for (int attempt = 1; attempt <= attempts; ++attempt) {
+            hal_auto_af::MetricObservation obs{};
+            if (read_observation(1, 1, &obs) == HAL_OK) {
+                if (attempt > 1) {
+                    HAL_LOG_INFO("Autofocus: AF stats ready after %d warm-up "
+                                 "attempt(s)", attempt);
+                }
+                return;
+            }
+        }
+        HAL_LOG_WARNING("Autofocus: AF stats still not ready after %d warm-up "
+                        "attempts; scanning anyway", attempts);
+    }
+
     int measure_focus(int position, int metric_frames,
                       hal_auto_af::FocusSample* sample,
                       const hal_auto_af::TextureModel* texture = nullptr) {
@@ -1224,6 +1246,7 @@ private:
                         span = config_.coarse_span_low_zoom;
                     }
                 }
+                warm_up_stats();
                 result = run_one_shot_at(state.focus_pos, span, false);
             }
         }

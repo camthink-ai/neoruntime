@@ -54,6 +54,12 @@ struct AutofocusConfig {
     int startup_recovery_span = 320;
     int startup_ready_timeout_ms = 120000;
     int frame_wait_timeout_ms = 900;
+    // One-shot warm-up: right after a daemon restart the ISP AF statistics
+    // path may not answer its first reads yet (media pipeline still coming
+    // up), which used to kill the first job with "coarse scan failed".
+    // Retry the initial observation this many times before scanning.
+    // 0 disables.  Zero cost when the first read already succeeds.
+    int stat_warmup_attempts = 5;
     int move_timeout_ms = 10000;
     int pps = 1600;
     bool follow_sync_motion = true;
