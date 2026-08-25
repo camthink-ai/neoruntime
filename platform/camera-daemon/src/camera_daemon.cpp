@@ -4008,10 +4008,8 @@ bool CameraDaemon::set_ircut(uint32_t mode) {
 }
 
 bool CameraDaemon::start_autofocus_one_shot(uint64_t* job_id, std::string* error) {
-    if (config_.lens_model == "fg2009") {
-        if (error) *error = "autofocus not supported on lens fg2009";
-        return false;
-    }
+    // FG2009 runs one-shot AF too: the scan rides the current focus position
+    // (the curve landing) with a +-300-step window, no zoom-follow involved.
 #ifdef HAS_GRPC
     if (autofocus_controller_) return autofocus_controller_->start_one_shot(job_id, error);
 #endif
@@ -4022,7 +4020,9 @@ bool CameraDaemon::start_autofocus_one_shot(uint64_t* job_id, std::string* error
 bool CameraDaemon::start_autofocus_zoom_follow(float ratio, uint64_t* job_id,
                                                 std::string* error) {
     if (config_.lens_model == "fg2009") {
-        if (error) *error = "autofocus not supported on lens fg2009";
+        // "Follow" on fg2009 is the DUAL_REL curve landing inside
+        // ZoomGotoRatio; the af0832 follow engine has no role here.
+        if (error) *error = "zoom follow not supported on lens fg2009";
         return false;
     }
 #ifdef HAS_GRPC
@@ -4097,16 +4097,35 @@ bool CameraDaemon::set_led_duty_raw(uint32_t led_id, uint32_t duty_percent) {
 }
 
 void CameraDaemon::on_fg2009_zoom_moved(double zoom_ratio) {
-    if (!illumination_controller_) return;
     // Mirror the AF0832 zoom-follow cycle in one shot: takeover (drops a
     // stale manual override), apply the endpoint LUT row, release.
-    std::string error;
-    illumination_controller_->begin_zoom_follow(zoom_ratio, &error);
-    illumination_controller_->apply_endpoint_ratio(zoom_ratio, &error);
-    illumination_controller_->end_zoom_follow(zoom_ratio, &error);
-    if (!error.empty()) {
-        HAL_LOG_WARNING("CameraDaemon: IR zoom-follow reapply at %.3fx: %s",
-                        zoom_ratio, error.c_str());
+    if (illumination_controller_) {
+        std::string error;
+        illumination_controller_->begin_zoom_follow(zoom_ratio, &error);
+        illumination_controller_->apply_endpoint_ratio(zoom_ratio, &error);
+        illumination_controller_->end_zoom_follow(zoom_ratio, &error);
+        if (!error.empty()) {
+            HAL_LOG_WARNING("CameraDaemon: IR zoom-follow reapply at %.3fx: %s",
+                            zoom_ratio, error.c_str());
+        }
+    }
+    // Post-zoom one-shot AF: the DUAL_REL landing rode the INF tracking
+    // curve, so the current focus position is the search center and the
+    // injected coarse span (300) is the bench-validated search window.  This
+    // observer runs with the lens service mutex held, so only the pure
+    // enqueue is safe here; the worker's wait_lens_ready rides out the zoom
+    // travel before scanning, and the scan only moves focus, so this never
+    // re-enters the observer.
+    if (autofocus_controller_) {
+        uint64_t job_id = 0;
+        std::string af_error;
+        if (autofocus_controller_->start_one_shot(&job_id, &af_error)) {
+            HAL_LOG_INFO("CameraDaemon: post-zoom autofocus job %llu started at "
+                         "%.3fx", (unsigned long long)job_id, zoom_ratio);
+        } else {
+            HAL_LOG_INFO("CameraDaemon: post-zoom autofocus skipped at %.3fx: %s",
+                         zoom_ratio, af_error.c_str());
+        }
     }
 }
 
