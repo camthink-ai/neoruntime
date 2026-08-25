@@ -216,13 +216,14 @@ struct DaemonConfig {
     // shared section so af0832 packages are unaffected).  yaml-overridable
     // via lens.fg2009.af_* keys for bench tuning without a rebuild.
     int lens_fg2009_af_coarse_step = 40;
-    // Uniform local coarse window (±200, step 40 → ~11 samples) around the
-    // curve landing across the whole zoom range — the bench-validated
-    // low-ratio policy, now trusted everywhere.  The zoom-tiered fields
-    // stay yaml-selectable but default to single-span.
-    int lens_fg2009_af_coarse_span = 200;
-    int lens_fg2009_af_coarse_span_low_zoom = 0;
-    float lens_fg2009_af_coarse_span_zoom_threshold = 1.35f;
+    // Local coarse window around the curve landing, tiered by zoom ratio:
+    // below 1.95x span 200 (~11 samples at step 40); at/above it the window
+    // compresses to 150 — at high magnification the depth of field is thin,
+    // so wide sweeps hold the image far out of focus through most probes
+    // (seen as long blur stretches in the stream).
+    int lens_fg2009_af_coarse_span = 150;
+    int lens_fg2009_af_coarse_span_low_zoom = 200;
+    float lens_fg2009_af_coarse_span_zoom_threshold = 1.95f;
     int lens_fg2009_af_fine_span = 48;
     int lens_fg2009_af_pps = 900;
     int lens_fg2009_af_move_timeout_ms = 15000;
@@ -230,6 +231,9 @@ struct DaemonConfig {
     // confidence gate and never re-scan.
     float lens_fg2009_af_confidence_accept = 0.0f;
     int lens_fg2009_af_balanced_retry = 0;
+    // Run one refinement one-shot right after the boot park lands on the
+    // curve (the job queues immediately and waits for the lens to park).
+    int lens_fg2009_af_boot_oneshot = 1;
 
     AutofocusConfig autofocus;
     IlluminationConfig infrared;

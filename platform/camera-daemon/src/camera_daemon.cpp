@@ -3016,7 +3016,25 @@ void CameraDaemon::start_grpc_server() {
     chmod(sock_path, 0660);
     chown(sock_path, -1, 1001);
 
-    if (autofocus_controller_) autofocus_controller_->start();
+    if (autofocus_controller_) {
+        autofocus_controller_->start();
+        if (config_.lens_model == "fg2009" && config_.lens_fg2009_af_boot_oneshot) {
+            // Boot focus: the FG2009 park lands on the INF curve; refine once
+            // right after the lens parks.  The queued job blocks in
+            // wait_lens_ready until the bootstrap finishes and the motors
+            // stop, so the scan always starts from the parked position (and
+            // the stat warm-up covers the still-warming video pipeline).
+            uint64_t boot_job = 0;
+            std::string af_error;
+            if (autofocus_controller_->start_one_shot(&boot_job, &af_error)) {
+                HAL_LOG_INFO("CameraDaemon: fg2009 boot autofocus job %llu queued",
+                             (unsigned long long)boot_job);
+            } else {
+                HAL_LOG_WARNING("CameraDaemon: fg2009 boot autofocus rejected: %s",
+                                af_error.c_str());
+            }
+        }
+    }
 }
 
 void CameraDaemon::stop_grpc_server() {

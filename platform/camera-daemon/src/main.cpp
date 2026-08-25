@@ -676,6 +676,8 @@ static DaemonConfig load_config(const std::string& path) {
                     cfg.lens_fg2009_af_confidence_accept = parse_float_config(val, "lens.fg2009.af_confidence_accept");
                 else if (trimmed.find("af_balanced_retry:") != std::string::npos)
                     cfg.lens_fg2009_af_balanced_retry = (int)parse_u32_config(val, "lens.fg2009.af_balanced_retry");
+                else if (trimmed.find("af_boot_oneshot:") != std::string::npos)
+                    cfg.lens_fg2009_af_boot_oneshot = (int)parse_u32_config(val, "lens.fg2009.af_boot_oneshot");
                 else if (trimmed.find("af_pps:") != std::string::npos)
                     cfg.lens_fg2009_af_pps = (int)parse_u32_config(val, "lens.fg2009.af_pps", HAL_LENS_FG2009_MAX_PPS);
                 else if (trimmed.find("af_move_timeout_ms:") != std::string::npos)
