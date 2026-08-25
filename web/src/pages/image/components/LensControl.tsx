@@ -39,16 +39,10 @@ const ZOOM_DISPLAY_MIN = 1.0;
 const ZOOM_DISPLAY_MAX = 2.88;
 
 // Fine-grained +/- and slider steps (percent of range per click): zoom 0.5%
-// ≈ 12 steps ≈ 0.006x; focus 1% (FG2009: 1% of the 600-step window ≈ 6 steps).
+// ≈ 12 steps ≈ 0.006x; focus 1% (FG2009: 1% of the 2453-step travel ≈ 24
+// steps).
 const ZOOM_STEP_PERCENT = 0.5;
 const FOCUS_STEP_PERCENT = 1;
-
-// FG2009 focus window: after each zoom move the daemon drives focus onto the
-// INF tracking curve, and the slider narrows to +/-300 steps around that
-// landing point for comfortable fine-tuning (full travel is 2453 steps).
-// At the travel ends the window shifts inward so the span stays 600.
-const FOCUS_WINDOW_STEPS = 300;
-const FG2009_FOCUS_STEP_PERCENT = 1; // 1% of the 600-step window ≈ 6 steps
 
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 
@@ -139,56 +133,9 @@ export default function LensControl() {
     [lensStatus]
   );
 
-  // FG2009 focus window: the zoom follow (daemon-side, INF tracking curve)
-  // lands focus on a known point; the slider narrows to +/-300 steps around
-  // it. Re-anchored when zoom_ratio changes (new follow landing), on mount,
-  // or when focus ends up outside the window (e.g. MCU reinit park).
-  const focusPos = lensStatus?.focus_pos;
-  const focusTravel = lensStatus
-    ? lensStatus.focus_limit.max_pos - lensStatus.focus_limit.min_pos
-    : 0;
-  const [focusCenter, setFocusCenter] = useState<number | null>(null);
-  const prevZoomRatio = useRef<number | null>(null);
-  useEffect(() => {
-    if (!isFg2009 || focusPos == null) return;
-    const zr = lensStatus?.zoom_ratio ?? null;
-    const zoomMoved = prevZoomRatio.current != null && zr != null
-      && zr !== prevZoomRatio.current;
-    prevZoomRatio.current = zr;
-    setFocusCenter(prev => {
-      if (prev == null || zoomMoved) return focusPos;
-      return Math.abs(focusPos - prev) > FOCUS_WINDOW_STEPS ? focusPos : prev;
-    });
-  }, [isFg2009, focusPos, lensStatus?.zoom_ratio]);
-
-  const focusWindow = useMemo(() => {
-    if (!isFg2009 || !lensStatus || focusTravel <= 0 || focusCenter == null) {
-      return null;
-    }
-    const { min_pos, max_pos } = lensStatus.focus_limit;
-    let lo = focusCenter - FOCUS_WINDOW_STEPS;
-    let hi = focusCenter + FOCUS_WINDOW_STEPS;
-    // Travel-end bounce: keep the full 600-step span inside [min, max].
-    if (lo < min_pos) {
-      lo = min_pos;
-      hi = Math.min(max_pos, min_pos + 2 * FOCUS_WINDOW_STEPS);
-    }
-    if (hi > max_pos) {
-      hi = max_pos;
-      lo = Math.max(min_pos, max_pos - 2 * FOCUS_WINDOW_STEPS);
-    }
-    return { lo, hi };
-  }, [isFg2009, lensStatus, focusTravel, focusCenter]);
-
-  // Window mode maps the slider onto [lo, hi]; otherwise the full travel.
-  const focusSliderLevel = useMemo(() => {
-    if (!lensStatus) return fLevel;
-    if (focusWindow && focusPos != null) {
-      const span = focusWindow.hi - focusWindow.lo;
-      if (span > 0) return clamp01((focusPos - focusWindow.lo) / span);
-    }
-    return fLevel;
-  }, [lensStatus, fLevel, focusWindow, focusPos]);
+  // FG2009 focus: full travel, same as AF0832. The one-shot AF may land the
+  // true peak well outside the INF curve landing (wide end), so a narrowed
+  // +/-300 window around the landing would hide the sharp focus position.
 
   // Sync local percent from server when it changes
   const prevZ = useMemo(() => zLevel, [zLevel]);
@@ -196,7 +143,7 @@ export default function LensControl() {
     setZoomPercent(prevZ * 100);
   }, [prevZ]);
 
-  const prevF = useMemo(() => focusSliderLevel, [focusSliderLevel]);
+  const prevF = fLevel;
   useEffect(() => {
     setFocusPercent(prevF * 100);
   }, [prevF]);
@@ -206,13 +153,8 @@ export default function LensControl() {
     return ZOOM_DISPLAY_MIN + (zoomDisplayMax - ZOOM_DISPLAY_MIN) * level;
   }, [zoomPercent, zoomDisplayMax]);
 
-  const focusDisplay = useMemo(() => {
-    // FG2009 window mode: window-relative percent — 0% at the slider's left
-    // end, 100% at the right; the +/-300 geometry stays under the hood.
-    // AF0832: percent over the full travel. Both are plain percents.
-    const level = isFg2009 ? focusSliderLevel : fLevel;
-    return `${(level * 100).toFixed(1)}%`;
-  }, [fLevel, focusSliderLevel, isFg2009]);
+  // Plain percent over the full travel, FG2009 and AF0832 alike.
+  const focusDisplay = `${(fLevel * 100).toFixed(1)}%`;
 
   const afBusy = autofocusStatus?.busy ?? false;
   const isOneshotAF = afBusy
@@ -462,16 +404,9 @@ export default function LensControl() {
           label={t('sys.ptz.focus', 'Focus')}
           displayValue={focusDisplay}
           level={focusPercent}
-          stepPercent={isFg2009 ? FG2009_FOCUS_STEP_PERCENT : FOCUS_STEP_PERCENT}
+          stepPercent={FOCUS_STEP_PERCENT}
           onLevelChange={setFocusPercent}
           onCommit={async level => {
-            if (focusWindow && focusTravel > 0) {
-              // Window mode: map [0,1] back onto the window, then express
-              // the target as an absolute level over the full travel.
-              const steps = focusWindow.lo + level * (focusWindow.hi - focusWindow.lo);
-              await setFocusLevel.mutateAsync(clamp01(steps / focusTravel));
-              return;
-            }
             await setFocusLevel.mutateAsync(level);
           }}
           busy={isFocusBusy}
