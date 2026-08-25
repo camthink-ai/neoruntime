@@ -77,6 +77,13 @@ struct AutofocusConfig {
     int max_focus_pos = 592;
     int coarse_step = 40;
     int coarse_span = 160;
+    // Zoom-tiered coarse window for open-loop lenses: when both are > 0 and
+    // the current optical ratio is below the threshold, one-shot scans use
+    // coarse_span_low_zoom instead of coarse_span (the tracking curve is
+    // trusted more at low magnification, so the window narrows).  0 keeps
+    // single-span behavior (closed-loop default).
+    int coarse_span_low_zoom = 0;
+    float coarse_span_zoom_threshold = 0.0f;
     int fine_step = 8;
     int fine_span = 24;
     // Bench observability: log every scan probe (position, FV, duration) and

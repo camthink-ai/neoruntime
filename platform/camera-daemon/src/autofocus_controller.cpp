@@ -1208,7 +1208,16 @@ private:
                 result.error = HAL_ERR_NOT_READY;
                 result.message = "lens state unavailable";
             } else {
-                result = run_one_shot_at(state.focus_pos, config_.coarse_span, false);
+                int span = config_.coarse_span;
+                if (config_.coarse_span_low_zoom > 0
+                    && config_.coarse_span_zoom_threshold > 0.0f) {
+                    const float ratio = lens_->pos_to_ratio(state.zoom_pos);
+                    if (ratio > 0.0f
+                        && ratio < config_.coarse_span_zoom_threshold) {
+                        span = config_.coarse_span_low_zoom;
+                    }
+                }
+                result = run_one_shot_at(state.focus_pos, span, false);
             }
         }
 
