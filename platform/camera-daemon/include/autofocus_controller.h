@@ -79,6 +79,10 @@ struct AutofocusConfig {
     int coarse_span = 160;
     int fine_step = 8;
     int fine_span = 24;
+    // Bench observability: log every scan probe (position, FV, duration) and
+    // the coarse/fine window bounds so tuning sessions can watch the scan
+    // live in journalctl.  Off by default.
+    bool trace_scan = false;
     int max_moves = 200;
     int balanced_retry = 1;
     double confidence_accept = 0.80;

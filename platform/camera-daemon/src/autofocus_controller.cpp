@@ -513,6 +513,10 @@ private:
             return HAL_ERR_INVALID_ARG;
         const auto cached = cache->find(position);
         if (cached != cache->end() && cached->second.metric_frames >= metric_frames) {
+            if (config_.trace_scan) {
+                HAL_LOG_INFO("Autofocus trace: probe pos=%d cached fv=%.4f",
+                             position, cached->second.sample.m);
+            }
             curve->push_back(cached->second.sample);
             if (cached->second.sample.m > *best_metric) {
                 *best_metric = cached->second.sample.m;
@@ -522,7 +526,16 @@ private:
         }
         if (++*moves > config_.max_moves) return HAL_ERR_INVALID_STATE;
         hal_auto_af::FocusSample sample{};
+        const auto probe_t0 = std::chrono::steady_clock::now();
         const int ret = measure_focus(position, metric_frames, &sample);
+        if (config_.trace_scan) {
+            const int took_ms = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - probe_t0).count());
+            HAL_LOG_INFO("Autofocus trace: probe pos=%d frames=%d fv=%.4f took=%dms moves=%d%s",
+                         position, metric_frames, sample.m, took_ms, *moves,
+                         ret == HAL_OK ? "" : " FAILED");
+        }
         if (ret != HAL_OK) return ret;
         curve->push_back(sample);
         (*cache)[position] = {sample, metric_frames};
@@ -572,6 +585,12 @@ private:
         const int coarse_hi = std::min(max_pos, center + span);
         result.scan_lo = coarse_lo;
         result.scan_hi = coarse_hi;
+        if (config_.trace_scan) {
+            HAL_LOG_INFO("Autofocus trace: coarse window [%d..%d] center=%d step=%d "
+                         "focus_range=[%d..%d]",
+                         coarse_lo, coarse_hi, center, config_.coarse_step,
+                         min_pos, max_pos);
+        }
 
         std::unordered_map<int, CachedFocusSample> cache;
         std::vector<hal_auto_af::FocusSample> coarse_curve;
@@ -605,6 +624,12 @@ private:
         const int fine_hi = std::min(max_pos, fine_center + fine_span);
         int fine_best = best_pos;
         double fine_metric = best_metric;
+        if (config_.trace_scan) {
+            HAL_LOG_INFO("Autofocus trace: fine window [%d..%d] center=%d step=%d "
+                         "coarse_best=%d fv=%.4f",
+                         fine_lo, fine_hi, fine_center, config_.fine_step,
+                         best_pos, best_metric);
+        }
         set_state(AutofocusState::Fine, endpoint ? 0.92 : 0.48,
                   balanced ? "balanced fine scan" : "fast fine scan");
         ret = scan_symmetric(fine_center, fine_lo, fine_hi, config_.fine_step,
@@ -1191,6 +1216,16 @@ private:
             lens_->stop_all(1000);
             finish_job(AutofocusState::Cancelled, HAL_ERR_INVALID_STATE, "cancelled");
         } else if (result.error == HAL_OK && result.confident) {
+            // Mirror the failure branch: publish the winning scan stats so a
+            // completed job does not report the previous failure's numbers.
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                status_.best_focus = result.best_pos;
+                status_.focus_pos = result.best_pos;
+                status_.metric = result.metric;
+                status_.confidence = result.confidence;
+                status_.reproducibility = result.reproducibility;
+            }
             finish_job(AutofocusState::Completed, HAL_OK, "autofocus completed");
         } else {
             {

@@ -589,6 +589,8 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.autofocus.fine_step = static_cast<int>(parse_u32_config(val, "autofocus.fine_step"));
             else if (trimmed.find("fine_span:") != std::string::npos)
                 cfg.autofocus.fine_span = static_cast<int>(parse_u32_config(val, "autofocus.fine_span"));
+            else if (trimmed.find("trace_scan:") != std::string::npos)
+                cfg.autofocus.trace_scan = (val == "true" || val == "1");
             else if (trimmed.find("max_moves:") != std::string::npos)
                 cfg.autofocus.max_moves = static_cast<int>(parse_u32_config(val, "autofocus.max_moves"));
             else if (trimmed.find("balanced_retry:") != std::string::npos)
