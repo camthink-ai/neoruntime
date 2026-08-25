@@ -203,8 +203,9 @@ export default function LightingControl() {
   const handleLoadPreset = async (p: IrPreset) => {
     try {
       if (isFg2009) {
-        // Ratio-only goto lands focus on the INF tracking curve already;
-        // autofocus is not available on the open-loop lens.
+        // Ratio-only goto lands focus on the INF tracking curve and the
+        // daemon's post-zoom observer runs a one-shot AF automatically;
+        // an explicit oneshot here would only double-run it.
         await lensGotoRatio.mutateAsync(p.zoom_ratio);
       } else {
         await lensGoto.mutateAsync({ zoomRatio: p.zoom_ratio });

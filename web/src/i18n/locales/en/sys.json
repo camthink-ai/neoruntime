@@ -1738,8 +1738,7 @@
       },
       "lens": {
         "title": "Lens Control",
-        "model_badge": "Factory-fitted lens model",
-        "manual_only": "Manual zoom & focus"
+        "model_badge": "Factory-fitted lens model"
       },
       "peripheral": {
         "title": "Peripheral Control",

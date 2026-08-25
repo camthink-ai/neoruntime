@@ -195,7 +195,6 @@ export const useAutofocusStatus = (options?: { enabled?: boolean }) => useQuery<
       return (response as any).data as AutofocusStatus;
     },
     refetchInterval: 400,
-    // AF-disabled lenses (fg2009) never poll the autofocus status.
     enabled: options?.enabled ?? true,
   });
 

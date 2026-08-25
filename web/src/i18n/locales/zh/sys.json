@@ -1743,8 +1743,7 @@
       },
       "lens": {
         "title": "镜头控制",
-        "model_badge": "出厂镜头型号",
-        "manual_only": "手动变倍与聚焦"
+        "model_badge": "出厂镜头型号"
       },
       "peripheral": {
         "title": "外设控制",

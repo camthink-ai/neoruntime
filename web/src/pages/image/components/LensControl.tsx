@@ -99,7 +99,7 @@ export default function LensControl() {
     ? lensStatus.zoom_ratio_range.max
     : ZOOM_DISPLAY_MAX;
 
-  const { data: autofocusStatus } = useAutofocusStatus({ enabled: !isFg2009 });
+  const { data: autofocusStatus } = useAutofocusStatus();
 
   const oneshotAutofocus = useOneshotAutofocus();
   const startZoomFollow = useStartZoomFollow();
@@ -370,39 +370,33 @@ export default function LensControl() {
         </h3>
 
         <div className="flex items-center justify-between">
-          {isFg2009 ? (
-            <span className="text-sm text-muted-foreground">
-              {t('sys.device.lens.manual_only', 'Manual zoom & focus')}
-            </span>
-          ) : (
-            <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
-              <span>{t('sys.ptz.oneshot_af', 'One-shot AF')}</span>
-              <TooltipProvider delayDuration={200}>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      className="h-7 w-7 text-muted-foreground hover:text-foreground"
-                      aria-label={t(
-                        'sys.ptz.oneshot_af_hint',
-                        'Tap to trigger auto focus at current zoom position'
-                      )}
-                    >
-                      <Info className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="top" className="text-xs max-w-[280px]">
-                    {t(
+          <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+            <span>{t('sys.ptz.oneshot_af', 'One-shot AF')}</span>
+            <TooltipProvider delayDuration={200}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                    aria-label={t(
                       'sys.ptz.oneshot_af_hint',
                       'Tap to trigger auto focus at current zoom position'
                     )}
-                  </TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-            </div>
-          )}
+                  >
+                    <Info className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="text-xs max-w-[280px]">
+                  {t(
+                    'sys.ptz.oneshot_af_hint',
+                    'Tap to trigger auto focus at current zoom position'
+                  )}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </div>
           <div className="flex items-center gap-1">
             <TooltipProvider delayDuration={200}>
               <Tooltip>
@@ -424,23 +418,21 @@ export default function LensControl() {
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
-            {!isFg2009 && (
-              <Button
-                type="button"
-                variant="outline"
-                size="icon"
-                className="h-9 w-9 bg-[#f24a001a] border-transparent hover:bg-[#f24a001a]"
-                disabled={isOneshotAF || isZoomBusy || isFocusBusy}
-                onClick={handleOneshotAutofocus}
-                aria-label={t('sys.ptz.oneshot_af', 'One-shot AF')}
-              >
-                {isOneshotAF ? (
-                  <Loader2 className="w-4 h-4 animate-spin text-primary" />
-                ) : (
-                  <Crosshair className="w-4 h-4 text-primary" />
-                )}
-              </Button>
-            )}
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="h-9 w-9 bg-[#f24a001a] border-transparent hover:bg-[#f24a001a]"
+              disabled={isOneshotAF || isZoomBusy || isFocusBusy}
+              onClick={handleOneshotAutofocus}
+              aria-label={t('sys.ptz.oneshot_af', 'One-shot AF')}
+            >
+              {isOneshotAF ? (
+                <Loader2 className="w-4 h-4 animate-spin text-primary" />
+              ) : (
+                <Crosshair className="w-4 h-4 text-primary" />
+              )}
+            </Button>
           </div>
         </div>
 
