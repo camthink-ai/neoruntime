@@ -2900,6 +2900,13 @@ static void apply_fg2009_autofocus_overrides(const DaemonConfig& cfg,
     af->balanced_retry = cfg.lens_fg2009_af_balanced_retry;
     af->pps = cfg.lens_fg2009_af_pps;
     af->move_timeout_ms = cfg.lens_fg2009_af_move_timeout_ms;
+    // The boot one-shot job blocks in wait_lens_ready() until the FG2009
+    // bootstrap parks.  After some restarts the first MCU lens_init stalls for
+    // ~2 minutes before failing and the retry succeeds (observed: init fail at
+    // +117s, bootstrapped at +128s) — just past the shared 120s deadline, which
+    // surfaced as "lens did not become ready" in the UI.  The boot AF is not
+    // latency-critical, so wait up to 5 minutes instead.
+    af->startup_ready_timeout_ms = 300000;
 }
 
 #ifdef HAS_GRPC
