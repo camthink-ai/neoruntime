@@ -660,6 +660,14 @@ static DaemonConfig load_config(const std::string& path) {
                     cfg.lens_fg2009.zoom_pps = (uint16_t)parse_u32_config(val, "lens.fg2009.zoom_pps", HAL_LENS_FG2009_MAX_PPS);
                 else if (trimmed.find("focus_pps:") != std::string::npos)
                     cfg.lens_fg2009.focus_pps = (uint16_t)parse_u32_config(val, "lens.fg2009.focus_pps", HAL_LENS_FG2009_MAX_PPS);
+                else if (trimmed.find("af_coarse_step:") != std::string::npos)
+                    cfg.lens_fg2009_af_coarse_step = (int)parse_u32_config(val, "lens.fg2009.af_coarse_step");
+                else if (trimmed.find("af_coarse_span:") != std::string::npos)
+                    cfg.lens_fg2009_af_coarse_span = (int)parse_u32_config(val, "lens.fg2009.af_coarse_span");
+                else if (trimmed.find("af_pps:") != std::string::npos)
+                    cfg.lens_fg2009_af_pps = (int)parse_u32_config(val, "lens.fg2009.af_pps", HAL_LENS_FG2009_MAX_PPS);
+                else if (trimmed.find("af_move_timeout_ms:") != std::string::npos)
+                    cfg.lens_fg2009_af_move_timeout_ms = (int)parse_u32_config(val, "lens.fg2009.af_move_timeout_ms");
                 else if (trimmed.find("focus_curve_path:") != std::string::npos)
                     cfg.lens_fg2009_focus_curve_path = val;
             }

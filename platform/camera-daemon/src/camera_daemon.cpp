@@ -2880,6 +2880,23 @@ bool CameraDaemon::load_profile_config(std::string* profile_name) {
     return false;
 }
 
+/* FG2009 one-shot autofocus injection: geometry is a lens property — the
+ * focus range is the vendor curve range (curve coordinates, the same space
+ * the daemon uses everywhere for fg2009) and startup AF stays off because
+ * power-on parking already lands on the curve.  Tunables take fg2009-specific
+ * defaults (yaml lens.fg2009.af_* can override them) so the shared
+ * autofocus: section keeps its af0832 values untouched. */
+static void apply_fg2009_autofocus_overrides(const DaemonConfig& cfg,
+                                             AutofocusConfig* af) {
+    af->min_focus_pos = 0;
+    af->max_focus_pos = 2453;
+    af->startup_af = false;
+    af->coarse_step = cfg.lens_fg2009_af_coarse_step;
+    af->coarse_span = cfg.lens_fg2009_af_coarse_span;
+    af->pps = cfg.lens_fg2009_af_pps;
+    af->move_timeout_ms = cfg.lens_fg2009_af_move_timeout_ms;
+}
+
 #ifdef HAS_GRPC
 void CameraDaemon::start_grpc_server() {
     std::string server_address("unix:///run/aipc/camera-control.sock");
@@ -2967,15 +2984,16 @@ void CameraDaemon::start_grpc_server() {
                              ? SelectedMode::Infrared : SelectedMode::Day;
     }
 
-    // FG2009 is open-loop with no AF: the controller would only ever fail.
-    if (config_.autofocus.enabled && config_.lens_model == "fg2009") {
-        HAL_LOG_INFO("CameraDaemon: autofocus disabled for lens model fg2009");
-    } else if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
+    AutofocusConfig af_cfg = config_.autofocus;
+    if (config_.lens_model == "fg2009") {
+        apply_fg2009_autofocus_overrides(config_, &af_cfg);
+    }
+    if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
         hal_loader_->has_isp() && video_source_ && frame_router_) {
         autofocus_controller_ = std::make_unique<AutofocusController>(
             hal_loader_->isp(), hal_loader_->video(), video_source_->video_ctx(),
             frame_router_.get(), lens_controller_, illumination_controller_.get(),
-            config_.autofocus,
+            af_cfg,
             0, 0,
             [this]() { return refresh_autofocus_video_context(); });
     } else if (config_.autofocus.enabled) {

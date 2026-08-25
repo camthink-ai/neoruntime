@@ -210,6 +210,15 @@ struct DaemonConfig {
     HalLensFg2009Params lens_fg2009 = {};
     // FG2009 focus-tracking curve CSV (zoom_step,focus_step; empty = default)
     std::string lens_fg2009_focus_curve_path;
+    // FG2009 one-shot autofocus tunables.  Injected over the shared
+    // autofocus: section when lens_model == "fg2009" (geometry overrides
+    // min/max_focus_pos unconditionally; these code defaults win over the
+    // shared section so af0832 packages are unaffected).  yaml-overridable
+    // via lens.fg2009.af_* keys for bench tuning without a rebuild.
+    int lens_fg2009_af_coarse_step = 60;
+    int lens_fg2009_af_coarse_span = 300;
+    int lens_fg2009_af_pps = 900;
+    int lens_fg2009_af_move_timeout_ms = 15000;
 
     AutofocusConfig autofocus;
     IlluminationConfig infrared;

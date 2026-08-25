@@ -104,7 +104,11 @@ public:
 
     bool af0832_bootstrapped() const override {
         std::lock_guard<std::mutex> lock(mu_);
-        return af0832_bootstrapped_;
+        // AF readiness gate (used by AutofocusController::wait_lens_ready).
+        // AF0832: the bootstrap RPC must have run.  FG2009 has no bootstrap
+        // RPC — initialized implies anchored, which is the equivalent
+        // "lens is usable for AF" state.
+        return fg2009_ ? initialized_ : af0832_bootstrapped_;
     }
 
     int state_get(LensControllerState* state) override {
