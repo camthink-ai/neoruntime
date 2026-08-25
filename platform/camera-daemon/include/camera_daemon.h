@@ -225,7 +225,9 @@ struct DaemonConfig {
     int lens_fg2009_af_coarse_span_low_zoom = 200;
     float lens_fg2009_af_coarse_span_zoom_threshold = 1.95f;
     int lens_fg2009_af_fine_span = 48;
-    int lens_fg2009_af_pps = 900;
+    // 700 pps: measurably quieter than 900 with no focus-quality cost —
+    // scan moves are short, travel time stays well inside move_timeout.
+    int lens_fg2009_af_pps = 700;
     int lens_fg2009_af_move_timeout_ms = 15000;
     // Trust the curve landing: accept the first scan without the
     // confidence gate and never re-scan.
