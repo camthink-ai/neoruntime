@@ -16,6 +16,7 @@
 - [ ] `make check` passes locally (or I noted why below)
 - [ ] Web / Python checks pass if those areas changed
 - [ ] Tests added/updated for new behavior
+- [ ] If API routes changed (`platform/platform-api/server/main.go`), `docs/api/swagger.yaml` updated in the same PR (`Swagger sync` CI job must stay green)
 - [ ] No secrets, internal IPs, or proprietary vendor code introduced
 - [ ] Commit messages follow the conventional-commits policy
 
