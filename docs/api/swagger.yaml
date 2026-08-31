@@ -1563,6 +1563,45 @@ paths:
                   properties:
                     data:
                       type: object
+  /device/lens/goto-ratio:
+    post:
+      tags:
+      - Device Control
+      summary: Position lens at a zoom ratio
+      description: Drives the lens to the requested optical zoom ratio (AF0832
+        goto zoom ratio); rejects values below 1.0.
+      operationId: lensGotoZoomRatio
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - zoom_ratio
+              properties:
+                zoom_ratio:
+                  type: number
+                  format: float
+                  minimum: 1
+                  description: Target optical zoom ratio (>= 1.0)
+      responses:
+        '200':
+          description: Goto result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        success:
+                          type: boolean
+                        message:
+                          type: string
   /device/fan:
     get:
       tags:
