@@ -17,15 +17,18 @@ info:
     - Stream (HLS video streaming)
 
     '
-  version: 1.0.0
+  version: 1.0.2
   contact:
     name: AIPC Platform Team
     email: support@camthink.ai
 servers:
+- url: /api/v1
+  description: Current host (resolved against wherever this spec is served,
+    e.g. http://<device>:8080/api/v1 — same-origin, no CORS)
 - url: http://localhost:8080/api/v1
-  description: Development server
+  description: Local development
 - url: http://{host}:8080/api/v1
-  description: Production server
+  description: Explicit host
   variables:
     host:
       default: localhost
@@ -170,6 +173,133 @@ paths:
                         service:
                           type: string
                           example: platform-api
+  /ai/capabilities:
+    get:
+      tags:
+      - AI Runtime
+      summary: Get supported model formats and types
+      operationId: getAiCapabilities
+      responses:
+        '200':
+          description: Supported formats and model types
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        formats:
+                          type: array
+                          items:
+                            type: object
+                        model_types:
+                          type: array
+                          items:
+                            type: string
+  /ai/models/parse:
+    post:
+      tags:
+      - AI Runtime
+      summary: Parse an uploaded model file
+      description: Uploads a model file (multipart field "model") and returns parsed
+        metadata (HEF network/input info) without loading it.
+      operationId: parseModel
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+              - model
+              properties:
+                model:
+                  type: string
+                  format: binary
+                  description: Model file (.hef, .onnx, ...)
+      responses:
+        '200':
+          description: Parsed model metadata
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /ai/models/scan:
+    post:
+      tags:
+      - AI Runtime
+      summary: Rescan disk for model files
+      description: Seeds/refreshes the model registry from on-disk model directories.
+      operationId: scanModels
+      responses:
+        '200':
+          description: Scan result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /ai/models/{model_id}/load:
+    post:
+      tags:
+      - AI Runtime
+      summary: Load a model into the AI runtime
+      operationId: loadModel
+      parameters:
+      - name: model_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Load result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /ai/models/{model_id}/unload:
+    post:
+      tags:
+      - AI Runtime
+      summary: Unload a model from the AI runtime
+      operationId: unloadModel
+      parameters:
+      - name: model_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Unload result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
   /ai/models:
     get:
       tags:
@@ -739,6 +869,32 @@ paths:
                       type: object
                       description: Empty data
   /device/gpio:
+    get:
+      tags:
+      - Device Control
+      summary: Batch read GPIO values
+      description: Reads multiple GPIO pins in one call. Without the pins parameter
+        returns the full pin catalog with live values.
+      operationId: gpioBatchRead
+      parameters:
+      - name: pins
+        in: query
+        required: false
+        description: Comma-separated pin names/numbers (max 64). Omit to read all.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: GPIO pin catalog with live values
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
     post:
       tags:
       - Device Control
@@ -802,6 +958,774 @@ paths:
                           type: integer
                         value:
                           type: boolean
+  /device/lens/status:
+    get:
+      tags:
+      - Device Control
+      summary: Get lens motor status
+      description: Zoom/focus motor states, positions, iris ADC and configured limits.
+      operationId: getLensStatus
+      responses:
+        '200':
+          description: Lens status
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/LensStatus'
+  /device/lens/oneshot-af:
+    post:
+      tags:
+      - Device Control
+      summary: Trigger one-shot autofocus
+      operationId: oneshotAutofocus
+      responses:
+        '200':
+          description: Autofocus job accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        accepted:
+                          type: boolean
+                        job_id:
+                          type: integer
+                          format: int64
+                        message:
+                          type: string
+  /device/lens/af/oneshot:
+    post:
+      tags:
+      - Device Control
+      summary: Trigger one-shot autofocus (alias)
+      description: Alias of /device/lens/oneshot-af.
+      operationId: oneshotAutofocusAlias
+      responses:
+        '200':
+          description: Autofocus job accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        accepted:
+                          type: boolean
+                        job_id:
+                          type: integer
+                          format: int64
+                        message:
+                          type: string
+  /device/lens/zoom-follow:
+    post:
+      tags:
+      - Device Control
+      summary: Start focus zoom-follow at a zoom ratio
+      description: Locks focus tracking to the given optical zoom ratio (must be greater than 0).
+      operationId: startZoomFollow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - ratio
+              properties:
+                ratio:
+                  type: number
+                  description: Zoom ratio to follow (greater than 0)
+      responses:
+        '200':
+          description: Zoom-follow result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        accepted:
+                          type: boolean
+                        job_id:
+                          type: integer
+                          format: int64
+                        message:
+                          type: string
+  /device/lens/af/status:
+    get:
+      tags:
+      - Device Control
+      summary: Get autofocus job status
+      description: Rich one-shot AF status — state, progress, best-focus metric, confidence,
+        reproducibility, estimated distance and positions.
+      operationId: getAutofocusStatus
+      responses:
+        '200':
+          description: Autofocus status
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/AutofocusStatus'
+  /device/lens/af/cancel:
+    post:
+      tags:
+      - Device Control
+      summary: Cancel a running autofocus job
+      operationId: cancelAutofocus
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                job_id:
+                  type: integer
+                  format: int64
+                  description: Job to cancel; omit to cancel the current job
+      responses:
+        '200':
+          description: Cancel result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /device/lens/zoom-level:
+    put:
+      tags:
+      - Device Control
+      summary: Move zoom to a normalized level
+      operationId: setZoomLevel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - level
+              properties:
+                level:
+                  type: number
+                  description: Normalized zoom level (0.0-1.0)
+      responses:
+        '200':
+          description: Zoom moved
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /device/lens/focus-level:
+    put:
+      tags:
+      - Device Control
+      summary: Move focus to a normalized level
+      operationId: setFocusLevel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - level
+              properties:
+                level:
+                  type: number
+                  description: Normalized focus level (0.0-1.0)
+      responses:
+        '200':
+          description: Focus moved
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /device/lens/reset-zero:
+    post:
+      tags:
+      - Device Control
+      summary: Reset lens motor zero point
+      description: Recalibrates zoom and/or focus motor zero (long operation, up to 120s).
+      operationId: lensResetZero
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                zoom:
+                  type: boolean
+                  description: Reset zoom zero point
+                focus:
+                  type: boolean
+                  description: Reset focus zero point
+      responses:
+        '200':
+          description: Reset-zero result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /device/lens/iris:
+    post:
+      tags:
+      - Device Control
+      summary: Drive iris motor
+      operationId: controlIris
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                speed:
+                  type: integer
+                  description: Iris drive speed (negative closes, positive opens)
+      responses:
+        '200':
+          description: Iris command result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /device/lens/iris-target:
+    post:
+      tags:
+      - Device Control
+      summary: Set iris target ADC value
+      operationId: setIrisTarget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target:
+                  type: integer
+                  description: Target iris ADC value
+      responses:
+        '200':
+          description: Iris target set
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /device/lens/limits:
+    put:
+      tags:
+      - Device Control
+      summary: Set zoom/focus travel limits
+      operationId: setLensLimits
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                zoom_limit:
+                  $ref: '#/components/schemas/LensLimit'
+                focus_limit:
+                  $ref: '#/components/schemas/LensLimit'
+      responses:
+        '200':
+          description: Lens limits set
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
+  /device/lens/init:
+    post:
+      tags:
+      - Device Control
+      summary: Initialize lens with configured limits
+      description: Uses limits from device-control.yaml; no request body required.
+      operationId: lensInit
+      responses:
+        '200':
+          description: Lens init result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /device/lens/goto:
+    post:
+      tags:
+      - Device Control
+      summary: Position lens at zoom ratio and focus distance
+      description: High-level AF0832 positioning — e.g. zoom_ratio 2.0, focus_distance_m 5.0.
+      operationId: lensGotoRatioDistance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                zoom_ratio:
+                  type: number
+                  description: Optical zoom ratio (1.0-2.88)
+                focus_distance_m:
+                  type: number
+                  description: Focus distance in meters
+      responses:
+        '200':
+          description: Goto result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /device/fan:
+    get:
+      tags:
+      - Device Control
+      summary: Get fan state
+      operationId: getFan
+      responses:
+        '200':
+          description: Fan state
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/EnvCtrlState'
+    post:
+      tags:
+      - Device Control
+      summary: Enable/disable the fan
+      operationId: setFan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enable:
+                  type: boolean
+      responses:
+        '200':
+          description: Fan state after update
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/EnvCtrlState'
+  /device/heat:
+    get:
+      tags:
+      - Device Control
+      summary: Get heater state
+      operationId: getHeat
+      responses:
+        '200':
+          description: Heater state
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/EnvCtrlState'
+    post:
+      tags:
+      - Device Control
+      summary: Enable/disable the heater
+      operationId: setHeat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enable:
+                  type: boolean
+      responses:
+        '200':
+          description: Heater state after update
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/EnvCtrlState'
+  /device/radar:
+    get:
+      tags:
+      - Device Control
+      summary: Get radar state
+      operationId: getRadar
+      responses:
+        '200':
+          description: Radar state
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/EnvCtrlState'
+    post:
+      tags:
+      - Device Control
+      summary: Enable/disable the radar
+      operationId: setRadar
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enable:
+                  type: boolean
+      responses:
+        '200':
+          description: Radar state after update
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/EnvCtrlState'
+  /device/alarm-out:
+    post:
+      tags:
+      - Device Control
+      summary: Set alarm output channel state
+      operationId: setAlarmOut
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                channel:
+                  type: integer
+                enable:
+                  type: boolean
+      responses:
+        '200':
+          description: Alarm output state after update
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/AlarmChannelState'
+  /device/alarm-out/{channel}:
+    get:
+      tags:
+      - Device Control
+      summary: Get alarm output channel state
+      operationId: getAlarmOut
+      parameters:
+      - name: channel
+        in: path
+        required: true
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: Alarm output state
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/AlarmChannelState'
+  /device/wiegand:
+    post:
+      tags:
+      - Device Control
+      summary: Set wiegand output channel state
+      operationId: setWiegand
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                channel:
+                  type: integer
+                enable:
+                  type: boolean
+      responses:
+        '200':
+          description: Wiegand state after update
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/AlarmChannelState'
+  /device/wiegand/{channel}:
+    get:
+      tags:
+      - Device Control
+      summary: Get wiegand output channel state
+      operationId: getWiegand
+      parameters:
+      - name: channel
+        in: path
+        required: true
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: Wiegand state
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/AlarmChannelState'
+  /device/alarm-outputs:
+    get:
+      tags:
+      - Device Control
+      summary: Get all alarm/wiegand output states
+      operationId: getAlarmOutputs
+      responses:
+        '200':
+          description: All alarm output states
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        success:
+                          type: boolean
+                        message:
+                          type: string
+                        alarm_out0:
+                          type: boolean
+                        alarm_out1:
+                          type: boolean
+                        wiegand0:
+                          type: boolean
+                        wiegand1:
+                          type: boolean
+  /device/rs485/init:
+    post:
+      tags:
+      - Device Control
+      summary: Initialize the RS485 bus
+      operationId: rs485Init
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                baudrate:
+                  type: integer
+                  description: Baud rate (e.g. 9600, 115200)
+                config:
+                  type: string
+                  description: Serial config string (e.g. 8N1)
+      responses:
+        '200':
+          description: RS485 init result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        success:
+                          type: boolean
+                        message:
+                          type: string
+  /device/rs485/deinit:
+    post:
+      tags:
+      - Device Control
+      summary: Deinitialize the RS485 bus
+      operationId: rs485Deinit
+      responses:
+        '200':
+          description: RS485 deinit result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        success:
+                          type: boolean
+                        message:
+                          type: string
+  /device/rs485/tx:
+    post:
+      tags:
+      - Device Control
+      summary: Transmit data over RS485
+      operationId: rs485Tx
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - data
+              properties:
+                data:
+                  type: string
+                  description: Base64-encoded payload to transmit
+      responses:
+        '200':
+          description: RS485 transmit result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /device/capabilities:
+    get:
+      tags:
+      - Device Control
+      summary: Get device hardware capabilities
+      description: Feature flags for what this hardware variant supports.
+      operationId: getDeviceCapabilities
+      responses:
+        '200':
+          description: Device capabilities
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/DeviceCapabilities'
   /apps:
     get:
       tags:
@@ -1048,48 +1972,6 @@ paths:
                       $ref: '#/components/schemas/AppPermissions'
         '404':
           description: App not found
-  /streams:
-    get:
-      tags:
-      - Stream
-      summary: List available streams
-      operationId: listStreams
-      responses:
-        '200':
-          description: List of streams
-          content:
-            application/json:
-              schema:
-                allOf:
-                - $ref: '#/components/schemas/APIResponse'
-                - type: object
-                  properties:
-                    data:
-                      $ref: '#/components/schemas/StreamListResponse'
-  /streams/{stream_id}:
-    get:
-      tags:
-      - Stream
-      summary: Get stream information
-      operationId: getStreamInfo
-      parameters:
-      - name: stream_id
-        in: path
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Stream information
-          content:
-            application/json:
-              schema:
-                allOf:
-                - $ref: '#/components/schemas/APIResponse'
-                - type: object
-                  properties:
-                    data:
-                      $ref: '#/components/schemas/StreamInfo'
   /h264/{stream_id}:
     get:
       tags:
@@ -1357,6 +2239,57 @@ paths:
                                 type: integer
                               packets_recv:
                                 type: integer
+  /monitor/snapshot:
+    get:
+      tags: [Monitor]
+      summary: One-shot resource snapshot
+      description: Single-call sampling of CPU, memory, NPU usage, temperatures and
+        network counters — cheaper than polling the individual endpoints.
+      operationId: getResourceSnapshot
+      responses:
+        '200':
+          description: Resource snapshot
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        timestamp:
+                          type: integer
+                          format: int64
+                          description: Unix milliseconds
+                        cpu:
+                          type: number
+                          description: CPU usage percent
+                        memory:
+                          type: number
+                          description: Memory usage percent
+                        npu:
+                          type: number
+                          description: NPU usage percent
+                        temperatures:
+                          type: object
+                          properties:
+                            cpu:
+                              type: number
+                            npu:
+                              type: number
+                            board:
+                              type: number
+                        network:
+                          type: object
+                          properties:
+                            bytes_sent:
+                              type: integer
+                              format: int64
+                            bytes_recv:
+                              type: integer
+                              format: int64
   /monitor/gyro/attitude:
     get:
       tags:
@@ -3064,6 +3997,112 @@ paths:
                       properties:
                         image:
                           type: string
+  /apps/upload-manifest:
+    post:
+      tags: [App Manager]
+      summary: Upload app manifest
+      description: Uploads a YAML app manifest (multipart field "file", .yaml/.yml only)
+        for later package install.
+      operationId: uploadManifest
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: App manifest YAML
+      responses:
+        '200':
+          description: Manifest uploaded
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /apps/install-package:
+    post:
+      tags: [App Manager]
+      summary: Install app from uploaded manifest and image
+      description: Async install — returns a task_id whose progress is tracked via
+        /apps/install-progress/{task_id}.
+      operationId: installPackage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [manifest_path]
+              properties:
+                manifest_path:
+                  type: string
+                  description: Server-side path of the manifest (from upload-manifest)
+                image_path:
+                  type: string
+                  description: Optional server-side path of the container image
+                force:
+                  type: boolean
+                  description: Reinstall if the app already exists
+      responses:
+        '200':
+          description: Async install accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        task_id:
+                          type: string
+  /apps/install-progress/{task_id}:
+    get:
+      tags: [App Manager]
+      summary: Get async install progress
+      operationId: getInstallProgress
+      parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Install progress
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        task_id:
+                          type: string
+                        phase:
+                          type: string
+                        percent:
+                          type: integer
+                        message:
+                          type: string
+                        app_id:
+                          type: string
+                        error:
+                          type: string
 
   # ==================== Container Log / Exec WebSockets ====================
   /containers/{id}/logs/ws:
@@ -3379,12 +4418,32 @@ paths:
       operationId: detectOTAUpdate
       responses:
         '200':
-          description: Update availability status
+          description: Update availability status (always no update —
+            updates are pushed locally, not polled from a remote server)
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        update_available:
+                          type: boolean
+                        version:
+                          type: string
+                        changelog:
+                          type: string
 
   /system/ota/install:
     post:
       tags: [System]
       summary: Upload and install a new firmware package
+      description: Parses the package (advisory compatibility check), then
+        deploys it. An incompatible package fails during validate with status
+        failed — the parse endpoint reports the same verdict beforehand.
       operationId: installOTA
       requestBody:
         content:
@@ -3398,10 +4457,36 @@ paths:
       responses:
         '200':
           description: OTA installation process started
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        message:
+                          type: string
+                          example: OTA upgrade started
+                        status:
+                          type: string
+                          example: started
+                        progress:
+                          type: string
+                          description: URL to poll for progress
+                          example: /api/v1/system/ota/status
+                        job_id:
+                          type: string
 
   # ==================== Login ====================
   /login:
     post:
+      servers:
+      - url: /api
+        description: Login is registered at /api/login, outside the /api/v1
+          group; relative so try-it-out hits the host serving this page
       tags: [System]
       summary: Authenticate and get API token
       operationId: login
@@ -3426,6 +4511,53 @@ paths:
                       $ref: '#/components/schemas/LoginResponse'
         '401':
           description: Invalid credentials
+  /logout:
+    post:
+      tags: [System]
+      summary: Revoke the current API token
+      description: Revokes the bearer token used for this request (server-side revocation).
+      operationId: logout
+      responses:
+        '200':
+          description: Token revoked
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      nullable: true
+  /auth/public-key:
+    get:
+      tags: [System]
+      summary: Get the device RSA public key
+      description: PEM public key used by clients to encrypt password payloads for login.
+      operationId: getPublicKey
+      responses:
+        '200':
+          description: Public key material
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        public_key:
+                          type: string
+                          description: PEM-encoded RSA public key
+                        algorithm:
+                          type: string
+                          example: RSA-2048/PKCS1v15
+                        unix_timestamp:
+                          type: integer
+                          format: int64
 
   # ==================== OTA Extended ====================
   /system/ota/status:
@@ -3506,7 +4638,11 @@ paths:
                           type: string
                         progress:
                           type: string
+                          description: URL to poll for progress
+                          example: /api/v1/system/ota/status
                         source_path:
+                          type: string
+                        job_id:
                           type: string
 
   # ==================== OS A/B Upgrade ====================
@@ -3528,7 +4664,16 @@ paths:
                   format: binary
       responses:
         '200':
-          description: Package uploaded
+          description: Package uploaded; returns the created job
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/OSUpgradeJob'
 
   /system/os-upgrade/validate:
     post:
@@ -3543,7 +4688,18 @@ paths:
               $ref: '#/components/schemas/OSUpgradeJobRequest'
       responses:
         '200':
-          description: Package validation result
+          description: Package validation result; compatibility_valid /
+            compatibility_warning judge the installed app against the target OS
+            (advisory)
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/OSUpgradeJob'
 
   /system/os-upgrade/install:
     post:
@@ -3558,7 +4714,16 @@ paths:
               $ref: '#/components/schemas/OSUpgradeJobRequest'
       responses:
         '200':
-          description: Independent updater service started
+          description: Independent updater service started; returns the job
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/OSUpgradeJob'
 
   /system/os-upgrade/status:
     get:
@@ -3572,7 +4737,23 @@ paths:
           type: string
       responses:
         '200':
-          description: Current OS upgrade status
+          description: Current OS upgrade status (job with log tail; bare
+            idle status when no job exists)
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      anyOf:
+                      - $ref: '#/components/schemas/OSUpgradeJob'
+                      - type: object
+                        properties:
+                          status:
+                            type: string
+                            example: idle
 
   /system/os-upgrade/reboot:
     post:
@@ -3588,6 +4769,21 @@ paths:
       responses:
         '200':
           description: Reboot service started
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        job_id:
+                          type: string
+                        status:
+                          type: string
+                          example: rebooting
 
   /system/os-upgrade/cancel:
     post:
@@ -3602,7 +4798,16 @@ paths:
               $ref: '#/components/schemas/OSUpgradeJobRequest'
       responses:
         '200':
-          description: Job cancelled
+          description: Job cancelled; returns the updated job
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/OSUpgradeJob'
 
   /system/os-upgrade/package:
     delete:
@@ -3620,6 +4825,31 @@ paths:
           description: Package deleted
 
   # ==================== System Time ====================
+  /system/time/sync-from-client:
+    post:
+      tags: [System]
+      summary: Sync device clock from client timestamp
+      description: Sets the device clock using the client's Unix-epoch seconds; compensates
+        for request transit latency where measurable.
+      operationId: syncTimeFromClient
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SyncFromClientRequest'
+      responses:
+        '200':
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
   /system/time:
     get:
       tags: [System]
@@ -3679,6 +4909,30 @@ paths:
                   properties:
                     data:
                       $ref: '#/components/schemas/TimeConfig'
+    put:
+      tags: [System]
+      summary: Save time configuration (timezone)
+      description: Persists the timezone into the device time configuration.
+      operationId: saveTimeConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SaveTimeConfigRequest'
+      responses:
+        '200':
+          description: Time configuration saved
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      description: Empty data
 
   /system/time/timezone:
     put:
@@ -3738,6 +4992,73 @@ paths:
                       type: array
                       items:
                         type: string
+
+  /config/jobs:
+    get:
+      tags: [System]
+      summary: List config-controller apply jobs
+      description: Read-only audit of config apply/delete/reconcile job history.
+      operationId: listConfigJobs
+      parameters:
+      - name: domain
+        in: query
+        required: false
+        schema:
+          type: string
+        description: Filter by config domain
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+        description: Max jobs to return
+      responses:
+        '200':
+          description: Config job list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        jobs:
+                          type: array
+                          items:
+                            type: object
+                        count:
+                          type: integer
+  /config/jobs/{id}:
+    get:
+      tags: [System]
+      summary: Get one config job by ID
+      operationId: getConfigJob
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Config job
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        job:
+                          type: object
+        '404':
+          description: Job not found
 
   # ==================== Event Logs ====================
   /event-logs:
@@ -3858,6 +5179,43 @@ paths:
                     data:
                       type: object
                       additionalProperties: true
+  /event-logs/templates:
+    get:
+      tags: [Event Logs]
+      summary: Get event message templates
+      description: All event codes with their localized (en/zh) message templates,
+        module, level and declared parameters.
+      operationId: getEventLogTemplates
+      responses:
+        '200':
+          description: Event templates keyed by code
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        templates:
+                          type: object
+                          additionalProperties:
+                            type: object
+                            properties:
+                              en:
+                                type: string
+                              zh:
+                                type: string
+                              module:
+                                type: string
+                              level:
+                                type: string
+                              params:
+                                type: array
+                                items:
+                                  type: string
 
   # ==================== Debug Logs ====================
   /debug-logs/export:
@@ -4048,9 +5406,74 @@ paths:
       responses:
         '200':
           description: Device name updated
+  /device-info/factory:
+    get:
+      tags: [Device Info]
+      summary: Get factory information
+      description: Read-only factory-programmed fields (batch, line, calibration date, ...).
+      operationId: getFactoryInfo
+      responses:
+        '200':
+          description: Factory information
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      additionalProperties: true
+    post:
+      tags: [Device Info]
+      summary: Write one factory field
+      description: Writes a single factory-programmed field (write-once semantics;
+        intended for the production line).
+      operationId: updateFactoryField
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [field, value]
+              properties:
+                field:
+                  type: string
+                value:
+                  type: string
+      responses:
+        '200':
+          description: Factory field written
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
 
   # ==================== Media Extended ====================
   /media/image:
+    get:
+      tags: [Media]
+      summary: Get current ISP image parameters
+      operationId: getImageConfig
+      responses:
+        '200':
+          description: ISP image parameters
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/MediaImageConfig'
     put:
       tags: [Media]
       summary: Update ISP image parameters
@@ -4115,6 +5538,22 @@ paths:
           description: AI overlay updated
 
   /media/osd:
+    get:
+      tags: [Media]
+      summary: Get OSD (On-Screen Display) configuration
+      operationId: getOsdConfig
+      responses:
+        '200':
+          description: OSD configuration
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/MediaOsdConfig'
     put:
       tags: [Media]
       summary: Update OSD (On-Screen Display) configuration
@@ -4158,6 +5597,663 @@ paths:
                           type: string
                         interrupt_ms:
                           type: integer
+
+  /media/transform:
+    get:
+      tags: [Media]
+      summary: Get transform configuration
+      operationId: getTransformConfig
+      responses:
+        '200':
+          description: Transform configuration
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/MediaTransformConfig'
+    put:
+      tags: [Media]
+      summary: Update transform configuration
+      description: Partial update — rotation (0/90/180/270), flip, dewarp, grayscale,
+        DIS and EIS.
+      operationId: updateTransformConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MediaTransformConfig'
+      responses:
+        '200':
+          description: Transform configuration updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/MediaTransformConfig'
+  /media/osd/upload-image:
+    post:
+      tags: [Media]
+      summary: Upload an OSD overlay image
+      description: PNG or BMP only; stored under /data/aipc/etc/osd and referenced by
+        image overlays via image_path.
+      operationId: uploadOsdImage
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: PNG or BMP image
+      responses:
+        '200':
+          description: Image stored
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        path:
+                          type: string
+                        size:
+                          type: integer
+                          format: int64
+  /media/osd/font:
+    get:
+      tags: [Media]
+      summary: Download the OSD font file
+      operationId: getOsdFont
+      responses:
+        '200':
+          description: TTF font file (cacheable, max-age 86400)
+          content:
+            font/ttf:
+              schema:
+                type: string
+                format: binary
+  /media/osd/image/{name}:
+    get:
+      tags: [Media]
+      summary: Serve a stored OSD overlay image
+      operationId: getOsdImage
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Image filename under /data/aipc/etc/osd
+      responses:
+        '200':
+          description: Image binary
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+  /media/privacy-mask:
+    get:
+      tags: [Media]
+      summary: Get privacy mask configuration
+      operationId: getPrivacyMaskConfig
+      responses:
+        '200':
+          description: Privacy mask configuration
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/PrivacyMaskConfig'
+    put:
+      tags: [Media]
+      summary: Update privacy mask configuration
+      description: Partial update; region points accept both snake_case and camelCase
+        point arrays (points_x / pointsX).
+      operationId: updatePrivacyMaskConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrivacyMaskConfig'
+      responses:
+        '200':
+          description: Privacy mask configuration updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/PrivacyMaskConfig'
+  /media/profile:
+    get:
+      tags: [Media]
+      summary: Get the active pipeline profile name
+      operationId: getMediaProfile
+      responses:
+        '200':
+          description: Current profile
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        profile_name:
+                          type: string
+  /media/profiles:
+    get:
+      tags: [Media]
+      summary: List available pipeline profiles
+      operationId: listMediaProfiles
+      responses:
+        '200':
+          description: Profile list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        profiles:
+                          type: array
+                          items:
+                            type: string
+                        current_profile:
+                          type: string
+  /media/profile/switch:
+    post:
+      tags: [Media]
+      summary: Switch the active pipeline profile
+      description: Hot profile switch — returns the accepted flag and expected stream
+        interrupt duration.
+      operationId: switchMediaProfile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [profile_name]
+              properties:
+                profile_name:
+                  type: string
+      responses:
+        '200':
+          description: Switch result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        success:
+                          type: boolean
+                        message:
+                          type: string
+                        interrupt_ms:
+                          type: integer
+  /media/profile/backup:
+    post:
+      tags: [Media]
+      summary: Back up the active pipeline profile
+      operationId: backupMediaProfile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                path:
+                  type: string
+                  description: Destination path for the profile backup
+      responses:
+        '200':
+          description: Backup result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        success:
+                          type: boolean
+                        message:
+                          type: string
+  /media/pipeline/reconfigure:
+    post:
+      tags: [Media]
+      summary: Reconfigure the full pipeline
+      description: Sends 1-4 stream definitions (input geometry + encoder settings);
+        camera-daemon rebuilds the pipeline.
+      operationId: reconfigurePipeline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [streams]
+              properties:
+                streams:
+                  type: array
+                  minItems: 1
+                  maxItems: 4
+                  items:
+                    type: object
+                    required: [input_width, input_height, input_framerate]
+                    properties:
+                      stream_id:
+                        type: string
+                        description: Defaults to sinkN when omitted
+                      input_width:
+                        type: integer
+                      input_height:
+                        type: integer
+                      input_framerate:
+                        type: integer
+                      codec:
+                        type: string
+                      encoder_width:
+                        type: integer
+                      encoder_height:
+                        type: integer
+                      encoder_framerate:
+                        type: integer
+                      encoder_bitrate:
+                        type: integer
+                      encoder_gop:
+                        type: integer
+      responses:
+        '200':
+          description: Pipeline reconfiguration result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /media/status:
+    get:
+      tags: [Media]
+      summary: Get live status of all streams
+      description: Merges camera-daemon live encoder state with the configured stream
+        table; disabled streams appear with status "inactive".
+      operationId: getMediaStreamStatus
+      responses:
+        '200':
+          description: Stream status list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/StreamStatusList'
+  /media/streams:
+    post:
+      tags: [Media]
+      summary: Add a stream
+      description: Adds an encoder stream at runtime (stream_id, geometry, fps, codec,
+        bitrate, gop). Codec defaults to h264.
+      operationId: addStream
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stream_id, width, height, fps]
+              properties:
+                stream_id:
+                  type: string
+                width:
+                  type: integer
+                height:
+                  type: integer
+                fps:
+                  type: integer
+                codec:
+                  type: string
+                  default: h264
+                bitrate:
+                  type: integer
+                gop:
+                  type: integer
+      responses:
+        '200':
+          description: Stream added
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /media/streams/{name}:
+    delete:
+      tags: [Media]
+      summary: Remove a stream
+      description: The main stream cannot be removed.
+      operationId: removeStream
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Stream removed
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /media/streams/{name}/enable:
+    post:
+      tags: [Media]
+      summary: Enable a stream
+      description: Pipeline-level enable via ReconfigurePipeline; the main stream is
+        always enabled.
+      operationId: enableStream
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Stream enable result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+  /media/streams/{name}/disable:
+    delete:
+      tags: [Media]
+      summary: Disable a stream
+      description: Pipeline-level disable via ReconfigurePipeline; the main stream
+        cannot be disabled.
+      operationId: disableStream
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Stream disable result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+
+  # ==================== Audio ====================
+  /audio/capture-devices:
+    get:
+      tags: [Media]
+      summary: List audio capture devices
+      operationId: listCaptureDevices
+      responses:
+        '200':
+          description: Capture device list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        devices:
+                          type: array
+                          items:
+                            type: object
+  /audio/playback-devices:
+    get:
+      tags: [Media]
+      summary: List audio playback devices
+      operationId: listPlaybackDevices
+      responses:
+        '200':
+          description: Playback device list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        devices:
+                          type: array
+                          items:
+                            type: object
+  /audio/status:
+    get:
+      tags: [Media]
+      summary: Get audio pipeline status
+      operationId: getAudioStatus
+      responses:
+        '200':
+          description: Audio status
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/AudioStatus'
+  /audio/capture/start:
+    post:
+      tags: [Media]
+      summary: Start audio capture
+      operationId: startAudioCapture
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AudioConfigRequest'
+      responses:
+        '200':
+          description: Capture started
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        message:
+                          type: string
+  /audio/capture/stop:
+    post:
+      tags: [Media]
+      summary: Stop audio capture
+      operationId: stopAudioCapture
+      responses:
+        '200':
+          description: Capture stopped
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        message:
+                          type: string
+  /audio/config:
+    put:
+      tags: [Media]
+      summary: Update audio configuration
+      description: Persists audio config to camera-daemon.yaml (device, sample rate,
+        channels, codec, bitrate, volume, mute, playback_enabled).
+      operationId: setAudioConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AudioConfigRequest'
+      responses:
+        '200':
+          description: Audio config updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        message:
+                          type: string
+  /audio/playback/start:
+    post:
+      tags: [Media]
+      summary: Start audio playback
+      operationId: startAudioPlayback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AudioConfigRequest'
+      responses:
+        '200':
+          description: Playback started
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        message:
+                          type: string
+  /audio/playback/stop:
+    post:
+      tags: [Media]
+      summary: Stop audio playback
+      operationId: stopAudioPlayback
+      responses:
+        '200':
+          description: Playback stopped
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        message:
+                          type: string
+  /audio/stream:
+    get:
+      tags: [Media]
+      summary: Audio capture stream (WebSocket)
+      description: WebSocket carrying captured audio frames from device to browser.
+      operationId: audioStreamWS
+      responses:
+        '101':
+          description: WebSocket upgrade
+  /audio/talk:
+    get:
+      tags: [Media]
+      summary: Two-way talk (WebSocket)
+      description: Push-to-talk — browser microphone PCM pushed to the device speaker.
+      operationId: audioTalkWS
+      responses:
+        '101':
+          description: WebSocket upgrade
 
   # ==================== Files Extended ====================
   /files/batch-download:
@@ -4509,14 +6605,17 @@ components:
           description: Empty data
         app_id:
           type: string
-    StreamInfo:
+    StreamStatus:
       type: object
       properties:
-        id:
+        stream_id:
           type: string
-        name:
+        status:
           type: string
-        url:
+          description: e.g. active / inactive / error
+        has_encoder:
+          type: boolean
+        codec:
           type: string
         width:
           type: integer
@@ -4524,18 +6623,363 @@ components:
           type: integer
         fps:
           type: integer
-        codec:
-          type: string
-        bitrate:
+        bitrate_bps:
           type: integer
-    StreamListResponse:
+        gop:
+          type: integer
+        ms_since_last_frame:
+          type: integer
+          nullable: true
+          description: Milliseconds since the last encoded frame; null when unknown
+        measured_fps:
+          type: number
+        status_detail:
+          type: string
+    StreamStatusList:
       type: object
       properties:
         streams:
           type: array
           items:
-            $ref: '#/components/schemas/StreamInfo'
-
+            $ref: '#/components/schemas/StreamStatus'
+    StreamView:
+      type: object
+      description: Config-view projection of a stream (GET /media/streams),
+        as opposed to the runtime state in StreamStatus (GET /media/status).
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        codec:
+          type: string
+        width:
+          type: integer
+        height:
+          type: integer
+        fps:
+          type: integer
+        bitrate:
+          type: integer
+        gop:
+          type: integer
+        enabled:
+          type: boolean
+        status:
+          type: string
+          description: active when enabled in config, stopped otherwise
+        rtsp_url:
+          type: string
+          description: RTSP mount URL; empty when RTSP base is unconfigured
+        h264_ws_path:
+          type: string
+          description: H264-over-WebSocket route on this API; prefix with the
+            API base URL and swap http->ws
+    InfraredStatus:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        mode:
+          type: string
+          description: Effective IR mode
+        transition:
+          type: string
+        output_source:
+          type: string
+        auto_follow:
+          type: boolean
+        follow_active:
+          type: boolean
+        manual_override:
+          type: boolean
+        degraded:
+          type: boolean
+        requested_near_pwm:
+          type: integer
+        requested_far_pwm:
+          type: integer
+        applied_near_pwm:
+          type: integer
+        applied_far_pwm:
+          type: integer
+        zoom_ratio:
+          type: number
+        active_profile:
+          type: string
+        selected_mode:
+          type: string
+          description: Operator selection (auto / day / infrared)
+        light_percent:
+          type: integer
+        light_mv:
+          type: integer
+        light_milli:
+          type: integer
+        light_valid:
+          type: boolean
+        night_enter:
+          type: integer
+        day_enter:
+          type: integer
+    IrPreset:
+      type: object
+      properties:
+        name:
+          type: string
+        zoom_ratio:
+          type: number
+          description: Optical zoom ratio (1.0-2.88)
+        near_pwm:
+          type: integer
+          minimum: 0
+          maximum: 100
+        far_pwm:
+          type: integer
+          minimum: 0
+          maximum: 100
+    LensLimit:
+      type: object
+      properties:
+        min_pos:
+          type: integer
+        max_pos:
+          type: integer
+    LensStatus:
+      type: object
+      properties:
+        zoom_state:
+          type: integer
+          description: 'Motor state: 0=NO_CFG 1=STOPPED 2=RUNNING 3=RESET_ZERO 4=ERROR'
+        focus_state:
+          type: integer
+        zoom_rz_done:
+          type: boolean
+        focus_rz_done:
+          type: boolean
+        zoom_pos:
+          type: integer
+        focus_pos:
+          type: integer
+        iris_adc:
+          type: integer
+        autofocus_enabled:
+          type: boolean
+        zoom_limit:
+          $ref: '#/components/schemas/LensLimit'
+        focus_limit:
+          $ref: '#/components/schemas/LensLimit'
+    AutofocusStatus:
+      type: object
+      properties:
+        job_id:
+          type: integer
+          format: int64
+        operation:
+          type: string
+        state:
+          type: string
+        progress:
+          type: number
+        busy:
+          type: boolean
+        anchor_valid:
+          type: boolean
+        requested_ratio:
+          type: number
+        effective_ratio:
+          type: number
+        zoom_pos:
+          type: integer
+        focus_pos:
+          type: integer
+        best_focus:
+          type: integer
+        metric:
+          type: number
+        confidence:
+          type: number
+        reproducibility:
+          type: number
+        estimated_distance_m:
+          type: number
+        elapsed_ms:
+          type: integer
+        error_code:
+          type: integer
+        message:
+          type: string
+    EnvCtrlState:
+      type: object
+      properties:
+        success:
+          type: boolean
+        enabled:
+          type: boolean
+        message:
+          type: string
+    AlarmChannelState:
+      type: object
+      properties:
+        success:
+          type: boolean
+        enabled:
+          type: boolean
+        message:
+          type: string
+    DeviceCapabilities:
+      type: object
+      properties:
+        has_video:
+          type: boolean
+        has_codec:
+          type: boolean
+        has_led:
+          type: boolean
+        has_sensor:
+          type: boolean
+        has_mcu:
+          type: boolean
+        has_env_ctrl:
+          type: boolean
+        has_alarm:
+          type: boolean
+        has_rs485:
+          type: boolean
+        has_osd:
+          type: boolean
+        has_draw:
+          type: boolean
+        has_audio:
+          type: boolean
+    MediaTransformConfig:
+      type: object
+      properties:
+        rotation:
+          type: integer
+          enum:
+          - 0
+          - 90
+          - 180
+          - 270
+        flip:
+          type: integer
+          description: Flip mode
+        dewarp:
+          type: boolean
+        grayscale:
+          type: boolean
+        dis:
+          type: boolean
+          description: Digital image stabilization
+        eis:
+          type: boolean
+          description: Electronic image stabilization
+    PrivacyMaskRegion:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        enabled:
+          type: boolean
+        points_x:
+          type: array
+          items:
+            type: number
+        points_y:
+          type: array
+          items:
+            type: number
+    PrivacyMaskConfig:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        color:
+          type: integer
+        blur_radius:
+          type: integer
+        regions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PrivacyMaskRegion'
+        dpm_enabled:
+          type: boolean
+          description: DPM label-based masking
+        dpm_labels:
+          type: string
+        dpm_mode:
+          type: string
+        dpm_color:
+          type: integer
+    AudioConfigRequest:
+      type: object
+      properties:
+        device:
+          type: string
+          description: ALSA device name
+        sample_rate:
+          type: integer
+          example: 48000
+        channels:
+          type: integer
+          example: 2
+        codec:
+          type: string
+          example: aac
+        bitrate:
+          type: integer
+        volume:
+          type: number
+          description: Omitted = no change
+        mute:
+          type: boolean
+          description: Omitted = no change
+        playback_enabled:
+          type: boolean
+          description: Omitted = no change
+    AudioStatus:
+      type: object
+      properties:
+        capturing:
+          type: boolean
+        playing:
+          type: boolean
+        device:
+          type: string
+        sample_rate:
+          type: integer
+        channels:
+          type: integer
+        codec:
+          type: string
+        volume:
+          type: number
+        mute:
+          type: boolean
+        playback_enabled:
+          type: boolean
+    SaveTimeConfigRequest:
+      type: object
+      required:
+      - timezone
+      properties:
+        timezone:
+          type: string
+          example: Asia/Shanghai
+    SyncFromClientRequest:
+      type: object
+      required:
+      - client_timestamp
+      properties:
+        client_timestamp:
+          type: integer
+          format: int64
+          description: Client time as Unix epoch seconds
     ErrorDetail:
       type: object
       properties:
@@ -4870,19 +7314,51 @@ components:
     OTAStatusResponse:
       type: object
       properties:
+        job_id:
+          type: string
+          description: Client-visible upgrade session ID
         status:
           type: string
-          enum: [idle, downloading, installing, completed, failed]
+          enum: [idle, uploading, extracting, deploying, success, failed]
         progress:
           type: integer
           minimum: 0
           maximum: 100
-        current_version:
-          type: string
-        target_version:
-          type: string
         message:
           type: string
+          description: Human readable message
+        current_step:
+          type: string
+        version:
+          type: string
+          description: Target version
+        start_time:
+          type: integer
+          format: int64
+          description: Unix timestamp
+        finished_at:
+          type: integer
+          format: int64
+          description: Unix timestamp when terminal
+        error:
+          type: string
+          description: Error message if failed
+        reboot_needed:
+          type: boolean
+        reboot_confirmed:
+          type: boolean
+          description: Whether the required reboot was observed
+        boot_id:
+          type: string
+          description: Boot ID that wrote the terminal status
+        current_boot_id:
+          type: string
+        log_path:
+          type: string
+          description: Device-local deploy log path
+        log_tail:
+          type: string
+          description: Last deploy log lines for failed status
 
     OTAParseResponse:
       type: object
@@ -4900,6 +7376,33 @@ components:
         firmware_size:
           type: integer
           format: int64
+        compatibility:
+          $ref: '#/components/schemas/AppCompatibility'
+          description: Advisory verdict of the package against the running OS;
+            the install endpoint enforces the same check as a hard gate.
+
+    AppCompatibility:
+      type: object
+      description: Compatibility verdict of an app/OS package against the
+        running OS (version-range contract, replaces the legacy compat-level).
+      properties:
+        valid:
+          type: boolean
+        error_code:
+          type: string
+          description: e.g. APP_OS_METADATA_UNAVAILABLE, APP_MANIFEST_MISSING,
+            APP_COMPATIBILITY_METADATA_INVALID, or an osupgrade compatibility code
+        message:
+          type: string
+        os_version:
+          type: string
+          description: Currently running OS version
+        app_min_os_version:
+          type: string
+          description: Minimum OS version the package supports
+        app_max_os_version:
+          type: string
+          description: Maximum OS version the package supports (empty = unbounded)
 
     OTAInstallFromPathRequest:
       type: object
@@ -5241,6 +7744,145 @@ components:
         job_id:
           type: string
           format: uuid
+
+    OSUpgradeJob:
+      type: object
+      description: A/B OS upgrade job. App compatibility is advisory for OS
+        upgrades — the install proceeds regardless and compatibility_valid /
+        compatibility_warning record the verdict for the operator.
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+          enum: [idle, uploading, validating, ready, installing, installed,
+            awaiting_reboot, rebooting, verifying, success, rollback, failed,
+            cancelled]
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        message:
+          type: string
+        error:
+          type: string
+        file_name:
+          type: string
+        file_size:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+        current_version:
+          type: string
+        target_version:
+          type: string
+        build_time:
+          type: string
+        machine:
+          type: string
+        product:
+          type: string
+        hardware_version:
+          type: string
+        current_copy:
+          type: string
+          description: Active OS copy (a or b)
+        target_copy:
+          type: string
+        previous_copy:
+          type: string
+        upgrade_mode:
+          type: string
+        upgrade_strategy:
+          type: string
+          description: standard or full
+        update_mode:
+          type: string
+        available_update_modes:
+          type: array
+          items:
+            type: string
+        available_update_mode_options:
+          type: array
+          items:
+            $ref: '#/components/schemas/OSUpgradeModeOption'
+        available_upgrade_strategies:
+          type: array
+          items:
+            $ref: '#/components/schemas/OSUpgradeStrategyOption'
+        supports_standard_upgrade:
+          type: boolean
+        supports_full_upgrade:
+          type: boolean
+        recovery_source:
+          type: string
+        recovery_version:
+          type: string
+        secure_boot_key_id:
+          type: string
+        app_version:
+          type: string
+          description: Version of the currently installed app package
+        compatibility_valid:
+          type: boolean
+          description: Whether the installed app is expected to run on the
+            target OS (advisory)
+        compatibility_warning:
+          type: string
+        rollback_supported:
+          type: boolean
+        service_interruption_required:
+          type: boolean
+        downgrade_allowed:
+          type: boolean
+        signature_valid:
+          type: boolean
+        reboot_required:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        log:
+          type: string
+          description: Tail of the upgrade log (status endpoint only)
+
+    OSUpgradeModeOption:
+      type: object
+      properties:
+        mode:
+          type: string
+        supported:
+          type: boolean
+        default:
+          type: boolean
+        reason:
+          type: string
+        warning:
+          type: string
+        warning_code:
+          type: string
+        warning_copy:
+          type: string
+        warning_target:
+          type: string
+
+    OSUpgradeStrategyOption:
+      type: object
+      properties:
+        strategy:
+          type: string
+        modes:
+          type: array
+          items:
+            type: string
+        supported:
+          type: boolean
+        reason:
+          type: string
 
     StoreInstallCreate:
       type: object
