@@ -76,3 +76,16 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec tsc -b
       - run: pnpm build
+
+  swagger-sync:
+    name: Swagger sync
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PyYAML
+        run: pip install pyyaml
+      - name: docs/api/swagger.yaml matches registered routes
+        run: python scripts/check_swagger_sync.py
