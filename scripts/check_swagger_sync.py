@@ -23,6 +23,21 @@ HTTP = ("get", "post", "put", "delete", "patch", "head", "options")
 
 def registered_routes():
     src = open(MAIN_GO, encoding="utf-8").read()
+    # strip line comments first: a disabled (commented-out) registration is
+    # not a live route and must not keep a stale spec entry green
+    src = "\n".join(line.split("//", 1)[0] for line in src.splitlines())
+
+    # registration forms this parser does not understand must fail loudly
+    # instead of silently passing as "in sync" (Any/Handle are gin's generic
+    # registration APIs; narrower matches like HandlerFunc/HandleWebSocket
+    # are not registrations)
+    unknown = {m.group(1) for m in re.finditer(r"\b\w+\.(Any|Handle)\(", src)}
+    if unknown:
+        sys.exit(
+            f"unparsed gin registration form(s) {sorted(unknown)} in {MAIN_GO} — "
+            "extend this parser to cover them"
+        )
+
     groups = {}
     for m in re.finditer(r'(\w+)\s*:?=\s*([\w.]+)\.Group\("([^"]*)"\)', src):
         var, parent, prefix = m.groups()
@@ -55,6 +70,10 @@ def registered_routes():
 def normalize(route):
     path, method = route
     if path == "/api/login":
+        # alias: the auth route lives outside the v1 group, and the swagger
+        # op carries a servers override (/api) instead of the /api/v1 base.
+        # If login ever moves into the v1 group, remove this alias so the
+        # op's server override gets revisited.
         path = "/login"
     elif path.startswith(BASE):
         path = path[len(BASE):]
