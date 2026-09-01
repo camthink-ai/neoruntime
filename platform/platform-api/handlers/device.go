@@ -1050,7 +1050,7 @@ func (h *APIHandlers) SetAlarmOut(c *gin.Context) {
 
 	var req struct {
 		Channel uint32 `json:"channel"`
-		Enable  *bool   `json:"enable" binding:"required"`
+		Enable  *bool  `json:"enable" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
@@ -1107,7 +1107,7 @@ func (h *APIHandlers) SetWiegand(c *gin.Context) {
 
 	var req struct {
 		Channel uint32 `json:"channel"`
-		Enable  *bool   `json:"enable" binding:"required"`
+		Enable  *bool  `json:"enable" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
