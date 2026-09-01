@@ -581,9 +581,9 @@ export default function ImportModelDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
         onInteractOutside={e => e.preventDefault()}
-        className="sm:max-w-xl"
+        className="sm:max-w-xl max-h-[90vh] flex flex-col overflow-hidden"
       >
-        <DialogHeader>
+        <DialogHeader className="shrink-0">
           <DialogTitle>
             {step === 0
               ? t('sys.ai_models.action.import', 'Import Model')
@@ -592,7 +592,7 @@ export default function ImportModelDialog({
         </DialogHeader>
 
         {/* Step indicator — scroll on narrow screens */}
-        <div className="-mx-1 mb-4 mt-2 overflow-x-auto pb-1 sm:mx-0 sm:overflow-visible sm:pb-0">
+        <div className="-mx-1 mb-4 mt-2 overflow-x-auto pb-1 shrink-0 sm:mx-0 sm:overflow-visible sm:pb-0">
           <div className="flex min-w-max items-center justify-center px-1 sm:min-w-0">
             {steps.map((s, i) => (
               <div key={i} className="flex items-center">
@@ -630,7 +630,7 @@ export default function ImportModelDialog({
 
         {step === 0 ? (
           /* Step 0: Upload + Parse */
-          <div className="grid gap-4 py-2">
+          <div className="grid gap-4 py-2 flex-1 min-h-0 overflow-y-auto">
             <FileUpload
               single
               value={file ? [file] : []}
@@ -705,7 +705,7 @@ export default function ImportModelDialog({
           </div>
         ) : (
           /* Step 1: Configure + Register */
-          <div className="grid gap-4 py-2">
+          <div className="grid gap-4 py-2 flex-1 min-h-0 overflow-y-auto">
             {/* Model ID */}
             <div className="grid gap-2">
               <Label htmlFor="model-id">
@@ -812,7 +812,7 @@ export default function ImportModelDialog({
           </div>
         )}
 
-        <DialogFooter>
+        <DialogFooter className="shrink-0">
           {step === 0 ? (
             <>
               <Button

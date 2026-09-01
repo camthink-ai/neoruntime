@@ -6,7 +6,6 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import {
   Download,
   Play,
@@ -239,11 +238,11 @@ export default function AppDetailDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl max-h-[90vh] flex flex-col p-0">
-        <DialogHeader className="px-6 pt-6 pb-4">
+      <DialogContent className="max-w-2xl max-h-[90vh] flex flex-col overflow-hidden p-0">
+        <DialogHeader className="px-6 pt-6 pb-4 shrink-0">
           <DialogTitle className="sr-only">{displayName}</DialogTitle>
         </DialogHeader>
-        <ScrollArea className="flex-1 px-6 pb-6">
+        <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-6">
           {/* Header */}
           <div className="flex items-start justify-between mb-6">
             <div className="flex gap-4">
@@ -402,7 +401,7 @@ export default function AppDetailDialog({
               </>
             )}
           </div>
-        </ScrollArea>
+        </div>
       </DialogContent>
     </Dialog>
   );

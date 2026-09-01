@@ -8,7 +8,6 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { processApi } from '@/services/api/system';
 import Loading from '@/components/loading';
 
@@ -45,13 +44,13 @@ export function ProcessDetailDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[90vw] max-w-lg max-h-[80vh]">
-        <DialogHeader>
+      <DialogContent className="w-[90vw] max-w-lg max-h-[80vh] flex flex-col overflow-hidden">
+        <DialogHeader className="shrink-0">
           <DialogTitle>
             {t('maintenance.processes.process_details', 'Process Details')}
           </DialogTitle>
         </DialogHeader>
-        <ScrollArea className="max-h-[60vh] pr-4">
+        <div className="flex-1 min-h-0 overflow-y-auto">
           {processDetail ? (
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-4">
@@ -192,8 +191,8 @@ export function ProcessDetailDialog({
           ) : (
             <Loading fullHeight={false} className="h-32" />
           )}
-        </ScrollArea>
-        <DialogFooter>
+        </div>
+        <DialogFooter className="shrink-0">
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             {t('common.close', 'Close')}
           </Button>

@@ -113,8 +113,8 @@ export default function ModelDetailDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg overflow-hidden">
-        <DialogHeader className="min-w-0">
+      <DialogContent className="sm:max-w-lg max-h-[90vh] flex flex-col overflow-hidden">
+        <DialogHeader className="min-w-0 shrink-0">
           <DialogTitle className="flex items-start gap-2 min-w-0">
             <div className="w-8 h-8 shrink-0 rounded-lg flex items-center justify-center bg-primary/10 text-primary">
               {getModelIcon(
@@ -132,7 +132,7 @@ export default function ModelDetailDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-6 py-4">
+        <div className="space-y-6 py-4 flex-1 min-h-0 overflow-y-auto">
           {/* Status Badge */}
           <div className="flex items-center gap-3 flex-wrap">
             <Badge
@@ -341,7 +341,7 @@ export default function ModelDetailDialog({
           </div> */}
         </div>
 
-        <div className="flex justify-end gap-2">
+        <div className="flex justify-end gap-2 shrink-0">
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             {t('common.close', '关闭')}
           </Button>
