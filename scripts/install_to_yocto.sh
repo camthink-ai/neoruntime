@@ -16,8 +16,8 @@ fi
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Use the newest staged release tree, e.g. build/release/aipc-hailo15-1.0/
-STAGE_DIR="$(ls -dt "${PROJECT_ROOT}/build/release"/aipc-* 2>/dev/null | head -1)"
+# Use the newest staged release tree, e.g. build/release/neoruntime-hailo15-1.0/
+STAGE_DIR="$(ls -dt "${PROJECT_ROOT}/build/release"/neoruntime-* 2>/dev/null | head -1)"
 
 if [ -z "$STAGE_DIR" ] || [ ! -d "$STAGE_DIR/opt/aipc" ]; then
     echo "Error: No staged release found under ${PROJECT_ROOT}/build/release/"

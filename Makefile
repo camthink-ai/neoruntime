@@ -11,7 +11,7 @@
 BUILD_DIR ?= build/output
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || date +%Y%m%d-%H%M%S)
 RELEASE_DIR ?= build/release
-PKG_NAME = aipc-$(HAL_PLATFORM)-$(VERSION)
+PKG_NAME = neoruntime-$(HAL_PLATFORM)-$(VERSION)
 STAGE_DIR = $(RELEASE_DIR)/$(PKG_NAME)
 TARBALL = $(RELEASE_DIR)/$(PKG_NAME).tar.gz
 SDK_PATH ?= $(or $(HAILO_SDK_PATH),/opt/hailo-sdk)

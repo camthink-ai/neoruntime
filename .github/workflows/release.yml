@@ -55,14 +55,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hailo-firmware
-          path: build/release/aipc-hailo15-*.tar.gz
+          path: build/release/neoruntime-hailo15-*.tar.gz
 
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: build/release/aipc-hailo15-*.tar.gz
+          files: build/release/neoruntime-hailo15-*.tar.gz
 
   ct-disc-tools:
     name: Build ct-disc CLI + GUI tools
@@ -94,7 +94,7 @@ jobs:
             VERSION="${{ inputs.version }}"
             VERSION="${VERSION:-dev-${GITHUB_SHA:0:7}}"
           fi
-          echo "CT_DISC_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "CT_DISC_VERSION=${VERSION#v}" >> "$GITHUB_ENV"
 
       - name: Build CLI (all platforms)
         run: make -C tools/ct-disc build-all VERSION="$CT_DISC_VERSION"
