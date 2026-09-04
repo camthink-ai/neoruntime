@@ -6304,29 +6304,13 @@ static int hailo15_media_get_throttling_state(void *media_ctx, HalThrottlingStat
     return HAL_OK;
 }
 
-/* ---- M2: motion detection ---- */
-
-
-static HalMotionConfig to_hal_motion_config(const motion_detection_config_t &md)
-{
-    HalMotionConfig out{};
-    out.enabled = md.enabled;
-    out.roi_x = static_cast<int32_t>(md.roi.x);
-    out.roi_y = static_cast<int32_t>(md.roi.y);
-    out.roi_w = static_cast<int32_t>(md.roi.width);
-    out.roi_h = static_cast<int32_t>(md.roi.height);
-    switch (md.sensitivity_level)
-    {
-    case LOWEST:  out.sensitivity = HAL_MOTION_SENSITIVITY_LOWEST;  break;
-    case LOW:     out.sensitivity = HAL_MOTION_SENSITIVITY_LOW;     break;
-    case MEDIUM:  out.sensitivity = HAL_MOTION_SENSITIVITY_MEDIUM;  break;
-    case HIGH:    out.sensitivity = HAL_MOTION_SENSITIVITY_HIGH;    break;
-    case HIGHEST: out.sensitivity = HAL_MOTION_SENSITIVITY_HIGHEST; break;
-    default:      out.sensitivity = HAL_MOTION_SENSITIVITY_MEDIUM;  break;
-    }
-    out.threshold = md.threshold;
-    return out;
-}
+/* ---- M2: motion detection ----
+ * Motion configuration lives entirely in the HAL frame-difference engine's
+ * private state. It is deliberately NOT written into the medialib profile:
+ * the vendor module cannot run on this stack (stock profiles ship it disabled
+ * and its analysis stream_id is never populated — filling it breaks the
+ * frontend), and enabling it there only wakes a broken module that logs
+ * "Invalid motion_detection ROI size" every frame. */
 
 static int hailo15_media_set_motion_config(void *media_ctx, const HalMotionConfig *config)
 {
@@ -6344,44 +6328,9 @@ static int hailo15_media_set_motion_config(void *media_ctx, const HalMotionConfi
     {
         return HAL_ERR_INVALID_ARG;
     }
-    /* Do not hold priv->mutex across MediaLibrary calls: ML may invoke callbacks that take this lock. */
-    auto prof_exp = priv->media_lib->get_current_profile();
-    if (!prof_exp)
+    if (config->roi_x < 0 || config->roi_y < 0 || config->roi_w < 0 || config->roi_h < 0)
     {
-        return HAL_ERROR;
-    }
-    config_profile_t p = prof_exp.value();
-    motion_detection_config_t &md = p.application_settings.motion_detection;
-    md.enabled = config->enabled;
-    if (config->roi_w > 0 && config->roi_h > 0)
-    {
-        md.roi = roi_t{static_cast<uint32_t>(config->roi_x), static_cast<uint32_t>(config->roi_y),
-                       static_cast<uint32_t>(config->roi_w), static_cast<uint32_t>(config->roi_h)};
-    }
-    else
-    {
-        /* Full frame: clear the ROI. */
-        md.roi = roi_t{0, 0, 0, 0};
-    }
-    switch (config->sensitivity)
-    {
-    case HAL_MOTION_SENSITIVITY_LOWEST:  md.sensitivity_level = LOWEST;  break;
-    case HAL_MOTION_SENSITIVITY_LOW:     md.sensitivity_level = LOW;     break;
-    case HAL_MOTION_SENSITIVITY_MEDIUM:  md.sensitivity_level = MEDIUM;  break;
-    case HAL_MOTION_SENSITIVITY_HIGH:    md.sensitivity_level = HIGH;    break;
-    case HAL_MOTION_SENSITIVITY_HIGHEST: md.sensitivity_level = HIGHEST; break;
-    }
-    md.threshold = config->threshold;
-
-    /* Do NOT populate motion_detection.resolution.stream_id here: with it set,
-     * the medialib counts the motion resolution as a 4th output stream and
-     * perform_multi_resize fails every frame ("resolutions (4) != frames (3)"),
-     * killing the frontend output. The medialib module stays dormant; events
-     * come from the HAL frame-difference engine (hailo15_motion_detect_update). */
-    media_library_return r = priv->media_lib->set_override_parameters(p);
-    if (r != MEDIA_LIBRARY_SUCCESS)
-    {
-        return hailo15_ml_err(r);
+        return HAL_ERR_INVALID_ARG;
     }
     {
         std::lock_guard<std::recursive_mutex> lock(priv->mutex);
@@ -6424,16 +6373,22 @@ static int hailo15_media_set_motion_config(void *media_ctx, const HalMotionConfi
 static int hailo15_media_get_motion_config(void *media_ctx, HalMotionConfig *config)
 {
     auto *priv = hailo15_media_priv_from_hal(media_ctx);
-    if (!priv || !priv->media_lib || !config)
+    if (!priv || !config)
     {
         return HAL_ERR_INVALID_ARG;
     }
-    auto prof_exp = priv->media_lib->get_current_profile();
-    if (!prof_exp)
-    {
-        return HAL_ERROR;
-    }
-    *config = to_hal_motion_config(prof_exp->application_settings.motion_detection);
+    std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+    config->enabled = priv->motion_engine_enabled;
+    config->roi_x = static_cast<int32_t>(priv->motion_roi_x);
+    config->roi_y = static_cast<int32_t>(priv->motion_roi_y);
+    config->roi_w = static_cast<int32_t>(priv->motion_roi_w);
+    config->roi_h = static_cast<int32_t>(priv->motion_roi_h);
+    /* inverse of: sensitivity LOWEST(0)..HIGHEST(4) -> per-pixel delta 40..8 */
+    const int sens = (40 - priv->motion_diff_level) / 8;
+    config->sensitivity = static_cast<HalMotionSensitivity>(
+        sens < HAL_MOTION_SENSITIVITY_LOWEST ? HAL_MOTION_SENSITIVITY_LOWEST
+        : sens > HAL_MOTION_SENSITIVITY_HIGHEST ? HAL_MOTION_SENSITIVITY_HIGHEST : sens);
+    config->threshold = priv->motion_threshold;
     return HAL_OK;
 }
 

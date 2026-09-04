@@ -2933,7 +2933,8 @@ static void dispatch_line(int argc, char **av, const char *udp_host_def, uint16_
     {
         if (argc < 3)
         {
-            std::printf("usage: motion_set <0|1> [sens 0-4] [threshold 0-1]   # sensitivity: 0=lowest..4=highest\n");
+            std::printf("usage: motion_set <0|1> [sens 0-4] [threshold 0-1] [x y w h]\n"
+                        "  # sensitivity: 0=lowest..4=highest; ROI = analysis-stream pixels, omit = full frame\n");
             std::fflush(stdout);
             return;
         }
@@ -2948,9 +2949,17 @@ static void dispatch_line(int argc, char **av, const char *udp_host_def, uint16_
         mc.sensitivity = (argc >= 3) ? static_cast<HalMotionSensitivity>(std::atoi(av[2]))
                                      : HAL_MOTION_SENSITIVITY_MEDIUM;
         mc.threshold = (argc >= 4) ? std::atof(av[3]) : 0.05f;
+        if (argc >= 8)
+        {
+            mc.roi_x = std::atoi(av[4]);
+            mc.roi_y = std::atoi(av[5]);
+            mc.roi_w = std::atoi(av[6]);
+            mc.roi_h = std::atoi(av[7]);
+        }
         const int rc = HAL_MEDIA_OPS.set_motion_config(g_media_ctx, &mc);
-        std::printf("motion_set ret=%d (%s) enabled=%d sens=%d thr=%.3f\n", rc,
-                    hal_error_to_string((HalErrorCode)rc), (int)mc.enabled, (int)mc.sensitivity, mc.threshold);
+        std::printf("motion_set ret=%d (%s) enabled=%d sens=%d thr=%.3f roi=%d,%d %dx%d\n", rc,
+                    hal_error_to_string((HalErrorCode)rc), (int)mc.enabled, (int)mc.sensitivity, mc.threshold,
+                    mc.roi_x, mc.roi_y, mc.roi_w, mc.roi_h);
         std::fflush(stdout);
         return;
     }
