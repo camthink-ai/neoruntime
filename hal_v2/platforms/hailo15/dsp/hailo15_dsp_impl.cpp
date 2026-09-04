@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstring>
+#include <vector>
 
 extern "C" {
 
@@ -339,6 +340,113 @@ static int hailo15_dsp_flip_rotate_sync(Hailo15DspContext *ctx, const HalDspFlip
     return dsp_status_to_hal(st);
 }
 
+/* ---- M3: arbitrary-angle rotate / mesh dewarp / telescopic ---- */
+
+static int hailo15_dsp_rotate_sync(Hailo15DspContext *ctx, const HalDspRotateParams *params)
+{
+    dsp_affine_rotation_params_t r{};
+    dsp_image_properties_t src_image{};
+    dsp_image_properties_t dst_image{};
+    dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
+    dsp_data_plane_t dst_planes[HAL_MAX_PLANES]{};
+    hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    r.src = &src_image;
+    r.dst = &dst_image;
+    r.interpolation = hal_interp_to_dsp(params->interpolation);
+    r.theta = params->angle_deg_cw;
+
+    dsp_status st = dsp_rotate(ctx->device, &r);
+    return dsp_status_to_hal(st);
+}
+
+static int hailo15_dsp_dewarp_sync(Hailo15DspContext *ctx, const HalDspDewarpParams *params)
+{
+    if (params->src->format != HAL_PIX_FMT_NV12) {
+        return HAL_ERR_INVALID_FMT; /* hardware supports NV12 only */
+    }
+    if (params->interpolation != HAL_DSP_INTERPOLATION_BILINEAR) {
+        return HAL_ERR_NOT_SUPPORTED; /* hardware supports bilinear only */
+    }
+    if (!params->mesh_xy || params->grid_cols < 2U || params->grid_rows < 2U) {
+        return HAL_ERR_INVALID_ARG;
+    }
+
+    dsp_image_properties_t src_image{};
+    dsp_image_properties_t dst_image{};
+    dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
+    dsp_data_plane_t dst_planes[HAL_MAX_PLANES]{};
+    hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+
+    /* Convert the float mesh to the DSP Q15.16 fixed-point vertex table. */
+    const size_t verts = static_cast<size_t>(params->grid_cols) * params->grid_rows;
+    std::vector<int32_t> mesh_table(verts * 2U);
+    const float scale = 65536.0f; /* Q15.16 */
+    for (size_t i = 0; i < verts * 2U; ++i) {
+        const float v = params->mesh_xy[i] * scale;
+        /* Saturate to int32 range to keep malformed meshes from wrapping. */
+        mesh_table[i] = static_cast<int32_t>(
+            v > 2147483000.0f ? 2147483000.0f : (v < -2147483000.0f ? -2147483000.0f : v));
+    }
+    dsp_dewarp_mesh_t mesh{};
+    mesh.mesh_width = params->grid_cols;
+    mesh.mesh_height = params->grid_rows;
+    mesh.mesh_table = mesh_table.data();
+
+    dsp_status st = dsp_dewarp(ctx->device, &src_image, &dst_image, &mesh,
+                               hal_interp_to_dsp(params->interpolation));
+    return dsp_status_to_hal(st);
+}
+
+static int hailo15_dsp_multi_crop_resize_telescopic_sync(Hailo15DspContext *ctx,
+                                                         const HalDspMultiCropResizeParams *params)
+{
+    if (params->src->format != HAL_PIX_FMT_NV12) {
+        return HAL_ERR_INVALID_FMT; /* hardware supports NV12 only */
+    }
+    /* Telescopic path shares the multi-crop parameter layout. */
+    dsp_multi_crop_resize_params_t m{};
+    dsp_image_properties_t src_image{};
+    dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
+    hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    m.src = &src_image;
+    m.crop_resize_params_count = params->output_count;
+    m.interpolation = hal_interp_to_dsp(params->interpolation);
+
+    dsp_crop_resize_params_t crop_params_storage[DSP_MULTI_RESIZE_OUTPUTS_COUNT]{};
+    m.crop_resize_params = crop_params_storage;
+
+    dsp_image_properties_t dst_images[DSP_MULTI_RESIZE_OUTPUTS_COUNT]{};
+    dsp_data_plane_t dst_planes[DSP_MULTI_RESIZE_OUTPUTS_COUNT][HAL_MAX_PLANES]{};
+    dsp_roi_t crops[DSP_MULTI_RESIZE_OUTPUTS_COUNT]{};
+
+    for (uint32_t i = 0; i < params->output_count && i < DSP_MULTI_RESIZE_OUTPUTS_COUNT; ++i) {
+        const HalDspMultiCropOutput *out = &params->outputs[i];
+        dsp_crop_resize_params_t *cp = &crop_params_storage[i];
+
+        crops[i].start_x = out->crop.start_x;
+        crops[i].start_y = out->crop.start_y;
+        crops[i].end_x   = out->crop.end_x;
+        crops[i].end_y   = out->crop.end_y;
+        cp->crop = &crops[i];
+
+        for (uint32_t j = 0; j < DSP_MULTI_RESIZE_OUTPUTS_COUNT; ++j) {
+            cp->dst[j] = nullptr;
+        }
+        hal_frame_to_dsp_image(out->dst, &dst_images[i], dst_planes[i], HAL_MAX_PLANES);
+        cp->dst[0] = &dst_images[i];
+
+        dsp_scaling_properties_t scaling{};
+        scaling.scaling_mode = hal_scaling_to_dsp(out->scaling_mode);
+        hal_color_to_dsp(&out->letterbox_color, &scaling.color);
+        cp->scaling_params[0] = scaling;
+    }
+
+    dsp_status st = dsp_telescopic_multi_crop_and_resize(ctx->device, &m);
+    return dsp_status_to_hal(st);
+}
+
 static int hailo15_dsp_privacy_mask_sync(Hailo15DspContext *ctx, const HalDspPrivacyMaskParams *params)
 {
     (void)ctx;
@@ -513,6 +621,30 @@ static int hailo15_dsp_flip_rotate(void *dsp_ctx, const HalDspFlipRotateParams *
     return hailo15_dsp_flip_rotate_sync(static_cast<Hailo15DspContext *>(dsp_ctx), params);
 }
 
+static int hailo15_dsp_rotate(void *dsp_ctx, const HalDspRotateParams *params)
+{
+    if (!dsp_ctx || !params || !params->src || !params->dst) {
+        return HAL_ERR_INVALID_ARG;
+    }
+    return hailo15_dsp_rotate_sync(static_cast<Hailo15DspContext *>(dsp_ctx), params);
+}
+
+static int hailo15_dsp_dewarp(void *dsp_ctx, const HalDspDewarpParams *params)
+{
+    if (!dsp_ctx || !params || !params->src || !params->dst) {
+        return HAL_ERR_INVALID_ARG;
+    }
+    return hailo15_dsp_dewarp_sync(static_cast<Hailo15DspContext *>(dsp_ctx), params);
+}
+
+static int hailo15_dsp_multi_crop_resize_telescopic(void *dsp_ctx, const HalDspMultiCropResizeParams *params)
+{
+    if (!dsp_ctx || !params || !params->src || params->output_count == 0U || !params->outputs) {
+        return HAL_ERR_INVALID_ARG;
+    }
+    return hailo15_dsp_multi_crop_resize_telescopic_sync(static_cast<Hailo15DspContext *>(dsp_ctx), params);
+}
+
 static int hailo15_dsp_privacy_mask(void *dsp_ctx, const HalDspPrivacyMaskParams *params)
 {
     if (!dsp_ctx || !params || !params->image) {
@@ -635,7 +767,7 @@ static int hailo15_dsp_job_release(void *dsp_ctx, HalDspJobHandle job)
 
 static const char *hailo15_dsp_get_version(void)
 {
-    return "Hailo15 HAL-DSP 2.0.0";
+    return "Hailo15 HAL-DSP 2.1.0";
 }
 
 HalDspOps HAL_DSP_OPS = {
@@ -653,6 +785,9 @@ HalDspOps HAL_DSP_OPS = {
     .cancel               = hailo15_dsp_cancel,
     .job_release          = hailo15_dsp_job_release,
     .get_version          = hailo15_dsp_get_version,
+    .rotate               = hailo15_dsp_rotate,
+    .dewarp               = hailo15_dsp_dewarp,
+    .multi_crop_resize_telescopic = hailo15_dsp_multi_crop_resize_telescopic,
 };
 
 } /* extern "C" */

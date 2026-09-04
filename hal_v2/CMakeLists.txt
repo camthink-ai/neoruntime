@@ -768,6 +768,51 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         endif()
         target_compile_options(hal-dsp-media-udp-resize-test PRIVATE -Wall -Wextra -fPIC)
 
+        add_executable(hal-dsp-rotate-dewarp-test
+            examples/dsp_rotate_dewarp_test/dsp_rotate_dewarp_test.cpp
+        )
+        target_include_directories(hal-dsp-rotate-dewarp-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-dsp-rotate-dewarp-test PRIVATE hal)
+        else()
+            target_link_libraries(hal-dsp-rotate-dewarp-test PRIVATE
+                hal-hailo15-dsp
+                hal-common
+            )
+        endif()
+        target_compile_options(hal-dsp-rotate-dewarp-test PRIVATE -Wall -Wextra -fPIC)
+
+        add_executable(hal-nms-threshold-test
+            examples/nms_threshold_test/nms_threshold_test.cpp
+        )
+        target_include_directories(hal-nms-threshold-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-nms-threshold-test PRIVATE hal pthread)
+        else()
+            target_link_libraries(hal-nms-threshold-test PRIVATE hal-hailo15-model hal-common pthread)
+        endif()
+        target_compile_options(hal-nms-threshold-test PRIVATE -Wall -Wextra -fPIC)
+
+        add_executable(hal-motion-test examples/motion_test/motion_test.cpp)
+        target_include_directories(hal-motion-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-motion-test PRIVATE hal pthread)
+        else()
+            target_link_libraries(hal-motion-test PRIVATE
+                hal-hailo15-media hal-hailo15-video hal-hailo15-codec hal-hailo15-isp hal-common pthread)
+        endif()
+        target_compile_options(hal-motion-test PRIVATE -Wall -Wextra -fPIC)
+
+        add_executable(hal-codec-effect-test examples/codec_effect_test/codec_effect_test.cpp)
+        target_include_directories(hal-codec-effect-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-codec-effect-test PRIVATE hal pthread)
+        else()
+            target_link_libraries(hal-codec-effect-test PRIVATE
+                hal-hailo15-media hal-hailo15-video hal-hailo15-codec hal-hailo15-isp hal-common pthread)
+        endif()
+        target_compile_options(hal-codec-effect-test PRIVATE -Wall -Wextra -fPIC)
+
         add_executable(hal-ai-example-v2
             examples/ai_example_v2/ai_example_v2.cpp
             common/hal_clip_text_encoder.cpp
@@ -920,6 +965,27 @@ if(HAL_PLATFORM STREQUAL "hailo15")
             target_link_libraries(hal-genai-example-v2 PRIVATE hal-hailo15-model hal-common pthread)
         endif()
         target_compile_options(hal-genai-example-v2 PRIVATE -Wall -Wextra -fPIC)
+    endif()
+
+    if(HAVE_HAILO_MEDIALIB)
+        add_executable(hal-jpeg-web-test examples/jpeg_web_test/jpeg_web_test.cpp)
+        target_include_directories(hal-jpeg-web-test PRIVATE
+            ${HAL_V2_INC}
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib
+        )
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-jpeg-web-test PRIVATE hal pthread)
+        else()
+            target_link_libraries(hal-jpeg-web-test PRIVATE
+                hal-hailo15-media
+                hal-hailo15-video
+                hal-hailo15-codec
+                hal-hailo15-isp
+                hal-common
+                pthread
+            )
+        endif()
+        target_compile_options(hal-jpeg-web-test PRIVATE -Wall -Wextra -fPIC)
     endif()
 
     add_executable(hal-ota-test-v2 examples/ota_test_v2/ota_test_v2.cpp)

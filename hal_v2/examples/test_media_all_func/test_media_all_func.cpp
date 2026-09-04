@@ -1105,8 +1105,17 @@ static void print_help(void)
         "  # dynamic_change_image_config (pipeline rotation/flip/zoom/ISP-tuning flags) — state kept in g_image_cfg:\n"
         "  media_image_rotation <0|90|180|270>\n"
         "  media_image_flip <none|h|v|both>\n"
-        "  media_image_zoom <off|on> [level 1-5]\n"
+        "  media_image_zoom <off|on> [level 1-31]\n"
         "  media_image_dewarp <0|1> | media_image_dis <0|1> | media_image_eis <0|1> | media_image_grayscale <0|1>\n"
+        "  media_throttling                     # query SoC thermal throttling state\n"
+        "  motion_set <0|1> [sens 0-4] [thr 0-1] | motion_get | motion_sub   # motion detection\n"
+        "  snapshot_list | snapshot [stage]      # multi-stage capture -> /tmp/medialib_snapshots/\n"
+        "  isp_wb_set <vidx> <0|1> [r gr gb b] | isp_wb_get <vidx>   # manual white balance\n"
+        "  isp_3dnr <vidx> <0|1> <strength>      # temporal NR\n"
+        "  isp_ae_stats <vidx>                   # AE histogram + luma grid\n"
+        "  isp_hdr_ratios <vidx> <ls>            # HDR exposure ratio (HDR profile only)\n"
+        "  enc_roi <cidx> <1|0> <bg_qp 0-15> [x y w h]...   # ROI/smart encoding (H.264+CVBR), coords NORMALIZED 0..1\n"
+        "  enc_roi_get <cidx> | enc_force_idr <cidx> | enc_stats <cidx>\n"
         "  media_image_privacy <0|1>              # enable/disable overlay (mutually exclusive with digital zoom)\n"
         "  media_image_privacy_style <blur> <r> <g> <b>   # blur 0=solid color; 2-64=pixelization block size\n"
         "  media_image_privacy_add <id> <x0> <y0> <x1> <y1> [x2 y2 ...]   # add/update region by id, up to 8 verts\n"
@@ -1129,7 +1138,7 @@ static void print_help(void)
         "  isp_exposure_get <vidx>\n"
         "  isp_exposure_set <vidx> auto <0|1> [backlight] | isp_exposure_set <vidx> manual <us> <gain>\n"
         "  # AF statistics (Hailo Imaging UG 6.3 AF):\n"
-        "  isp_af_set <vidx> <0|1> <x1> <y1> <w1> <h1> [x2 y2 w2 h2] [x3 y3 w3 h3]   # pixels, up to 3 windows\n"
+        "  isp_af_set <vidx> <0|1> <x1> <y1> <w1> <h1> [x2 y2 w2 h2] [x3 y3 w3 h3]   # PIXEL coords (sensor image; x>=5,y>=2,w*h<=128^3), up to 3 windows\n"
         "  isp_af_get <vidx>\n"
         "  isp_af_meas <vidx>\n"
         "  codec_status <idx> | codec_start <idx> | codec_stop <idx> | codec_get_config <idx>\n"
@@ -1234,6 +1243,13 @@ static const char *config_field_type_str(HalConfigFieldType t)
     case HAL_CONFIG_FIELD_STRING:  return "string";
     default:                       return "?";
     }
+}
+
+static void motion_event_cb(void *ctx, bool detected, uint64_t frame_id, uint64_t ts, void *user)
+{
+    std::printf("[motion] %s frame=%llu ts=%llu ctx=%p user=%p\n", detected ? "START" : "STOP",
+                (unsigned long long)frame_id, (unsigned long long)ts, ctx, user);
+    std::fflush(stdout);
 }
 
 static void dispatch_line(int argc, char **av, const char *udp_host_def, uint16_t udp_port_def)
@@ -1996,7 +2012,7 @@ static void dispatch_line(int argc, char **av, const char *udp_host_def, uint16_
             {
                 g_image_cfg.digital_zoom_value = 1;
             }
-            if (g_image_cfg.digital_zoom_value > 5)
+            if (g_image_cfg.digital_zoom_value > 31)
             {
                 g_image_cfg.digital_zoom_value = 5;
             }
@@ -2284,6 +2300,137 @@ static void dispatch_line(int argc, char **av, const char *udp_host_def, uint16_
         }
         g_image_cfg.grayscale = (std::atoi(av[1]) != 0);
         apply_image("media_image_grayscale");
+        return;
+    }
+
+    /* ------------------- Encoder smart control (M1) ------------------- */
+
+    if (std::strcmp(cmd, "enc_roi") == 0)
+    {
+        if (argc < 4)
+        {
+            std::printf("usage: enc_roi <cidx> <1|0> <bg_qp_delta 0-15> [x y w h]...   # up to %d ROIs, coords NORMALIZED 0..1\n",
+                        HAL_CODEC_ROI_MAX);
+            std::fflush(stdout);
+            return;
+        }
+        int cidx = std::atoi(av[1]);
+        auto *cc = static_cast<HalCodecContext *>(
+            (g_codec_list && cidx >= 0 && static_cast<uint32_t>(cidx) < g_codec_count) ? g_codec_list[cidx] : nullptr);
+        if (!cc || !HAL_CODEC_OPS.set_roi_config)
+        {
+            std::printf("enc_roi: bad codec index or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        HalCodecRoiConfig roi{};
+        roi.enabled = (std::atoi(av[2]) != 0);
+        roi.background_qp_delta = std::atoi(av[3]);
+        int argi = 4;
+        while (argi + 3 < argc && roi.roi_count < HAL_CODEC_ROI_MAX)
+        {
+            roi.rois[roi.roi_count].x = std::atof(av[argi]);
+            roi.rois[roi.roi_count].y = std::atof(av[argi + 1]);
+            roi.rois[roi.roi_count].w = std::atof(av[argi + 2]);
+            roi.rois[roi.roi_count].h = std::atof(av[argi + 3]);
+            roi.roi_count++;
+            argi += 4;
+        }
+        int rc = HAL_CODEC_OPS.set_roi_config(cc, &roi);
+        std::printf("enc_roi ret=%d (%s) enabled=%d bg_qp=%d rois=%u\n", rc, hal_error_to_string((HalErrorCode)rc),
+                    (int)roi.enabled, roi.background_qp_delta, roi.roi_count);
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "enc_roi_get") == 0)
+    {
+        if (argc < 2)
+        {
+            std::printf("usage: enc_roi_get <cidx>\n");
+            std::fflush(stdout);
+            return;
+        }
+        int cidx = std::atoi(av[1]);
+        auto *cc = static_cast<HalCodecContext *>(
+            (g_codec_list && cidx >= 0 && static_cast<uint32_t>(cidx) < g_codec_count) ? g_codec_list[cidx] : nullptr);
+        if (!cc || !HAL_CODEC_OPS.get_roi_config)
+        {
+            std::printf("enc_roi_get: bad codec index or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        HalCodecRoiConfig roi{};
+        int rc = HAL_CODEC_OPS.get_roi_config(cc, &roi);
+        std::printf("enc_roi_get ret=%d enabled=%d bg_qp=%d rois=%u\n", rc, (int)roi.enabled,
+                    roi.background_qp_delta, roi.roi_count);
+        for (uint32_t i = 0; i < roi.roi_count; ++i)
+        {
+            std::printf("  roi[%u] x=%.3f y=%.3f w=%.3f h=%.3f\n", i, roi.rois[i].x, roi.rois[i].y, roi.rois[i].w,
+                        roi.rois[i].h);
+        }
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "enc_force_idr") == 0)
+    {
+        if (argc < 2)
+        {
+            std::printf("usage: enc_force_idr <cidx>\n");
+            std::fflush(stdout);
+            return;
+        }
+        int cidx = std::atoi(av[1]);
+        auto *cc = static_cast<HalCodecContext *>(
+            (g_codec_list && cidx >= 0 && static_cast<uint32_t>(cidx) < g_codec_count) ? g_codec_list[cidx] : nullptr);
+        if (!cc || !HAL_CODEC_OPS.force_idr)
+        {
+            std::printf("enc_force_idr: bad codec index or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        int rc = HAL_CODEC_OPS.force_idr(cc);
+        std::printf("enc_force_idr ret=%d (%s)\n", rc, hal_error_to_string((HalErrorCode)rc));
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "enc_stats") == 0)
+    {
+        if (argc < 2)
+        {
+            std::printf("usage: enc_stats <cidx>\n");
+            std::fflush(stdout);
+            return;
+        }
+        int cidx = std::atoi(av[1]);
+        auto *cc = static_cast<HalCodecContext *>(
+            (g_codec_list && cidx >= 0 && static_cast<uint32_t>(cidx) < g_codec_count) ? g_codec_list[cidx] : nullptr);
+        if (!cc || !HAL_CODEC_OPS.get_stream_stats)
+        {
+            std::printf("enc_stats: bad codec index or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        HalCodecStreamStats st{};
+        int rc = HAL_CODEC_OPS.get_stream_stats(cc, &st);
+        std::printf("enc_stats ret=%d fps=%.2f bitrate=%u kbps window=%us\n", rc, st.fps, st.bitrate_kbps,
+                    st.monitor_period_s);
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "media_throttling") == 0)
+    {
+        if (!g_media_ctx || !HAL_MEDIA_OPS.get_throttling_state)
+        {
+            std::printf("media_throttling: media not initialized or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        HalThrottlingState st = HAL_THROTTLING_UNINITIALIZED;
+        int rc = HAL_MEDIA_OPS.get_throttling_state(g_media_ctx, &st);
+        const char *names[] = {"UNINITIALIZED", "FULL_PERFORMANCE", "COOLING", "S0", "S1", "S2", "S3", "S4"};
+        const char *nm = (st >= 0 && st <= HAL_THROTTLING_S4) ? names[st] : "?";
+        std::printf("media_throttling ret=%d state=%s (%d)\n", rc, nm, (int)st);
+        std::fflush(stdout);
         return;
     }
 
@@ -2631,6 +2778,240 @@ static void dispatch_line(int argc, char **av, const char *udp_host_def, uint16_
 
 #undef NEED_CIDX
 
+    /* ------------------- ISP M2 additions ------------------- */
+
+    if (std::strcmp(cmd, "isp_wb_set") == 0)
+    {
+        if (argc < 3)
+        {
+            std::printf("usage: isp_wb_set <vidx> <0|1> [r gr gb b]   # manual WB gains, 1.0=neutral\n");
+            std::fflush(stdout);
+            return;
+        }
+        const int vidx = std::atoi(av[1]);
+        HalVideoContext *vc = video_at(vidx);
+        if (!vc || !HAL_ISP_OPS.set_wb_config)
+        {
+            std::printf("isp_wb_set: bad vidx or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        HalIspWbConfig wb{};
+        wb.manual_state = (std::atoi(av[2]) != 0);
+        wb.r_gain = wb.gr_gain = wb.gb_gain = wb.b_gain = 1.0f;
+        if (argc >= 7)
+        {
+            wb.r_gain = std::atof(av[3]);
+            wb.gr_gain = std::atof(av[4]);
+            wb.gb_gain = std::atof(av[5]);
+            wb.b_gain = std::atof(av[6]);
+        }
+        const int rc = HAL_ISP_OPS.set_wb_config(vc, &wb);
+        std::printf("isp_wb_set ret=%d manual=%d r=%.3f gr=%.3f gb=%.3f b=%.3f\n", rc, (int)wb.manual_state,
+                    wb.r_gain, wb.gr_gain, wb.gb_gain, wb.b_gain);
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "isp_wb_get") == 0)
+    {
+        if (argc < 2)
+        {
+            std::printf("usage: isp_wb_get <vidx>\n");
+            std::fflush(stdout);
+            return;
+        }
+        const int vidx = std::atoi(av[1]);
+        HalVideoContext *vc = video_at(vidx);
+        if (!vc || !HAL_ISP_OPS.get_current_wb_config)
+        {
+            std::printf("isp_wb_get: bad vidx or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        HalIspWbConfig wb{};
+        const int rc = HAL_ISP_OPS.get_current_wb_config(vc, &wb);
+        std::printf("isp_wb_get ret=%d manual=%d r=%.3f gr=%.3f gb=%.3f b=%.3f\n", rc, (int)wb.manual_state,
+                    wb.r_gain, wb.gr_gain, wb.gb_gain, wb.b_gain);
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "isp_3dnr") == 0)
+    {
+        if (argc < 4)
+        {
+            std::printf("usage: isp_3dnr <vidx> <0|1> <strength 0-100>\n");
+            std::fflush(stdout);
+            return;
+        }
+        const int vidx = std::atoi(av[1]);
+        HalVideoContext *vc = video_at(vidx);
+        if (!vc || !HAL_ISP_OPS.set_3dnr_config)
+        {
+            std::printf("isp_3dnr: bad vidx or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        HalIspNr3dConfig nr{};
+        nr.enabled = (std::atoi(av[2]) != 0);
+        nr.strength = std::atoi(av[3]);
+        const int rc = HAL_ISP_OPS.set_3dnr_config(vc, &nr);
+        std::printf("isp_3dnr ret=%d (%s) enabled=%d strength=%d\n", rc,
+                    hal_error_to_string((HalErrorCode)rc), (int)nr.enabled, nr.strength);
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "isp_ae_stats") == 0)
+    {
+        if (argc < 2)
+        {
+            std::printf("usage: isp_ae_stats <vidx>\n");
+            std::fflush(stdout);
+            return;
+        }
+        const int vidx = std::atoi(av[1]);
+        HalVideoContext *vc = video_at(vidx);
+        if (!vc || !HAL_ISP_OPS.get_ae_stats)
+        {
+            std::printf("isp_ae_stats: bad vidx or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        static HalIspAeStats st; /* large: keep off the stack */
+        const int rc = HAL_ISP_OPS.get_ae_stats(vc, &st);
+        if (rc != HAL_OK)
+        {
+            std::printf("isp_ae_stats ret=%d (%s)\n", rc, hal_error_to_string((HalErrorCode)rc));
+            std::fflush(stdout);
+            return;
+        }
+        uint64_t total = 0;
+        uint32_t peak = 0;
+        int peak_bin = -1;
+        if (st.hist_valid)
+        {
+            for (int i = 0; i < 256; ++i)
+            {
+                total += st.hist[i];
+                if (st.hist[i] > peak)
+                {
+                    peak = st.hist[i];
+                    peak_bin = i;
+                }
+            }
+        }
+        std::printf("isp_ae_stats ret=%d hist_valid=%d total=%llu peak_bin=%d luma_valid=%d luma[12]=%u\n", rc,
+                    (int)st.hist_valid, (unsigned long long)total, peak_bin, (int)st.luma_valid,
+                    st.luma_valid ? st.luma[12] : 0U);
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "isp_hdr_ratios") == 0)
+    {
+        if (argc < 3)
+        {
+            std::printf("usage: isp_hdr_ratios <vidx> <ls_ratio>   # HDR profile only\n");
+            std::fflush(stdout);
+            return;
+        }
+        const int vidx = std::atoi(av[1]);
+        HalVideoContext *vc = video_at(vidx);
+        if (!vc || !HAL_ISP_OPS.set_hdr_ratios)
+        {
+            std::printf("isp_hdr_ratios: bad vidx or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        const int rc = HAL_ISP_OPS.set_hdr_ratios(vc, std::atof(av[2]), 0.0f);
+        std::printf("isp_hdr_ratios ret=%d (%s)\n", rc, hal_error_to_string((HalErrorCode)rc));
+        std::fflush(stdout);
+        return;
+    }
+
+    /* ------------------- motion / snapshot (M2) ------------------- */
+
+    if (std::strcmp(cmd, "motion_set") == 0)
+    {
+        if (argc < 3)
+        {
+            std::printf("usage: motion_set <0|1> [sens 0-4] [threshold 0-1]   # sensitivity: 0=lowest..4=highest\n");
+            std::fflush(stdout);
+            return;
+        }
+        if (!g_media_ctx || !HAL_MEDIA_OPS.set_motion_config)
+        {
+            std::printf("motion_set: media not initialized or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        HalMotionConfig mc{};
+        mc.enabled = (std::atoi(av[1]) != 0);
+        mc.sensitivity = (argc >= 3) ? static_cast<HalMotionSensitivity>(std::atoi(av[2]))
+                                     : HAL_MOTION_SENSITIVITY_MEDIUM;
+        mc.threshold = (argc >= 4) ? std::atof(av[3]) : 0.05f;
+        const int rc = HAL_MEDIA_OPS.set_motion_config(g_media_ctx, &mc);
+        std::printf("motion_set ret=%d (%s) enabled=%d sens=%d thr=%.3f\n", rc,
+                    hal_error_to_string((HalErrorCode)rc), (int)mc.enabled, (int)mc.sensitivity, mc.threshold);
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "motion_get") == 0)
+    {
+        if (!g_media_ctx || !HAL_MEDIA_OPS.get_motion_config)
+        {
+            std::printf("motion_get: media not initialized or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        HalMotionConfig mc{};
+        const int rc = HAL_MEDIA_OPS.get_motion_config(g_media_ctx, &mc);
+        std::printf("motion_get ret=%d enabled=%d sens=%d thr=%.3f roi=%d,%d %dx%d\n", rc, (int)mc.enabled,
+                    (int)mc.sensitivity, mc.threshold, mc.roi_x, mc.roi_y, mc.roi_w, mc.roi_h);
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "motion_sub") == 0)
+    {
+        if (!g_media_ctx || !HAL_MEDIA_OPS.subscribe_motion)
+        {
+            std::printf("motion_sub: media not initialized or op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        const int rc = HAL_MEDIA_OPS.subscribe_motion(g_media_ctx, motion_event_cb, nullptr);
+        std::printf("motion_sub ret=%d (%s)\n", rc, hal_error_to_string((HalErrorCode)rc));
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "snapshot_list") == 0)
+    {
+        if (!HAL_VIDEO_OPS.list_snapshot_stages)
+        {
+            std::printf("snapshot_list: op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        static char stages[2048];
+        const int rc = HAL_VIDEO_OPS.list_snapshot_stages(nullptr, stages, sizeof(stages));
+        std::printf("snapshot_list ret=%d stages:\n%s\n", rc, stages);
+        std::fflush(stdout);
+        return;
+    }
+    if (std::strcmp(cmd, "snapshot") == 0)
+    {
+        if (!HAL_VIDEO_OPS.request_snapshot)
+        {
+            std::printf("snapshot: op unavailable\n");
+            std::fflush(stdout);
+            return;
+        }
+        const char *stage = (argc >= 2) ? av[1] : nullptr;
+        const int rc = HAL_VIDEO_OPS.request_snapshot(nullptr, stage);
+        std::printf("snapshot ret=%d (%s) stage=%s   # files land under /tmp/medialib_snapshots/<ts>/\n", rc,
+                    hal_error_to_string((HalErrorCode)rc), stage ? stage : "(all)");
+        std::fflush(stdout);
+        return;
+    }
+
     if (std::strcmp(cmd, "isp_get_image") == 0)
     {
         if (argc < 2)
@@ -2905,6 +3286,7 @@ static void dispatch_line(int argc, char **av, const char *udp_host_def, uint16_
         if (argc < 3)
         {
             std::printf("usage: isp_af_set <vidx> <0|1> <x1> <y1> <w1> <h1> [x2 y2 w2 h2] [x3 y3 w3 h3]\n");
+            std::printf("       AF windows are PIXEL coords on the sensor image (x>=5, y>=2, w*h<=128^3)\n");
             return;
         }
         const int vidx = std::atoi(av[1]);

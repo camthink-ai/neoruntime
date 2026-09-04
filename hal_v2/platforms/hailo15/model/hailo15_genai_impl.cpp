@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -576,6 +577,99 @@ static int genai_set_stop_tokens(HalGenaiSession *session, const char *const *ut
     return HAL_ERR_NOT_INITIALIZED;
 }
 
+/* ---- M3: context (KV cache) persistence ---- */
+
+static int genai_save_context(HalGenaiSession *session, void **buf, size_t *len)
+{
+    auto *impl = reinterpret_cast<HalGenaiSessionImpl *>(session);
+    if (!impl || !buf || !len)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    try
+    {
+        hailort::Expected<hailort::BufferPtr> exp =
+            (impl->kind == HAL_GENAI_KIND_VLM) ? impl->vlm->save_context() : impl->llm->save_context();
+        if (!exp)
+        {
+            return map_hailo_status(exp.status());
+        }
+        hailort::BufferPtr b = exp.value();
+        const size_t sz = b->size();
+        void *out = std::malloc(sz ? sz : 1U);
+        if (!out)
+        {
+            return HAL_ERR_NO_MEM;
+        }
+        std::memcpy(out, b->data(), sz);
+        *buf = out;
+        *len = sz;
+        return HAL_OK;
+    }
+    catch (...)
+    {
+        return HAL_ERROR;
+    }
+}
+
+static int genai_load_context(HalGenaiSession *session, const void *buf, size_t len)
+{
+    auto *impl = reinterpret_cast<HalGenaiSessionImpl *>(session);
+    if (!impl || !buf || len == 0U)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    try
+    {
+        /* load_context takes a non-const MemoryView over caller memory; the SDK
+         * documents it as read-only context data. */
+        hailort::MemoryView view(const_cast<void *>(buf), len);
+        const hailo_status st =
+            (impl->kind == HAL_GENAI_KIND_VLM) ? impl->vlm->load_context(view) : impl->llm->load_context(view);
+        return map_hailo_status(st);
+    }
+    catch (...)
+    {
+        return HAL_ERROR;
+    }
+}
+
+static int genai_get_context_usage(HalGenaiSession *session, size_t *used, size_t *capacity)
+{
+    auto *impl = reinterpret_cast<HalGenaiSessionImpl *>(session);
+    if (!impl || !used || !capacity)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    try
+    {
+        auto u = (impl->kind == HAL_GENAI_KIND_VLM) ? impl->vlm->get_context_usage_size()
+                                                    : impl->llm->get_context_usage_size();
+        if (!u)
+        {
+            return map_hailo_status(u.status());
+        }
+        auto c = (impl->kind == HAL_GENAI_KIND_VLM) ? impl->vlm->max_context_capacity()
+                                                    : impl->llm->max_context_capacity();
+        if (!c)
+        {
+            return map_hailo_status(c.status());
+        }
+        *used = u.value();
+        *capacity = c.value();
+        return HAL_OK;
+    }
+    catch (...)
+    {
+        return HAL_ERROR;
+    }
+}
+
+static void genai_free_context_buffer(void *buf)
+{
+    std::free(buf);
+}
+
 static const char *genai_get_version(void)
 {
     return "HAL-GenAI hailo15 (HailoRT GenAI)";
@@ -592,6 +686,10 @@ HalGenaiOps HAL_GENAI_OPS = {
     .abort_generation = genai_abort_generation,
     .get_vlm_input_layout = genai_get_vlm_input_layout,
     .set_stop_tokens = genai_set_stop_tokens,
+    .save_context = genai_save_context,
+    .load_context = genai_load_context,
+    .get_context_usage = genai_get_context_usage,
+    .free_context_buffer = genai_free_context_buffer,
     .get_version = genai_get_version,
 };
 

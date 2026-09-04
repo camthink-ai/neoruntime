@@ -71,6 +71,39 @@ static int stub_genai_stop(HalGenaiSession *session, const char *const *utf8_seq
     return HAL_ERR_NOT_SUPPORTED;
 }
 
+static int stub_genai_save_context(HalGenaiSession *session, void **buf, size_t *len)
+{
+    (void)session;
+    if (buf)
+        *buf = NULL;
+    if (len)
+        *len = 0;
+    return HAL_ERR_NOT_SUPPORTED;
+}
+
+static int stub_genai_load_context(HalGenaiSession *session, const void *buf, size_t len)
+{
+    (void)session;
+    (void)buf;
+    (void)len;
+    return HAL_ERR_NOT_SUPPORTED;
+}
+
+static int stub_genai_get_context_usage(HalGenaiSession *session, size_t *used, size_t *capacity)
+{
+    (void)session;
+    if (used)
+        *used = 0;
+    if (capacity)
+        *capacity = 0;
+    return HAL_ERR_NOT_SUPPORTED;
+}
+
+static void stub_genai_free_context_buffer(void *buf)
+{
+    (void)buf;
+}
+
 static const char *stub_genai_version(void)
 {
     return "HAL-GenAI stub";
@@ -85,5 +118,9 @@ HalGenaiOps HAL_GENAI_OPS = {
     .abort_generation = stub_genai_abort,
     .get_vlm_input_layout = stub_genai_layout,
     .set_stop_tokens = stub_genai_stop,
+    .save_context = stub_genai_save_context,
+    .load_context = stub_genai_load_context,
+    .get_context_usage = stub_genai_get_context_usage,
+    .free_context_buffer = stub_genai_free_context_buffer,
     .get_version = stub_genai_version,
 };

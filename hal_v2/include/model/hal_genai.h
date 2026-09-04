@@ -122,6 +122,43 @@ typedef struct {
      */
     int (*set_stop_tokens)(HalGenaiSession *session, const char *const *utf8_sequences, int num_sequences);
 
+    /* ---------- context (KV cache) persistence, M3 additions ---------- */
+
+    /**
+     * Save the current generation context (KV cache) to a heap buffer.
+     *
+     * The buffer is owned by the HAL and must be released with
+     * @ref free_context_buffer. Contexts are model-specific: loading into a
+     * session created with a different model fails.
+     *
+     * @param session Session handle.
+     * @param buf     Receives the allocated buffer pointer.
+     * @param len     Receives the buffer size in bytes.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*save_context)(HalGenaiSession *session, void **buf, size_t *len);
+
+    /**
+     * Restore a previously saved generation context.
+     * @param session Session handle.
+     * @param buf     Buffer from @ref save_context.
+     * @param len     Buffer size in bytes.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*load_context)(HalGenaiSession *session, const void *buf, size_t len);
+
+    /**
+     * Query context occupancy.
+     * @param session   Session handle.
+     * @param used      Receives used context tokens/bytes (SDK-defined unit).
+     * @param capacity  Receives total context capacity (same unit).
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*get_context_usage)(HalGenaiSession *session, size_t *used, size_t *capacity);
+
+    /** Free a buffer returned by @ref save_context. */
+    void (*free_context_buffer)(void *buf);
+
     const char *(*get_version)(void);
 } HalGenaiOps;
 

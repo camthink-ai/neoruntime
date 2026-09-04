@@ -50,6 +50,7 @@ struct Hailo15HwCodecPriv
     std::string stream_id;
     std::string stored_json;
     HalCodecConfig effective_config{};
+    HalCodecRoiConfig roi_config{};
     bool started{false};
 };
 
@@ -467,6 +468,171 @@ static int hw_codec_dynamic_change_config(void *codec_ctx, const HalCodecConfig 
 
 } // namespace
 
+namespace
+{
+
+/* SmartStream+ constraint (Hailo Media Library 1.12): H.264 + CVBR only. */
+static int check_smart_encoder_supported(const HalCodecConfig &cfg)
+{
+    if (cfg.packet_type != HAL_PACKET_TYPE_H264)
+    {
+        HAL_LOG_ERROR("hailo15_codec: smart encoder requires H.264 (current packet type %d)",
+                      static_cast<int>(cfg.packet_type));
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+    if (cfg.rc_mode != HAL_RC_CVBR)
+    {
+        HAL_LOG_ERROR("hailo15_codec: smart encoder requires CVBR rate control (current rc_mode %d)",
+                      static_cast<int>(cfg.rc_mode));
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+    return HAL_OK;
+}
+
+static int validate_roi_config(const HalCodecRoiConfig *config)
+{
+    if (config->roi_count > HAL_CODEC_ROI_MAX)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    /* medialib smart_encoder schema: background_qp_delta [1..15]. */
+    if (config->background_qp_delta < 0 || config->background_qp_delta > 15)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    for (uint32_t i = 0; i < config->roi_count; ++i)
+    {
+        const HalCodecRoi &r = config->rois[i];
+        if (r.x < 0.0f || r.y < 0.0f || r.w <= 0.0f || r.h <= 0.0f ||
+            r.x + r.w > 1.001f || r.y + r.h > 1.001f)
+        {
+            return HAL_ERR_INVALID_ARG;
+        }
+    }
+    return HAL_OK;
+}
+
+static void fill_roi_json(nlohmann::json &node, const HalCodecRoiConfig *config)
+{
+    node["enabled"] = config->enabled;
+    node["background_qp_delta"] = config->background_qp_delta;
+    node["analytics_labels"] = nlohmann::json::array(); /* schema-required field */
+    nlohmann::json rois = nlohmann::json::array();
+    for (uint32_t i = 0; i < config->roi_count; ++i)
+    {
+        rois.push_back(nlohmann::json{
+            {"x", config->rois[i].x},
+            {"y", config->rois[i].y},
+            {"width", config->rois[i].w},
+            {"height", config->rois[i].h},
+        });
+    }
+    node["rois"] = std::move(rois);
+}
+
+static int hw_codec_set_roi_config(void *codec_ctx, const HalCodecRoiConfig *config)
+{
+    auto *cc = ctx_ptr(codec_ctx);
+    auto *hp = hw_priv(cc);
+    if (!cc || !hp || !hp->encoder || !config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    const int sup = check_smart_encoder_supported(hp->effective_config);
+    if (sup != HAL_OK)
+    {
+        return sup;
+    }
+    const int val = validate_roi_config(config);
+    if (val != HAL_OK)
+    {
+        return val;
+    }
+    try
+    {
+        std::string json_copy;
+        {
+            std::lock_guard<std::mutex> lock(hp->mutex);
+            json_copy = hp->stored_json;
+        }
+        auto j = nlohmann::json::parse(json_copy, nullptr, false);
+        if (j.is_discarded())
+        {
+            return HAL_ERR_RESULT;
+        }
+        auto &node = j.at("encoding").at("hailo_encoder")["smart_encoder"];
+        fill_roi_json(node, config);
+
+        std::lock_guard<std::mutex> lock(hp->mutex);
+        media_library_return r = hp->encoder->set_config(j.dump());
+        if (r != MEDIA_LIBRARY_SUCCESS)
+        {
+            return hailo15_ml_err(r);
+        }
+        hp->stored_json = j.dump();
+        hp->roi_config = *config;
+        return HAL_OK;
+    }
+    catch (...)
+    {
+        return HAL_ERR_RESULT;
+    }
+}
+
+static int hw_codec_get_roi_config(void *codec_ctx, HalCodecRoiConfig *config)
+{
+    auto *cc = ctx_ptr(codec_ctx);
+    auto *hp = hw_priv(cc);
+    if (!cc || !hp || !config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(hp->mutex);
+    *config = hp->roi_config;
+    return HAL_OK;
+}
+
+static int hw_codec_force_idr(void *codec_ctx)
+{
+    auto *cc = ctx_ptr(codec_ctx);
+    auto *hp = hw_priv(cc);
+    if (!cc || !hp || !hp->encoder)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(hp->mutex);
+    hp->encoder->force_keyframe();
+    return HAL_OK;
+}
+
+static int hw_codec_get_stream_stats(void *codec_ctx, HalCodecStreamStats *stats)
+{
+    auto *cc = ctx_ptr(codec_ctx);
+    auto *hp = hw_priv(cc);
+    if (!cc || !hp || !hp->encoder || !stats)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(hp->mutex);
+    stats->fps = hp->encoder->get_current_fps();
+    stats->bitrate_kbps = 0;
+    stats->monitor_period_s = 0;
+    if (cc->config.packet_type != HAL_PACKET_TYPE_MJPEG)
+    {
+        encoder_monitors mon = hp->encoder->get_encoder_monitors();
+        if (mon.bitrate_monitor.enabled && mon.bitrate_monitor.ma_bitrate > 0)
+        {
+            /* ma_bitrate is bytes/s over the moving window (see hailo_encoder_impl.cpp). */
+            stats->bitrate_kbps =
+                static_cast<uint32_t>((static_cast<uint64_t>(mon.bitrate_monitor.ma_bitrate) * 8U) / 1000U);
+            stats->monitor_period_s = mon.bitrate_monitor.period;
+        }
+    }
+    return HAL_OK;
+}
+
+} // namespace
+
 extern "C" {
 
 static int hailo15_codec_init(const HalCodecConfig *config, void **codec_ctx_return)
@@ -751,9 +917,211 @@ static int hailo15_codec_dynamic_change_config(void *codec_ctx, const HalCodecCo
     return HAL_OK;
 }
 
+static int hailo15_codec_set_roi_config(void *codec_ctx, const HalCodecRoiConfig *config)
+{
+    HalCodecContext *cc = ctx_ptr(codec_ctx);
+    if (cc->config.type == HAL_CODEC_TYPE_HW)
+    {
+        return hw_codec_set_roi_config(codec_ctx, config);
+    }
+    Hailo15MediaPriv *priv = media_priv_from_codec(cc);
+    if (!cc || !priv || !config || !priv->media_lib)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (cc->config.type != HAL_CODEC_TYPE_FROM_MEDIA)
+    {
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+    const int sup = check_smart_encoder_supported(cc->config);
+    if (sup != HAL_OK)
+    {
+        return sup;
+    }
+    const int val = validate_roi_config(config);
+    if (val != HAL_OK)
+    {
+        return val;
+    }
+
+    const std::string eid = cc->codec_name;
+    /* Do not hold priv->mutex across MediaLibrary calls: ML may invoke callbacks that take this lock. */
+    auto prof_exp = priv->media_lib->get_current_profile();
+    if (!prof_exp)
+    {
+        return HAL_ERROR;
+    }
+    config_profile_t prof = prof_exp.value();
+    auto it = prof.encoded_output_streams.find(eid);
+    if (it == prof.encoded_output_streams.end())
+    {
+        return HAL_ERR_INVALID_STATE;
+    }
+
+    bool merged = false;
+    std::visit(
+        [&](auto &&enc) {
+            using T = std::decay_t<decltype(enc)>;
+            if constexpr (std::is_same_v<T, hailo_encoder_config_t>)
+            {
+                smart_encoder_config_t &se = enc.smart_encoder;
+                se.enabled = config->enabled;
+                se.background_qp_delta = static_cast<uint8_t>(config->background_qp_delta);
+                se.rois.clear();
+                for (uint32_t i = 0; i < config->roi_count; ++i)
+                {
+                    se.rois.push_back(normalized_roi_t{
+                        config->rois[i].x, config->rois[i].y, config->rois[i].w, config->rois[i].h});
+                }
+                merged = true;
+            }
+        },
+        it->second.encoding);
+    if (!merged)
+    {
+        /* jpeg_encoder_config_t has no smart encoder. */
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+
+    media_library_return r = priv->media_lib->set_override_parameters(prof);
+    if (r != MEDIA_LIBRARY_SUCCESS)
+    {
+        return hailo15_ml_err(r);
+    }
+    return HAL_OK;
+}
+
+static int hailo15_codec_get_roi_config(void *codec_ctx, HalCodecRoiConfig *config)
+{
+    HalCodecContext *cc = ctx_ptr(codec_ctx);
+    if (cc->config.type == HAL_CODEC_TYPE_HW)
+    {
+        return hw_codec_get_roi_config(codec_ctx, config);
+    }
+    Hailo15MediaPriv *priv = media_priv_from_codec(cc);
+    if (!cc || !priv || !config || !priv->media_lib)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (cc->config.type != HAL_CODEC_TYPE_FROM_MEDIA)
+    {
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+    const std::string eid = cc->codec_name;
+    auto prof_exp = priv->media_lib->get_current_profile();
+    if (!prof_exp)
+    {
+        return HAL_ERROR;
+    }
+    auto it = prof_exp->encoded_output_streams.find(eid);
+    if (it == prof_exp->encoded_output_streams.end())
+    {
+        return HAL_ERR_INVALID_STATE;
+    }
+
+    bool merged = false;
+    std::visit(
+        [&](auto &&enc) {
+            using T = std::decay_t<decltype(enc)>;
+            if constexpr (std::is_same_v<T, hailo_encoder_config_t>)
+            {
+                const smart_encoder_config_t &se = enc.smart_encoder;
+                std::memset(config, 0, sizeof(*config));
+                config->enabled = se.enabled;
+                config->background_qp_delta = se.background_qp_delta;
+                config->roi_count = 0;
+                for (const auto &roi : se.rois)
+                {
+                    if (config->roi_count >= HAL_CODEC_ROI_MAX)
+                    {
+                        break;
+                    }
+                    config->rois[config->roi_count].x = roi.x;
+                    config->rois[config->roi_count].y = roi.y;
+                    config->rois[config->roi_count].w = roi.width;
+                    config->rois[config->roi_count].h = roi.height;
+                    config->roi_count++;
+                }
+                merged = true;
+            }
+        },
+        it->second.encoding);
+    if (!merged)
+    {
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+    return HAL_OK;
+}
+
+static MediaLibraryEncoderPtr from_media_encoder(Hailo15MediaPriv *priv, HalCodecContext *cc)
+{
+    const std::string eid = cc->codec_name;
+    auto it = priv->media_lib->m_encoders.find(eid);
+    if (it == priv->media_lib->m_encoders.end())
+    {
+        return nullptr;
+    }
+    return it->second;
+}
+
+static int hailo15_codec_force_idr(void *codec_ctx)
+{
+    HalCodecContext *cc = ctx_ptr(codec_ctx);
+    if (cc->config.type == HAL_CODEC_TYPE_HW)
+    {
+        return hw_codec_force_idr(codec_ctx);
+    }
+    Hailo15MediaPriv *priv = media_priv_from_codec(cc);
+    if (!cc || !priv || !priv->media_lib)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    MediaLibraryEncoderPtr enc = from_media_encoder(priv, cc);
+    if (!enc)
+    {
+        return HAL_ERR_INVALID_STATE;
+    }
+    media_library_return r = enc->force_keyframe();
+    return hailo15_ml_err(r);
+}
+
+static int hailo15_codec_get_stream_stats(void *codec_ctx, HalCodecStreamStats *stats)
+{
+    HalCodecContext *cc = ctx_ptr(codec_ctx);
+    if (cc->config.type == HAL_CODEC_TYPE_HW)
+    {
+        return hw_codec_get_stream_stats(codec_ctx, stats);
+    }
+    Hailo15MediaPriv *priv = media_priv_from_codec(cc);
+    if (!cc || !priv || !priv->media_lib || !stats)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    MediaLibraryEncoderPtr enc = from_media_encoder(priv, cc);
+    if (!enc)
+    {
+        return HAL_ERR_INVALID_STATE;
+    }
+    stats->fps = enc->get_current_fps();
+    stats->bitrate_kbps = 0;
+    stats->monitor_period_s = 0;
+    if (cc->config.packet_type != HAL_PACKET_TYPE_MJPEG)
+    {
+        encoder_monitors mon = enc->get_encoder_monitors();
+        if (mon.bitrate_monitor.enabled && mon.bitrate_monitor.ma_bitrate > 0)
+        {
+            /* ma_bitrate is bytes/s over the moving window (see hailo_encoder_impl.cpp). */
+            stats->bitrate_kbps =
+                static_cast<uint32_t>((static_cast<uint64_t>(mon.bitrate_monitor.ma_bitrate) * 8U) / 1000U);
+            stats->monitor_period_s = mon.bitrate_monitor.period;
+        }
+    }
+    return HAL_OK;
+}
+
 static const char *hailo15_codec_get_version(void)
 {
-    return "Hailo15 HAL-CODEC 2.0.0";
+    return "Hailo15 HAL-CODEC 2.1.0";
 }
 
 HalCodecOps HAL_CODEC_OPS = {
@@ -769,6 +1137,10 @@ HalCodecOps HAL_CODEC_OPS = {
     .get_current_config = hailo15_codec_get_current_config,
     .dynamic_change_config = hailo15_codec_dynamic_change_config,
     .get_version = hailo15_codec_get_version,
+    .set_roi_config = hailo15_codec_set_roi_config,
+    .get_roi_config = hailo15_codec_get_roi_config,
+    .force_idr = hailo15_codec_force_idr,
+    .get_stream_stats = hailo15_codec_get_stream_stats,
 };
 
 } // extern "C"

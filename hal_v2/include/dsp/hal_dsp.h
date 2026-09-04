@@ -179,6 +179,41 @@ typedef struct {
     HalDspInterpolation   interpolation;
 } HalDspFlipRotateParams;
 
+/* ---- M3 additions: arbitrary-angle rotate, mesh dewarp, telescopic ---- */
+
+/**
+ * Parameters for an arbitrary-angle affine rotation (clockwise degrees).
+ *
+ * Unlike flip_rotate (0/90/180/270 only), any angle is accepted (e.g. 45.0
+ * for PTZ-style overlays). The destination frame must be large enough to
+ * hold the rotated image.
+ */
+typedef struct {
+    const HalFrameBuffer *src;
+    HalFrameBuffer       *dst;
+    float                 angle_deg_cw;   /* clockwise rotation angle in degrees */
+    HalDspInterpolation   interpolation;
+} HalDspRotateParams;
+
+/**
+ * Parameters for mesh-based dewarp / geometric correction.
+ *
+ * @p mesh_xy is a flattened grid of source-image coordinates sampling an
+ * even grid over the destination image: grid_cols x grid_rows vertices,
+ * each an (x, y) float pair in source pixels. The DSP cell size is fixed
+ * (64x64 destination pixels per cell), so the grid must cover the whole
+ * output (cols = ceil(dst_width / 64) + 1, rows likewise). Only NV12 and
+ * bilinear interpolation are supported by the hardware.
+ */
+typedef struct {
+    const HalFrameBuffer *src;
+    HalFrameBuffer       *dst;
+    const float          *mesh_xy;       /* grid_cols * grid_rows * 2 floats (x,y pairs) */
+    uint32_t              grid_cols;     /* mesh vertices per row */
+    uint32_t              grid_rows;     /* mesh vertices per column */
+    HalDspInterpolation   interpolation; /* only BILINEAR is supported */
+} HalDspDewarpParams;
+
 /** Privacy mask type (solid color or blur / pixelization). */
 typedef enum {
     HAL_DSP_PRIVACY_MASK_COLOR = 0,
@@ -341,6 +376,40 @@ typedef struct {
      * @return Static version string, e.g. \"Hailo15 HAL-DSP 2.0.0\".
      */
     const char *(*get_version)(void);
+
+    /* ---------- M3 additions: rotate / dewarp / telescopic ---------- */
+
+    /**
+     * @brief Arbitrary-angle affine rotation (see HalDspRotateParams).
+     * @param dsp_ctx DSP context.
+     * @param params  Rotation parameters.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*rotate)(void *dsp_ctx, const HalDspRotateParams *params);
+
+    /**
+     * @brief Mesh-based dewarp / geometric correction (see HalDspDewarpParams).
+     *
+     * Hardware constraint: NV12 format, bilinear interpolation only.
+     *
+     * @param dsp_ctx DSP context.
+     * @param params  Dewarp parameters (float mesh; converted internally).
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*dewarp)(void *dsp_ctx, const HalDspDewarpParams *params);
+
+    /**
+     * @brief Telescopic multi crop + resize (progressive x2 downscale stages).
+     *
+     * Same parameter layout as multi_crop_and_resize(); the telescopic path
+     * improves quality for large (>x2) downscales at the cost of extra
+     * intermediate compute. Hardware constraint: NV12, bilinear only.
+     *
+     * @param dsp_ctx DSP context.
+     * @param params  Multi crop+resize parameters.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*multi_crop_resize_telescopic)(void *dsp_ctx, const HalDspMultiCropResizeParams *params);
 } HalDspOps;
 
 /** Platform-specific DSP operations (resolved at link time). */

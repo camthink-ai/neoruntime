@@ -92,6 +92,59 @@ typedef struct {
 } HalCodecConfig;
 
 /* --------------------------------------------------------------------
+ * Smart encoding (ROI)
+ * -------------------------------------------------------------------- */
+
+/** Maximum number of coding ROIs supported by the HAL API. */
+#define HAL_CODEC_ROI_MAX 10
+
+/**
+ * One coding region of interest (normalized coordinates).
+ * The union of all ROIs is encoded at higher quality; the rest of the frame
+ * gets @c background_qp_delta added to its QP (coarser, lower bitrate).
+ */
+typedef struct {
+    float x;         /* left edge,   normalized [0..1] */
+    float y;         /* top edge,    normalized [0..1] */
+    float w;         /* width,       normalized [0..1] */
+    float h;         /* height,      normalized [0..1] */
+} HalCodecRoi;
+
+/**
+ * ROI / smart-encoder configuration.
+ *
+ * Maps to Hailo Media Library @c smart_encoder_config_t (SmartStream+).
+ * Platform constraint (Hailo-15): H.264 + CVBR rate control only; other
+ * codec / RC combinations return HAL_ERR_NOT_SUPPORTED.
+ *
+ * @note ROI config is an independent structure: HalCodecConfig is untouched.
+ */
+typedef struct {
+    bool     enabled;              /* smart encoder master switch */
+    int      background_qp_delta;  /* QP added outside ROIs [0..15]; 0 = platform default */
+    uint32_t roi_count;            /* 0..HAL_CODEC_ROI_MAX when enabled; 0 = no static ROIs */
+    HalCodecRoi rois[HAL_CODEC_ROI_MAX];
+} HalCodecRoiConfig;
+
+/* --------------------------------------------------------------------
+ * Encoder stream statistics
+ * -------------------------------------------------------------------- */
+
+/**
+ * Runtime statistics of one encoder stream.
+ * Convention: fps = -1.0f and bitrate_kbps = 0 mean "unknown".
+ *
+ * fps comes from the encoder's measured output rate; bitrate_kbps is the
+ * moving average over the monitor window (Hailo computes bytes/s internally,
+ * converted to kilobits/s here). MJPEG streams have no bitrate monitor.
+ */
+typedef struct {
+    float    fps;               /* measured encoder output fps, -1.0f if unknown */
+    uint32_t bitrate_kbps;      /* moving-average bitrate in kbps, 0 if unknown */
+    uint32_t monitor_period_s;  /* bitrate monitor averaging window in seconds, 0 if unknown */
+} HalCodecStreamStats;
+
+/* --------------------------------------------------------------------
  * Callback type
  * -------------------------------------------------------------------- */
 
@@ -255,6 +308,52 @@ typedef struct {
      * NULL = not supported by this HAL.
      */
     int (*deinit_from_context)(int encoder_handle);
+
+    /* ---------- smart encoding / runtime control (M1 additions) ---------- */
+
+    /**
+     * @brief Configure ROI / smart encoding for the encoder stream.
+     *
+     * Applies at runtime; takes effect from the next GOP (per Hailo
+     * SmartStream+ behavior). Hailo-15 constraint: H.264 + CVBR only
+     * (HAL_ERR_NOT_SUPPORTED otherwise). MJPEG streams are not supported.
+     *
+     * @param codec_ctx Codec context (HW or FROM_MEDIA).
+     * @param config    ROI configuration; enabled=false disables smart encoding.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*set_roi_config)(void *codec_ctx, const HalCodecRoiConfig *config);
+
+    /**
+     * @brief Retrieve the current ROI / smart encoding configuration.
+     * @param codec_ctx Codec context.
+     * @param config    Receives the current configuration.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*get_roi_config)(void *codec_ctx, HalCodecRoiConfig *config);
+
+    /**
+     * @brief Force the next frame to be encoded as an intra (IDR) frame.
+     *
+     * Useful for snapshot-on-demand, stream joining, and error recovery.
+     *
+     * @param codec_ctx Codec context (HW or FROM_MEDIA).
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*force_idr)(void *codec_ctx);
+
+    /**
+     * @brief Query runtime statistics of the encoder stream.
+     *
+     * Returns current fps, moving-average bitrate and encoded frame count.
+     * Fields the platform cannot determine are set to their "unknown" value
+     * (see HalCodecStreamStats) instead of failing the whole call.
+     *
+     * @param codec_ctx Codec context (HW or FROM_MEDIA).
+     * @param stats     Receives the statistics.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*get_stream_stats)(void *codec_ctx, HalCodecStreamStats *stats);
 } HalCodecOps;
 
 /** Platform-specific codec operations (resolved at link time). */

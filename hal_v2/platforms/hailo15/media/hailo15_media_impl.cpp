@@ -17,6 +17,7 @@
 
 #include <hailo/media_library/encoder_config_types.hpp>
 #include <hailo/media_library/media_library_api_types.hpp>
+#include <hailo/media_library/snapshot.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -2158,6 +2159,47 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
         }
     }
 
+    /* --- Patch motion_detection (target profile wins; includes the analysis
+     * stream binding that stock profiles leave empty, without which the
+     * medialib motion module silently skips detection). from_json reads
+     * resolution.stream_id even though stock profiles omit it. --- */
+    {
+        const motion_detection_config_t &md = target_profile.application_settings.motion_detection;
+        const char *sens = "MEDIUM";
+        switch (md.sensitivity_level)
+        {
+        case LOWEST:  sens = "LOWEST";  break;
+        case LOW:     sens = "LOW";     break;
+        case HIGH:    sens = "HIGH";    break;
+        case HIGHEST: sens = "HIGHEST"; break;
+        default:      sens = "MEDIUM";  break;
+        }
+        json mdj = {
+            {"enabled", md.enabled},
+            /* NOTE: resolution.stream_id is intentionally NOT serialized — the
+             * config schema (additionalProperties:false) rejects it, and the
+             * official profiles never populate it either (every stock config
+             * ships motion_detection disabled; the medialib module therefore
+             * never runs: output_frames lookup uses the empty stream_id).
+             * The HAL runs its own frame-difference detector in the frontend
+             * bridge instead — see subscribe_motion. */
+            {"resolution",
+             {{"width", md.resolution.dimensions.destination_width},
+              {"height", md.resolution.dimensions.destination_height},
+              {"framerate", md.resolution.framerate}}},
+            {"roi",
+             {{"x", md.roi.x}, {"y", md.roi.y}, {"width", md.roi.width}, {"height", md.roi.height}}},
+            {"sensitivity_level", sens},
+            {"threshold", md.threshold},
+            {"buffer_pool_size", md.buffer_pool_size},
+        };
+        if (md.resolution.pool_max_buffers != 0)
+        {
+            mdj["resolution"]["pool_max_buffers"] = md.resolution.pool_max_buffers;
+        }
+        (*app_obj)["motion_detection"] = std::move(mdj);
+    }
+
     /* --- Patch encoded_output_streams --- */
     if (active_prof->contains("encoded_output_streams") &&
         (*active_prof)["encoded_output_streams"].is_array())
@@ -2316,6 +2358,60 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
                                 }
                             }
                         }
+                        else if constexpr (std::is_same_v<T, jpeg_encoder_config_t>)
+                        {
+                            /* JPEG encoder: no hailo_encoder template applies. Build a fresh
+                             * JPEG config (input_stream + jpeg_encoder{n_threads,quality}),
+                             * borrowing version/metadata from the donor template file so the
+                             * architecture check passes; content_hash is recomputed. */
+                            if (new_entry.contains("encoding") && new_entry["encoding"].is_string())
+                            {
+                                std::string tmpl_path = new_entry["encoding"].get<std::string>();
+                                std::ifstream ef(tmpl_path);
+                                if (ef.is_open())
+                                {
+                                    json enc_cfg;
+                                    ef >> enc_cfg;
+                                    ef.close();
+                                    enc_cfg["encoding"] = {
+                                        {"input_stream",
+                                         {{"format", enc.input_stream.format},
+                                          {"framerate", enc.input_stream.framerate},
+                                          {"height", enc.input_stream.height},
+                                          {"width", enc.input_stream.width}}},
+                                        {"jpeg_encoder",
+                                         {{"n_threads", enc.n_threads}, {"quality", enc.quality}}}};
+                                    if (enc_cfg.contains("metadata") && enc_cfg["metadata"].is_object())
+                                    {
+                                        auto enc_hash = compute_medialib_content_hash(enc_cfg);
+                                        if (enc_hash)
+                                        {
+                                            enc_cfg["metadata"]["content_hash"] = *enc_hash;
+                                        }
+                                    }
+                                    std::string new_path = std::string("/tmp/encoder_inject_") + tid + ".json";
+                                    std::ofstream of(new_path);
+                                    if (of.is_open())
+                                    {
+                                        of << enc_cfg.dump(4);
+                                        of.close();
+                                        new_entry["encoding"] = new_path;
+                                        HAL_LOG_INFO("hailo15_media: patch_json: wrote JPEG encoder config '%s' for '%s'",
+                                                     new_path.c_str(), tid.c_str());
+                                    }
+                                    else
+                                    {
+                                        HAL_LOG_ERROR("hailo15_media: patch_json: FAILED to write JPEG encoder config '%s'",
+                                                      new_path.c_str());
+                                    }
+                                }
+                                else
+                                {
+                                    HAL_LOG_ERROR("hailo15_media: patch_json: FAILED to open template encoder config '%s' (jpeg)",
+                                                  tmpl_path.c_str());
+                                }
+                            }
+                        }
                     }, enc_it->second.encoding);
                 }
 
@@ -2379,6 +2475,13 @@ static int hailo15_media_init(const HalMediaConfig *config, void **media_ctx_ret
     {
         return HAL_ERR_INVALID_ARG;
     }
+
+    /* Enable the medialib snapshot manager BEFORE pipeline components are
+     * created: stages (pre_isp_raw / multiresize_<id> / encoder_<WxH> ...)
+     * register themselves during component construction, so a later enable
+     * leaves request_snapshot() with an empty stage set. File output only
+     * happens when a snapshot is actually requested. */
+    SnapshotManager::get_instance().enable_snapshot(true);
 
     std::string json;
     std::string effective_path; /* non-empty when config was loaded from a file path */
@@ -3457,6 +3560,32 @@ static int hailo15_media_add_codec_stream(void *media_ctx, const HalMediaAddCode
                 return kv.second;
             }
         }
+        /* No JPEG stream in this profile (defaults carry only H.264/H.265): synthesize
+         * a JPEG template from any existing encoder's input geometry. The JPEG schema
+         * only requires input_stream + n_threads[1..4] + quality[0..100]; the caller
+         * overwrites width/height/framerate/quality afterwards. Without any encoder
+         * at all there is no geometry donor — keep the error then. */
+        if (want_jpeg)
+        {
+            for (const auto &kv : p.encoded_output_streams)
+            {
+                input_config_t in{};
+                std::visit([&](auto &enc) { in = enc.input_stream; }, kv.second.encoding);
+                if (in.width == 0U || in.height == 0U)
+                {
+                    continue;
+                }
+                config_encoded_output_stream_t tmpl{};
+                tmpl.osd = config_stream_osd_t{};
+                tmpl.masking = privacy_mask_config_t{};
+                jpeg_encoder_config_t je{};
+                je.input_stream = in;
+                je.n_threads = 1;
+                je.quality = 85;
+                tmpl.encoding = je;
+                return tmpl;
+            }
+        }
         return std::nullopt;
     };
 
@@ -3577,6 +3706,32 @@ static int hailo15_media_add_streams_batch(void *media_ctx, const HalMediaAddCod
             if (is_jpeg == want_jpeg)
             {
                 return kv.second;
+            }
+        }
+        /* No JPEG stream in this profile (defaults carry only H.264/H.265): synthesize
+         * a JPEG template from any existing encoder's input geometry. The JPEG schema
+         * only requires input_stream + n_threads[1..4] + quality[0..100]; the caller
+         * overwrites width/height/framerate/quality afterwards. Without any encoder
+         * at all there is no geometry donor — keep the error then. */
+        if (want_jpeg)
+        {
+            for (const auto &kv : p.encoded_output_streams)
+            {
+                input_config_t in{};
+                std::visit([&](auto &enc) { in = enc.input_stream; }, kv.second.encoding);
+                if (in.width == 0U || in.height == 0U)
+                {
+                    continue;
+                }
+                config_encoded_output_stream_t tmpl{};
+                tmpl.osd = config_stream_osd_t{};
+                tmpl.masking = privacy_mask_config_t{};
+                jpeg_encoder_config_t je{};
+                je.input_stream = in;
+                je.n_threads = 1;
+                je.quality = 85;
+                tmpl.encoding = je;
+                return tmpl;
             }
         }
         return std::nullopt;
@@ -4407,6 +4562,12 @@ static int hailo15_media_dynamic_change_image_config(void *media_ctx, const HalM
     auto *hm = static_cast<HalMediaContext *>(media_ctx);
     if (!priv || !priv->media_lib || !cfg || !hm)
     {
+        return HAL_ERR_INVALID_ARG;
+    }
+    /* Digital zoom magnification: medialib DIGITAL_ZOOM_MODE_MAGNIFICATION supports up to 31x. */
+    if (cfg->digital_zoom && (cfg->digital_zoom_value < 1 || cfg->digital_zoom_value > 31))
+    {
+        HAL_LOG_ERROR("hailo15_media: digital_zoom_value %d out of range [1..31]", cfg->digital_zoom_value);
         return HAL_ERR_INVALID_ARG;
     }
 
@@ -6047,9 +6208,258 @@ static int hailo15_media_reconfigure_pipeline(void *media_ctx, const HalPipeline
     return rc;
 }
 
+static HalThrottlingState to_hal_throttling_state(media_library_throttling_state_t st)
+{
+    switch (st)
+    {
+    case media_library_throttling_state_t::THROTTLING_STATE_FULL_PERFORMANCE:
+        return HAL_THROTTLING_FULL_PERFORMANCE;
+    case media_library_throttling_state_t::THROTTLING_STATE_COOLING:
+        return HAL_THROTTLING_COOLING;
+    case media_library_throttling_state_t::THROTTLING_STATE_S0:
+        return HAL_THROTTLING_S0;
+    case media_library_throttling_state_t::THROTTLING_STATE_S1:
+        return HAL_THROTTLING_S1;
+    case media_library_throttling_state_t::THROTTLING_STATE_S2:
+        return HAL_THROTTLING_S2;
+    case media_library_throttling_state_t::THROTTLING_STATE_S3:
+        return HAL_THROTTLING_S3;
+    case media_library_throttling_state_t::THROTTLING_STATE_S4:
+        return HAL_THROTTLING_S4;
+    case media_library_throttling_state_t::THROTTLING_STATE_UNINITIALIZED:
+    default:
+        return HAL_THROTTLING_UNINITIALIZED;
+    }
+}
+
+static int hailo15_media_subscribe_throttling(void *media_ctx, HalThrottlingCallback callback, void *userdata)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !priv->media_lib || !callback)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    HalMediaContext *hm = static_cast<HalMediaContext *>(media_ctx);
+    {
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->throttling_cb = callback;
+        priv->throttling_cb_user = userdata;
+    }
+    /* Only one subscriber is supported by medialib; a re-subscribe replaces. */
+    media_library_return r = priv->media_lib->subscribe_to_throttling_state_change(
+        [priv, hm](media_library_throttling_state_t st) {
+            HalThrottlingCallback cb = nullptr;
+            void *ud = nullptr;
+            {
+                std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+                cb = priv->throttling_cb;
+                ud = priv->throttling_cb_user;
+            }
+            if (!cb)
+            {
+                return;
+            }
+            /* Profile name is best-effort; medialib's throttling event carries state only. */
+            cb(hm, to_hal_throttling_state(st), "", ud);
+        });
+    if (r != MEDIA_LIBRARY_SUCCESS)
+    {
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->throttling_cb = nullptr;
+        priv->throttling_cb_user = nullptr;
+        return hailo15_ml_err(r);
+    }
+    return HAL_OK;
+}
+
+static int hailo15_media_unsubscribe_throttling(void *media_ctx)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !priv->media_lib)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    media_library_return r = priv->media_lib->unsubscribe_from_throttling_state_change();
+    {
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->throttling_cb = nullptr;
+        priv->throttling_cb_user = nullptr;
+    }
+    return hailo15_ml_err(r);
+}
+
+static int hailo15_media_get_throttling_state(void *media_ctx, HalThrottlingState *state_out)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !priv->media_lib || !state_out)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    auto st_exp = priv->media_lib->get_throttling_state();
+    if (!st_exp)
+    {
+        return hailo15_ml_err(st_exp.error());
+    }
+    *state_out = to_hal_throttling_state(st_exp.value());
+    return HAL_OK;
+}
+
+/* ---- M2: motion detection ---- */
+
+
+static HalMotionConfig to_hal_motion_config(const motion_detection_config_t &md)
+{
+    HalMotionConfig out{};
+    out.enabled = md.enabled;
+    out.roi_x = static_cast<int32_t>(md.roi.x);
+    out.roi_y = static_cast<int32_t>(md.roi.y);
+    out.roi_w = static_cast<int32_t>(md.roi.width);
+    out.roi_h = static_cast<int32_t>(md.roi.height);
+    switch (md.sensitivity_level)
+    {
+    case LOWEST:  out.sensitivity = HAL_MOTION_SENSITIVITY_LOWEST;  break;
+    case LOW:     out.sensitivity = HAL_MOTION_SENSITIVITY_LOW;     break;
+    case MEDIUM:  out.sensitivity = HAL_MOTION_SENSITIVITY_MEDIUM;  break;
+    case HIGH:    out.sensitivity = HAL_MOTION_SENSITIVITY_HIGH;    break;
+    case HIGHEST: out.sensitivity = HAL_MOTION_SENSITIVITY_HIGHEST; break;
+    default:      out.sensitivity = HAL_MOTION_SENSITIVITY_MEDIUM;  break;
+    }
+    out.threshold = md.threshold;
+    return out;
+}
+
+static int hailo15_media_set_motion_config(void *media_ctx, const HalMotionConfig *config)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !priv->media_lib || !config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (config->threshold < 0.0f || config->threshold > 1.0f)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (config->sensitivity < HAL_MOTION_SENSITIVITY_LOWEST ||
+        config->sensitivity > HAL_MOTION_SENSITIVITY_HIGHEST)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    /* Do not hold priv->mutex across MediaLibrary calls: ML may invoke callbacks that take this lock. */
+    auto prof_exp = priv->media_lib->get_current_profile();
+    if (!prof_exp)
+    {
+        return HAL_ERROR;
+    }
+    config_profile_t p = prof_exp.value();
+    motion_detection_config_t &md = p.application_settings.motion_detection;
+    md.enabled = config->enabled;
+    if (config->roi_w > 0 && config->roi_h > 0)
+    {
+        md.roi = roi_t{static_cast<uint32_t>(config->roi_x), static_cast<uint32_t>(config->roi_y),
+                       static_cast<uint32_t>(config->roi_w), static_cast<uint32_t>(config->roi_h)};
+    }
+    else
+    {
+        /* Full frame: clear the ROI. */
+        md.roi = roi_t{0, 0, 0, 0};
+    }
+    switch (config->sensitivity)
+    {
+    case HAL_MOTION_SENSITIVITY_LOWEST:  md.sensitivity_level = LOWEST;  break;
+    case HAL_MOTION_SENSITIVITY_LOW:     md.sensitivity_level = LOW;     break;
+    case HAL_MOTION_SENSITIVITY_MEDIUM:  md.sensitivity_level = MEDIUM;  break;
+    case HAL_MOTION_SENSITIVITY_HIGH:    md.sensitivity_level = HIGH;    break;
+    case HAL_MOTION_SENSITIVITY_HIGHEST: md.sensitivity_level = HIGHEST; break;
+    }
+    md.threshold = config->threshold;
+
+    /* Do NOT populate motion_detection.resolution.stream_id here: with it set,
+     * the medialib counts the motion resolution as a 4th output stream and
+     * perform_multi_resize fails every frame ("resolutions (4) != frames (3)"),
+     * killing the frontend output. The medialib module stays dormant; events
+     * come from the HAL frame-difference engine (hailo15_motion_detect_update). */
+    media_library_return r = priv->media_lib->set_override_parameters(p);
+    if (r != MEDIA_LIBRARY_SUCCESS)
+    {
+        return hailo15_ml_err(r);
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->motion_engine_enabled = config->enabled;
+        priv->motion_threshold = config->threshold;
+        /* sensitivity LOWEST(0)..HIGHEST(4) -> per-pixel delta 40..8 */
+        priv->motion_diff_level = 40 - (config->sensitivity * 8);
+        priv->motion_last_state = false; /* re-arm transition detection */
+        if (priv->motion_analysis_sid.empty() && !priv->frontend_stream_ids.empty())
+        {
+            /* pick the smallest output stream as the analysis source */
+            uint64_t best = UINT64_MAX;
+            for (const auto &sid : priv->frontend_stream_ids)
+            {
+                const auto vs = priv->video_by_stream.find(sid);
+                uint64_t area = UINT64_MAX;
+                if (vs != priv->video_by_stream.end())
+                {
+                    area = static_cast<uint64_t>(vs->second->config.width) * vs->second->config.height;
+                }
+                if (area > 0 && area < best)
+                {
+                    best = area;
+                    priv->motion_analysis_sid = sid;
+                }
+            }
+        }
+        priv->motion_prev_grid.clear();
+    }
+    return HAL_OK;
+}
+
+static int hailo15_media_get_motion_config(void *media_ctx, HalMotionConfig *config)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !priv->media_lib || !config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    auto prof_exp = priv->media_lib->get_current_profile();
+    if (!prof_exp)
+    {
+        return HAL_ERROR;
+    }
+    *config = to_hal_motion_config(prof_exp->application_settings.motion_detection);
+    return HAL_OK;
+}
+
+static int hailo15_media_subscribe_motion(void *media_ctx, HalMotionCallback callback, void *userdata)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !callback)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+    priv->motion_cb = callback;
+    priv->motion_cb_user = userdata;
+    priv->motion_last_state = false;
+    return HAL_OK;
+}
+
+static int hailo15_media_unsubscribe_motion(void *media_ctx)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+    priv->motion_cb = nullptr;
+    priv->motion_cb_user = nullptr;
+    return HAL_OK;
+}
+
 static const char *hailo15_media_get_version(void)
 {
-    return "Hailo15 HAL-MEDIA 2.0.0";
+    return "Hailo15 HAL-MEDIA 2.2.0";
 }
 
 /* --------------------------------------------------------------------
@@ -6309,6 +6719,13 @@ HalMediaOps HAL_MEDIA_OPS = {
     .reconfigure_pipeline = hailo15_media_reconfigure_pipeline,
     .get_version = hailo15_media_get_version,
     .attach_frame_analytics = hailo15_media_attach_frame_analytics,
+    .subscribe_throttling = hailo15_media_subscribe_throttling,
+    .unsubscribe_throttling = hailo15_media_unsubscribe_throttling,
+    .get_throttling_state = hailo15_media_get_throttling_state,
+    .set_motion_config = hailo15_media_set_motion_config,
+    .get_motion_config = hailo15_media_get_motion_config,
+    .subscribe_motion = hailo15_media_subscribe_motion,
+    .unsubscribe_motion = hailo15_media_unsubscribe_motion,
 };
 
 } // extern "C"

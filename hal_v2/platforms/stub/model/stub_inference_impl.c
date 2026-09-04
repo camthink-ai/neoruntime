@@ -71,6 +71,14 @@ static int stub_infer_tensor_from_frame(const HalFrameBuffer *frame, HalTensor *
     return 0;
 }
 
+static int stub_infer_tensor_from_frame_ex(HalInferenceSession *session, const HalFrameBuffer *frame,
+                                           HalTensor *tensor)
+{
+    (void)session;
+    /* Stub has no model geometry; behave as the raw-copy variant. */
+    return stub_infer_tensor_from_frame(frame, tensor);
+}
+
 static int stub_infer_run(HalInferenceSession *session, const HalTensor *inputs, int num_inputs, HalTensor *outputs,
                           int num_outputs)
 {
@@ -123,7 +131,7 @@ static void stub_infer_free_tensor(HalTensor *tensor)
 
 static const char *stub_infer_get_version(void)
 {
-    return "HAL-INFERENCE stub 2.0.0 (platform stub)";
+    return "HAL-INFERENCE stub 2.1.0 (platform stub)";
 }
 
 static int stub_infer_query_system_performance_stats(const char *device_id, uint32_t sampling_period_ms,
@@ -142,6 +150,7 @@ HalInferenceOps HAL_INFERENCE_OPS = {
     .get_model_info = stub_infer_get_model_info,
     .alloc_input = stub_infer_alloc_input,
     .tensor_from_frame = stub_infer_tensor_from_frame,
+    .tensor_from_frame_ex = stub_infer_tensor_from_frame_ex,
     .run = stub_infer_run,
     .run_async = stub_infer_run_async,
     .runtime_acquire = stub_infer_runtime_acquire,

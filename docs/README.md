@@ -26,6 +26,7 @@
 | -------- | ----------- |
 | [architecture/README.md](architecture/README.md) | System architecture overview |
 | [architecture/hal_v2_overview.md](architecture/hal_v2_overview.md) | HAL v2 design and extension points |
+| [architecture/hal_v2_hailo15_gap_adaptation_plan.md](architecture/hal_v2_hailo15_gap_adaptation_plan.md) | Hailo-15 capability gap adaptation plan (batched API additions) |
 | [architecture/security-architecture.md](architecture/security-architecture.md) | Security model (auth, sandbox, seccomp) |
 | [os-image-aipc-restore-design.md](deployment/os-image-aipc-restore-design.md) | OS image restore / `aipc-restore` design |
 

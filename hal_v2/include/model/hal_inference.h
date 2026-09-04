@@ -190,6 +190,27 @@ typedef struct {
     uint8_t reserved[7];
 } HalInferenceRuntimeConfig;
 
+/**
+ * On-chip NMS runtime parameters (HailoRT InferModel::set_nms_*).
+ *
+ * Only applied to output streams using HailoRT's on-chip NMS format
+ * (@c is_nms in the model info); other models ignore these fields.
+ * Zero / negative values select the platform default (score 0.4, IoU 0.6,
+ * per-class max 50, total max 100, no class filter) — matching the
+ * zero-initialized-config = unchanged-behavior convention.
+ *
+ * @note These take effect at session create time (HailoRT applies NMS
+ * parameters during configure()); they are not runtime-mutable on an
+ * already-created session.
+ */
+typedef struct {
+    float    score_threshold;        /* <=0 = default */
+    float    iou_threshold;          /* <=0 = default */
+    uint32_t max_proposals_per_class;/* 0 = default */
+    uint32_t max_proposals_total;    /* 0 = default */
+    uint32_t class_filter_mask[8];   /* 256-class bitmask; all-zero = no filter */
+} HalInferenceNmsConfig;
+
 /* ========== Inference Config ========== */
 typedef struct {
     char model_path[HAL_MAX_MODEL_PATH];
@@ -206,6 +227,8 @@ typedef struct {
     HalInferenceRuntime *runtime;
     /** Per-model scheduler parameters (effective only when runtime uses a non-NONE algorithm). */
     HalInferenceSchedulerConfig scheduler;
+    /** On-chip NMS parameters, applied to NMS-format outputs at configure time. */
+    HalInferenceNmsConfig nms;
 } HalInferenceConfig;
 
 /* ========== Inference performance (device + host) ========== */
@@ -226,6 +249,10 @@ typedef struct {
     int64_t ram_used_kib;
     /** DSP or secondary accelerator load, percent 0..100, or -1.0f if unknown / N/A. */
     float dsp_utilization;
+    /** SoC on-die temperature, sensor 0, degrees Celsius, or -1.0f if unknown. */
+    float soc_temp_c;
+    /** SoC on-die temperature, sensor 1, degrees Celsius, or -1.0f if unknown. */
+    float soc_temp_c1;
 } HalInferencePerfStats;
 
 /**
@@ -281,12 +308,38 @@ typedef struct HalInferenceOps {
     int (*alloc_input)(HalInferenceSession *session, int input_idx, HalTensor *tensor);
 
     /**
-     * @brief Create input tensor from frame buffer (convenience function)
+     * @brief Create input tensor from frame buffer (RAW COPY — no preprocessing).
+     *
+     * Copies the frame planes verbatim into a flat uint8 tensor. The
+     * HalInferenceConfig::preprocess rules are NOT applied here; the caller is
+     * responsible for matching the model input geometry/format, or must use
+     * @ref tensor_from_frame_ex instead.
+     *
      * @param frame Input frame
      * @param tensor Output tensor
      * @return HAL_OK on success
      */
     int (*tensor_from_frame)(const HalFrameBuffer *frame, HalTensor *tensor);
+
+    /**
+     * @brief Create input tensor from a frame, applying the session's
+     *        HalInferenceConfig::preprocess rules (resize / color conversion /
+     *        letterbox / normalize) to match the model's first input stream.
+     *
+     * Unlike @ref tensor_from_frame, this is session-aware: the target geometry
+     * and format come from the model input stream, and the transformation runs
+     * through HailoRT's host-side InputTransformContext. Fast paths with no
+     * copy overhead when the frame already matches the model input exactly.
+     *
+     * Supported source formats: NV12, RGB24, BGR24, GRAY8.
+     *
+     * @param session Inference session (defines target input + preprocess rules).
+     * @param frame   Input frame (any of the supported formats, any geometry).
+     * @param tensor  Output tensor; uint8 unless preprocess.normalize is set
+     *                (then float32, (in/255 - mean)/std per channel).
+     * @return HAL_OK on success, negative HalErrorCode on failure.
+     */
+    int (*tensor_from_frame_ex)(HalInferenceSession *session, const HalFrameBuffer *frame, HalTensor *tensor);
 
     /**
      * @brief Run inference (synchronous)
@@ -373,6 +426,41 @@ typedef struct HalInferenceOps {
 
 /* ========== Global Operations Table ========== */
 extern HalInferenceOps HAL_INFERENCE_OPS;
+
+/* ========== On-chip NMS output decoding ========== */
+
+/**
+ * One detection decoded from an on-chip NMS output tensor.
+ * Coordinates are normalized [0..1] relative to the model input frame.
+ */
+typedef struct {
+    float y_min, x_min, y_max, x_max;   /* normalized [0..1] */
+    float score;                        /* confidence [0..1] */
+} HalNmsDetection;
+
+/**
+ * @brief Decode an on-chip NMS output tensor into detections.
+ *
+ * Raw run() outputs of streams whose HalModelTensorInfo::is_nms is set use the
+ * Hailo-15 NMS layout (measured on target, HailoRT 5.3.0):
+ *
+ *   [count : float32] [count x { y_min, x_min, y_max, x_max, score : float32 x5 }]
+ *
+ * The per-class variants repeat this block per class; this helper decodes the
+ * first (highest-priority) block, which on single-head detectors is the
+ * complete result. Coordinates are normalized to the model input frame.
+ *
+ * Platform-neutral pure decoding — works on any HAL build.
+ *
+ * @param t          Output tensor obtained from run() (is_nms stream).
+ * @param out        Caller array receiving decoded detections.
+ * @param max_count  Capacity of @p out; excess boxes are truncated.
+ * @param count_out  Receives the number of decoded boxes (<= max_count).
+ * @return HAL_OK on success, HAL_ERR_INVALID_ARG / HAL_ERR_INVALID_SIZE on
+ *         malformed input.
+ */
+int hal_inference_decode_nms(const HalTensor *t, HalNmsDetection *out,
+                             uint32_t max_count, uint32_t *count_out);
 
 /* ========== Helper Functions ========== */
 

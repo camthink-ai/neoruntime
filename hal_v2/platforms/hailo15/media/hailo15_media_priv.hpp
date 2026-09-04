@@ -102,6 +102,26 @@ struct Hailo15MediaPriv
     /* Diagnostics: per-stream counters for troubleshooting buffer pool exhaustion. */
     std::map<std::string, size_t> enc_pkt_count;
     std::map<std::string, size_t> feed_err_count;
+
+    /* Thermal throttling subscription (subscribe_throttling). Guarded by mutex. */
+    HalThrottlingCallback throttling_cb{nullptr};
+    void *throttling_cb_user{nullptr};
+
+    /* Motion detection subscription (subscribe_motion). Guarded by mutex.
+     * Events come from the HAL's own frame-difference engine (see
+     * hailo15_motion_detect_update): the medialib module is effectively
+     * unusable — every stock profile ships it disabled and its analysis
+     * stream_id is never populated (output_frames lookup silently skips). */
+    HalMotionCallback motion_cb{nullptr};
+    void *motion_cb_user{nullptr};
+    bool motion_last_state{false};
+    bool motion_engine_enabled{false};
+    float motion_threshold{0.05f};
+    int motion_diff_level{24}; /* per-pixel delta 8..40 mapped from sensitivity */
+    std::string motion_analysis_sid;
+    std::vector<uint8_t> motion_prev_grid; /* downsampled luma of previous frame */
+    uint32_t motion_grid_w{0};
+    uint32_t motion_grid_h{0};
 };
 
 inline Hailo15MediaPriv *hailo15_media_priv_from_hal(void *media_ctx)

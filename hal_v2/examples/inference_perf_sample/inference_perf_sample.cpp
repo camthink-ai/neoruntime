@@ -31,10 +31,11 @@ static bool arg_looks_like_platform_config_json(const char *s)
 static void print_perf(int index, const HalInferencePerfStats *p)
 {
     std::printf(
-        "sample %d: npu=%.2f%% cpu=%.2f%% ram_used=%lldKiB ram_total=%lldKiB dsp=%.2f%%\n", index,
-        static_cast<double>(p->npu_utilization), static_cast<double>(p->cpu_utilization),
+        "sample %d: npu=%.2f%% cpu=%.2f%% ram_used=%lldKiB ram_total=%lldKiB dsp=%.2f%% soc_temp=%.1fC/%.1fC\n",
+        index, static_cast<double>(p->npu_utilization), static_cast<double>(p->cpu_utilization),
         static_cast<long long>(p->ram_used_kib), static_cast<long long>(p->ram_total_kib),
-        static_cast<double>(p->dsp_utilization));
+        static_cast<double>(p->dsp_utilization), static_cast<double>(p->soc_temp_c),
+        static_cast<double>(p->soc_temp_c1));
 }
 
 int main(int argc, char **argv)

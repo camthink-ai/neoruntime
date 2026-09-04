@@ -597,6 +597,32 @@ bool safe_ext_ctrl_set(v4l2::v4l2ControlManager &m, CtrlEnum ctrl, const T &valu
     }
 }
 
+/** Ext-control read (e.g. WB gains); returns false when the control is absent. */
+template<typename CtrlEnum, typename T>
+bool safe_ext_ctrl_get(v4l2::v4l2ControlManager &m, CtrlEnum ctrl, T &value)
+{
+    try
+    {
+        auto opt = m.ext_ctrl_get<T>(ctrl);
+        if (!opt.has_value())
+        {
+            return false;
+        }
+        value = opt.value();
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        HAL_LOG_DEBUG("Hailo15 ISP: ext_ctrl_get (%d) failed: %s", static_cast<int>(ctrl), e.what());
+        return false;
+    }
+    catch (...)
+    {
+        HAL_LOG_DEBUG("Hailo15 ISP: ext_ctrl_get (%d) failed: unknown exception", static_cast<int>(ctrl));
+        return false;
+    }
+}
+
 /** Controls that may be absent from medialib v4l2 maps (e.g. NOISE_REDUCTION): no WARNING spam. */
 template<typename CtrlEnum, typename T>
 bool safe_ext_ctrl_set_optional(v4l2::v4l2ControlManager &m, CtrlEnum ctrl, const T &value)
@@ -1021,6 +1047,114 @@ static bool resolve_af_measurement_ctrl(int fd)
         }
     }
     return false;
+}
+
+/* ---- M2: AE statistics controls (isp_ae_hist / isp_ae_luma) ---- */
+static std::mutex s_ae_mu;
+static bool s_ae_hist_valid = false;
+static bool s_ae_luma_valid = false;
+static struct v4l2_query_ext_ctrl s_ae_hist_info {};
+static struct v4l2_query_ext_ctrl s_ae_luma_info {};
+static bool s_ae_en_valid = false;
+static bool s_ae_win_valid = false;
+static struct v4l2_query_ext_ctrl s_ae_en_info {};
+static struct v4l2_query_ext_ctrl s_ae_win_info {};
+
+static bool resolve_ae_enable_win_ctrls(int fd)
+{
+    std::lock_guard<std::mutex> lk(s_ae_mu);
+    if (!s_ae_en_valid)
+    {
+        s_ae_en_valid = v4l2_query_ext_ctrl_by_exact_name(fd, "isp_ae_enable", &s_ae_en_info);
+    }
+    if (!s_ae_win_valid)
+    {
+        s_ae_win_valid = v4l2_query_ext_ctrl_by_exact_name(fd, "isp_ae_hist_window", &s_ae_win_info);
+    }
+    return s_ae_en_valid || s_ae_win_valid;
+}
+
+static bool resolve_ae_stats_ctrls(int fd)
+{
+    std::lock_guard<std::mutex> lk(s_ae_mu);
+    if (s_ae_hist_valid || s_ae_luma_valid)
+    {
+        return true;
+    }
+    static const char *k_hist_names[] = {"isp_ae_hist", "isp_ae_histogram", "ae_hist"};
+    for (const char *nm : k_hist_names)
+    {
+        if (v4l2_query_ext_ctrl_by_exact_name(fd, nm, &s_ae_hist_info))
+        {
+            s_ae_hist_valid = true;
+            break;
+        }
+    }
+    static const char *k_luma_names[] = {"isp_ae_luma", "isp_ae_average_luma_grid", "ae_luma"};
+    for (const char *nm : k_luma_names)
+    {
+        if (v4l2_query_ext_ctrl_by_exact_name(fd, nm, &s_ae_luma_info))
+        {
+            s_ae_luma_valid = true;
+            break;
+        }
+    }
+    return s_ae_hist_valid || s_ae_luma_valid;
+}
+
+/* ---- M2: AWB enable control (manual/auto switch; absent from medialib v4l2 map) ---- */
+static std::mutex s_awb_en_mu;
+static bool s_awb_en_valid = false;
+static struct v4l2_query_ext_ctrl s_awb_en_info {};
+
+static bool resolve_awb_enable_ctrl(int fd)
+{
+    std::lock_guard<std::mutex> lk(s_awb_en_mu);
+    if (s_awb_en_valid)
+    {
+        return true;
+    }
+    if (v4l2_query_ext_ctrl_by_exact_name(fd, "isp_awb_enable", &s_awb_en_info))
+    {
+        s_awb_en_valid = true;
+        return true;
+    }
+    return false;
+}
+
+/* ---- M2: 3DNR (temporal NR) control probing ---- */
+static std::mutex s_3dnr_mu;
+static bool s_3dnr_ctrl_valid = false;
+static struct v4l2_query_ext_ctrl s_3dnr_ctrl_info {};
+
+static bool s_3dnr_en_valid = false;
+static struct v4l2_query_ext_ctrl s_3dnr_en_info {};
+
+static bool resolve_3dnr_ctrl(int fd)
+{
+    std::lock_guard<std::mutex> lk(s_3dnr_mu);
+    if (!s_3dnr_ctrl_valid)
+    {
+        static const char *k_try_names[] = {
+            "isp_3dnr_strength",
+            "isp_3dnr",
+            "isp_tnr_strength",
+            "3dnr_strength",
+        };
+        for (const char *nm : k_try_names)
+        {
+            if (v4l2_query_ext_ctrl_by_exact_name(fd, nm, &s_3dnr_ctrl_info))
+            {
+                s_3dnr_ctrl_valid = true;
+                break;
+            }
+        }
+    }
+    if (!s_3dnr_en_valid)
+    {
+        s_3dnr_en_valid = v4l2_query_ext_ctrl_by_exact_name(fd, "isp_3dnr_enable", &s_3dnr_en_info);
+    }
+    return s_3dnr_ctrl_valid || s_3dnr_en_valid;
 }
 
 static bool v4l2_set_ext_ctrl_blob(int fd, const struct v4l2_query_ext_ctrl &info, const void *data, size_t size)
@@ -2422,7 +2556,436 @@ static int hailo15_isp_get_af_measurement(void *video_ctx, HalIspAfMeasurement *
 
 static const char *hailo15_isp_get_version(void)
 {
-    return "Hailo15 HAL-ISP 2.0.0";
+    return "Hailo15 HAL-ISP 2.2.0";
+}
+
+/* ---- M2: manual white balance ---- */
+
+/** Freeze/unfreeze the AWB auto algorithm (awbv2 — NOT aw_drv4, which is
+ *  Auto-WDR). Manual WB gains are overwritten every frame while AWB runs
+ *  (imaging guide: "wb control must disable awb"), so manual mode must first
+ *  disable the algorithm block, then isp_awb_enable + isp_awb_mode. */
+static bool ml_set_awbv2_auto(Hailo15MediaPriv *priv, bool auto_enabled)
+{
+    if (!priv || !priv->media_lib)
+    {
+        return false;
+    }
+    try
+    {
+        /* Do not hold priv->mutex across MediaLibrary calls: ML may invoke callbacks that take this lock. */
+        auto prof_exp = priv->media_lib->get_current_profile();
+        if (!prof_exp.has_value())
+        {
+            return false;
+        }
+        config_profile_t p = prof_exp.value();
+        auto &awbv2 = p.iq_settings.automatic_algorithms_config.awbv2;
+        if (awbv2.disable)
+        {
+            return true; /* module disabled in tuning — nothing to toggle */
+        }
+        if (awbv2.enabled == auto_enabled)
+        {
+            return true;
+        }
+        awbv2.enabled = auto_enabled;
+        const media_library_return r = priv->media_lib->set_override_parameters(p);
+        if (r != MEDIA_LIBRARY_SUCCESS)
+        {
+            HAL_LOG_WARNING("Hailo15 ISP: set_override_parameters (awbv2=%d) failed (%d)",
+                            auto_enabled ? 1 : 0, static_cast<int>(r));
+            return false;
+        }
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        HAL_LOG_WARNING("Hailo15 ISP: ml_set_awbv2_auto: %s", e.what());
+        return false;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+/* ---- M2: manual white balance ---- */
+
+static int hailo15_isp_set_wb_config(void *video_ctx, const HalIspWbConfig *config)
+{
+    if (!config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    /* Hailo WB gain controls are Q8.8 (256 = 1.0x). Control ranges (imaging
+     * guide 6.2): r/gr [100..1023] (~0.39..4.0x), gb/b [100..399] (~0.39..1.56x). */
+    for (float g : {config->r_gain, config->gr_gain, config->gb_gain, config->b_gain})
+    {
+        if (g < 0.39f || g > 4.0f)
+        {
+            return HAL_ERR_INVALID_ARG;
+        }
+    }
+    if (config->gb_gain > 1.56f || config->b_gain > 1.56f)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    bool ccm_requested = false;
+    for (float v : config->ccm)
+    {
+        if (v != 0.0f)
+        {
+            ccm_requested = true;
+            break;
+        }
+    }
+    try
+    {
+        auto &m = isp_ctrl_mgr();
+        wait_safe_to_pull_once(m);
+        if (config->manual_state)
+        {
+            /* Official manual-WB sequence (imaging guide 6.2 + webserver):
+             * 1) freeze the AWB algorithm (awbv2) so it stops overwriting gains
+             * 2) isp_awb_enable = 0  (hard prerequisite for gain writes)
+             * 3) isp_awb_mode  = 0  (manual)
+             * 4) write the four Q8.8 gains
+             * 5) optional CCM matrix when requested */
+            Hailo15MediaPriv *priv = media_priv_from_video_ctx(video_ctx);
+            if (priv && !ml_set_awbv2_auto(priv, false))
+            {
+                HAL_LOG_WARNING("hailo15_isp_set_wb_config: freezing awbv2 failed (continuing)");
+            }
+            auto fd_opt = m.get_fd(v4l2::Device::VIDEO0);
+            if (!fd_opt.has_value())
+            {
+                return HAL_ERROR;
+            }
+            const int fd = *fd_opt.value();
+            if (resolve_awb_enable_ctrl(fd))
+            {
+                const int32_t zero = 0;
+                if (!v4l2_set_ext_ctrl_blob(fd, s_awb_en_info, &zero, sizeof(zero)))
+                {
+                    HAL_LOG_ERROR("hailo15_isp_set_wb_config: isp_awb_enable=0 failed");
+                    return HAL_ERROR;
+                }
+            }
+            if (!safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AWB_MODE, static_cast<int32_t>(0)))
+            {
+                HAL_LOG_ERROR("hailo15_isp_set_wb_config: AWB_MODE->manual failed");
+                return HAL_ERROR;
+            }
+            const int32_t r  = static_cast<int32_t>(config->r_gain  * 256.0f + 0.5f);
+            const int32_t gr = static_cast<int32_t>(config->gr_gain * 256.0f + 0.5f);
+            const int32_t gb = static_cast<int32_t>(config->gb_gain * 256.0f + 0.5f);
+            const int32_t b  = static_cast<int32_t>(config->b_gain  * 256.0f + 0.5f);
+            if (!safe_ext_ctrl_set(m, v4l2::Video0Ctrl::WB_R_GAIN, r) ||
+                !safe_ext_ctrl_set(m, v4l2::Video0Ctrl::WB_GR_GAIN, gr) ||
+                !safe_ext_ctrl_set(m, v4l2::Video0Ctrl::WB_GB_GAIN, gb) ||
+                !safe_ext_ctrl_set(m, v4l2::Video0Ctrl::WB_B_GAIN, b))
+            {
+                HAL_LOG_ERROR("hailo15_isp_set_wb_config: WB gain write failed (r=%d gr=%d gb=%d b=%d)",
+                              r, gr, gb, b);
+                return HAL_ERROR;
+            }
+            if (ccm_requested)
+            {
+                static struct v4l2_query_ext_ctrl ccm_info {};
+                static bool ccm_valid = false;
+                if (!ccm_valid)
+                {
+                    ccm_valid = v4l2_query_ext_ctrl_by_exact_name(fd, "isp_wb_cc_matrix", &ccm_info);
+                }
+                if (ccm_valid)
+                {
+                    if (!v4l2_set_ext_ctrl_blob(fd, ccm_info, config->ccm, sizeof(config->ccm)))
+                    {
+                        HAL_LOG_ERROR("hailo15_isp_set_wb_config: isp_wb_cc_matrix write failed");
+                        return HAL_ERROR;
+                    }
+                }
+                else
+                {
+                    HAL_LOG_ERROR("hailo15_isp_set_wb_config: isp_wb_cc_matrix control not present");
+                    return HAL_ERR_NOT_SUPPORTED;
+                }
+            }
+        }
+        else
+        {
+            /* Auto: re-enable the algorithm block and both v4l2 switches. */
+            Hailo15MediaPriv *priv = media_priv_from_video_ctx(video_ctx);
+            if (priv && !ml_set_awbv2_auto(priv, true))
+            {
+                HAL_LOG_WARNING("hailo15_isp_set_wb_config: re-enabling awbv2 failed (continuing)");
+            }
+            auto fd_opt = m.get_fd(v4l2::Device::VIDEO0);
+            if (fd_opt.has_value() && resolve_awb_enable_ctrl(*fd_opt.value()))
+            {
+                const int32_t one = 1;
+                (void)v4l2_set_ext_ctrl_blob(*fd_opt.value(), s_awb_en_info, &one, sizeof(one));
+            }
+            if (!safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AWB_MODE, static_cast<int32_t>(1)))
+            {
+                HAL_LOG_ERROR("hailo15_isp_set_wb_config: AWB_MODE->auto failed");
+                return HAL_ERROR;
+            }
+        }
+        return HAL_OK;
+    }
+    catch (const std::exception &e)
+    {
+        HAL_LOG_ERROR("hailo15_isp_set_wb_config exception: %s", e.what());
+        return HAL_ERROR;
+    }
+    catch (...)
+    {
+        return HAL_ERROR;
+    }
+}
+
+static int hailo15_isp_get_current_wb_config(void *video_ctx, HalIspWbConfig *config)
+{
+    if (!config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    std::memset(config, 0, sizeof(*config));
+    try
+    {
+        auto &m = isp_ctrl_mgr();
+        wait_safe_to_pull_once(m);
+        Hailo15MediaPriv *priv = media_priv_from_video_ctx(video_ctx);
+        bool manual_known = false;
+        if (priv && priv->media_lib)
+        {
+            try
+            {
+                auto prof_exp = priv->media_lib->get_current_profile();
+                if (prof_exp.has_value())
+                {
+                    config->manual_state = !prof_exp->iq_settings.automatic_algorithms_config.awbv2.enabled;
+                    manual_known = true;
+                }
+            }
+            catch (...)
+            {
+            }
+        }
+        if (!manual_known)
+        {
+            int32_t awb_mode = 0;
+            if (!safe_get(m, v4l2::Video0Ctrl::AWB_MODE, awb_mode))
+            {
+                return HAL_ERROR;
+            }
+            config->manual_state = (awb_mode == 1);
+        }
+        int32_t r = 256, gr = 256, gb = 256, b = 256;
+        if (!safe_ext_ctrl_get(m, v4l2::Video0Ctrl::WB_R_GAIN, r) ||
+            !safe_ext_ctrl_get(m, v4l2::Video0Ctrl::WB_GR_GAIN, gr) ||
+            !safe_ext_ctrl_get(m, v4l2::Video0Ctrl::WB_GB_GAIN, gb) ||
+            !safe_ext_ctrl_get(m, v4l2::Video0Ctrl::WB_B_GAIN, b))
+        {
+            return HAL_ERROR;
+        }
+        config->r_gain  = static_cast<float>(r)  / 256.0f;
+        config->gr_gain = static_cast<float>(gr) / 256.0f;
+        config->gb_gain = static_cast<float>(gb) / 256.0f;
+        config->b_gain  = static_cast<float>(b)  / 256.0f;
+        (void)video_ctx;
+        return HAL_OK;
+    }
+    catch (...)
+    {
+        return HAL_ERROR;
+    }
+}
+
+/* ---- M2: 3DNR ---- */
+
+static int hailo15_isp_set_3dnr_config(void *video_ctx, const HalIspNr3dConfig *config)
+{
+    if (!config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (config->strength < 0 || config->strength > 100)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    try
+    {
+        auto &m = isp_ctrl_mgr();
+        wait_safe_to_pull_once(m);
+        auto fd_opt = m.get_fd(v4l2::Device::VIDEO0);
+        if (!fd_opt.has_value())
+        {
+            return HAL_ERROR;
+        }
+        const int fd = *fd_opt.value();
+        if (!resolve_3dnr_ctrl(fd))
+        {
+            HAL_LOG_WARNING("hailo15_isp_set_3dnr_config: no temporal-NR control found (tried isp_3dnr_strength et al.)");
+            return HAL_ERR_NOT_SUPPORTED;
+        }
+        /* Verified on target: isp_3dnr_enable (bool) gates the engine and
+         * isp_3dnr_strength is [0..128] — strength 128 measurably drops
+         * flat-region high-frequency energy by ~40%. Enable first, then map
+         * the HAL [0..100] scale onto [0..128]. */
+        /* Both controls are scalars (bool / int) — S_CTRL semantics, not
+         * blob payloads (a 4-byte blob write against a 1-byte bool is
+         * silently ineffective, verified on target). */
+        auto scalar_set = [fd](const struct v4l2_query_ext_ctrl &info, int32_t value) -> bool
+        {
+            struct v4l2_control c{};
+            c.id = info.id;
+            c.value = value;
+            return ioctl(fd, VIDIOC_S_CTRL, &c) == 0;
+        };
+        if (s_3dnr_en_valid)
+        {
+            const int32_t en = config->enabled ? 1 : 0;
+            if (!scalar_set(s_3dnr_en_info, en))
+            {
+                HAL_LOG_ERROR("hailo15_isp_set_3dnr_config: isp_3dnr_enable=%d failed", en);
+                return HAL_ERROR;
+            }
+        }
+        if (s_3dnr_ctrl_valid)
+        {
+            const int32_t val = config->enabled
+                ? static_cast<int32_t>((config->strength * 128 + 50) / 100)
+                : 0;
+            if (!scalar_set(s_3dnr_ctrl_info, val))
+            {
+                HAL_LOG_ERROR("hailo15_isp_set_3dnr_config: isp_3dnr_strength=%d failed", val);
+                return HAL_ERROR;
+            }
+        }
+        (void)video_ctx;
+        return HAL_OK;
+    }
+    catch (...)
+    {
+        return HAL_ERROR;
+    }
+}
+
+/* ---- M2: AE statistics ---- */
+
+static int hailo15_isp_get_ae_stats(void *video_ctx, HalIspAeStats *stats)
+{
+    if (!stats)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    std::memset(stats, 0, sizeof(*stats));
+    try
+    {
+        auto &m = isp_ctrl_mgr();
+        wait_safe_to_pull_once(m);
+        auto fd_opt = m.get_fd(v4l2::Device::VIDEO0);
+        if (!fd_opt.has_value())
+        {
+            return HAL_ERROR;
+        }
+        const int fd = *fd_opt.value();
+        if (!resolve_ae_stats_ctrls(fd))
+        {
+            return HAL_ERR_NOT_SUPPORTED;
+        }
+        /* Ensure AE statistics are enabled (mirrors AF: isp_af_enable gates the
+         * stats engine; isp_ae_enable is the AE equivalent) and the histogram
+         * window is configured (default is 0x0 = no measurement region, which
+         * yields an all-zero histogram). */
+        (void)resolve_ae_enable_win_ctrls(fd);
+        if (s_ae_en_valid)
+        {
+            const int32_t one = 1;
+            struct v4l2_control c{};
+            c.id = s_ae_en_info.id;
+            c.value = one;
+            (void)ioctl(fd, VIDIOC_S_CTRL, &c);
+        }
+        if (s_ae_win_valid)
+        {
+            /* isp_ae_hist_window is u16 dims=[4] = {x, y, w, h}; default all
+             * zeros -> driver may treat as "no window". Use 0,0 (full frame
+             * implied) only if a size is required; otherwise leave driver
+             * default. We write zeros explicitly to match AF window style. */
+            uint16_t win[4] = {0, 0, 0, 0};
+            (void)v4l2_set_ext_ctrl_blob(fd, s_ae_win_info, win, sizeof(win));
+        }
+        if (s_ae_hist_valid)
+        {
+            stats->hist_valid =
+                v4l2_get_ext_ctrl_blob(fd, s_ae_hist_info, stats->hist, sizeof(stats->hist));
+        }
+        if (s_ae_luma_valid)
+        {
+            /* isp_ae_luma is a u8 x 25 control (element type differs from the
+             * u32 histogram) — read bytes, then widen into the HAL array. */
+            uint8_t luma8[HAL_ISP_AE_LUMA_GRID];
+            if (v4l2_get_ext_ctrl_blob(fd, s_ae_luma_info, luma8, sizeof(luma8)))
+            {
+                for (int i = 0; i < HAL_ISP_AE_LUMA_GRID; ++i)
+                {
+                    stats->luma[i] = luma8[i];
+                }
+                stats->luma_valid = true;
+            }
+        }
+        if (!stats->hist_valid && !stats->luma_valid)
+        {
+            return HAL_ERROR;
+        }
+        (void)video_ctx;
+        return HAL_OK;
+    }
+    catch (...)
+    {
+        return HAL_ERROR;
+    }
+}
+
+/* ---- M2: HDR exposure ratios ---- */
+
+static int hailo15_isp_set_hdr_ratios(void *video_ctx, float ls_ratio, float vs_ratio)
+{
+    Hailo15MediaPriv *priv = media_priv_from_video_ctx(video_ctx);
+    if (!priv || !priv->media_lib)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (ls_ratio <= 1.0f || ls_ratio > 64.0f)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (vs_ratio < 0.0f || vs_ratio > 64.0f)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    /* Do not hold priv->mutex across MediaLibrary calls: ML may invoke callbacks that take this lock. */
+    auto prof_exp = priv->media_lib->get_current_profile();
+    if (!prof_exp)
+    {
+        return HAL_ERROR;
+    }
+    config_profile_t p = prof_exp.value();
+    hdr_config_t &hdr = p.iq_settings.hdr;
+    if (!hdr.enabled)
+    {
+        return HAL_ERR_INVALID_STATE;
+    }
+    hdr.ls_ratio = ls_ratio;
+    if (vs_ratio > 0.0f)
+    {
+        hdr.vs_ratio = vs_ratio;
+    }
+    media_library_return r = priv->media_lib->set_override_parameters(p);
+    return hailo15_ml_err(r);
 }
 
 HalIspOps HAL_ISP_OPS = {
@@ -2438,6 +3001,11 @@ HalIspOps HAL_ISP_OPS = {
     .wait_af_measurement = hailo15_isp_wait_af_measurement,
     .get_af_measurement = hailo15_isp_get_af_measurement,
     .get_version = hailo15_isp_get_version,
+    .set_wb_config = hailo15_isp_set_wb_config,
+    .get_current_wb_config = hailo15_isp_get_current_wb_config,
+    .set_3dnr_config = hailo15_isp_set_3dnr_config,
+    .get_ae_stats = hailo15_isp_get_ae_stats,
+    .set_hdr_ratios = hailo15_isp_set_hdr_ratios,
 };
 
 } // extern "C"

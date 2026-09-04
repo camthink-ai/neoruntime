@@ -155,7 +155,7 @@ typedef struct {
     HalFlipDirection flip_direction;    /* image flip / mirror */
 
     bool digital_zoom;                  /* enable digital zoom (mutually exclusive with privacy_mask) */
-    int  digital_zoom_value;            /* zoom magnification level [1..5] (only used when digital_zoom == true) */
+    int  digital_zoom_value;            /* zoom magnification level [1..31] (only used when digital_zoom == true) */
 
     bool dewarp;                        /* enable Lens Distortion Correction (LDC) */
     bool dis;                           /* enable Digital Image Stabilization */
@@ -304,6 +304,88 @@ typedef struct {
     HalPipelineStreamConfig *streams;
     uint32_t                 stream_count;    /* number of streams (1-4) */
 } HalPipelineReconfig;
+
+/* --------------------------------------------------------------------
+ * Motion detection
+ * -------------------------------------------------------------------- */
+
+/** Motion detection sensitivity. */
+typedef enum {
+    HAL_MOTION_SENSITIVITY_LOWEST = 0,
+    HAL_MOTION_SENSITIVITY_LOW,
+    HAL_MOTION_SENSITIVITY_MEDIUM,
+    HAL_MOTION_SENSITIVITY_HIGH,
+    HAL_MOTION_SENSITIVITY_HIGHEST,
+} HalMotionSensitivity;
+
+/**
+ * Motion detection configuration (frontend frame-difference engine).
+ *
+ * Hailo mapping: medialib application_settings.motion_detection
+ * (motion_detection_config_t). Enabling allocates an internal low-resolution
+ * analysis stream, so toggling @c enabled may briefly restart the pipeline.
+ *
+ * An all-zero roi means full frame.
+ */
+typedef struct {
+    bool     enabled;
+    int32_t  roi_x, roi_y, roi_w, roi_h;  /* pixels; all-zero = full frame */
+    HalMotionSensitivity sensitivity;     /* LOWEST..HIGHEST */
+    float    threshold;                   /* 0..1 changed-pixel ratio in ROI to trigger */
+} HalMotionConfig;
+
+/**
+ * Motion state change callback.
+ *
+ * Fires on state transitions (no-motion -> motion, motion -> no-motion) of
+ * the frontend analysis, not on every frame.
+ *
+ * @param media_ctx       Media context the event belongs to.
+ * @param motion_detected true when motion started, false when it stopped.
+ * @param frame_id        Monotonic frontend frame counter.
+ * @param timestamp_ns    Frame timestamp (nanoseconds).
+ * @param userdata        Opaque pointer registered at subscribe time.
+ *
+ * @note Invoked from an internal worker thread; return quickly.
+ */
+typedef void (*HalMotionCallback)(void *media_ctx, bool motion_detected,
+                                  uint64_t frame_id, uint64_t timestamp_ns, void *userdata);
+
+/* --------------------------------------------------------------------
+ * Thermal throttling
+ * -------------------------------------------------------------------- */
+
+/**
+ * Pipeline throttling state.
+ * Maps to Hailo Media Library @c media_library_throttling_state_t.
+ *
+ * The SoC thermal manager degrades performance stepwise (S0..S4) when the
+ * chip heats up and recovers through COOLING back to FULL_PERFORMANCE.
+ */
+typedef enum {
+    HAL_THROTTLING_UNINITIALIZED = 0,
+    HAL_THROTTLING_FULL_PERFORMANCE,     /* no restriction */
+    HAL_THROTTLING_COOLING,              /* recovering towards full performance */
+    HAL_THROTTLING_S0,                   /* restriction level 0 (mildest) */
+    HAL_THROTTLING_S1,
+    HAL_THROTTLING_S2,
+    HAL_THROTTLING_S3,
+    HAL_THROTTLING_S4,                   /* restriction level 4 (strongest) */
+} HalThrottlingState;
+
+/**
+ * Thermal throttling state change callback.
+ *
+ * @param media_ctx    Media context the event belongs to.
+ * @param state        New throttling state.
+ * @param profile_name Active profile after the restriction was applied
+ *                     (platform string; may be empty), NUL-terminated.
+ * @param userdata     Opaque pointer registered at subscribe time.
+ *
+ * @note Invoked from an internal worker thread; return quickly.
+ */
+typedef void (*HalThrottlingCallback)(void *media_ctx, HalThrottlingState state,
+                                      const char *profile_name, void *userdata);
 
 /* --------------------------------------------------------------------
  * Media operations table
@@ -704,6 +786,75 @@ typedef struct {
     int (*attach_frame_analytics)(void *media_ctx, HalFrameBuffer *frame,
                                   const HalFrameDetection *dets, uint32_t det_count,
                                   const HalFrameSegmentation *segs, uint32_t seg_count);
+
+    /* ---------- thermal throttling events (M1 additions) ---------- */
+
+    /**
+     * @brief Subscribe to thermal throttling state changes.
+     *
+     * The callback fires when the SoC thermal manager restricts or restores
+     * pipeline performance (e.g. AI-ISP gated off under heat — previously
+     * only visible as HAL_ERR_PROFILE_RESTRICTED on switch_profile()).
+     *
+     * Only one subscriber is supported; a second subscribe replaces the first.
+     *
+     * @param media_ctx Media context.
+     * @param callback  State change callback.
+     * @param userdata  Opaque pointer passed to the callback.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*subscribe_throttling)(void *media_ctx, HalThrottlingCallback callback, void *userdata);
+
+    /**
+     * @brief Unsubscribe from throttling state changes.
+     * @param media_ctx Media context.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*unsubscribe_throttling)(void *media_ctx);
+
+    /**
+     * @brief Query the current thermal throttling state (poll variant).
+     * @param media_ctx Media context.
+     * @param state_out Receives the current state.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*get_throttling_state)(void *media_ctx, HalThrottlingState *state_out);
+
+    /* ---------- motion detection (M2 additions) ---------- */
+
+    /**
+     * @brief Configure the frontend motion detection engine.
+     *
+     * @param media_ctx Media context.
+     * @param config    Motion configuration; enabled=false disables detection.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*set_motion_config)(void *media_ctx, const HalMotionConfig *config);
+
+    /**
+     * @brief Retrieve the current motion detection configuration.
+     * @param media_ctx Media context.
+     * @param config    Receives the current configuration.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*get_motion_config)(void *media_ctx, HalMotionConfig *config);
+
+    /**
+     * @brief Subscribe to motion state change events (transition-triggered).
+     *
+     * @param media_ctx Media context.
+     * @param callback  Motion callback.
+     * @param userdata  Opaque pointer passed to the callback.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*subscribe_motion)(void *media_ctx, HalMotionCallback callback, void *userdata);
+
+    /**
+     * @brief Unsubscribe from motion events.
+     * @param media_ctx Media context.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*unsubscribe_motion)(void *media_ctx);
 } HalMediaOps;
 
 /** Platform-specific media operations (resolved at link time). */

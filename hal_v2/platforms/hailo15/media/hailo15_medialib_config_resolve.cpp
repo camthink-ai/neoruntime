@@ -288,7 +288,7 @@ static const char kDefaultEncoderJson[] = R"HALCFG({
         "rc_mode": "CVBR",
         "zoom_bitrate_adjuster": { "mode": "DISABLED" }
       },
-      "smart_encoder": { "background_qp_delta": 10, "enabled": false, "rois": [] }
+      "smart_encoder": { "analytics_labels": [], "background_qp_delta": 10, "enabled": false, "rois": [] }
     },
     "input_stream": { "format": "NV12", "framerate": 30, "height": 1080, "width": 1920 }
   }
