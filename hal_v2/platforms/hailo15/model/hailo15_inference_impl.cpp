@@ -1379,12 +1379,34 @@ static int hailo15_infer_tensor_from_frame_ex(HalInferenceSession *session,
         return hailo15_infer_tensor_from_frame(frame, tensor);
     }
 
-    /* ---- General path: stage the source as packed RGB888 ----
-     * InputTransformContext's image-shape model expresses packed formats
-     * (h * w * features); NV12 cannot be represented, so convert NV12 -> RGB
-     * here on the CPU (BT.601) and let the transform own resize + quantization.
-     * Production NV12-input models take the fast path above and skip this. */
-    const size_t rgb_sz = (size_t)frame->width * frame->height * 3;
+    /* ---- Target channel order ----
+     * An explicit preprocess.color request wins; otherwise stage RGB: this
+     * HailoRT stack exposes packed model inputs as RGB888/NHWC — there is no
+     * BGR order, so BGR output only happens on an explicit user request. */
+    const bool out_bgr = (p->cfg.preprocess.color == HAL_PREPROCESS_COLOR_NV12_TO_BGR ||
+                          p->cfg.preprocess.color == HAL_PREPROCESS_COLOR_RGB_TO_BGR);
+    /* Packed 3-channel interleaved model inputs only: NV12-order inputs are
+     * served by the exact-match fast path above and cannot be resized on the
+     * CPU staging path; planar (NHCW) or non-3-channel inputs are rejected. */
+    const bool packed_rgb_ok =
+        (dfm.order == HAILO_FORMAT_ORDER_RGB888 || dfm.order == HAILO_FORMAT_ORDER_NHWC) &&
+        dsh.features == 3;
+    if (!packed_rgb_ok)
+    {
+        HAL_LOG_ERROR("hailo15_inference: tensor_from_frame_ex: model input order %d "
+                      "(features %u) only supported on the exact-match fast path",
+                      (int)dfm.order, (unsigned)dsh.features);
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+
+    /* ---- General path: stage the source as packed RGB888/BGR888 ----
+     * NV12 cannot be expressed by a packed 3-channel staging buffer, so
+     * convert it here on the CPU (BT.601 limited range) and resize on the
+     * CPU (bilinear). Production NV12-input models take the fast path above
+     * and skip this. Plane strides are honored: media/DMA buffers commonly
+     * carry row padding. */
+    const uint32_t w = frame->width, h = frame->height;
+    const size_t rgb_sz = (size_t)w * h * 3;
     auto src_buf = alloc_aligned_shared(rgb_sz, 4096);
     if (!src_buf)
     {
@@ -1395,41 +1417,70 @@ static int hailo15_infer_tensor_from_frame_ex(HalInferenceSession *session,
     if (frame->format == HAL_PIX_FMT_NV12)
     {
         const uint8_t *uvp = static_cast<const uint8_t *>(frame->planes[1]);
-        const uint32_t w = frame->width, h = frame->height;
+        const uint32_t ys = frame->strides[0] ? frame->strides[0] : w;
+        const uint32_t uvs = frame->strides[1] ? frame->strides[1] : w;
         for (uint32_t j = 0; j < h; ++j)
         {
-            const size_t yrow = (size_t)j * w;
-            const size_t uvrow = (size_t)(j / 2) * w;
+            const size_t yrow = (size_t)j * ys;
+            const size_t uvrow = (size_t)(j / 2) * uvs;
             for (uint32_t i = 0; i < w; ++i)
             {
                 const int Y = yp[yrow + i];
                 const int U = (int)uvp[uvrow + (i & ~1u)] - 128;
                 const int V = (int)uvp[uvrow + (i & ~1u) + 1] - 128;
-                int R = (Y - 16) * 298 / 256 + 409 * V / 256 + 128;
-                int G = (Y - 16) * 298 / 256 - 100 * U / 256 - 208 * V / 256 + 128;
-                int B = (Y - 16) * 298 / 256 + 516 * U / 256 + 128;
-                const size_t o = (yrow + i) * 3;
-                s[o + 0] = (uint8_t)(R < 0 ? 0 : (R > 255 ? 255 : R));
-                s[o + 1] = (uint8_t)(G < 0 ? 0 : (G > 255 ? 255 : G));
-                s[o + 2] = (uint8_t)(B < 0 ? 0 : (B > 255 ? 255 : B));
+                /* BT.601 limited range; the +128 rounding bias belongs inside
+                 * the division (adding it afterwards offsets every channel by
+                 * half-range: black would decode to 128, not 0). */
+                int R = ((Y - 16) * 298 + 409 * V + 128) / 256;
+                int G = ((Y - 16) * 298 - 100 * U - 208 * V + 128) / 256;
+                int B = ((Y - 16) * 298 + 516 * U + 128) / 256;
+                R = R < 0 ? 0 : (R > 255 ? 255 : R);
+                G = G < 0 ? 0 : (G > 255 ? 255 : G);
+                B = B < 0 ? 0 : (B > 255 ? 255 : B);
+                const size_t o = ((size_t)j * w + i) * 3;
+                if (out_bgr)
+                {
+                    s[o + 0] = (uint8_t)B;
+                    s[o + 1] = (uint8_t)G;
+                    s[o + 2] = (uint8_t)R;
+                }
+                else
+                {
+                    s[o + 0] = (uint8_t)R;
+                    s[o + 1] = (uint8_t)G;
+                    s[o + 2] = (uint8_t)B;
+                }
             }
         }
     }
-    else if (frame->format == HAL_PIX_FMT_BGR24)
+    else if (frame->format == HAL_PIX_FMT_BGR24 || frame->format == HAL_PIX_FMT_RGB24)
     {
         const uint8_t *q = static_cast<const uint8_t *>(frame->planes[0]);
-        for (size_t i = 0; i < rgb_sz; i += 3)
+        const uint32_t srs = frame->strides[0] ? frame->strides[0] : w * 3;
+        const bool swap = ((frame->format == HAL_PIX_FMT_BGR24) != out_bgr);
+        for (uint32_t j = 0; j < h; ++j)
         {
-            s[i + 0] = q[i + 2];
-            s[i + 1] = q[i + 1];
-            s[i + 2] = q[i + 0];
+            const uint8_t *src_row = q + (size_t)j * srs;
+            uint8_t *dst_row = s + (size_t)j * w * 3;
+            if (swap)
+            {
+                for (uint32_t i = 0; i < w; ++i)
+                {
+                    dst_row[(size_t)i * 3 + 0] = src_row[(size_t)i * 3 + 2];
+                    dst_row[(size_t)i * 3 + 1] = src_row[(size_t)i * 3 + 1];
+                    dst_row[(size_t)i * 3 + 2] = src_row[(size_t)i * 3 + 0];
+                }
+            }
+            else
+            {
+                std::memcpy(dst_row, src_row, (size_t)w * 3);
+            }
         }
     }
     else
     {
         std::memcpy(s, frame->planes[0], rgb_sz);
     }
-    const size_t src_total_rgb = rgb_sz;
 
     /* ---- Target content geometry (letterbox keeps the source aspect) ---- */
     const uint32_t outW = dsh.width, outH = dsh.height;
@@ -1524,7 +1575,9 @@ static int hailo15_infer_tensor_from_frame_ex(HalInferenceSession *session,
     tensor->data = final_data;
     tensor->dma_fd = -1;
     tensor->ndim = 1;
-    tensor->shape[0] = (int32_t)final_sz;
+    /* shape counts elements; byte_size counts bytes (uint8: identical). */
+    const size_t elem_size = (odtype == HAL_DTYPE_FLOAT32) ? sizeof(float) : 1;
+    tensor->shape[0] = (int32_t)(final_sz / elem_size);
     tensor->dtype = odtype;
     tensor->byte_size = (uint32_t)final_sz;
     std::snprintf(tensor->name, sizeof(tensor->name), "%s", name.c_str());
@@ -1877,7 +1930,6 @@ HalInferenceOps HAL_INFERENCE_OPS = {
     .get_model_info = hailo15_infer_get_model_info,
     .alloc_input = hailo15_infer_alloc_input,
     .tensor_from_frame = hailo15_infer_tensor_from_frame,
-    .tensor_from_frame_ex = hailo15_infer_tensor_from_frame_ex,
     .run = hailo15_infer_run,
     .run_async = hailo15_infer_run_async,
     .runtime_acquire = hailo15_infer_runtime_acquire,
@@ -1886,6 +1938,8 @@ HalInferenceOps HAL_INFERENCE_OPS = {
     .free_tensor = hailo15_infer_free_tensor,
     .query_system_performance_stats = hailo15_infer_query_system_performance_stats,
     .get_version = hailo15_infer_get_version,
+    /* M3 additions (appended at the table tail, after get_version) */
+    .tensor_from_frame_ex = hailo15_infer_tensor_from_frame_ex,
 };
 
 } // extern "C"

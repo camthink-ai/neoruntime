@@ -133,7 +133,7 @@ typedef struct {
  */
 typedef struct {
     char     serial_number[33];       /**< SN */
-    char     mac_address[18];         /**< MAC formatted "aa:bb:cc:dd:ee:ff" (lowercase) */
+    char     mac_address[18];         /**< MAC formatted "aa:bb:cc:dd:ee:ff" (lowercase); empty string when the field is unprogrammed */
     char     product_number[17];      /**< PN */
     char     batch[9];                /**< BATCH */
     char     hardware_revision[9];    /**< HWREV */

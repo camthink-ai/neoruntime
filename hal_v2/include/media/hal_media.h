@@ -326,10 +326,13 @@ typedef enum {
  * analysis stream, so toggling @c enabled may briefly restart the pipeline.
  *
  * An all-zero roi means full frame.
+ *
+ * @note ROI coordinates are pixels on the motion analysis stream (the
+ * smallest output stream), not the main/full-resolution sensor image.
  */
 typedef struct {
     bool     enabled;
-    int32_t  roi_x, roi_y, roi_w, roi_h;  /* pixels; all-zero = full frame */
+    int32_t  roi_x, roi_y, roi_w, roi_h;  /* analysis-stream pixels; all-zero = full frame */
     HalMotionSensitivity sensitivity;     /* LOWEST..HIGHEST */
     float    threshold;                   /* 0..1 changed-pixel ratio in ROI to trigger */
 } HalMotionConfig;

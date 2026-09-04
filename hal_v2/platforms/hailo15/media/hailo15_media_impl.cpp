@@ -6389,6 +6389,13 @@ static int hailo15_media_set_motion_config(void *media_ctx, const HalMotionConfi
         priv->motion_threshold = config->threshold;
         /* sensitivity LOWEST(0)..HIGHEST(4) -> per-pixel delta 40..8 */
         priv->motion_diff_level = 40 - (config->sensitivity * 8);
+        /* Analysis ROI (pixels on the motion analysis stream); all-zero = full
+         * frame. Applied by the frame-difference engine, which only compares
+         * blocks intersecting the ROI. */
+        priv->motion_roi_x = config->roi_x > 0 ? static_cast<uint32_t>(config->roi_x) : 0;
+        priv->motion_roi_y = config->roi_y > 0 ? static_cast<uint32_t>(config->roi_y) : 0;
+        priv->motion_roi_w = config->roi_w > 0 ? static_cast<uint32_t>(config->roi_w) : 0;
+        priv->motion_roi_h = config->roi_h > 0 ? static_cast<uint32_t>(config->roi_h) : 0;
         priv->motion_last_state = false; /* re-arm transition detection */
         if (priv->motion_analysis_sid.empty() && !priv->frontend_stream_ids.empty())
         {

@@ -150,7 +150,6 @@ HalInferenceOps HAL_INFERENCE_OPS = {
     .get_model_info = stub_infer_get_model_info,
     .alloc_input = stub_infer_alloc_input,
     .tensor_from_frame = stub_infer_tensor_from_frame,
-    .tensor_from_frame_ex = stub_infer_tensor_from_frame_ex,
     .run = stub_infer_run,
     .run_async = stub_infer_run_async,
     .runtime_acquire = stub_infer_runtime_acquire,
@@ -159,4 +158,6 @@ HalInferenceOps HAL_INFERENCE_OPS = {
     .free_tensor = stub_infer_free_tensor,
     .query_system_performance_stats = stub_infer_query_system_performance_stats,
     .get_version = stub_infer_get_version,
+    /* M3 addition (appended at the table tail, after get_version) */
+    .tensor_from_frame_ex = stub_infer_tensor_from_frame_ex,
 };

@@ -118,9 +118,10 @@ HalGenaiOps HAL_GENAI_OPS = {
     .abort_generation = stub_genai_abort,
     .get_vlm_input_layout = stub_genai_layout,
     .set_stop_tokens = stub_genai_stop,
+    .get_version = stub_genai_version,
+    /* M3 additions (appended at the table tail, after get_version) */
     .save_context = stub_genai_save_context,
     .load_context = stub_genai_load_context,
     .get_context_usage = stub_genai_get_context_usage,
     .free_context_buffer = stub_genai_free_context_buffer,
-    .get_version = stub_genai_version,
 };

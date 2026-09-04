@@ -2618,17 +2618,22 @@ static int hailo15_isp_set_wb_config(void *video_ctx, const HalIspWbConfig *conf
         return HAL_ERR_INVALID_ARG;
     }
     /* Hailo WB gain controls are Q8.8 (256 = 1.0x). Control ranges (imaging
-     * guide 6.2): r/gr [100..1023] (~0.39..4.0x), gb/b [100..399] (~0.39..1.56x). */
-    for (float g : {config->r_gain, config->gr_gain, config->gb_gain, config->b_gain})
+     * guide 6.2): r/gr [100..1023] (~0.39..4.0x), gb/b [100..399] (~0.39..1.56x).
+     * Gains only apply in manual mode — skip the range check when restoring
+     * auto (a zero-initialized config with manual_state=false must pass). */
+    if (config->manual_state)
     {
-        if (g < 0.39f || g > 4.0f)
+        for (float g : {config->r_gain, config->gr_gain, config->gb_gain, config->b_gain})
+        {
+            if (g < 0.39f || g > 4.0f)
+            {
+                return HAL_ERR_INVALID_ARG;
+            }
+        }
+        if (config->gb_gain > 1.56f || config->b_gain > 1.56f)
         {
             return HAL_ERR_INVALID_ARG;
         }
-    }
-    if (config->gb_gain > 1.56f || config->b_gain > 1.56f)
-    {
-        return HAL_ERR_INVALID_ARG;
     }
     bool ccm_requested = false;
     for (float v : config->ccm)

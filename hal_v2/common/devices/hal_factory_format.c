@@ -217,7 +217,13 @@ int hal_factory_format_read_all(const HalFactoryIo *io, HalFactoryInfo *out)
     out->valid = true;
     out->active_slot = a.letter;
     out->seq = a.seq;
-    decode_mac(a.data + K_OFF_MAC, out->mac_address);
+    /* An unprogrammed MAC slot reads 0xFF..FF and has no K_FLAG_MAC_VALID:
+     * report it as empty rather than the broadcast address ff:ff:ff:ff:ff:ff. */
+    if (a.data[K_OFF_FLAGS] & K_FLAG_MAC_VALID) {
+        decode_mac(a.data + K_OFF_MAC, out->mac_address);
+    } else {
+        out->mac_address[0] = '\0';
+    }
     decode_ascii(a.data + K_OFF_SN, 32, out->serial_number, sizeof(out->serial_number));
     decode_ascii(a.data + K_OFF_PN, 16, out->product_number, sizeof(out->product_number));
     decode_ascii(a.data + K_OFF_BATCH, 8, out->batch, sizeof(out->batch));
@@ -240,9 +246,13 @@ int hal_factory_format_get(const HalFactoryIo *io, HalFactoryField field,
     }
 
     if (m.mac) {
-        char buf[18];
-        decode_mac(a.data + m.off, buf);
-        (void)snprintf(value, value_size, "%s", buf);
+        if (a.data[K_OFF_FLAGS] & K_FLAG_MAC_VALID) {
+            char buf[18];
+            decode_mac(a.data + m.off, buf);
+            (void)snprintf(value, value_size, "%s", buf);
+        } else {
+            value[0] = '\0'; /* unprogrammed: empty, not ff:ff:ff:ff:ff:ff */
+        }
     } else {
         decode_ascii(a.data + m.off, m.len, value, value_size);
     }

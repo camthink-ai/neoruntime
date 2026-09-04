@@ -523,6 +523,7 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         else()
             target_include_directories(hal-hailo15-factory PRIVATE ${HAILORT_INC_DIR})
             target_link_libraries(hal-hailo15-factory PRIVATE ${HAILORT_LIB})
+            target_compile_definitions(hal-hailo15-factory PRIVATE HAL_HAVE_HAILORT=1)
         endif()
     endif()
 

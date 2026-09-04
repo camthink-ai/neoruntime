@@ -122,7 +122,11 @@ typedef struct {
      */
     int (*set_stop_tokens)(HalGenaiSession *session, const char *const *utf8_sequences, int num_sequences);
 
-    /* ---------- context (KV cache) persistence, M3 additions ---------- */
+    const char *(*get_version)(void);
+
+    /* ---------- context (KV cache) persistence, M3 additions ----------
+     * Appended after get_version so every pre-existing member keeps its
+     * table offset (SOVERSION-2 ABI compatibility). */
 
     /**
      * Save the current generation context (KV cache) to a heap buffer.
@@ -158,8 +162,6 @@ typedef struct {
 
     /** Free a buffer returned by @ref save_context. */
     void (*free_context_buffer)(void *buf);
-
-    const char *(*get_version)(void);
 } HalGenaiOps;
 
 extern HalGenaiOps HAL_GENAI_OPS;

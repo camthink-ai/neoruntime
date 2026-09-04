@@ -122,6 +122,10 @@ struct Hailo15MediaPriv
     std::vector<uint8_t> motion_prev_grid; /* downsampled luma of previous frame */
     uint32_t motion_grid_w{0};
     uint32_t motion_grid_h{0};
+    /* Analysis ROI in pixels of the motion analysis stream (the smallest
+     * output stream); all-zero = full frame. The frame-difference engine
+     * only compares blocks intersecting this ROI. */
+    uint32_t motion_roi_x{0}, motion_roi_y{0}, motion_roi_w{0}, motion_roi_h{0};
 };
 
 inline Hailo15MediaPriv *hailo15_media_priv_from_hal(void *media_ctx)

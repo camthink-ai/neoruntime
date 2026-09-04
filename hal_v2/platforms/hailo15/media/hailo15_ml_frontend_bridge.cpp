@@ -119,17 +119,34 @@ bool hailo15_motion_detect_update(Hailo15MediaPriv *p, const std::string &sid,
     bool detected = p->motion_last_state;
     if (p->motion_prev_grid.size() == grid.size() && p->motion_grid_w == gw)
     {
-        uint32_t changed = 0;
-        const int diff = p->motion_diff_level;
-        for (size_t i = 0; i < grid.size(); ++i)
+        /* Restrict the comparison to blocks intersecting the configured ROI
+         * (all-zero ROI = full frame). The trigger ratio counts ROI blocks
+         * only, so motion outside the ROI cannot fire callbacks. */
+        uint32_t bx0 = 0, bx1 = gw, by0 = 0, by1 = gh;
+        if (p->motion_roi_w > 0 && p->motion_roi_h > 0)
         {
-            const int d = (int)grid[i] - (int)p->motion_prev_grid[i];
-            if (d > diff || d < -diff)
+            const uint32_t rx1 = std::min(p->motion_roi_x + p->motion_roi_w, fw);
+            const uint32_t ry1 = std::min(p->motion_roi_y + p->motion_roi_h, fh);
+            bx0 = std::min(p->motion_roi_x / 16, gw);
+            bx1 = std::min((rx1 + 15) / 16, gw);
+            by0 = std::min(p->motion_roi_y / 16, gh);
+            by1 = std::min((ry1 + 15) / 16, gh);
+        }
+        uint32_t changed = 0, total = 0;
+        const int diff = p->motion_diff_level;
+        for (uint32_t bj = by0; bj < by1; ++bj)
+        {
+            for (uint32_t bi = bx0; bi < bx1; ++bi)
             {
-                ++changed;
+                const int d = (int)grid[(size_t)bj * gw + bi] - (int)p->motion_prev_grid[(size_t)bj * gw + bi];
+                if (d > diff || d < -diff)
+                {
+                    ++changed;
+                }
+                ++total;
             }
         }
-        const float ratio = (float)changed / (float)grid.size();
+        const float ratio = total ? (float)changed / (float)total : 0.0f;
         detected = ratio > p->motion_threshold;
     }
     p->motion_prev_grid = std::move(grid);

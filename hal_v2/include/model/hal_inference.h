@@ -322,26 +322,6 @@ typedef struct HalInferenceOps {
     int (*tensor_from_frame)(const HalFrameBuffer *frame, HalTensor *tensor);
 
     /**
-     * @brief Create input tensor from a frame, applying the session's
-     *        HalInferenceConfig::preprocess rules (resize / color conversion /
-     *        letterbox / normalize) to match the model's first input stream.
-     *
-     * Unlike @ref tensor_from_frame, this is session-aware: the target geometry
-     * and format come from the model input stream, and the transformation runs
-     * through HailoRT's host-side InputTransformContext. Fast paths with no
-     * copy overhead when the frame already matches the model input exactly.
-     *
-     * Supported source formats: NV12, RGB24, BGR24, GRAY8.
-     *
-     * @param session Inference session (defines target input + preprocess rules).
-     * @param frame   Input frame (any of the supported formats, any geometry).
-     * @param tensor  Output tensor; uint8 unless preprocess.normalize is set
-     *                (then float32, (in/255 - mean)/std per channel).
-     * @return HAL_OK on success, negative HalErrorCode on failure.
-     */
-    int (*tensor_from_frame_ex)(HalInferenceSession *session, const HalFrameBuffer *frame, HalTensor *tensor);
-
-    /**
      * @brief Run inference (synchronous)
      * @param session Session handle
      * @param inputs Input tensors
@@ -422,6 +402,28 @@ typedef struct HalInferenceOps {
      * @return Version string
      */
     const char* (*get_version)(void);
+
+    /**
+     * @brief Create input tensor from a frame, applying the session's
+     *        HalInferenceConfig::preprocess rules (resize / color conversion /
+     *        letterbox / normalize) to match the model's first input stream.
+     *
+     * Unlike @ref tensor_from_frame, this is session-aware: the target geometry
+     * and format come from the model input stream. Fast path with no copy
+     * overhead when the frame already matches the model input exactly.
+     *
+     * Supported source formats: NV12, RGB24, BGR24. Resized/converted staging
+     * targets packed RGB888/BGR888 model inputs; NV12-order model inputs are
+     * only served by the exact-match fast path.
+     *
+     * @param session Inference session (defines target input + preprocess rules).
+     * @param frame   Input frame (any of the supported formats, any geometry).
+     * @param tensor  Output tensor; uint8 unless preprocess.normalize is set
+     *                (then float32, (in/255 - mean)/std per channel; shape[0]
+     *                counts elements, byte_size counts bytes).
+     * @return HAL_OK on success, negative HalErrorCode on failure.
+     */
+    int (*tensor_from_frame_ex)(HalInferenceSession *session, const HalFrameBuffer *frame, HalTensor *tensor);
 } HalInferenceOps;
 
 /* ========== Global Operations Table ========== */

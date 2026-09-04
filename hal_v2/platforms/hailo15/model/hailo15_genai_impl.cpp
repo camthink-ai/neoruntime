@@ -686,11 +686,12 @@ HalGenaiOps HAL_GENAI_OPS = {
     .abort_generation = genai_abort_generation,
     .get_vlm_input_layout = genai_get_vlm_input_layout,
     .set_stop_tokens = genai_set_stop_tokens,
+    .get_version = genai_get_version,
+    /* M3 additions (appended at the table tail, after get_version) */
     .save_context = genai_save_context,
     .load_context = genai_load_context,
     .get_context_usage = genai_get_context_usage,
     .free_context_buffer = genai_free_context_buffer,
-    .get_version = genai_get_version,
 };
 
 #endif /* HAL_HAVE_HAL_GENAI */
