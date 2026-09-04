@@ -82,6 +82,7 @@ extern "C" {
 #include "peripheral/devices/hal_lens.h"
 #include "peripheral/devices/hal_env_ctrl.h"
 #include "peripheral/devices/hal_lens_af0832.h"
+#include "peripheral/devices/hal_factory.h"
 }
 
 #include <atomic>
@@ -196,6 +197,13 @@ static const char *k_commands[] = {
     "gpio_sub",
     "gpio_unsub",
     "gpio_unexport",
+    "factory_init",
+    "factory_deinit",
+    "factory_info",
+    "factory_get",
+    "factory_set",
+    "factory_erase",
+    "factory_ver",
 };
 static const size_t k_commands_count = sizeof(k_commands) / sizeof(k_commands[0]);
 
@@ -619,6 +627,11 @@ static void print_help()
     std::puts("  gpio_unexport <num>                    (release; gpio_unsub first if subscribed)");
     std::puts("  gpio_set <num> <0|1> | gpio_get <num>");
     std::puts("  gpio_sub <num> <none|rising|falling|both> | gpio_unsub <num>");
+    std::puts("  factory_init | factory_deinit");
+    std::puts("  factory_info | factory_ver");
+    std::puts("  factory_get <SN|MAC|PN|BATCH|HWREV>");
+    std::puts("  factory_set <SN|MAC|PN|BATCH|HWREV> <value>");
+    std::puts("  factory_erase                    (DESTRUCTIVE: 256B -> 0xFF)");
 }
 
 static void on_alarm_evt(void *mcu_ctx, uint8_t ch, bool level, void *ud)
@@ -664,6 +677,29 @@ static HalGpioEdge parse_edge(const std::string &s)
     return HAL_GPIO_EDGE_NONE;
 }
 
+static bool parse_factory_field(const std::string &s, HalFactoryField *out)
+{
+    if (!out) return false;
+    if (s == "SN" || s == "sn" || s == "serial")  { *out = HAL_FACTORY_FIELD_SN;    return true; }
+    if (s == "MAC" || s == "mac")                 { *out = HAL_FACTORY_FIELD_MAC;   return true; }
+    if (s == "PN" || s == "pn" || s == "part")    { *out = HAL_FACTORY_FIELD_PN;    return true; }
+    if (s == "BATCH" || s == "batch")             { *out = HAL_FACTORY_FIELD_BATCH; return true; }
+    if (s == "HWREV" || s == "hwrev")             { *out = HAL_FACTORY_FIELD_HWREV; return true; }
+    return false;
+}
+
+static const char *factory_field_name(HalFactoryField f)
+{
+    switch (f) {
+        case HAL_FACTORY_FIELD_SN:    return "SN";
+        case HAL_FACTORY_FIELD_MAC:   return "MAC";
+        case HAL_FACTORY_FIELD_PN:    return "PN";
+        case HAL_FACTORY_FIELD_BATCH: return "BATCH";
+        case HAL_FACTORY_FIELD_HWREV: return "HWREV";
+        default: return "?";
+    }
+}
+
 static void on_gpio_evt(void *io_ctx, uint32_t gpio_num, bool value, void *userdata)
 {
     (void)io_ctx;
@@ -703,9 +739,11 @@ int main(int argc, char **argv)
     (void)HAL_IO_OPS.init(&io);
 
     HalLensAf0832 *af = nullptr;
+    void *factory = nullptr;
 
     std::printf("hal_v2 peripheral cli started, dev=%s baud=%" PRIu32 " (reset_mcu: host_mcu_reset_gpio=%u)\n",
                 serial, baud, (unsigned)mcucfg.host_mcu_reset_gpio);
+    std::printf("factory HAL: %s (type factory_init to open)\n", HAL_FACTORY_OPS.get_version());
     print_help();
 
     char line[MAX_LINE];
@@ -1078,12 +1116,77 @@ int main(int argc, char **argv)
             continue;
         }
 
+        if (cmd == "factory_init") {
+            if (factory) { std::puts("factory already init"); continue; }
+            uint64_t t0 = now_monotonic_us();
+            int r = HAL_FACTORY_OPS.init(nullptr, &factory);
+            ok_dt(r, t0);
+            continue;
+        }
+        if (cmd == "factory_deinit") {
+            if (!factory) { std::puts("factory not init"); continue; }
+            uint64_t t0 = now_monotonic_us();
+            int r = HAL_FACTORY_OPS.deinit(factory);
+            factory = nullptr;
+            ok_dt(r, t0);
+            continue;
+        }
+        if (cmd == "factory_ver") {
+            std::printf("%s\n", HAL_FACTORY_OPS.get_version());
+            continue;
+        }
+        if (cmd == "factory_info") {
+            if (!factory) { std::puts("factory not init (run factory_init)"); continue; }
+            HalFactoryInfo info{};
+            uint64_t t0 = now_monotonic_us();
+            int r = HAL_FACTORY_OPS.read_all(factory, &info);
+            ok_dt(r, t0);
+            std::printf("valid=%u active_slot=%c seq=%" PRIu32 "\n",
+                        info.valid ? 1u : 0u, info.valid ? info.active_slot : '-', info.seq);
+            std::printf("  SN=%s\n  MAC=%s\n  PN=%s\n  BATCH=%s\n  HWREV=%s\n",
+                        info.serial_number, info.mac_address, info.product_number,
+                        info.batch, info.hardware_revision);
+            continue;
+        }
+        if (cmd == "factory_get" && args.size() >= 2) {
+            if (!factory) { std::puts("factory not init (run factory_init)"); continue; }
+            HalFactoryField f;
+            if (!parse_factory_field(args[1], &f)) { std::puts("bad field (SN|MAC|PN|BATCH|HWREV)"); continue; }
+            char value[64] = {0};
+            uint64_t t0 = now_monotonic_us();
+            int r = HAL_FACTORY_OPS.get(factory, f, value, sizeof(value));
+            std::printf("ret=%d (%s) dt_ms=%.3f %s=%s\n",
+                        r, hal_error_to_string((HalErrorCode)r), elapsed_ms(t0),
+                        factory_field_name(f), value);
+            continue;
+        }
+        if (cmd == "factory_set" && args.size() >= 3) {
+            if (!factory) { std::puts("factory not init (run factory_init)"); continue; }
+            HalFactoryField f;
+            if (!parse_factory_field(args[1], &f)) { std::puts("bad field (SN|MAC|PN|BATCH|HWREV)"); continue; }
+            uint64_t t0 = now_monotonic_us();
+            int r = HAL_FACTORY_OPS.set(factory, f, args[2].c_str());
+            ok_dt(r, t0);
+            continue;
+        }
+        if (cmd == "factory_erase") {
+            if (!factory) { std::puts("factory not init (run factory_init)"); continue; }
+            uint64_t t0 = now_monotonic_us();
+            int r = HAL_FACTORY_OPS.erase(factory);
+            ok_dt(r, t0);
+            continue;
+        }
+
         std::puts("unknown or invalid command, try: help");
     }
 
     if (af) {
         hal_lens_af0832_destroy(af);
         af = nullptr;
+    }
+    if (factory) {
+        (void)HAL_FACTORY_OPS.deinit(factory);
+        factory = nullptr;
     }
     if (io) {
         (void)HAL_IO_OPS.deinit(io);

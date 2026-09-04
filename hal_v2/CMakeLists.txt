@@ -46,6 +46,7 @@ set(_HAL_V2_COMMON_SOURCES
     common/hal_udp_stream.cpp
     common/host_link/host_link_core.c
     common/host_link/host_link_port_posix.c
+    common/devices/hal_factory_format.c
 )
 
 if(HAL_V2_BUILD_MONOLITHIC)
@@ -511,6 +512,20 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         target_link_libraries(hal-hailo15-ota PRIVATE hal-hailo15-mcu)
     endif()
 
+    # Factory EEPROM (AT24C02): Linux at24 sysfs backend (default) has no vendor
+    # dependency; the HailoRT I2C backend is compiled in only when hailort is
+    # available (guarded by HAL_HAVE_HAILORT inside the .cpp).
+    hal_hailo15_plain_target(hal-hailo15-factory platforms/hailo15/peripherals/hailo15_factory_impl.cpp)
+    if(HAVE_HAILORT)
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_include_directories(hal PRIVATE ${HAILORT_INC_DIR})
+            target_link_libraries(hal PRIVATE ${HAILORT_LIB})
+        else()
+            target_include_directories(hal-hailo15-factory PRIVATE ${HAILORT_INC_DIR})
+            target_link_libraries(hal-hailo15-factory PRIVATE ${HAILORT_LIB})
+        endif()
+    endif()
+
     # Optional: HailoDSP library for image processing (crop/resize, convert, blend, privacy mask).
     find_path(HAILODSP_INC_DIR
         NAMES hailo/hailodsp.h
@@ -861,6 +876,7 @@ if(HAL_PLATFORM STREQUAL "hailo15")
             hal-hailo15-rs485
             hal-hailo15-lens
             hal-hailo15-env-ctrl
+            hal-hailo15-factory
             hal-devices
             hal-common
         )
@@ -945,6 +961,7 @@ elseif(HAL_PLATFORM STREQUAL "stub")
         platforms/stub/peripherals/stub_lens_impl.c
         platforms/stub/peripherals/stub_env_ctrl_impl.c
         platforms/stub/peripherals/stub_ota_impl.c
+        platforms/stub/peripherals/stub_factory_impl.c
     )
     if(HAL_V2_BUILD_MONOLITHIC)
         target_sources(hal PRIVATE ${_HAL_V2_STUB_SOURCES})
