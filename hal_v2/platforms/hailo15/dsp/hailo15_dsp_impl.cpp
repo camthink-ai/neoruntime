@@ -82,11 +82,30 @@ static void hal_color_to_dsp(const HalDspColor *src, dsp_color_t *dst)
     dst->b = src->b;
 }
 
-static void hal_frame_to_dsp_image(const HalFrameBuffer *frame,
-                                   dsp_image_properties_t *image,
-                                   dsp_data_plane_t *planes_storage,
-                                   size_t planes_storage_count)
+/**
+ * Build a dsp_image_properties_t from a HalFrameBuffer.
+ *
+ * Validation: DMABUF frames must carry a valid fd for every plane, USERPTR
+ * frames a non-NULL pointer. Without this check a missing plane silently
+ * leaves fd=0 (stdin) / userptr=NULL in the union, which the driver may
+ * misinterpret far from the root cause.
+ *
+ * @return HAL_OK, or HAL_ERR_INVALID_ARG on a malformed frame descriptor.
+ */
+static int hal_frame_to_dsp_image(const HalFrameBuffer *frame,
+                                  dsp_image_properties_t *image,
+                                  dsp_data_plane_t *planes_storage,
+                                  size_t planes_storage_count)
 {
+    if (!frame || !image || !planes_storage)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (frame->num_planes == 0 || frame->num_planes > planes_storage_count)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+
     std::memset(image, 0, sizeof(*image));
     image->width  = frame->width;
     image->height = frame->height;
@@ -95,11 +114,16 @@ static void hal_frame_to_dsp_image(const HalFrameBuffer *frame,
 
     image->planes = planes_storage;
 
-    const uint32_t n = (frame->num_planes > planes_storage_count) ? (uint32_t)planes_storage_count : frame->num_planes;
-    for (uint32_t i = 0; i < n; ++i) {
-        if (frame->mem_type == HAL_MEM_DMABUF && frame->dma_fds[i] >= 0) {
+    for (uint32_t i = 0; i < frame->num_planes; ++i) {
+        if (frame->mem_type == HAL_MEM_DMABUF) {
+            if (frame->dma_fds[i] < 0) {
+                return HAL_ERR_INVALID_ARG;
+            }
             planes_storage[i].fd = frame->dma_fds[i];
         } else {
+            if (!frame->planes[i]) {
+                return HAL_ERR_INVALID_ARG;
+            }
             planes_storage[i].userptr = frame->planes[i];
         }
         planes_storage[i].bytesperline = frame->strides[i];
@@ -108,13 +132,50 @@ static void hal_frame_to_dsp_image(const HalFrameBuffer *frame,
 
     image->memory = (frame->mem_type == HAL_MEM_DMABUF) ? DSP_MEMORY_TYPE_DMABUF
                                                         : DSP_MEMORY_TYPE_USERPTR;
+    return HAL_OK;
 }
 
 /* ---------------------- Worker thread ---------------------- */
 
+/**
+ * Complete a job: publish the result, take ownership of params_copy, and honor a
+ * concurrent job_release() by deleting the job when the caller already gave it up.
+ * Called only from the worker thread (or deinit drain below).
+ */
+static void hailo15_dsp_finish_job(HalDspJobHandle job, HalDspJobStatus status, int result_code)
+{
+    void *params_copy = nullptr;
+    bool delete_job = false;
+    {
+        std::lock_guard<std::mutex> guard(job->mtx);
+        params_copy = job->params_copy;
+        job->params_copy = nullptr;
+        if (!job->completed.load()) {
+            /* Publish the executor's outcome only when no terminal state exists yet:
+             * cancel() may already have marked this job CANCELLED while it sat in the
+             * queue or executed. Keep that verdict so waiters observe one consistent
+             * final status regardless of who terminated the job first. */
+            job->result.status = status;
+            job->result.result_code = result_code;
+            job->completed.store(true);
+        }
+        /* Notify before publishing worker_done: once that flag is visible, a racing
+         * job_release() may delete the job, so nothing (including the cv) may be
+         * touched after it. Notifying under the lock is legal and keeps the job
+         * guaranteed alive here. */
+        job->cv.notify_all();
+        delete_job = job->release_requested.load();
+        job->worker_done.store(true); /* final access to the job by the worker */
+    }
+    std::free(params_copy);
+    if (delete_job) {
+        delete job;
+    }
+}
+
 static void hailo15_dsp_worker_thread(Hailo15DspContext *ctx)
 {
-    while (!ctx->stop_flag.load()) {
+    for (;;) {
         Hailo15DspJobItem item{};
         {
             std::unique_lock<std::mutex> lock(ctx->queue_mtx);
@@ -122,7 +183,7 @@ static void hailo15_dsp_worker_thread(Hailo15DspContext *ctx)
                 return ctx->stop_flag.load() || !ctx->job_queue.empty();
             });
             if (ctx->stop_flag.load()) {
-                break;
+                break; /* stop requested: leave queued jobs to the fail-drain below */
             }
             item = ctx->job_queue.front();
             ctx->job_queue.pop();
@@ -168,13 +229,24 @@ static void hailo15_dsp_worker_thread(Hailo15DspContext *ctx)
             break;
         }
 
+        hailo15_dsp_finish_job(job, (rc == HAL_OK) ? HAL_DSP_JOB_COMPLETED : HAL_DSP_JOB_FAILED, rc);
+    }
+
+    /* Fail jobs still queued at shutdown instead of leaking them: their waiters
+     * would otherwise block forever and never see a result. */
+    for (;;) {
+        Hailo15DspJobItem item{};
         {
-            std::lock_guard<std::mutex> guard(job->mtx);
-            job->result.status = (rc == HAL_OK) ? HAL_DSP_JOB_COMPLETED : HAL_DSP_JOB_FAILED;
-            job->result.result_code = rc;
-            job->completed.store(true);
+            std::lock_guard<std::mutex> lock(ctx->queue_mtx);
+            if (ctx->job_queue.empty()) {
+                break;
+            }
+            item = ctx->job_queue.front();
+            ctx->job_queue.pop();
         }
-        job->cv.notify_all();
+        if (item.job) {
+            hailo15_dsp_finish_job(item.job, HAL_DSP_JOB_FAILED, HAL_ERR_INVALID_STATE);
+        }
     }
 }
 
@@ -187,8 +259,16 @@ static int hailo15_dsp_convert_format_sync(Hailo15DspContext *ctx, const HalDspC
     dsp_image_properties_t dst_image{};
     dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
     dsp_data_plane_t dst_planes[HAL_MAX_PLANES]{};
-    hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
-    hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    int rc = hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
+    rc = hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
     dsp_status st = dsp_convert_format(ctx->device, &src_image, &dst_image);
     return dsp_status_to_hal(st);
 }
@@ -205,8 +285,16 @@ static int hailo15_dsp_resize_sync(Hailo15DspContext *ctx, const HalDspResizePar
     dsp_image_properties_t dst_image{};
     dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
     dsp_data_plane_t dst_planes[HAL_MAX_PLANES]{};
-    hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
-    hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    int rc = hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
+    rc = hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
     r.src = &src_image;
     r.dst = &dst_image;
     r.interpolation = hal_interp_to_dsp(params->interpolation);
@@ -222,8 +310,16 @@ static int hailo15_dsp_crop_resize_sync(Hailo15DspContext *ctx, const HalDspCrop
     dsp_image_properties_t dst_image{};
     dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
     dsp_data_plane_t dst_planes[HAL_MAX_PLANES]{};
-    hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
-    hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    int rc = hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
+    rc = hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
     r.src = &src_image;
     r.dst = &dst_image;
     r.interpolation = hal_interp_to_dsp(params->interpolation);
@@ -252,7 +348,11 @@ static int hailo15_dsp_multi_crop_resize_sync(Hailo15DspContext *ctx, const HalD
     dsp_multi_crop_resize_params_t m{};
     dsp_image_properties_t src_image{};
     dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
-    hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    int rc = hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
     m.src = &src_image;
     m.crop_resize_params_count = params->output_count;
     m.interpolation = hal_interp_to_dsp(params->interpolation);
@@ -277,7 +377,11 @@ static int hailo15_dsp_multi_crop_resize_sync(Hailo15DspContext *ctx, const HalD
         for (uint32_t j = 0; j < DSP_MULTI_RESIZE_OUTPUTS_COUNT; ++j) {
             cp->dst[j] = nullptr;
         }
-        hal_frame_to_dsp_image(out->dst, &dst_images[i], dst_planes[i], HAL_MAX_PLANES);
+        rc = hal_frame_to_dsp_image(out->dst, &dst_images[i], dst_planes[i], HAL_MAX_PLANES);
+        if (rc != HAL_OK)
+        {
+            return rc;
+        }
         cp->dst[0] = &dst_images[i];
 
         dsp_scaling_properties_t scaling{};
@@ -293,17 +397,31 @@ static int hailo15_dsp_multi_crop_resize_sync(Hailo15DspContext *ctx, const HalD
 static int hailo15_dsp_blend_sync(Hailo15DspContext *ctx, const HalDspBlendParams *params)
 {
     (void)ctx;
+    if (!params)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
     dsp_image_properties_t base_image{};
     dsp_data_plane_t base_planes[HAL_MAX_PLANES]{};
-    hal_frame_to_dsp_image(params->base, &base_image, base_planes, HAL_MAX_PLANES);
+    int rc = hal_frame_to_dsp_image(params->base, &base_image, base_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
 
-    static dsp_overlay_properties_t overlays_storage[50];
+    /* Stack storage: blend may be called concurrently from multiple threads and a
+     * shared static array would corrupt the in-flight descriptors. */
+    dsp_overlay_properties_t overlays_storage[50];
     dsp_data_plane_t overlays_planes[50][HAL_MAX_PLANES]{};
     size_t count = (params->overlay_count > 50) ? 50 : params->overlay_count;
     for (size_t i = 0; i < count; ++i) {
         HalDspOverlay *src_ov = &params->overlays[i];
         dsp_overlay_properties_t *dst_ov = &overlays_storage[i];
-        hal_frame_to_dsp_image(src_ov->overlay, &dst_ov->overlay, overlays_planes[i], HAL_MAX_PLANES);
+        rc = hal_frame_to_dsp_image(src_ov->overlay, &dst_ov->overlay, overlays_planes[i], HAL_MAX_PLANES);
+        if (rc != HAL_OK)
+        {
+            return rc;
+        }
         dst_ov->x_offset = src_ov->x_offset;
         dst_ov->y_offset = src_ov->y_offset;
     }
@@ -320,8 +438,16 @@ static int hailo15_dsp_flip_rotate_sync(Hailo15DspContext *ctx, const HalDspFlip
     dsp_image_properties_t dst_image{};
     dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
     dsp_data_plane_t dst_planes[HAL_MAX_PLANES]{};
-    hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
-    hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    int rc = hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
+    rc = hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
     r.src = &src_image;
     r.dst = &dst_image;
     r.interpolation = hal_interp_to_dsp(params->interpolation);
@@ -349,8 +475,16 @@ static int hailo15_dsp_rotate_sync(Hailo15DspContext *ctx, const HalDspRotatePar
     dsp_image_properties_t dst_image{};
     dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
     dsp_data_plane_t dst_planes[HAL_MAX_PLANES]{};
-    hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
-    hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    int rc = hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
+    rc = hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
     r.src = &src_image;
     r.dst = &dst_image;
     r.interpolation = hal_interp_to_dsp(params->interpolation);
@@ -376,8 +510,16 @@ static int hailo15_dsp_dewarp_sync(Hailo15DspContext *ctx, const HalDspDewarpPar
     dsp_image_properties_t dst_image{};
     dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
     dsp_data_plane_t dst_planes[HAL_MAX_PLANES]{};
-    hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
-    hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    int rc = hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
+    rc = hal_frame_to_dsp_image(params->dst, &dst_image, dst_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
 
     /* Convert the float mesh to the DSP Q15.16 fixed-point vertex table. */
     const size_t verts = static_cast<size_t>(params->grid_cols) * params->grid_rows;
@@ -409,7 +551,11 @@ static int hailo15_dsp_multi_crop_resize_telescopic_sync(Hailo15DspContext *ctx,
     dsp_multi_crop_resize_params_t m{};
     dsp_image_properties_t src_image{};
     dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
-    hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    int rc = hal_frame_to_dsp_image(params->src, &src_image, src_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
     m.src = &src_image;
     m.crop_resize_params_count = params->output_count;
     m.interpolation = hal_interp_to_dsp(params->interpolation);
@@ -434,7 +580,11 @@ static int hailo15_dsp_multi_crop_resize_telescopic_sync(Hailo15DspContext *ctx,
         for (uint32_t j = 0; j < DSP_MULTI_RESIZE_OUTPUTS_COUNT; ++j) {
             cp->dst[j] = nullptr;
         }
-        hal_frame_to_dsp_image(out->dst, &dst_images[i], dst_planes[i], HAL_MAX_PLANES);
+        rc = hal_frame_to_dsp_image(out->dst, &dst_images[i], dst_planes[i], HAL_MAX_PLANES);
+        if (rc != HAL_OK)
+        {
+            return rc;
+        }
         cp->dst[0] = &dst_images[i];
 
         dsp_scaling_properties_t scaling{};
@@ -455,7 +605,11 @@ static int hailo15_dsp_privacy_mask_sync(Hailo15DspContext *ctx, const HalDspPri
     }
     dsp_image_properties_t image{};
     dsp_data_plane_t img_planes[HAL_MAX_PLANES]{};
-    hal_frame_to_dsp_image(params->image, &image, img_planes, HAL_MAX_PLANES);
+    int rc = hal_frame_to_dsp_image(params->image, &image, img_planes, HAL_MAX_PLANES);
+    if (rc != HAL_OK)
+    {
+        return rc;
+    }
 
     // Apply each region sequentially (in-place on the same image).
     for (uint32_t ri = 0; ri < params->region_count; ri++)
@@ -668,6 +822,8 @@ static int hailo15_dsp_submit(void *dsp_ctx, HalDspOpType op_type, const void *p
     job->result.status = HAL_DSP_JOB_PENDING;
     job->result.result_code = HAL_OK;
     job->completed.store(false);
+    job->worker_done.store(false);
+    job->release_requested.store(false);
     job->params_copy = nullptr;
 
     size_t param_size = 0;
@@ -694,6 +850,13 @@ static int hailo15_dsp_submit(void *dsp_ctx, HalDspOpType op_type, const void *p
 
     {
         std::lock_guard<std::mutex> lock(ctx->queue_mtx);
+        if (ctx->stop_flag.load()) {
+            /* Shutting down: a job queued now could outlive the worker's fail-drain
+             * (it would never complete and its handle would leak). */
+            std::free(copy);
+            delete job;
+            return HAL_ERR_INVALID_STATE;
+        }
         ctx->job_queue.push(Hailo15DspJobItem{job});
     }
     ctx->queue_cv.notify_one();
@@ -743,11 +906,18 @@ static int hailo15_dsp_cancel(void *dsp_ctx, HalDspJobHandle job)
     }
     {
         std::lock_guard<std::mutex> lock(job->mtx);
+        /* Re-check under the lock: finish_job may have published a result between
+         * the unlocked fast-path check above and here. */
+        if (job->completed.load()) {
+            return HAL_ERR_INVALID_STATE;
+        }
         job->result.status = HAL_DSP_JOB_CANCELLED;
         job->result.result_code = HAL_ERROR;
         job->completed.store(true);
+        /* Notify under the lock: job lifetime from this side is the caller's
+         * responsibility, but this keeps us symmetric with finish_job. */
+        job->cv.notify_all();
     }
-    job->cv.notify_all();
     return HAL_OK;
 }
 
@@ -757,17 +927,30 @@ static int hailo15_dsp_job_release(void *dsp_ctx, HalDspJobHandle job)
     if (!job) {
         return HAL_OK;
     }
-    if (job->params_copy) {
-        std::free(job->params_copy);
-        job->params_copy = nullptr;
+    /* Hand off deletion to the worker when the job is still queued or executing;
+     * the worker takes params_copy ownership at completion. See HalDspJobTag. */
+    bool delete_job = false;
+    {
+        std::lock_guard<std::mutex> guard(job->mtx);
+        if (job->worker_done.load()) {
+            if (job->params_copy) {
+                std::free(job->params_copy);
+                job->params_copy = nullptr;
+            }
+            delete_job = true;
+        } else {
+            job->release_requested.store(true);
+        }
     }
-    delete job;
+    if (delete_job) {
+        delete job;
+    }
     return HAL_OK;
 }
 
 static const char *hailo15_dsp_get_version(void)
 {
-    return "Hailo15 HAL-DSP 2.1.0";
+    return "Hailo15 HAL-DSP 2.1.1";
 }
 
 HalDspOps HAL_DSP_OPS = {
