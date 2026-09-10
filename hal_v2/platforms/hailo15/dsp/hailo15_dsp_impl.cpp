@@ -150,9 +150,15 @@ static void hailo15_dsp_finish_job(HalDspJobHandle job, HalDspJobStatus status, 
         std::lock_guard<std::mutex> guard(job->mtx);
         params_copy = job->params_copy;
         job->params_copy = nullptr;
-        job->result.status = status;
-        job->result.result_code = result_code;
-        job->completed.store(true);
+        if (!job->completed.load()) {
+            /* Publish the executor's outcome only when no terminal state exists yet:
+             * cancel() may already have marked this job CANCELLED while it sat in the
+             * queue or executed. Keep that verdict so waiters observe one consistent
+             * final status regardless of who terminated the job first. */
+            job->result.status = status;
+            job->result.result_code = result_code;
+            job->completed.store(true);
+        }
         /* Notify before publishing worker_done: once that flag is visible, a racing
          * job_release() may delete the job, so nothing (including the cv) may be
          * touched after it. Notifying under the lock is legal and keeps the job
@@ -900,11 +906,18 @@ static int hailo15_dsp_cancel(void *dsp_ctx, HalDspJobHandle job)
     }
     {
         std::lock_guard<std::mutex> lock(job->mtx);
+        /* Re-check under the lock: finish_job may have published a result between
+         * the unlocked fast-path check above and here. */
+        if (job->completed.load()) {
+            return HAL_ERR_INVALID_STATE;
+        }
         job->result.status = HAL_DSP_JOB_CANCELLED;
         job->result.result_code = HAL_ERROR;
         job->completed.store(true);
+        /* Notify under the lock: job lifetime from this side is the caller's
+         * responsibility, but this keeps us symmetric with finish_job. */
+        job->cv.notify_all();
     }
-    job->cv.notify_all();
     return HAL_OK;
 }
 
