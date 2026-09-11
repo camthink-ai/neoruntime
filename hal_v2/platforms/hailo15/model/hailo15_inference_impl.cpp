@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -95,6 +96,9 @@ struct Hailo15InferPriv
     std::vector<std::string> input_names;
     std::vector<std::string> output_names;
     std::string hef_basename;  // e.g. "hailo_yolov8n_384_640" from model path
+    /** NMS tensor-name prefix derived from the selected backend_function (see
+     *  nms_tensor_prefix_for_function). Empty → fall back to hef_basename. */
+    std::string nms_name_prefix;
     HalInferenceConfig cfg{};
 
     // Async inference bookkeeping (run_async). pending_async lets destroy()
@@ -358,13 +362,18 @@ static void hailo15_attach_postprocess_roi(Hailo15InferPriv *p, HalTensor *outpu
         hailo_vstream_info_t vi{};
         std::memset(&vi, 0, sizeof(vi));
         const bool is_nms = stinfo.is_nms();
-        if (is_nms && !p->hef_basename.empty())
+        // Prefix priority: selected backend_function → HEF basename. The function
+        // prefix decouples tensor naming from file naming (app-bundled HEFs); the
+        // basename keeps platform-materialized and built-in models working.
+        const std::string &nms_prefix =
+            !p->nms_name_prefix.empty() ? p->nms_name_prefix : p->hef_basename;
+        if (is_nms && !nms_prefix.empty())
         {
-            // Replace network-group prefix with HEF filename for postprocess compat.
+            // Replace network-group prefix with the vendor-recognized basename.
             // e.g. "yolov8n/yolov8_nms_postprocess" → "hailo_yolov8n_384_640/yolov8_nms_postprocess"
             const auto slash_pos = name.find('/');
             if (slash_pos != std::string::npos)
-                std::snprintf(vi.name, sizeof(vi.name), "%s%s", p->hef_basename.c_str(), name.c_str() + slash_pos);
+                std::snprintf(vi.name, sizeof(vi.name), "%s%s", nms_prefix.c_str(), name.c_str() + slash_pos);
             else
                 std::snprintf(vi.name, sizeof(vi.name), "%s", name.c_str());
         }
@@ -456,6 +465,25 @@ static inline std::string extract_json_string_value_best_effort(const char *json
     if (!q)
         return default_value ? std::string(default_value) : std::string();
     return std::string(p, q);
+}
+
+/** The vendor YOLO postprocess plugin looks NMS output tensors up by name
+ *  "<prefix>/yolov8_nms_postprocess" where <prefix> is one of the HEF basenames
+ *  its functions were compiled for. Deriving the prefix from the selected
+ *  backend_function (forwarded in platform_config by ai-runtime) instead of the
+ *  file path decouples tensor naming from file naming: app-bundled HEFs live at
+ *  arbitrary paths whose basename never matches. Unknown/absent function →
+ *  empty string, and callers fall back to the HEF file basename (the
+ *  platform's materialized runtime copies keep that path valid). */
+static std::string nms_tensor_prefix_for_function(const std::string &backend_function)
+{
+    static const std::map<std::string, std::string> kFunctionToPrefix = {
+        {"hailo_yolov8n", "hailo_yolov8n_384_640"},
+        {"hailo_yolov8s", "hailo_yolov8s_384_640"},
+        {"hailo_yolov8m", "hailo_yolov8m_384_640"},
+    };
+    const auto it = kFunctionToPrefix.find(backend_function);
+    return it == kFunctionToPrefix.end() ? std::string() : it->second;
 }
 
 static inline void preprocess_defaults(HalPreprocessConfig *p)
@@ -932,9 +960,11 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
     // device id: from platform_config JSON or default.
     const char *pcfg = config->platform_config;
     std::string device_id = "device0";
+    std::string backend_function;
     if (pcfg && str_has_json_object_prefix(pcfg))
     {
         device_id = extract_json_string_value_best_effort(pcfg, "device_id", "device0");
+        backend_function = extract_json_string_value_best_effort(pcfg, "backend_function", "");
     }
     // device_id + hef_basename are derived once and (re)applied to `p` in both the
     // primary path here and the no-latency-flag retry branch below, which deletes
@@ -952,6 +982,8 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
             hef_basename.resize(dot);
     }
     p->hef_basename = hef_basename;
+    // NMS tensor naming prefers the selected backend_function over the file name.
+    p->nms_name_prefix = nms_tensor_prefix_for_function(backend_function);
 
     // Acquire shared VDevice — enables HailoRT ROUND_ROBIN scheduling across
     // all models so the NPU can pipeline inference for multiple network groups.
@@ -1080,6 +1112,7 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
             // would be empty and NMS/postprocess tensor-name mapping would break.
             p->device_id = device_id;
             p->hef_basename = hef_basename;
+            p->nms_name_prefix = nms_tensor_prefix_for_function(backend_function);
 
             p->vdevice = get_shared_vdevice();
             if (!p->vdevice)

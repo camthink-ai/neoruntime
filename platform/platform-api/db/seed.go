@@ -75,8 +75,10 @@ func SeedDiskModels(db *gorm.DB) *ScanResult {
 			continue
 		}
 		catName := entry.Name()
-		// Skip internal CAS directory
-		if catName == "blobs" {
+		// Skip internal directories: the CAS blob store and the runtime
+		// materialization tree (runtime/<model_id>/*.hef — already-registered
+		// hardlinks, must not be picked up as new disk models).
+		if catName == "blobs" || catName == "runtime" {
 			continue
 		}
 		catDir := filepath.Join(modelDir, catName)
@@ -120,7 +122,7 @@ func registerDiskModel(modelRepo *repo.AIModelRepo, hefPath, category string) er
 	// Extract metadata via hailortcli parse-hef
 	var networkName string
 	var inputWidth, inputHeight int
-	if store, storeErr := storage.NewModelStorage(constants.ModelsPath()+"/blobs", 0); storeErr == nil {
+	if store, storeErr := storage.NewModelStorage(constants.ModelsPath()+"/blobs", 0, 0); storeErr == nil {
 		if info, parseErr := store.ValidateHEF(hefPath); parseErr == nil && info != nil {
 			networkName = info.NetworkName
 			inputWidth = info.InputWidth
@@ -177,6 +179,10 @@ func registerDiskModel(modelRepo *repo.AIModelRepo, hefPath, category string) er
 		InputWidth:    inputWidth,
 		InputHeight:   inputHeight,
 		Status:        "uploaded",
+		// Disk discovery is not a load promise: without an explicit
+		// "unloaded" the column default would let the self-heal loop
+		// auto-load every model found by a scan.
+		DesiredState: "unloaded",
 	}
 
 	return modelRepo.Create(dbModel)

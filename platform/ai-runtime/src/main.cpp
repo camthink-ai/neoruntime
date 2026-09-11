@@ -111,13 +111,18 @@ int main(int argc, char* argv[]) {
     // ── Preload models ───────────────────────────────────────────────────────
     for (auto& pm : cfg.preload_models) {
         LOG_INFO("Preloading model: %s -> %s (type=%s)", pm.id.c_str(), pm.path.c_str(), pm.type.c_str());
-        int rc = model_mgr.register_model(pm.id, pm.path);
+        // Register the same decoding identity the gRPC path carries. This
+        // keeps config-preloaded entries compatible with an identical later
+        // co-owner registration while rejecting a same-id/path request that
+        // would rewire their postprocess session to a different type/config.
+        int rc = model_mgr.register_model(pm.id, pm.path, "<system>", false,
+                                          pm.postprocess_json, pm.type);
         if (rc < 0) {
             LOG_WARN("Failed to preload model %s: %d", pm.id.c_str(), rc);
             continue;
         }
         if (!pm.type.empty() && model_mgr.has_post_ops()) {
-            model_mgr.init_post_process(pm.id, pm.type);
+            model_mgr.init_post_process(pm.id, pm.type, pm.postprocess_json);
         }
         if (!pm.postprocess_json.empty() && model_mgr.has_post_ops()) {
             model_mgr.update_postprocess_config(pm.id, pm.postprocess_json);

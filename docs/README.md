@@ -98,6 +98,12 @@
 | [api/swagger.yaml](api/swagger.yaml) | OpenAPI spec for the Platform API |
 | [testing/lens_api_test.sh](testing/lens_api_test.sh) | Lens API test harness |
 
+## Planning
+
+| Document | Description |
+| -------- | ----------- |
+| [platform-adaptation-backlog.md](platform-adaptation-backlog.md) | Post-DSP-P0 adaptation backlog (release hygiene, daemon defects, HAL gaps, next daemon contracts) |
+
 SDK and application guides live in the sibling repositories:
 
 - `camthink-ai/neoruntime-sdks`

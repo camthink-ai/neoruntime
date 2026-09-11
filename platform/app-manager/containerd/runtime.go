@@ -184,7 +184,7 @@ func (r *Runtime) CreateMultiContainerApp(
 
 		// Build OCI options
 		containerID := fmt.Sprintf("aipc-%s-%s", appID, containerName)
-		opts := r.buildOCIOptionsForContainer(appID, containerName, &containerSpec, containerConfig)
+		opts := r.buildOCIOptionsForContainer(appID, containerName, &containerSpec, containerConfig, appManifest.ModelEnvVars())
 
 		// Normalize image name
 		imageName := manifest.NormalizeImageName(containerSpec.Image)
@@ -309,6 +309,8 @@ func (r *Runtime) buildOCIOptions(appID string, appManifest *manifest.AppManifes
 
 	// Set environment variables
 	envVars := appManifest.ToContainerEnv()
+	// spec.models aliases become AIPC_MODEL_<alias>=<id> (nil when undeclared).
+	envVars = append(envVars, appManifest.ModelEnvVars()...)
 	envVars = append(envVars, fmt.Sprintf("AIPC_HOST_PREFIX=%s", constants.RootPath()))
 	envVars = append(envVars, fmt.Sprintf("APP_ID=%s", appManifest.Metadata.ID))
 	opts = append(opts, oci.WithEnv(envVars))
@@ -410,6 +412,7 @@ func (r *Runtime) buildOCIOptionsForContainer(
 	containerName string,
 	containerSpec *manifest.ContainerSpec,
 	containerConfig *security.ContainerConfig,
+	modelEnvs []string,
 ) []oci.SpecOpts {
 	var opts []oci.SpecOpts
 
@@ -421,6 +424,9 @@ func (r *Runtime) buildOCIOptionsForContainer(
 	for _, envVar := range containerSpec.Env {
 		envVars = append(envVars, fmt.Sprintf("%s=%s", envVar.Name, manifest.ExpandEnvRefs(envVar.Value)))
 	}
+	// Model aliases are visible to every container: the primary consumer is
+	// usually the main container, but sidecars may also need to resolve ids.
+	envVars = append(envVars, modelEnvs...)
 	// Add role environment variable for app to know its role
 	envVars = append(envVars, fmt.Sprintf("APP_ROLE=%s", containerSpec.Role))
 	envVars = append(envVars, fmt.Sprintf("AIPC_HOST_PREFIX=%s", constants.RootPath()))

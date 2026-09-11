@@ -3,6 +3,8 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,6 +40,8 @@ import (
 	"aipc/platform/common/socket"
 	"aipc/platform/common/utils"
 	eventpb "aipc/platform/event-bus/proto"
+	"aipc/platform/modelload"
+	"aipc/platform/platform-api/model"
 )
 
 type AppManagerServer struct {
@@ -69,6 +74,32 @@ type AppManagerServer struct {
 
 	// Async install tasks
 	taskStore *InstallTaskStore
+
+	// Per-app lifecycle serialization. Install/update/start/uninstall mutate the
+	// same registry, manifest and app-models tree; different apps remain fully
+	// parallel while operations for one ID cannot cross transaction boundaries.
+	appMutationMu    sync.Mutex
+	appMutationLocks map[string]*sync.Mutex
+
+	// extractModelFile pulls a file out of a containerd image; swappable in
+	// tests. Wired to containerd.Client.ExtractFileFromImage in
+	// NewAppManagerServer; nil when containerd is unavailable.
+	extractModelFile func(ctx context.Context, imageRef, containerPath, destDir string) (string, error)
+}
+
+func (s *AppManagerServer) lockAppMutation(appID string) func() {
+	s.appMutationMu.Lock()
+	if s.appMutationLocks == nil {
+		s.appMutationLocks = make(map[string]*sync.Mutex)
+	}
+	mu := s.appMutationLocks[appID]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		s.appMutationLocks[appID] = mu
+	}
+	s.appMutationMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 type Config struct {
@@ -162,6 +193,9 @@ func NewAppManagerServer(cfg *Config) (*AppManagerServer, error) {
 		resolver:                depResolver,
 		multiContainerInstances: make(map[string]*containerd.MultiContainerInstance),
 		taskStore:               NewInstallTaskStore(),
+	}
+	if containerdClientWrapper != nil {
+		server.extractModelFile = containerdClientWrapper.ExtractFileFromImage
 	}
 
 	// Create read-only sqlite connection for accessing model paths
@@ -401,21 +435,29 @@ func (s *AppManagerServer) stopAndCleanupContainer(ctx context.Context, appID st
 
 	if appInfo.State == registry.AppStateRunning {
 		stopReq := &proto.StopRequest{AppId: appID, TimeoutSeconds: 10}
-		if _, err := s.StopApp(ctx, stopReq); err != nil {
-			logger.Warn("Failed to stop app %s during update: %v", appID, err)
+		st, err := s.StopApp(ctx, stopReq)
+		if err != nil {
+			return fmt.Errorf("stop app %s: %w", appID, err)
+		}
+		if st == nil || !st.Success {
+			message := "missing stop status"
+			if st != nil && st.Message != "" {
+				message = st.Message
+			}
+			return fmt.Errorf("stop app %s was refused: %s", appID, message)
 		}
 	}
 
 	if appInfo.ContainerID != "" && s.client != nil && s.runtime != nil {
 		container, err := s.client.GetContainer(ctx, appInfo.ContainerID)
 		if err == nil {
-			if task, err := container.Task(ctx, nil); err == nil {
+			if task, taskErr := container.Task(ctx, nil); taskErr == nil {
 				if stopErr := s.runtime.StopAppContainer(ctx, task, 5); stopErr != nil {
-					logger.Warn("Failed to stop container during update: %v", stopErr)
+					return fmt.Errorf("stop container during update: %w", stopErr)
 				}
 			}
 			if err := s.runtime.RemoveAppContainer(ctx, container); err != nil {
-				logger.Warn("Failed to remove container during update: %v", err)
+				return fmt.Errorf("remove container during update: %w", err)
 			}
 		}
 	}
@@ -447,11 +489,28 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 			},
 		}, nil
 	}
+	unlockApp := s.lockAppMutation(appManifest.Metadata.ID)
+	defer unlockApp()
+
+	// Resolve spec.model dependencies before pulling the image (fail fast):
+	// by id first (runtime/platform.db), then by declared bundled path, which
+	// is extracted after the image is available.
+	resolution, err := s.resolveModelDependencies(ctx, appManifest, nil)
+	if err != nil {
+		return &proto.InstallResponse{
+			Status: &proto.Status{
+				Success: false,
+				Message: fmt.Sprintf("Model dependency validation failed: %v", err),
+				Code:    400,
+			},
+		}, nil
+	}
 
 	// Check duplicate BEFORE pulling image
 	appID := appManifest.Metadata.ID
 	var isUpdate bool
 	var wasRunning bool
+	var oldAppInfo *registry.AppInfo
 	var oldWebURL string
 	var oldRestartCount int
 	var oldInstalledAt time.Time
@@ -468,16 +527,14 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		}
 		// Force overwrite: preserve state then stop + remove container
 		existingApp, _ := s.registry.Get(appID)
+		oldAppInfo = existingApp
 		wasRunning = existingApp.State == registry.AppStateRunning
 		oldWebURL = existingApp.WebURL
 		oldRestartCount = existingApp.RestartCount
 		oldInstalledAt = existingApp.InstalledAt
 		isUpdate = true
 
-		logger.Info("Updating existing app %s (was running=%v)", appID, wasRunning)
-		if err := s.stopAndCleanupContainer(ctx, appID); err != nil {
-			logger.Warn("Failed to cleanup existing app %s: %v", appID, err)
-		}
+		logger.Info("Preparing update of existing app %s (was running=%v)", appID, wasRunning)
 	}
 
 	// Validate seccomp profile
@@ -552,6 +609,100 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		}
 	}
 
+	// Prepare every bundled package in a sibling tree. Force updates always run
+	// this transaction, including an empty replacement (which removes old models).
+	var registeredFresh bool
+	committed := false
+	stoppedExisting := false
+	defer func() {
+		if !committed && stoppedExisting && wasRunning {
+			go func() {
+				if st, err := s.StartApp(context.Background(), &proto.StartRequest{AppId: appID}); err != nil || st == nil || !st.Success {
+					logger.Error("Rollback: failed to restart previous app %s: rpc=%v status=%v", appID, err, st)
+				}
+			}()
+		}
+	}()
+	var modelTx *bundledModelTransaction
+	if isUpdate || len(resolution.pathPending) > 0 {
+		modelTx, err = s.prepareBundledModelTransaction(ctx, appID, appManifest, resolution.pathPending, nil)
+		if err != nil {
+			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Bundled model preparation failed: %v", err), Code: 400}}, nil
+		}
+	}
+
+	// All new packages are now verified while the old app/runtime/tree remain
+	// intact. Stop the old container before quiescing its registrations;
+	// otherwise it can race a new inference into the strict unload window.
+	if isUpdate {
+		stoppedExisting = true
+		if err := s.stopAndCleanupContainer(ctx, appID); err != nil {
+			if modelTx != nil {
+				modelTx.Rollback(ctx)
+			}
+			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to stop existing app before update: %v", err), Code: 409}}, nil
+		}
+	}
+	if modelTx != nil {
+		if err := modelTx.Publish(ctx); err != nil {
+			modelTx.Rollback(ctx)
+			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Bundled model publish failed: %v", err), Code: 409}}, nil
+		}
+	}
+
+	// Same rollback contract as runAsyncInstall for fresh installs: from
+	// here until the install is committed, a failure rolls the extracted
+	// models back (and undoes a registry entry saved by a later step) —
+	// nothing of a failed install survives. Updates keep their artifacts:
+	// the registry entry (old or new) owns them and UninstallApp cleans up.
+	defer func() {
+		if committed {
+			return
+		}
+		if registeredFresh {
+			if unErr := s.registry.Unregister(appID); unErr != nil {
+				logger.Warn("Rollback: failed to unregister app %s: %v", appID, unErr)
+			}
+		} else if isUpdate && oldAppInfo != nil {
+			if upErr := s.registry.Update(oldAppInfo); upErr != nil {
+				logger.Error("Rollback: failed to restore old app registry %s: %v", appID, upErr)
+			}
+		}
+		if modelTx != nil {
+			modelTx.Rollback(ctx)
+		}
+	}()
+
+	// Warn when a shadowed bundled copy differs from the platform copy that
+	// won resolution (best-effort, never fails the install).
+	s.checkShadowedModels(ctx, appManifest, resolution.shadowed, nil)
+
+	// Snapshot the canonical manifest so a failure after publication can restore
+	// the previous app metadata together with the old model tree.
+	manifestRollback, err := manifestPublishRollback(appID)
+	if err != nil {
+		return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to snapshot manifest: %v", err), Code: 500}}, nil
+	}
+	defer func() {
+		if !committed {
+			manifestRollback()
+		}
+	}()
+
+	// Store the manifest under the managed manifests root before
+	// registering, so cleanup can never target a caller-owned parent
+	// directory (CLI tarball unpack dirs, legacy top-level paths).
+	canonicalPath, err := canonicalizeManifest(req.ManifestPath, appManifest.Metadata.ID)
+	if err != nil {
+		return &proto.InstallResponse{
+			Status: &proto.Status{
+				Success: false,
+				Message: fmt.Sprintf("Failed to store manifest: %v", err),
+				Code:    500,
+			},
+		}, nil
+	}
+
 	// Create app info with plugin fields
 	appInfo := &registry.AppInfo{
 		ID:           appManifest.Metadata.ID,
@@ -559,7 +710,7 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		Version:      appManifest.Metadata.Version,
 		Image:        appManifest.GetNormalizedImage(),
 		State:        registry.AppStateInstalled,
-		ManifestPath: req.ManifestPath,
+		ManifestPath: canonicalPath,
 		InstancePath: fmt.Sprintf("%s/%s", s.config.Apps.InstancesPath, appManifest.Metadata.ID),
 		IsPlugin:     appManifest.IsPlugin(),
 	}
@@ -612,6 +763,7 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 				},
 			}, nil
 		}
+		registeredFresh = true
 	}
 
 	// Create instance directory
@@ -636,6 +788,12 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 	// Register permissions with AI Runtime
 	if err := s.registerAppPermissions(ctx, appInfo.ID, appManifest); err != nil {
 		logger.Warn("Failed to register app permissions: %v", err)
+	}
+
+	// The install is committed from here: discard the old bundled tree backup.
+	committed = true
+	if modelTx != nil {
+		modelTx.Commit()
 	}
 
 	// Publish event
@@ -677,10 +835,30 @@ func (s *AppManagerServer) AsyncInstallApp(ctx context.Context, req *proto.Async
 		return nil, fmt.Errorf("manifest_path is required")
 	}
 
-	task := s.taskStore.Create()
-	logger.Info("Created install task: %s", task.ID)
+	// Claim an immutable manifest snapshot before returning a task id. The
+	// caller may close/cancel the wizard immediately after acceptance, and its
+	// request staging can then be cleaned without racing the background parse.
+	manifestData, err := os.ReadFile(req.ManifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read manifest before accepting task: %w", err)
+	}
+	appManifest, err := manifest.ParseManifest(manifestData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse manifest before accepting task: %w", err)
+	}
+	if err := appManifest.Validate(); err != nil {
+		return nil, fmt.Errorf("failed to validate manifest before accepting task: %w", err)
+	}
 
-	go s.runAsyncInstall(task.ID, req.ManifestPath, req.ImagePath, req.Force)
+	task := s.taskStore.Create()
+	claimed, err := claimAppStaging(task.ID, req.ManifestPath, req.ImagePath)
+	if err != nil {
+		task.Fail(err.Error())
+		return nil, err
+	}
+	manifestPath, imagePath := claimed[0], claimed[1]
+	logger.Info("Created install task: %s", task.ID)
+	go s.runAsyncInstallSnapshot(task.ID, manifestData, manifestPath, imagePath, req.Force)
 
 	return &proto.AsyncInstallResponse{TaskId: task.ID}, nil
 }
@@ -703,18 +881,33 @@ func (s *AppManagerServer) GetInstallProgress(ctx context.Context, req *proto.In
 	}, nil
 }
 
-// runAsyncInstall executes the full installation flow in a background goroutine.
+// runAsyncInstall is the test/legacy wrapper; the production RPC snapshots
+// bytes before accepting the task and calls runAsyncInstallSnapshot directly.
 func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath string, force bool) {
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if task, ok := s.taskStore.Get(taskID); ok {
+			task.Fail(fmt.Sprintf("Failed to load manifest: %v", err))
+		}
+		return
+	}
+	s.runAsyncInstallSnapshot(taskID, data, manifestPath, imagePath, force)
+}
+
+// runAsyncInstallSnapshot executes the full installation flow from immutable
+// manifest bytes owned by the task.
+func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData []byte, manifestPath, imagePath string, force bool) {
 	task, ok := s.taskStore.Get(taskID)
 	if !ok {
 		return
 	}
+	defer cleanupOwnedAppStaging(manifestPath, imagePath)
 
 	ctx := namespaces.WithNamespace(context.Background(), s.config.Containerd.Namespace)
 
 	// Phase: validating (0-5%)
 	task.Update("validating", 2, "Validating manifest...")
-	appManifest, err := manifest.LoadManifest(manifestPath)
+	appManifest, err := manifest.ParseManifest(manifestData)
 	if err != nil {
 		task.Fail(fmt.Sprintf("Failed to load manifest: %v", err))
 		return
@@ -723,29 +916,50 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 		task.Fail(fmt.Sprintf("Invalid manifest: %v", err))
 		return
 	}
+	unlockApp := s.lockAppMutation(appManifest.Metadata.ID)
+	defer unlockApp()
 	if err := security.ValidateSeccompProfile(s.config.Security.SeccompProfile); err != nil {
 		task.Fail(fmt.Sprintf("Invalid seccomp profile: %v", err))
 		return
 	}
 	task.Update("validating", 5, "Validation complete")
 
-	// Check duplicate BEFORE pulling image
+	// Resolve spec.models dependencies before pulling the image: a missing
+	// required model fails here instead of after a multi-hundred-MB pull.
+	// Id misses with a declared path are extracted after the image arrives.
+	resolution, err := s.resolveModelDependencies(ctx, appManifest, task)
+	if err != nil {
+		task.Fail(err.Error())
+		return
+	}
+
+	// Check duplicate BEFORE pulling image. Force update keeps the old registry
+	// record until the replacement transaction commits.
 	asyncAppID := appManifest.Metadata.ID
+	var isUpdate, wasRunning bool
+	var oldAppInfo *registry.AppInfo
 	if s.registry.Exists(asyncAppID) {
 		if !force {
 			task.Fail(fmt.Sprintf("App %s already exists. Use force=true to overwrite.", asyncAppID))
 			return
 		}
-		task.Update("validating", 4, "Removing existing app for overwrite...")
-		if err := s.stopAndCleanupApp(ctx, asyncAppID); err != nil {
-			logger.Warn("Failed to cleanup existing app %s: %v", asyncAppID, err)
-		}
+		oldAppInfo, _ = s.registry.Get(asyncAppID)
+		isUpdate = oldAppInfo != nil
+		wasRunning = isUpdate && oldAppInfo.State == registry.AppStateRunning
+		task.Update("validating", 4, "Preparing existing app replacement...")
 	}
 
 	// Phase: pulling (5-80%)
-	// Phase: pulling (5-80%)
+	// All image references the app needs at start time: spec.image for
+	// single-container manifests, one per container for multi-container ones
+	// (spec.image is empty there, so GetNormalizedImage() alone cannot be used).
+	imageRefs := appManifest.ImageReferences()
+	primaryRef := ""
+	if len(imageRefs) > 0 {
+		primaryRef = imageRefs[0]
+	}
 	if imagePath != "" && s.client != nil {
-		imageName := appManifest.GetNormalizedImage()
+		imageName := primaryRef
 
 		isLocalFile := strings.HasSuffix(imagePath, ".tar") ||
 			strings.HasSuffix(imagePath, ".tar.gz") ||
@@ -789,22 +1003,72 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 			logger.Info("Image imported: %s", importedName)
 			task.Update("pulling", 80, "Image import complete")
 
-			// Reconcile the tar's true RepoTag against manifest.image and verify
-			// the manifest name is now resolvable in containerd. This catches the
-			// "tar tag != manifest.image" failure mode at install time instead of
-			// letting StartApp fail later (and auto-uninstall on offline devices).
-			tarRepoTag := utils.ExtractImageNameFromTar(imagePath)
+			// Reconcile the tar's true RepoTags against the manifest
+			// references and verify every image reference the app needs is
+			// now resolvable in containerd. This catches the "tar tag !=
+			// manifest image" failure mode at install time instead of letting
+			// StartApp fail later (and auto-uninstall on offline devices).
+			tarRepoTags := utils.ExtractAllImageNamesFromTar(imagePath)
+			tarRepoTag := ""
+			if len(tarRepoTags) > 0 {
+				tarRepoTag = tarRepoTags[0]
+			}
 			tarNormalized := manifest.NormalizeImageName(tarRepoTag)
 			if tarRepoTag == "" {
-				logger.Warn("Install reconcile: could not read RepoTag from tar %s (manifest.image=%s)", imagePath, imageName)
+				logger.Warn("Install reconcile: could not read RepoTag from tar %s (primary ref=%s)", imagePath, imageName)
 			} else if tarNormalized != imageName {
-				logger.Warn("Install reconcile: tar RepoTag %q (normalized %q) differs from manifest.image %q — retagged on import", tarRepoTag, tarNormalized, imageName)
+				logger.Warn("Install reconcile: tar RepoTag %q (normalized %q) differs from primary ref %q — retagged on import", tarRepoTag, tarNormalized, imageName)
 			} else {
-				logger.Info("Install reconcile: tar RepoTag %q matches manifest.image %q", tarRepoTag, imageName)
+				logger.Info("Install reconcile: tar RepoTag %q matches primary ref %q", tarRepoTag, imageName)
 			}
-			if _, verifyErr := s.client.GetImage(ctx, imageName); verifyErr != nil {
-				task.Fail(fmt.Sprintf("Install verify failed: manifest.image %s is not resolvable after import (retag may have failed). tar RepoTag=%q. Error: %v", imageName, tarRepoTag, verifyErr))
-				return
+			// docker save can bundle several images in one archive, and the
+			// containerd import above brings in every entry under its own
+			// archived tag. A non-primary reference the manifest needs is
+			// therefore satisfied when the archive carries it (its own image
+			// is retagged to the manifest's normalized ref and unpacked —
+			// ImportImage only unpacks the first entry) or when it already
+			// exists on the device. A reference the archive does not carry
+			// used to be retagged from the imported primary image, silently
+			// launching that image for a container whose manifest named
+			// another one; it now fails the install instead.
+			tarTagsByRef := make(map[string]string, len(tarRepoTags)) // normalized ref -> archived tag
+			for _, tag := range tarRepoTags {
+				if n := manifest.NormalizeImageName(tag); n != "" {
+					if _, ok := tarTagsByRef[n]; !ok {
+						tarTagsByRef[n] = tag
+					}
+				}
+			}
+			for _, ref := range imageRefs {
+				if ref == imageName {
+					continue
+				}
+				if _, getErr := s.client.GetImage(ctx, ref); getErr == nil {
+					logger.Info("Install reconcile: image %s already present, left untouched", ref)
+					continue
+				}
+				archivedTag, inArchive := tarTagsByRef[ref]
+				if !inArchive {
+					task.Fail(fmt.Sprintf("Install verify failed: image %s is referenced by the manifest but is neither in the uploaded archive (RepoTags: %v) nor present on the device. Bundle every image the app needs into the archive (docker save <image1> <image2> ... -o app.tar) or pre-install the missing image.", ref, tarRepoTags))
+					return
+				}
+				if archivedTag != ref {
+					if tagErr := s.client.TagImage(ctx, archivedTag, ref); tagErr != nil {
+						task.Fail(fmt.Sprintf("Install verify failed: image %s could not be retagged from its archived tag %s. Error: %v", ref, archivedTag, tagErr))
+						return
+					}
+					logger.Info("Retagged imported image %s -> %s (container image)", archivedTag, ref)
+				}
+				if unErr := s.client.EnsureImageUnpacked(ctx, ref); unErr != nil {
+					task.Fail(fmt.Sprintf("Install verify failed: image %s could not be prepared after import. Error: %v", ref, unErr))
+					return
+				}
+			}
+			for _, ref := range imageRefs {
+				if _, verifyErr := s.client.GetImage(ctx, ref); verifyErr != nil {
+					task.Fail(fmt.Sprintf("Install verify failed: image %s is not resolvable after import. tar RepoTags: %v. Error: %v", ref, tarRepoTags, verifyErr))
+					return
+				}
 			}
 
 			// Save tar file for self-healing recovery after power loss
@@ -815,33 +1079,124 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 			// Clean up uploaded tar file after successful import
 			s.cleanupUploadedTar(imagePath)
 		}
-	} else if s.client != nil && appManifest.GetNormalizedImage() != "" {
-		// No local tar was uploaded. Before proceeding, verify the manifest
-		// image is already resolvable in containerd (e.g. reinstall of an app
-		// whose image was imported previously). If it is not present, fail fast:
-		// an offline device cannot pull it, so StartApp would fail later and the
-		// app would auto-uninstall — leaving the user with no error signal that
-		// the image was never provided.
-		imageName := appManifest.GetNormalizedImage()
-		if _, verifyErr := s.client.GetImage(ctx, imageName); verifyErr != nil {
-			task.Fail(fmt.Sprintf("No image tar was uploaded and manifest.image %q is not present in containerd. An offline device cannot pull it — re-import the app together with its image tar, or ensure the image already exists on the device. Error: %v", imageName, verifyErr))
-			return
+	} else if s.client != nil && len(imageRefs) > 0 {
+		// No local tar was uploaded. Before proceeding, verify every image
+		// reference (spec.image, or one per container) is already resolvable
+		// in containerd (e.g. reinstall of an app whose image was imported
+		// previously). If one is not present, fail fast: an offline device
+		// cannot pull it, so StartApp would fail later and the app would
+		// auto-uninstall — leaving the user with no error signal that the
+		// image was never provided.
+		for _, ref := range imageRefs {
+			if _, verifyErr := s.client.GetImage(ctx, ref); verifyErr != nil {
+				task.Fail(fmt.Sprintf("No image tar was uploaded and image %q is not present in containerd. An offline device cannot pull it — re-import the app together with its image tar, or ensure the image already exists on the device. Error: %v", ref, verifyErr))
+				return
+			}
+			logger.Info("No image tar provided; image %s already present in containerd", ref)
 		}
-		logger.Info("No image tar provided; manifest.image %s already present in containerd", imageName)
 		task.Update("pulling", 80, "Image already present")
 	} else {
 		task.Update("pulling", 80, "No image to pull")
 	}
 
+	var modelTx *bundledModelTransaction
+	committed := false
+	stoppedExisting := false
+	defer func() {
+		if !committed && stoppedExisting && wasRunning {
+			go func() {
+				if st, err := s.StartApp(context.Background(), &proto.StartRequest{AppId: asyncAppID}); err != nil || st == nil || !st.Success {
+					logger.Error("Rollback: failed to restart previous app %s: rpc=%v status=%v", asyncAppID, err, st)
+				}
+			}()
+		}
+	}()
+	if isUpdate || len(resolution.pathPending) > 0 {
+		modelTx, err = s.prepareBundledModelTransaction(ctx, asyncAppID, appManifest, resolution.pathPending, task)
+		if err != nil {
+			task.Fail(fmt.Sprintf("Bundled model preparation failed: %v", err))
+			return
+		}
+	}
+	if isUpdate {
+		stoppedExisting = true
+		if err := s.stopAndCleanupContainer(ctx, asyncAppID); err != nil {
+			if modelTx != nil {
+				modelTx.Rollback(ctx)
+			}
+			task.Fail(fmt.Sprintf("Failed to stop existing app before update: %v", err))
+			return
+		}
+	}
+	if modelTx != nil {
+		if err := modelTx.Publish(ctx); err != nil {
+			modelTx.Rollback(ctx)
+			task.Fail(fmt.Sprintf("Bundled model publish failed: %v", err))
+			return
+		}
+	}
+
+	// From here until commit, restore the old tree/runtime registrations on any
+	// manifest, registry, or instance failure.
+	// until the install is committed, every later failure (manifest storage,
+	// registry save, instance dir) must roll the extracted models back too —
+	// the transient registrations and <root>/app-models/<app_id> live outside
+	// the app registry, and a failed install never runs UninstallApp for
+	// them. A registry entry saved before a later failure is unregistered as
+	// well: an app without its instance dir is half-installed.
+	var registeredApp *registry.AppInfo
+	defer func() {
+		if committed {
+			return
+		}
+		if registeredApp != nil {
+			if isUpdate && oldAppInfo != nil {
+				if upErr := s.registry.Update(oldAppInfo); upErr != nil {
+					logger.Error("Rollback: failed to restore old app registry %s: %v", oldAppInfo.ID, upErr)
+				}
+			} else if unErr := s.registry.Unregister(registeredApp.ID); unErr != nil {
+				logger.Warn("Rollback: failed to unregister app %s: %v", registeredApp.ID, unErr)
+			}
+		}
+		if modelTx != nil {
+			modelTx.Rollback(ctx)
+		}
+	}()
+
+	// Warn when a shadowed bundled copy differs from the platform copy that
+	// won resolution (best-effort, never fails the install).
+	s.checkShadowedModels(ctx, appManifest, resolution.shadowed, task)
+
 	// Phase: registering (80-95%)
 	task.Update("registering", 85, "Registering application...")
+
+	manifestRollback, err := manifestPublishRollback(asyncAppID)
+	if err != nil {
+		task.Fail(fmt.Sprintf("Failed to snapshot manifest: %v", err))
+		return
+	}
+	defer func() {
+		if !committed {
+			manifestRollback()
+		}
+	}()
+
+	// Store the manifest under the managed manifests root before
+	// registering, so cleanup can never target a caller-owned parent
+	// directory (CLI tarball unpack dirs, legacy top-level paths).
+	canonicalPath, err := canonicalizeManifestBytes(manifestData, manifestPath, appManifest.Metadata.ID)
+	if err != nil {
+		task.Fail(fmt.Sprintf("Failed to store manifest: %v", err))
+		return
+	}
+
 	appInfo := &registry.AppInfo{
 		ID:           appManifest.Metadata.ID,
 		Name:         appManifest.Metadata.Name,
 		Version:      appManifest.Metadata.Version,
 		Image:        appManifest.GetNormalizedImage(),
 		State:        registry.AppStateInstalled,
-		ManifestPath: manifestPath,
+		ManifestPath: canonicalPath,
 		InstancePath: fmt.Sprintf("%s/%s", s.config.Apps.InstancesPath, appManifest.Metadata.ID),
 		IsPlugin:     appManifest.IsPlugin(),
 	}
@@ -855,12 +1210,23 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 			})
 		}
 	}
+	if isUpdate && oldAppInfo != nil {
+		appInfo.WebURL = oldAppInfo.WebURL
+		appInfo.RestartCount = oldAppInfo.RestartCount
+		appInfo.InstalledAt = oldAppInfo.InstalledAt
+	}
 
 	task.Update("registering", 90, "Saving app registry...")
-	if err := s.registry.Register(appInfo); err != nil {
-		task.Fail(fmt.Sprintf("Failed to register app: %v", err))
+	if isUpdate {
+		err = s.registry.Update(appInfo)
+	} else {
+		err = s.registry.Register(appInfo)
+	}
+	if err != nil {
+		task.Fail(fmt.Sprintf("Failed to save app registry: %v", err))
 		return
 	}
+	registeredApp = appInfo
 
 	// Create instance directory
 	if err := os.MkdirAll(appInfo.InstancePath, 0755); err != nil {
@@ -873,13 +1239,31 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 		logger.Warn("Failed to register app permissions: %v", err)
 	}
 
+	// The install is committed from here: discard the old bundled tree backup.
+	committed = true
+	if modelTx != nil {
+		modelTx.Commit()
+	}
+
 	// Publish event
-	s.publishAppEvent("installed", appInfo.ID, map[string]interface{}{
+	eventType := "installed"
+	if isUpdate {
+		eventType = "updated"
+	}
+	s.publishAppEvent(eventType, appInfo.ID, map[string]interface{}{
 		"name":    appManifest.Metadata.Name,
 		"version": appManifest.Metadata.Version,
 	})
 
 	logger.Info("Async install complete: %s", appInfo.ID)
+
+	if isUpdate && wasRunning {
+		go func() {
+			if _, err := s.StartApp(context.Background(), &proto.StartRequest{AppId: appInfo.ID}); err != nil {
+				logger.Warn("Failed to auto-restart updated app %s: %v", appInfo.ID, err)
+			}
+		}()
+	}
 
 	// Phase: complete (100%)
 	task.Complete(appInfo.ID)
@@ -888,6 +1272,8 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 // StartApp implements AppManager.StartApp
 func (s *AppManagerServer) StartApp(ctx context.Context, req *proto.StartRequest) (*proto.Status, error) {
 	logger.Info("StartApp called: app_id=%s", req.AppId)
+	unlockApp := s.lockAppMutation(req.AppId)
+	defer unlockApp()
 
 	// Get app info
 	appInfo, err := s.registry.Get(req.AppId)
@@ -964,8 +1350,17 @@ func (s *AppManagerServer) startSingleContainerApp(ctx context.Context, appID st
 	}
 	// Create and start container via containerd
 	if s.runtime != nil {
-		// Preload models before creating container
-		s.PreloadModels(ctx, appID, appManifest)
+		// Preload required models before creating the container. A logical
+		// registration refusal (including an id/path/config collision) must
+		// stop the start — otherwise the app launches against no model or
+		// somebody else's incumbent registration.
+		if err := s.PreloadModels(ctx, appID, appManifest); err != nil {
+			return &proto.Status{
+				Success: false,
+				Message: "Required model preload failed: " + err.Error(),
+				Code:    412,
+			}, nil
+		}
 
 		// Ensure namespace is set in context for containerd operations
 		ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
@@ -1133,8 +1528,17 @@ func (s *AppManagerServer) startMultiContainerApp(ctx context.Context, appID str
 
 	ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
 
-	// Preload models
-	s.PreloadModels(ctx, appID, appManifest)
+	// Preload required models before touching the existing multi-container
+	// instance. A failed restore leaves the currently running instance alone
+	// instead of tearing it down and then discovering the replacement cannot
+	// infer.
+	if err := s.PreloadModels(ctx, appID, appManifest); err != nil {
+		return &proto.Status{
+			Success: false,
+			Message: "Required model preload failed: " + err.Error(),
+			Code:    412,
+		}, nil
+	}
 
 	// Check if there's an existing instance
 	s.multiContainerMutex.Lock()
@@ -1393,6 +1797,8 @@ func (s *AppManagerServer) stopMultiContainerApp(ctx context.Context, appID stri
 
 // UninstallApp implements AppManager.UninstallApp
 func (s *AppManagerServer) UninstallApp(ctx context.Context, req *proto.UninstallRequest) (*proto.Status, error) {
+	unlockApp := s.lockAppMutation(req.AppId)
+	defer unlockApp()
 	// Use background context for namespace and nested calls
 	bgCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -1480,11 +1886,18 @@ func (s *AppManagerServer) UninstallApp(ctx context.Context, req *proto.Uninstal
 		}
 	}
 
-	// Remove uploaded manifest file and its parent directory
+	// Remove the manifest. The app's own directory under the managed
+	// manifests root is removed with it; a manifest registered from
+	// anywhere else (legacy installs at the install-root top level, CLI
+	// installs from unpacked tarballs) gets only the file removed — never
+	// a parent directory the platform does not own.
 	if appInfo.ManifestPath != "" {
-		manifestDir := filepath.Dir(appInfo.ManifestPath)
-		if err := os.RemoveAll(manifestDir); err != nil {
-			logger.Warn("Failed to remove manifest dir %s: %v", manifestDir, err)
+		if manifestDir, ok := managedManifestDir(appInfo.ManifestPath, appInfo.ID); ok {
+			if err := os.RemoveAll(manifestDir); err != nil {
+				logger.Warn("Failed to remove manifest dir %s: %v", manifestDir, err)
+			}
+		} else if err := os.Remove(appInfo.ManifestPath); err != nil && !os.IsNotExist(err) {
+			logger.Warn("Failed to remove manifest file %s: %v", appInfo.ManifestPath, err)
 		}
 	}
 
@@ -2265,21 +2678,17 @@ func (s *AppManagerServer) repairSnapshotsIfNeeded() {
 
 // ─── Model Preloading Logic ───────────────────────────────────────────────────
 
-// ModelMeta contains model metadata from platform.db
-type ModelMeta struct {
-	FilePath  string
-	ModelType string
-	Variant   string
-}
-
-// getModelMeta retrieves model metadata from platform.db
-func (s *AppManagerServer) getModelMeta(modelID string) *ModelMeta {
+// getModelMeta retrieves the full model row from platform.db: the load-time
+// composition needs output_mode/config/threshold/max_detections beyond the
+// three columns this used to select. Columns missing from an older
+// platform-api schema scan as zero values, which the composition degrades
+// gracefully (e.g. ResolveOutputMode("") → platform mode).
+func (s *AppManagerServer) getModelMeta(modelID string) *model.AIModel {
 	if s.db == nil {
 		return nil
 	}
-	var meta ModelMeta
+	var meta model.AIModel
 	result := s.db.Table("ai_models").
-		Select("file_path, model_type, variant").
 		Where("model_id = ?", modelID).
 		Scan(&meta)
 	if result.Error != nil || meta.FilePath == "" {
@@ -2288,90 +2697,761 @@ func (s *AppManagerServer) getModelMeta(modelID string) *ModelMeta {
 	return &meta
 }
 
-// PreloadModels registers the models declared in the manifest with ai-runtime
-func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appManifest *manifest.AppManifest) {
+// modelRef pairs a spec.models entry with its alias; sorted by alias to keep
+// group membership and error/warning order deterministic across Go's
+// randomized map iteration.
+type modelRef struct {
+	alias   string
+	mapping manifest.ModelMapping
+}
+
+// pendingBundledModel is a spec.models entry whose id was not found on the
+// device but which declared a bundled image path: the AMPK package gets
+// extracted from the app image once it is available, unpacked and registered
+// as a transient model.
+type pendingBundledModel struct {
+	alias    string
+	id       string
+	path     string // absolute container path of the .bin package inside the app image
+	required bool
+	request  *inferencepb.ModelRegisterRequest
+}
+
+// shadowedBundledModel is a spec.models entry whose id was found on the
+// platform (runtime or platform.db) even though a bundled image path was
+// also declared: the platform copy wins resolution, so the bundled copy is
+// never used. checkShadowedModels compares both files' hashes to warn when
+// the ignored bundled version differs from the one that will actually run.
+type shadowedBundledModel struct {
+	alias        string
+	id           string
+	path         string // absolute container path inside the app image
+	platformPath string // host path of the platform copy that won resolution
+}
+
+// modelResolution is the outcome of resolving spec.models against the device.
+type modelResolution struct {
+	resolved    []string               // ids satisfied by the platform (runtime or platform.db)
+	pathPending []pendingBundledModel  // id misses with a declared path, to extract from the image
+	shadowed    []shadowedBundledModel // id hits with a declared path: platform copy wins, compare hashes
+}
+
+// resolveModelDependencies resolves spec.models per the resolution chain
+// id → bundled path → report: an id counts as found when ai-runtime has it
+// loaded OR platform.db knows it (PreloadModels registers db models at app
+// start, so a db hit must not fail the install). Id hits that also declared
+// a path are recorded as shadowed — the platform copy wins, and the bundled
+// copy gets a best-effort hash comparison later (checkShadowedModels). Id
+// misses with a declared path become pathPending, extracted by
+// extractImageModels once the image is in containerd. Ids found by neither
+// are reported immediately: missing
+// required models fail the install with one combined error; missing optional
+// ones surface as warnings (task progress message + log). When ai-runtime is
+// unreachable db hits still count as resolved; the rest cannot be verified:
+// required models fail, optional ones warn with the reason. task may be nil
+// (sync InstallApp path). Call before image pull so a missing model with no
+// fallback fails fast. Uses a single ListModels call (no per-id N+1).
+func (s *AppManagerServer) resolveModelDependencies(ctx context.Context, appManifest *manifest.AppManifest, task *InstallTask) (*modelResolution, error) {
+	res := &modelResolution{}
+	if appManifest == nil || len(appManifest.Spec.Models) == 0 {
+		return res, nil
+	}
+
+	aliases := make([]string, 0, len(appManifest.Spec.Models))
+	for alias := range appManifest.Spec.Models {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+	refs := make([]modelRef, 0, len(aliases))
+	byID := make(map[string]int, len(aliases))
+	for _, alias := range aliases {
+		mapping := appManifest.Spec.Models[alias]
+		if i, ok := byID[mapping.ID]; ok {
+			if refs[i].mapping.Path != mapping.Path {
+				return res, fmt.Errorf("model id %q has conflicting bundled paths", mapping.ID)
+			}
+			refs[i].mapping.Required = refs[i].mapping.Required || mapping.Required
+			continue
+		}
+		byID[mapping.ID] = len(refs)
+		refs = append(refs, modelRef{alias: alias, mapping: mapping})
+	}
+
+	// classify sorts each ref into resolved / pathPending / reported-missing.
+	// runtimeUp is false when the loaded set could not be queried, in which
+	// case only platform.db can confirm an id and unconfirmed ones report as
+	// "cannot be verified" rather than flat-out missing.
+	classify := func(runtimeUp bool, loaded map[string]*inferencepb.ModelInfo, unavailable string) error {
+		var requiredErrs, warnings []string
+		for _, ref := range refs {
+			// Membership in the runtime's loaded set is the hit; its
+			// ModelPath (when present) feeds the shadowed-hash comparison.
+			var info *inferencepb.ModelInfo
+			runtimeHit := false
+			if runtimeUp {
+				info, runtimeHit = loaded[ref.mapping.ID]
+			}
+			// But only a durable runtime entry resolves a dependency: this
+			// install must keep working after a reboot and when other apps
+			// come and go. Transient registrations are another app's
+			// bundled models — PreloadModels can neither restore them (no
+			// platform.db row, no bundled fallback for this app) nor keep
+			// them alive (uninstalling the owner removes them) — and
+			// app-owned non-transient entries share that fragility. Such
+			// hits fall through to the platform.db lookup, this app's own
+			// bundled path, or the missing-model report instead of
+			// silently passing validation.
+			if runtimeHit && (info.GetTransient() || !isRuntimeSystemOwner(info.GetOwnerId())) {
+				runtimeHit = false
+			}
+			platformPath := ""
+			if runtimeHit {
+				platformPath = info.ModelPath
+			}
+			if platformPath == "" {
+				if meta := s.getModelMeta(ref.mapping.ID); meta != nil {
+					platformPath = meta.FilePath
+				}
+			}
+			if runtimeHit || platformPath != "" {
+				res.resolved = append(res.resolved, ref.mapping.ID)
+				if ref.mapping.Path != "" && platformPath != "" {
+					res.shadowed = append(res.shadowed, shadowedBundledModel{
+						alias:        ref.alias,
+						id:           ref.mapping.ID,
+						path:         ref.mapping.Path,
+						platformPath: platformPath,
+					})
+				}
+				continue
+			}
+			if ref.mapping.Path != "" {
+				res.pathPending = append(res.pathPending, pendingBundledModel{
+					alias:    ref.alias,
+					id:       ref.mapping.ID,
+					path:     ref.mapping.Path,
+					required: ref.mapping.Required,
+				})
+				continue
+			}
+			entry := fmt.Sprintf("%q (alias %q)", ref.mapping.ID, ref.alias)
+			if runtimeUp {
+				if ref.mapping.Required {
+					requiredErrs = append(requiredErrs, fmt.Sprintf("required model %s is not available on the device and no bundled path is declared", entry))
+				} else {
+					warnings = append(warnings, fmt.Sprintf("optional model %s is not available on the device and no bundled path is declared", entry))
+				}
+			} else {
+				if ref.mapping.Required {
+					requiredErrs = append(requiredErrs, fmt.Sprintf("required model %s cannot be verified (%s)", entry, unavailable))
+				} else {
+					warnings = append(warnings, fmt.Sprintf("optional model %s cannot be verified (%s)", entry, unavailable))
+				}
+			}
+		}
+		return reportModelValidation(requiredErrs, warnings, task)
+	}
+
 	s.aiRuntimeMutex.RLock()
 	client := s.aiRuntimeClient
 	s.aiRuntimeMutex.RUnlock()
 	if client == nil || !s.config.AIRuntime.Enabled {
-		return
+		return res, classify(false, nil, "ai-runtime is not available")
+	}
+	resp, err := client.ListModels(ctx, &inferencepb.Empty{})
+	if err != nil {
+		return res, classify(false, nil, fmt.Sprintf("ai-runtime list models failed: %v", err))
+	}
+	loaded := make(map[string]*inferencepb.ModelInfo, len(resp.Models))
+	for _, m := range resp.Models {
+		loaded[m.ModelId] = m
+	}
+	return res, classify(true, loaded, "")
+}
+
+// isRuntimeSystemOwner reports whether a runtime registration owner denotes
+// the platform itself rather than an app. grpc_service.cpp normalizes
+// ownerless registrations to "<system>" before storing, so both spellings
+// count (tests seed raw gRPC shapes with "").
+func isRuntimeSystemOwner(owner string) bool {
+	return owner == "" || owner == systemOwnerMarker
+}
+
+// systemOwnerMarker mirrors AIRuntimeServiceImpl's owner normalization
+// (platform-api's systemOwnerID); duplicated here so app-manager does not
+// import platform-api internals.
+const systemOwnerMarker = "<system>"
+
+// appModelsDir is where bundled models unpacked from app images live:
+// {RootPath}/app-models/<app_id>/<alias>/ holding the extracted HEF plus its
+// registration.json sidecar (the .bin package itself is deleted after unpack).
+// Reinstalling an app overwrites its directory, making unpacking idempotent.
+func appModelsDir(appID string) string {
+	return filepath.Join(constants.RootPath(), "app-models", appID)
+}
+
+// extractImageModels unpacks path-pending bundled models — AMPK .bin packages
+// declared in spec.models — out of the app image (now present in containerd)
+// and registers them with ai-runtime as transient models: usable by the app,
+// invisible on the model page. Each package is digest-verified, its HEF
+// staged beside a registration.json sidecar (the durable record PreloadModels
+// restores from at every reboot), and registered with the composed variant;
+// the .bin itself is deleted after unpack. Fresh detection registrations get
+// a postprocess smoke test — a profile/HEF mismatch would otherwise surface
+// as per-frame infer failures once the app runs — and a failure rolls that
+// registration back and removes the unpacked files. Called on both install
+// paths after image availability and before the app is registered. A failing
+// required model aborts the install via the returned error; optional failures
+// warn and continue. task may be nil (sync InstallApp path). On failure,
+// models registered by this call are unregistered again so a failed install
+// leaves nothing behind (the app is never registered, so UninstallApp would
+// not run for it).
+func (s *AppManagerServer) extractImageModels(ctx context.Context, appID string, appManifest *manifest.AppManifest, pending []pendingBundledModel, task *InstallTask) error {
+	if len(pending) == 0 {
+		return nil
 	}
 
-	if appManifest == nil || len(appManifest.Spec.Permissions.Inference.Models) == 0 {
-		return
+	// Path safety precedes everything else: the app ID and model aliases
+	// become directory names under the data root, and this runs before
+	// canonicalizeManifest (the install step that rejects unsafe IDs).
+	if err := requireSafePathSegment("app id", appID); err != nil {
+		return err
+	}
+	for _, p := range pending {
+		if err := requireSafePathSegment("model alias", p.alias); err != nil {
+			return err
+		}
 	}
 
-	for _, modelID := range appManifest.Spec.Permissions.Inference.Models {
-		meta := s.getModelMeta(modelID)
-		if meta == nil {
-			logger.Warn("App %s requires model %s, but not found in platform.db", appID, modelID)
+	s.aiRuntimeMutex.RLock()
+	client := s.aiRuntimeClient
+	s.aiRuntimeMutex.RUnlock()
+	extractFn := s.extractModelFile
+	if client == nil || !s.config.AIRuntime.Enabled || extractFn == nil {
+		reason := "ai-runtime is not available"
+		if client != nil && s.config.AIRuntime.Enabled {
+			reason = "containerd is not available"
+		}
+		var requiredErrs, warnings []string
+		for _, p := range pending {
+			if p.required {
+				requiredErrs = append(requiredErrs, fmt.Sprintf("required model %q (alias %q) cannot be extracted (%s)", p.id, p.alias, reason))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("optional model %q (alias %q) cannot be extracted (%s)", p.id, p.alias, reason))
+			}
+		}
+		return reportModelValidationAt("registering", 82, requiredErrs, warnings, task)
+	}
+
+	// Bundled packages are extracted from the primary image (spec.image, or
+	// the main container's image for multi-container apps).
+	imageRefs := appManifest.ImageReferences()
+	imageRef := ""
+	if len(imageRefs) > 0 {
+		imageRef = imageRefs[0]
+	}
+
+	var requiredErrs, warnings []string
+	registered := make([]string, 0, len(pending)) // ids this call registered; rolled back on failure
+	baseDir := appModelsDir(appID)
+	for _, p := range pending {
+		if task != nil {
+			task.Update("registering", 82, fmt.Sprintf("Extracting bundled model %q (alias %q)...", p.id, p.alias))
+		}
+		fail := func(format string, args ...any) {
+			msg := fmt.Sprintf(format, args...)
+			entry := fmt.Sprintf("model %q (alias %q)", p.id, p.alias)
+			if p.required {
+				requiredErrs = append(requiredErrs, fmt.Sprintf("required %s: %s", entry, msg))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("optional %s: %s", entry, msg))
+			}
+		}
+		if imageRef == "" {
+			fail("the app declares no image to extract from")
 			continue
 		}
-
-		_, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-			ModelId:      modelID,
-			ModelPath:    meta.FilePath,
-			OwnerId:      appID,
-			ModelType:    meta.ModelType,
-			ModelVariant: meta.Variant,
+		aliasDir := filepath.Join(baseDir, p.alias)
+		binPath, err := extractFn(ctx, imageRef, p.path, aliasDir)
+		if err != nil {
+			fail("extract %q from image %s failed: %v", p.path, imageRef, err)
+			continue
+		}
+		reg, unpackErr := unpackBundledPackage(binPath, aliasDir, p.id)
+		os.Remove(binPath) // the .bin is transport only; HEF + sidecar remain
+		if unpackErr != nil {
+			fail("unpacking bundled package %s failed: %v", p.path, unpackErr)
+			continue
+		}
+		hefPath := filepath.Join(aliasDir, reg.HEF)
+		regResp, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
+			ModelId:       p.id,
+			ModelPath:     hefPath,
+			OwnerId:       appID,
+			ModelType:     reg.ModelType,
+			ModelVariant:  reg.ModelVariant,
+			Transient:     true,
+			RawOutputOnly: reg.RawOutputOnly,
 		})
 		if err != nil {
-			logger.Warn("Failed to preload model %s for app %s: %v", modelID, appID, err)
-		} else {
-			logger.Info("Preloaded model %s (path: %s, type: %s) for app %s", modelID, meta.FilePath, meta.ModelType, appID)
+			fail("registering unpacked model at %s failed: %v", hefPath, err)
+			continue
+		}
+		if regResp.Status != nil && !regResp.Status.Success {
+			fail("registering unpacked model at %s failed: %s", hefPath, regResp.Status.Message)
+			continue
+		}
+		if reg.ModelType == "detection" {
+			if smokeErr := s.probeFreshRegistration(ctx, client, appID, p.id); smokeErr != nil {
+				fail("postprocess smoke test failed (%v); registration rolled back", smokeErr)
+				// The registration is gone; drop the unpacked files too so a
+				// later PreloadModels cannot resurrect a known-broken model.
+				if rmErr := os.RemoveAll(aliasDir); rmErr != nil {
+					logger.Warn("Failed to remove unpacked files for failed model %s: %v", p.id, rmErr)
+				}
+				continue
+			}
+		}
+		registered = append(registered, p.id)
+		logger.Info("Unpacked and registered bundled model %q (alias %q) from %s%s for app %s (transient)",
+			p.id, p.alias, imageRef, p.path, appID)
+	}
+
+	err := reportModelValidationAt("registering", 82, requiredErrs, warnings, task)
+	if err != nil {
+		s.rollbackBundledModels(ctx, appID, registered)
+	}
+	return err
+}
+
+// rollbackBundledModels undoes a (possibly partial) extractImageModels run:
+// transient registrations are released and the unpack dir is removed, so a
+// failed install leaves nothing behind (the app is never registered on this
+// path, so UninstallApp would not run for it). The dir removal runs even
+// with no registrations to release — extracted files can outlive a
+// registration that already rolled itself back. Best-effort and idempotent:
+// unregistering with OwnerId set only releases this app's ownership (a
+// never-owned id is a no-op at the runtime), and RemoveAll on a missing
+// directory succeeds.
+func (s *AppManagerServer) rollbackBundledModels(ctx context.Context, appID string, modelIDs []string) {
+	s.aiRuntimeMutex.RLock()
+	client := s.aiRuntimeClient
+	s.aiRuntimeMutex.RUnlock()
+	if client != nil {
+		for _, id := range modelIDs {
+			if _, unErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: id, OwnerId: appID}); unErr != nil {
+				logger.Warn("Rollback: failed to unregister model %s for app %s: %v", id, appID, unErr)
+			}
+		}
+	}
+	if rmErr := os.RemoveAll(appModelsDir(appID)); rmErr != nil {
+		logger.Warn("Rollback: failed to remove %s: %v", appModelsDir(appID), rmErr)
+	}
+}
+
+// reportModelValidation turns collected per-model errors/warnings into the
+// install result: warnings always log and, when a task is attached, replace
+// its progress message; errors combine into a single returned error. Progress
+// stays in the validating phase (see reportModelValidationAt for other
+// phases).
+func reportModelValidation(requiredErrs, warnings []string, task *InstallTask) error {
+	return reportModelValidationAt("validating", 5, requiredErrs, warnings, task)
+}
+
+// reportModelValidationAt is reportModelValidation for install stages past
+// validation (e.g. bundled-model extraction reports at registering/82 so the
+// task never moves backwards).
+func reportModelValidationAt(phase string, pct float64, requiredErrs, warnings []string, task *InstallTask) error {
+	if len(warnings) > 0 {
+		msg := "Warning: " + strings.Join(warnings, "; ")
+		logger.Warn("%s", msg)
+		if task != nil {
+			task.Update(phase, pct, msg)
+		}
+	}
+	if len(requiredErrs) > 0 {
+		return fmt.Errorf("%s", strings.Join(requiredErrs, "; "))
+	}
+	return nil
+}
+
+// fileSHA256 streams a file through sha256 and returns the hex digest.
+// Always computed fresh from disk, never read back from a db hash column —
+// a stale stored hash would silently bless a mismatched pair.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// checkShadowedModels hardens the shadowing case: spec.models entries whose
+// id resolved from the platform while the image also bundles a copy. The
+// platform copy wins resolution, so a differing bundled version is silently
+// ignored — hash the platform file against the bundled package's inner HEF
+// and warn "平台已有同 id 模型，镜像内版本被忽略" on mismatch so the operator
+// knows the app is not running its bundled version. Purely informational:
+// any failure to read or hash either side (platform file gone, package absent
+// from the image, digest mismatch, containerd unavailable) skips that entry
+// via a debug log instead of failing the install. The extracted .bin lands
+// in a temp dir that is always removed — nothing is registered and nothing
+// persists under app-models. Runs on both install paths after the image is
+// in containerd; task may be nil (sync path).
+func (s *AppManagerServer) checkShadowedModels(ctx context.Context, appManifest *manifest.AppManifest, shadowed []shadowedBundledModel, task *InstallTask) {
+	if len(shadowed) == 0 || appManifest == nil {
+		return
+	}
+	extractFn := s.extractModelFile
+	if extractFn == nil {
+		logger.Debug("Skipping shadowed-model hash comparison for %d entries (containerd extraction unavailable)", len(shadowed))
+		return
+	}
+	imageRefs := appManifest.ImageReferences()
+	if len(imageRefs) == 0 {
+		return
+	}
+	imageRef := imageRefs[0]
+
+	var warnings []string
+	for _, m := range shadowed {
+		platformHash, err := fileSHA256(m.platformPath)
+		if err != nil {
+			logger.Debug("Shadowed model %q (alias %q): platform copy %s unreadable (%v), skipping hash comparison", m.id, m.alias, m.platformPath, err)
+			continue
+		}
+		tmpDir, err := os.MkdirTemp("", "aipc-shadowed-")
+		if err != nil {
+			logger.Debug("Shadowed model %q (alias %q): temp dir unavailable (%v), skipping hash comparison", m.id, m.alias, err)
+			continue
+		}
+		extractedPath, err := extractFn(ctx, imageRef, m.path, tmpDir)
+		if err != nil {
+			os.RemoveAll(tmpDir)
+			logger.Debug("Shadowed model %q (alias %q): bundled copy at %s unreadable (%v), skipping hash comparison", m.id, m.alias, m.path, err)
+			continue
+		}
+		// The bundled copy is an AMPK .bin: hash the inner HEF (digest-verified
+		// while streaming) so it compares against the platform's HEF hash — the
+		// package container itself would never match.
+		imageHash, hashErr := bundledPackageHEFHash(extractedPath)
+		os.RemoveAll(tmpDir)
+		if hashErr != nil {
+			logger.Debug("Shadowed model %q (alias %q): bundled package %s unreadable (%v), skipping hash comparison", m.id, m.alias, extractedPath, hashErr)
+			continue
+		}
+		if imageHash == platformHash {
+			logger.Info("Shadowed model %q (alias %q): bundled copy matches the platform copy at %s", m.id, m.alias, m.platformPath)
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"model %q (alias %q): 平台已有同 id 模型，镜像内版本被忽略 (bundled copy at %s differs from platform copy at %s)",
+			m.id, m.alias, m.path, m.platformPath))
+	}
+	if len(warnings) > 0 {
+		msg := "Warning: " + strings.Join(warnings, "; ")
+		logger.Warn("%s", msg)
+		if task != nil {
+			task.Update("registering", 82, msg)
 		}
 	}
 }
 
-// UnloadModels unregisters the models for this app_id
-func (s *AppManagerServer) UnloadModels(ctx context.Context, appID string, manifestPath string) {
+// PreloadModels registers the models the app depends on with ai-runtime:
+// platform models from platform.db, and bundled models from the HEF +
+// registration.json sidecar unpacked from the app image's AMPK .bin packages
+// at install time (restored e.g. after a device reboot, where the runtime
+// lost the registration but the unpacked files survived). Registering an
+// already-loaded model adds co-ownership, so repeated starts are safe.
+func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appManifest *manifest.AppManifest) error {
 	s.aiRuntimeMutex.RLock()
 	client := s.aiRuntimeClient
 	s.aiRuntimeMutex.RUnlock()
 	if client == nil || !s.config.AIRuntime.Enabled {
-		return
+		return nil
 	}
 
-	// Unload models declared in manifest
-	if manifestPath != "" {
-		appManifest, err := manifest.LoadManifest(manifestPath)
-		if err == nil && appManifest != nil {
-			for _, modelID := range appManifest.Spec.Permissions.Inference.Models {
-				_, err := client.UnregisterModel(ctx, &inferencepb.ModelInfo{
-					ModelId: modelID,
-					OwnerId: appID,
-				})
-				if err != nil {
-					logger.Warn("Failed to unload model %s for app %s: %v", modelID, appID, err)
-				} else {
-					logger.Info("Unloaded model %s for app %s", modelID, appID)
+	if appManifest == nil || len(appManifest.Spec.Permissions.Inference.Models) == 0 {
+		return nil
+	}
+
+	// Legacy permissions.inference.models entries have no optional bit and
+	// are therefore required. spec.models entries carry Required explicitly;
+	// optional restore failures remain warnings, while a required model must
+	// veto StartApp rather than launch a container that cannot infer.
+	requiredByID := make(map[string]bool, len(appManifest.Spec.Models))
+	for _, mapping := range appManifest.Spec.Models {
+		requiredByID[mapping.ID] = requiredByID[mapping.ID] || mapping.Required
+	}
+	var requiredErrs []string
+	recordFailure := func(modelID, message string) {
+		required, declared := requiredByID[modelID]
+		if !declared || required {
+			requiredErrs = append(requiredErrs, message)
+			logger.Error("%s", message)
+		} else {
+			logger.Warn("Optional %s", message)
+		}
+	}
+
+	// Bundled (path-declared) mappings by model id, for the platform.db-miss
+	// fallback: the alias locates the unpack dir whose registration.json sidecar
+	// holds the composed registration from install time (the .bin was deleted
+	// after unpack, so the type/variant cannot be re-derived). First alias per
+	// id wins; spec.models is tiny so determinism only matters for logging.
+	bundled := make(map[string]string, len(appManifest.Spec.Models))
+	aliases := make([]string, 0, len(appManifest.Spec.Models))
+	for alias := range appManifest.Spec.Models {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+	for _, alias := range aliases {
+		mapping := appManifest.Spec.Models[alias]
+		if mapping.Path == "" {
+			continue
+		}
+		if _, exists := bundled[mapping.ID]; !exists {
+			bundled[mapping.ID] = alias
+		}
+	}
+
+	// The runtime's current registrations: a model someone else already
+	// loaded only gains this app as a co-owner here (path and variant stay
+	// as registered), so preexisting entries are neither probed nor rolled
+	// back — only registrations this preload actually creates are ours to
+	// verify.
+	preexisting := make(map[string]bool)
+	if resp, err := client.ListModels(ctx, &inferencepb.Empty{}); err != nil {
+		logger.Warn("Failed to list runtime models before preloading for app %s: %v", appID, err)
+	} else {
+		for _, m := range resp.Models {
+			preexisting[m.ModelId] = true
+		}
+	}
+
+	seenModelIDs := make(map[string]bool, len(appManifest.Spec.Permissions.Inference.Models))
+	for _, modelID := range appManifest.Spec.Permissions.Inference.Models {
+		if seenModelIDs[modelID] {
+			continue
+		}
+		seenModelIDs[modelID] = true
+		if meta := s.getModelMeta(modelID); meta != nil {
+			if err := s.preloadPlatformModel(ctx, client, appID, modelID, meta, !preexisting[modelID]); err != nil {
+				recordFailure(modelID, fmt.Sprintf("failed to preload model %s for app %s: %v", modelID, appID, err))
+			}
+			continue
+		}
+		if alias, ok := bundled[modelID]; ok {
+			aliasDir := filepath.Join(appModelsDir(appID), alias)
+			reg, regErr := loadBundledRegistration(aliasDir)
+			if regErr != nil {
+				recordFailure(modelID, fmt.Sprintf("app %s declares bundled model %s (alias %q), but its unpack record is unreadable (reinstall the app): %v",
+					appID, modelID, alias, regErr))
+				continue
+			}
+			hefPath := filepath.Join(aliasDir, reg.HEF)
+			if _, statErr := os.Stat(hefPath); statErr != nil {
+				recordFailure(modelID, fmt.Sprintf("app %s declares bundled model %s, but the unpacked file %s is missing (reinstall the app): %v",
+					appID, modelID, hefPath, statErr))
+				continue
+			}
+			regResp, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
+				ModelId:       modelID,
+				ModelPath:     hefPath,
+				OwnerId:       appID,
+				ModelType:     reg.ModelType,
+				ModelVariant:  reg.ModelVariant,
+				Transient:     true,
+				RawOutputOnly: reg.RawOutputOnly,
+			})
+			if err != nil {
+				recordFailure(modelID, fmt.Sprintf("failed to restore bundled model %s for app %s: %v", modelID, appID, err))
+				continue
+			}
+			// Same refusal shape as preloadPlatformModel: a collision with
+			// another registration under this id (different path or variant)
+			// or a postprocess init failure answers success=false over an OK
+			// transport status. Logging "restored" and probing anyway would
+			// start the container against somebody else's weights.
+			if regResp != nil && regResp.Status != nil && !regResp.Status.Success {
+				recordFailure(modelID, fmt.Sprintf("restore of bundled model %s for app %s was refused: %s (another registration under this id wins; stop the owning app or reinstall with a unique model id)",
+					modelID, appID, regResp.Status.Message))
+				continue
+			}
+			logger.Info("Restored bundled model %s (path: %s, type: %s) for app %s (transient)", modelID, hefPath, reg.ModelType, appID)
+			// Fresh detection restore gets the same install-time smoke test:
+			// the HEF and sidecar are kept either way (the next start retries;
+			// only reinstall rewrites them), but a known-broken registration
+			// is not left behind for the app to infer against.
+			if !preexisting[modelID] && reg.ModelType == "detection" {
+				if err := s.probeFreshRegistration(ctx, client, appID, modelID); err != nil {
+					recordFailure(modelID, fmt.Sprintf("restored bundled model %s for app %s failed its postprocess smoke test: %v", modelID, appID, err))
+				}
+			}
+			continue
+		}
+		recordFailure(modelID, fmt.Sprintf("app %s requires model %s, but it is neither in platform.db nor bundled in the app image", appID, modelID))
+	}
+	if len(requiredErrs) > 0 {
+		return fmt.Errorf("%s", strings.Join(requiredErrs, "; "))
+	}
+	return nil
+}
+
+// preloadPlatformModel registers a platform.db model with ai-runtime through
+// the shared load-time composition, so a preloaded model behaves exactly like
+// one loaded via platform-api: detection models are materialized under a
+// plugin-recognized basename with a full-key variant blob, raw-output models
+// skip the postprocess session entirely. A freshly registered detection
+// model gets a load smoke test — a postprocess mismatch would otherwise
+// surface only as per-frame infer failures once the app is running — and the
+// registration is rolled back on failure with an Error log, since the app
+// cannot work without this model either way.
+func (s *AppManagerServer) preloadPlatformModel(ctx context.Context, client inferencepb.InferenceServiceClient, appID, modelID string, meta *model.AIModel, fresh bool) error {
+	path, variant, grpcType, err := modelload.RuntimeRegistration(meta)
+	if err != nil {
+		return fmt.Errorf("compose runtime registration: %w", err)
+	}
+	regResp, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
+		ModelId:      modelID,
+		ModelPath:    path,
+		OwnerId:      appID,
+		ModelType:    grpcType,
+		ModelVariant: variant,
+	})
+	if err != nil {
+		return fmt.Errorf("register with ai-runtime: %w", err)
+	}
+	// The runtime reports logical refusals as OK transport status with
+	// success=false — e.g. the same id registered from a different path
+	// (another app's bundled model won the race), or this variant conflicts
+	// with the incumbent. Treating that as restored would start the app's
+	// container against a registration that is not this model.
+	if regResp != nil && regResp.Status != nil && !regResp.Status.Success {
+		return fmt.Errorf("runtime refused registration: %s", regResp.Status.Message)
+	}
+	logger.Info("Preloaded model %s (path: %s, type: %s) for app %s", modelID, path, grpcType, appID)
+
+	if !fresh || model.ResolveModelType(meta.ModelType) != "detection" {
+		return nil
+	}
+	// The stored file stays (the platform row owns it); only this freshly
+	// created registration is rolled back on failure.
+	return s.probeFreshRegistration(ctx, client, appID, modelID)
+}
+
+// probeFreshRegistration smoke-tests a registration this app just created and
+// rolls it back on failure. A detection model whose postprocess profile does
+// not match its HEF registers fine but then fails every infer; probing one
+// frame right after RegisterModel catches the mismatch while the caller can
+// still undo the registration. Missing tensor info skips the probe (that is
+// RunLoadSmokeTest's contract). The smoke failure is returned so install-path
+// callers can route it into the install result; preload-path callers just
+// take the rollback and its Error log.
+func (s *AppManagerServer) probeFreshRegistration(ctx context.Context, client inferencepb.InferenceServiceClient, appID, modelID string) error {
+	info, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: modelID})
+	if infoErr != nil {
+		info = nil // no tensor info: RunLoadSmokeTest skips the probe
+	}
+	if smokeErr := modelload.RunLoadSmokeTest(ctx, client, modelID, info); smokeErr != nil {
+		logger.Error("Load smoke test failed for freshly registered model %s (app %s); rolling back registration: %v", modelID, appID, smokeErr)
+		if _, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID, OwnerId: appID}); unregErr != nil {
+			logger.Error("Failed to roll back registration of model %s for app %s: %v", modelID, appID, unregErr)
+		}
+		return smokeErr
+	}
+	return nil
+}
+
+// unregisterAppModel unregisters one model and reports whether the runtime
+// confirmed it gone. Transport errors and OK-with-success=false statuses
+// both count as "not confirmed" — success=false is how ai-runtime refuses
+// (e.g. while sessions are still in use).
+func (s *AppManagerServer) unregisterAppModel(ctx context.Context, client inferencepb.InferenceServiceClient, appID, modelID string) bool {
+	resp, err := client.UnregisterModel(ctx, &inferencepb.ModelInfo{
+		ModelId: modelID,
+		OwnerId: appID,
+	})
+	if err != nil {
+		logger.Warn("Failed to unload model %s for app %s: %v", modelID, appID, err)
+		return false
+	}
+	if !resp.GetSuccess() {
+		logger.Warn("Runtime refused to unload model %s for app %s: %s", modelID, appID, resp.GetMessage())
+		return false
+	}
+	logger.Info("Unloaded model %s for app %s", modelID, appID)
+	return true
+}
+
+// UnloadModels unregisters the models for this app_id and removes the model
+// files extracted from its image
+func (s *AppManagerServer) UnloadModels(ctx context.Context, appID string, manifestPath string) {
+	s.aiRuntimeMutex.RLock()
+	client := s.aiRuntimeClient
+	s.aiRuntimeMutex.RUnlock()
+	runtimeEnabled := client != nil && s.config.AIRuntime.Enabled
+
+	// Unregister first; the file removal at the end is gated on the outcome.
+	// A refused unregister leaves a live transient registration that still
+	// needs its HEF — deleting the files would orphan it with no retry path.
+	// When the runtime is unreachable there is no live registration
+	// (registrations die with the process), so the files can still go.
+	unregisterHiccup := false
+	if runtimeEnabled {
+		// Unload models declared in manifest
+		if manifestPath != "" {
+			appManifest, err := manifest.LoadManifest(manifestPath)
+			if err == nil && appManifest != nil {
+				for _, modelID := range appManifest.Spec.Permissions.Inference.Models {
+					if !s.unregisterAppModel(ctx, client, appID, modelID) {
+						unregisterHiccup = true
+					}
 				}
 			}
 		}
-	}
 
-	// Unload dynamically registered models by querying AI Runtime
-	resp, err := client.ListModels(ctx, &inferencepb.Empty{})
-	if err != nil {
-		logger.Warn("Failed to list models for app %s cleanup: %v", appID, err)
-		return
-	}
-	unloaded := 0
-	for _, m := range resp.Models {
-		if m.OwnerId == appID {
-			_, err := client.UnregisterModel(ctx, &inferencepb.ModelInfo{
-				ModelId: m.ModelId,
-				OwnerId: appID,
-			})
-			if err != nil {
-				logger.Warn("Failed to unload dynamic model %s for app %s: %v", m.ModelId, appID, err)
-			} else {
-				unloaded++
+		// Unload dynamically registered models by querying AI Runtime
+		resp, err := client.ListModels(ctx, &inferencepb.Empty{})
+		if err != nil {
+			logger.Warn("Failed to list models for app %s cleanup: %v", appID, err)
+			// Live registrations are unknown, not absent — keep the files.
+			unregisterHiccup = true
+		} else {
+			unloaded := 0
+			for _, m := range resp.Models {
+				if m.OwnerId == appID {
+					if s.unregisterAppModel(ctx, client, appID, m.ModelId) {
+						unloaded++
+					} else {
+						unregisterHiccup = true
+					}
+				}
+			}
+			if unloaded > 0 {
+				logger.Info("Unloaded %d dynamic models for app %s", unloaded, appID)
 			}
 		}
 	}
-	if unloaded > 0 {
-		logger.Info("Unloaded %d dynamic models for app %s", unloaded, appID)
+
+	// Remove bundled model files extracted at install time. UninstallApp is
+	// the only caller and reinstall recreates the directory, so this is safe
+	// and idempotent. Kept (with a warning) when an unregister above failed:
+	// a live registration may still reference them.
+	if err := requireSafePathSegment("app id", appID); err != nil {
+		// Install rejects unsafe IDs long before any files exist, so there is
+		// nothing to remove — and RemoveAll on the derived path could act far
+		// outside this app's own tree.
+		logger.Warn("Skipping extracted-model cleanup for app %s: %v", appID, err)
+	} else if unregisterHiccup {
+		logger.Warn("Keeping extracted model files for app %s: an unregister was not confirmed — a live registration may still need them; retry the uninstall", appID)
+	} else if err := os.RemoveAll(appModelsDir(appID)); err != nil {
+		logger.Warn("Failed to remove extracted model files for app %s: %v", appID, err)
 	}
 }
 

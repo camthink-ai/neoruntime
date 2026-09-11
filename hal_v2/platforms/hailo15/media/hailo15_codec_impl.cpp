@@ -13,14 +13,23 @@
 #include "media/hal_codec_internal.h"
 #include "media/hal_media.h"
 
+#include <hailo/media_library/config_manager.hpp>
+#include <hailo/media_library/dma_memory_allocator.hpp>
 #include <hailo/media_library/encoder.hpp>
 #include <hailo/media_library/files_utils.hpp>
 
+#include "hailo15_default_medialib.hpp"
+
+#include <dlfcn.h>
+
+#include <atomic>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -52,6 +61,11 @@ struct Hailo15HwCodecPriv
     HalCodecConfig effective_config{};
     HalCodecRoiConfig roi_config{};
     bool started{false};
+    /* Fed-vs-delivered accounting: a fed frame that never produced a packet
+     * is the observable signature of a pipeline bus error — and a bus error
+     * leaves the vendor encoder un-joinable (see hw_codec_deinit). */
+    std::atomic<uint64_t> frames_in{0};
+    std::atomic<uint64_t> frames_out{0};
 };
 
 static Hailo15HwCodecPriv *hw_priv(HalCodecContext *cc)
@@ -63,6 +77,268 @@ static Hailo15HwCodecPriv *hw_priv(HalCodecContext *cc)
     return static_cast<Hailo15HwCodecPriv *>(cc->priv);
 }
 
+/*
+ * Process-lifetime graveyard for errored encoders. Destroying a
+ * MediaLibraryEncoder whose GStreamer bus already quit the internal main
+ * loop runs the vendor's early-return stop() and then destroys a still
+ * joinable std::thread -> std::terminate. Park such instances here
+ * instead: the shared_ptr refcount stays alive, the leak is bounded (one
+ * per failed context) and identifiable in a core dump.
+ */
+static std::mutex g_errored_encoders_mu;
+static std::vector<MediaLibraryEncoderPtr> g_errored_encoders;
+
+static HailoFormat hal_format_to_hailo(HalPixelFormat f)
+{
+    switch (f)
+    {
+        case HAL_PIX_FMT_GRAY8:
+            return HAILO_FORMAT_GRAY8;
+        case HAL_PIX_FMT_RGB24:
+        case HAL_PIX_FMT_BGR24:
+            return HAILO_FORMAT_RGB;
+        case HAL_PIX_FMT_ARGB32:
+        case HAL_PIX_FMT_RGBA32:
+            return HAILO_FORMAT_ARGB;
+        default:
+            return HAILO_FORMAT_NV12;
+    }
+}
+
+static size_t hailo_plane_rows(HailoFormat fmt, size_t height, uint32_t plane)
+{
+    switch (fmt)
+    {
+        case HAILO_FORMAT_NV12:
+        case HAILO_FORMAT_A420:
+            return (plane == 0U) ? height : (height / 2U);
+        default:
+            return height;
+    }
+}
+
+/*
+ * Wrap a standalone (non-pipeline) dma-buf HalFrameBuffer into a
+ * MediaLibrary buffer so hw_codec_input_frame can feed the encoder.
+ * Plane mappings live in DmaMemoryAllocator's external-buffer table;
+ * the buffer's release path (owner == nullptr) unmaps them once the
+ * last reference — held by the GstBuffer the encoder builds — drops.
+ */
+static HailoMediaLibraryBufferPtr hailo15_wrap_dmabuf_frame(const HalFrameBuffer *frame)
+{
+    if (!frame || frame->mem_type != HAL_MEM_DMABUF || frame->num_planes == 0U ||
+        frame->num_planes > HAL_MAX_PLANES || frame->width == 0U || frame->height == 0U)
+    {
+        return nullptr;
+    }
+
+    auto &allocator = DmaMemoryAllocator::get_instance();
+    const HailoFormat fmt = hal_format_to_hailo(frame->format);
+    std::vector<hailo_data_plane_t> planes;
+    std::vector<void *> mapped;
+
+    for (uint32_t i = 0; i < frame->num_planes; i++)
+    {
+        if (frame->dma_fds[i] < 0 || frame->sizes[i] == 0U)
+        {
+            break;
+        }
+        void *userptr = nullptr;
+        if (allocator.map_external_dma_buffer(frame->sizes[i], static_cast<uint>(frame->dma_fds[i]), &userptr) !=
+            MEDIA_LIBRARY_SUCCESS)
+        {
+            break;
+        }
+        mapped.push_back(userptr);
+        const size_t rows = hailo_plane_rows(fmt, frame->height, i);
+        hailo_data_plane_t p{};
+        p.userptr = userptr;
+        p.fd = frame->dma_fds[i];
+        p.bytesperline = frame->strides[i];
+        /* Payload bytes: stride × rows when the stride is known, else the
+         * imported plane size. */
+        p.bytesused = frame->strides[i] ? (frame->strides[i] * rows) : frame->sizes[i];
+        planes.push_back(p);
+    }
+
+    if (planes.size() != frame->num_planes)
+    {
+        for (void *ptr : mapped)
+        {
+            (void)allocator.unmap_external_dma_buffer(ptr);
+        }
+        return nullptr;
+    }
+
+    auto bd = std::make_shared<hailo_buffer_data_t>(frame->width, frame->height, frame->num_planes, fmt,
+                                                    HAILO_MEMORY_TYPE_DMABUF, planes);
+    auto buf = std::make_shared<hailo_media_library_buffer>();
+    if (buf->create(nullptr, bd) != MEDIA_LIBRARY_SUCCESS)
+    {
+        return nullptr;
+    }
+    return buf;
+}
+
+/*
+ * Standalone encoders (no frontend pipeline) build with add_config_attacher=true.
+ * With no gst-mode interactor published, encodebin flags the attacher as owner and
+ * it registers a dummy-profile interactor — but dummy profiles are hardcoded to
+ * SENSOR_0 (from_frontend_config never maps the frontend sensor_index), which
+ * collides with the main pipeline's interactor: validate_sensor_index_uniqueness
+ * rejects the registration and parse_launch fails.
+ *
+ * Publish a full-json interactor instead: clone the compiled-in default profile
+ * with its sensor_config patched to SENSOR_1, register it via create() (passes the
+ * uniqueness check beside the main SENSOR_0 interactor), and store it in the
+ * plugin's gst_mode_config_manager_interactor slot — the same global encodebin
+ * consults (and frontendbinsrc sets when the GStreamer API owns the frontend).
+ * First call per process wins; the interactor is intentionally never freed, since
+ * the slot must outlive the encoder and the plugin nulls it only when the
+ * attacher itself owns the interactor (not the case here).
+ */
+/*
+ * The medialib GStreamer plugin keeps gst_mode_config_manager_interactor in its own
+ * BSS and GStreamer loads plugins RTLD_LOCAL, so the symbol is absent from the
+ * global lookup scope — dlsym(RTLD_DEFAULT) cannot see it. Locate the already-loaded
+ * plugin through /proc/self/maps and dlopen() the same path with RTLD_NOLOAD (returns
+ * the existing object without loading a second copy); dlsym() on that handle yields
+ * the same memory the plugin's encodebin/config-attacher bind to internally.
+ */
+static ConfigManagerInteractor **find_gst_mode_interactor_slot()
+{
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line))
+    {
+        const auto slash = line.rfind('/');
+        if (slash == std::string::npos)
+        {
+            continue;
+        }
+        if (line.substr(slash + 1) != "libgstmedialib.so")
+        {
+            continue;
+        }
+        void *handle = dlopen(line.substr(line.find('/')).c_str(), RTLD_NOW | RTLD_NOLOAD | RTLD_LOCAL);
+        if (handle == nullptr)
+        {
+            continue;
+        }
+        return static_cast<ConfigManagerInteractor **>(dlsym(handle, "gst_mode_config_manager_interactor"));
+    }
+    return nullptr;
+}
+
+static bool ensure_standalone_encoder_interactor(std::string *err_out)
+{
+    auto fail = [&](const std::string &msg) {
+        HAL_LOG_ERROR("hailo15_codec: standalone encoder interactor: %s", msg.c_str());
+        if (err_out != nullptr)
+        {
+            *err_out = msg;
+        }
+        return false;
+    };
+
+    ConfigManagerInteractor **slot = find_gst_mode_interactor_slot();
+    if (slot == nullptr)
+    {
+        return fail("gst_mode_config_manager_interactor not found (medialib plugin not loaded)");
+    }
+    if (*slot != nullptr)
+    {
+        return true;
+    }
+
+    /* Source profile: the compiled-in default container's default profile — the
+     * same Daylight-class config the main pipeline uses when the daemon starts
+     * without a persisted config (EIS/HDR/denoise off, so the second instance
+     * passes validate_multi_instance_restrictions too). */
+    std::string container_str;
+    std::string merr;
+    if (!hailo15::materialize_default_medialib_config(container_str, &merr))
+    {
+        return fail("default medialib unavailable: " + merr);
+    }
+    auto container = nlohmann::json::parse(container_str, nullptr, false);
+    if (container.is_discarded() || !container.contains("profiles") || !container["profiles"].is_array())
+    {
+        return fail("failed to parse default medialib container json");
+    }
+    const std::string default_name = container.value("default_profile", "");
+    std::string profile_path;
+    for (const auto &entry : container["profiles"])
+    {
+        if (entry.value("name", "") == default_name)
+        {
+            profile_path = entry.value("config_file", "");
+            break;
+        }
+    }
+    if (profile_path.empty())
+    {
+        return fail("default profile entry not found in container");
+    }
+
+    auto profile_src = files_utils::read_string_from_file(profile_path);
+    if (!profile_src.has_value())
+    {
+        return fail("failed to read profile " + profile_path);
+    }
+    auto profile = nlohmann::json::parse(profile_src.value(), nullptr, false);
+    if (profile.is_discarded() || profile.value("sensor_config", "").empty())
+    {
+        return fail("failed to parse profile " + profile_path);
+    }
+    const std::string sensor_path = profile.value("sensor_config", "");
+
+    auto sensor_src = files_utils::read_string_from_file(sensor_path);
+    if (!sensor_src.has_value())
+    {
+        return fail("failed to read sensor config " + sensor_path);
+    }
+    auto sensor = nlohmann::json::parse(sensor_src.value(), nullptr, false);
+    if (sensor.is_discarded() || !sensor.contains("input_video"))
+    {
+        return fail("failed to parse sensor config " + sensor_path);
+    }
+
+    /* Patched copies under a private scratch dir. Only sensor_id changes; the
+     * profile's other section refs keep pointing into the shared default bundle
+     * (re-extracted on every daemon start). */
+    const std::string scratch = "/var/tmp/hal_standalone_encoder";
+    sensor["input_video"]["sensor_id"] = "SENSOR_1";
+    const std::string patched_sensor_path = scratch + "/sensor_config.json";
+    const std::string patched_profile_path = scratch + "/standalone_profile.json";
+    if (files_utils::write_string_to_file_atomic(patched_sensor_path, sensor.dump()) != MEDIA_LIBRARY_SUCCESS)
+    {
+        return fail("failed to write " + patched_sensor_path);
+    }
+    profile["sensor_config"] = patched_sensor_path;
+    if (files_utils::write_string_to_file_atomic(patched_profile_path, profile.dump()) != MEDIA_LIBRARY_SUCCESS)
+    {
+        return fail("failed to write " + patched_profile_path);
+    }
+
+    auto crafted = nlohmann::json{
+        {"version", container.value("version", "2.0.0")},
+        {"metadata", container.value("metadata", nlohmann::json::object())},
+        {"backup_folder_path", scratch + "/backup"},
+        {"default_profile", "HAL_STANDALONE"},
+        {"profiles", nlohmann::json::array({{{"name", "HAL_STANDALONE"}, {"config_file", patched_profile_path}}})},
+    };
+    auto interactor_exp = ConfigManagerInteractor::create(crafted.dump());
+    if (!interactor_exp.has_value())
+    {
+        return fail("ConfigManagerInteractor::create failed (" +
+                    std::to_string(static_cast<int>(interactor_exp.error())) + ")");
+    }
+    *slot = interactor_exp.value().release();
+    HAL_LOG_INFO("hailo15_codec: standalone encoder interactor registered (profile HAL_STANDALONE, sensor 1)");
+    return true;
+}
+
 static int hw_codec_init(const HalCodecConfig *config, void **codec_ctx_return)
 {
     const Hailo15HalCodecPrivExt *ext = static_cast<const Hailo15HalCodecPrivExt *>(config->priv);
@@ -72,6 +348,12 @@ static int hw_codec_init(const HalCodecConfig *config, void **codec_ctx_return)
     if (rr != HAL_OK)
     {
         return rr;
+    }
+    std::string interactor_err;
+    if (!ensure_standalone_encoder_interactor(&interactor_err))
+    {
+        HAL_LOG_ERROR("hailo15_codec: cannot init standalone encoder: %s", interactor_err.c_str());
+        return HAL_ERR_RESULT;
     }
     std::string sid =
         (ext && ext->encoder_stream_id && ext->encoder_stream_id[0]) ? ext->encoder_stream_id : "hal_hw_0";
@@ -141,12 +423,42 @@ static int hw_codec_deinit(void *codec_ctx)
     {
         return HAL_ERR_INVALID_ARG;
     }
-    if (hp->started && hp->encoder)
+    if (hp->encoder)
     {
-        (void)hp->encoder->stop();
-        hp->started = false;
+        /*
+         * Vendor hazard: a GStreamer bus error (e.g. caps negotiation
+         * failure) quits the encoder's main loop from the bus callback.
+         * stop() then early-returns on !is_started() without joining the
+         * loop thread, and destroying the encoder tears down a still
+         * joinable std::thread -> std::terminate -> daemon SIGABRT.
+         *
+         * A fed frame that never came back as a packet means that error
+         * state is already latched, so in that case deliberately leak the
+         * instance (bounded: one per failed context) instead of killing
+         * the daemon. Balanced counters mean the pipeline is healthy and
+         * stop() runs its full join path — destroy normally.
+         */
+        if (hp->frames_in.load() != hp->frames_out.load())
+        {
+            HAL_LOG_WARNING("hailo15_codec: encoder %s in errored state "
+                            "(%llu frames in / %llu out) — parking instance "
+                            "to avoid vendor terminate-on-destroy",
+                            cc->codec_name,
+                            (unsigned long long)hp->frames_in.load(),
+                            (unsigned long long)hp->frames_out.load());
+            std::lock_guard<std::mutex> lk(g_errored_encoders_mu);
+            g_errored_encoders.push_back(std::move(hp->encoder));
+        }
+        else
+        {
+            if (hp->started)
+            {
+                (void)hp->encoder->stop();
+            }
+            hp->encoder.reset();
+        }
     }
-    hp->encoder.reset();
+    hp->started = false;
     delete hp;
     cc->priv = nullptr;
     std::free(cc);
@@ -200,12 +512,36 @@ static int hw_codec_input_frame(void *codec_ctx, HalFrameBuffer *frame)
 {
     auto *cc = ctx_ptr(codec_ctx);
     auto *hp = hw_priv(cc);
-    if (!cc || !hp || !hp->encoder || !frame || !frame->priv)
+    if (!cc || !hp || !hp->encoder || !frame)
     {
         return HAL_ERR_INVALID_ARG;
     }
-    auto *fp = static_cast<Hailo15FramePriv *>(frame->priv);
-    media_library_return r = hp->encoder->add_buffer(fp->ml_buf);
+    if (frame->priv)
+    {
+        auto *fp = static_cast<Hailo15FramePriv *>(frame->priv);
+        media_library_return r = hp->encoder->add_buffer(fp->ml_buf);
+        if (r == MEDIA_LIBRARY_SUCCESS)
+        {
+            hp->frames_in.fetch_add(1, std::memory_order_relaxed);
+        }
+        return hailo15_ml_err(r);
+    }
+    /*
+     * Standalone frames (e.g. daemon-imported DSP buffers) carry no
+     * Hailo15FramePriv: wrap their dma-buf planes instead. The mapping is
+     * owned by the wrapped buffer — the encoder's GstBuffer keeps it alive
+     * until encode completes, then release() unmaps the planes.
+     */
+    HailoMediaLibraryBufferPtr wrapped = hailo15_wrap_dmabuf_frame(frame);
+    if (!wrapped)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    media_library_return r = hp->encoder->add_buffer(wrapped);
+    if (r == MEDIA_LIBRARY_SUCCESS)
+    {
+        hp->frames_in.fetch_add(1, std::memory_order_relaxed);
+    }
     return hailo15_ml_err(r);
 }
 
@@ -222,6 +558,13 @@ static int hw_codec_subscribe(void *codec_ctx, HalCodecFrameCallback callback, v
     hp->userdata = userdata;
     media_library_return r = hp->encoder->subscribe(
         [cc, hp](HailoMediaLibraryBufferPtr buf, uint32_t sz) {
+            /* Count every delivered packet even when unsubscribed: the
+             * in/out balance is what makes hw_codec_deinit's destroy-or-
+             * leak decision, and it must reflect pipeline health. */
+            if (buf)
+            {
+                hp->frames_out.fetch_add(1, std::memory_order_relaxed);
+            }
             HalCodecFrameCallback cb = nullptr;
             void *ud = nullptr;
             {

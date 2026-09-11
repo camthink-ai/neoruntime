@@ -1,14 +1,18 @@
 #pragma once
 
 #include "camera.grpc.pb.h"
+#include "dsp_service.h"
 #include <grpcpp/grpcpp.h>
 
+#include <memory>
+
 class CameraDaemon;
+struct JpegShotState;
 
 class CameraControlServiceImpl final : public aipc::camera::CameraControl::Service {
 public:
     explicit CameraControlServiceImpl(CameraDaemon* daemon);
-    ~CameraControlServiceImpl() override = default;
+    ~CameraControlServiceImpl() override; /* in .cpp — jpeg_ is incomplete here */
 
     grpc::Status StartOneShotAutofocus(
         grpc::ServerContext* context,
@@ -332,6 +336,45 @@ public:
         const aipc::camera::GetConfigFieldRequest* request,
         aipc::camera::GetConfigFieldResponse* response) override;
 
+    // Synchronous DSP offload job (see docs proposal dsp-offload.md).
+    // Maps proto enums onto DspJobDesc and waits in DspService::submit_job
+    // (bounded by job_timeout_ms — a slow job fails the RPC, it never hangs).
+    grpc::Status SubmitDspJob(
+        grpc::ServerContext* context,
+        const aipc::camera::DspJobRequest* request,
+        aipc::camera::DspJobResponse* response) override;
+
+    // P2 async pair: enqueue without waiting (response carries job_id),
+    // then WaitDspJob (caller-chosen timeout_ms, 0 = non-blocking poll).
+    grpc::Status SubmitDspJobAsync(
+        grpc::ServerContext* context,
+        const aipc::camera::DspJobRequest* request,
+        aipc::camera::DspJobResponse* response) override;
+
+    grpc::Status WaitDspJob(
+        grpc::ServerContext* context,
+        const aipc::camera::DspWaitRequest* request,
+        aipc::camera::DspJobResponse* response) override;
+
+    // One-shot JPEG encode of a registered DSP buffer (S-3(a)). Pins the
+    // source in DspService, feeds it through a daemon-owned standalone MJPEG
+    // codec context (recreated on geometry/quality change) and waits for the
+    // packet — bounded by a fixed timeout, never hangs the RPC.
+    grpc::Status EncodeImage(
+        grpc::ServerContext* context,
+        const aipc::camera::EncodeImageRequest* request,
+        aipc::camera::EncodeImageResponse* response) override;
+
 private:
     CameraDaemon* daemon_;
+    /* Shared by the sync/async DSP submit handlers: maps the proto request
+     * onto DspJobDesc (explicit op switch, range-checked enums). Returns
+     * false with `response` already filled on rejection. */
+    bool FillDspJobDesc(const aipc::camera::DspJobRequest* request,
+                        DspJobDesc& desc,
+                        aipc::camera::DspJobResponse* response);
+    /* Serializes EncodeImage RPCs: the ctx state inside JpegShotState is
+     * self-guarded, but the lazy jpeg_ pointer (and its teardown) is not. */
+    std::mutex jpeg_mu_;
+    std::unique_ptr<JpegShotState> jpeg_; /* lazy — created on first EncodeImage */
 };

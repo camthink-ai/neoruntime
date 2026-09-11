@@ -377,6 +377,7 @@ static DaemonConfig load_config(const std::string& path) {
         if (trimmed.find("light_sensor:") == 0) { section = "light_sensor"; continue; }
         if (trimmed.find("service:") == 0) { section = "service"; continue; }
         if (trimmed.find("lens:") == 0) { section = "lens"; lens_subsection.clear(); continue; }
+        if (trimmed.find("dsp:") == 0) { section = "dsp"; continue; }
         if (trimmed.find("streams:") == 0) { section = "streams"; cfg.streams.clear(); continue; }
         if (trimmed.find("encoders:") == 0) { section = "encoders"; cfg.encoders.clear(); continue; }
 
@@ -415,6 +416,25 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.watchdog_timeout_ms = parse_u32_config(val, "watchdog.frame_timeout_ms");
             else if (trimmed.find("warn_threshold_ms:") != std::string::npos)
                 cfg.watchdog_warn_ms = parse_u32_config(val, "watchdog.warn_threshold_ms");
+        } else if (section == "dsp") {
+            // P2: DspServiceConfig knobs (defaults live in dsp_service.h).
+            // quota is per owning client (one budget per app connection).
+            if (trimmed.find("quota_jobs_per_sec:") != std::string::npos)
+                cfg.dsp.quota_jobs_per_sec = parse_float_config(val, "dsp.quota_jobs_per_sec");
+            else if (trimmed.find("quota_mpix_per_sec:") != std::string::npos)
+                cfg.dsp.quota_mpix_per_sec = parse_float_config(val, "dsp.quota_mpix_per_sec");
+            else if (trimmed.find("job_timeout_ms:") != std::string::npos)
+                cfg.dsp.job_timeout_ms = parse_u32_config(val, "dsp.job_timeout_ms");
+            else if (trimmed.find("max_batch:") != std::string::npos)
+                cfg.dsp.max_batch = parse_u32_config(val, "dsp.max_batch");
+            else if (trimmed.find("max_buffers_per_client:") != std::string::npos)
+                cfg.dsp.max_buffers_per_client = parse_u32_config(val, "dsp.max_buffers_per_client");
+            else if (trimmed.find("max_client_pixels:") != std::string::npos)
+                cfg.dsp.max_client_pixels = parse_u32_config(val, "dsp.max_client_pixels");
+            else if (trimmed.find("max_imports_per_client:") != std::string::npos)
+                cfg.dsp.max_imports_per_client = parse_u32_config(val, "dsp.max_imports_per_client");
+            else if (trimmed.find("max_async_jobs_per_client:") != std::string::npos)
+                cfg.dsp.max_async_jobs_per_client = parse_u32_config(val, "dsp.max_async_jobs_per_client");
         } else if (section == "ai_overlay") {
             if (trimmed.find("enabled:") != std::string::npos)
                 cfg.ai_overlay_enabled = (val == "true" || val == "1");

@@ -1,7 +1,7 @@
 // API 统一导出
 export { appsApi } from './apps';
 export { systemApi, monitorApi } from './system';
-export { aiApi } from './ai';
+export { aiApi, downloadModelPackage } from './ai';
 export { deviceApi } from './device';
 export { streamsApi } from './streams';
 export { logsApi } from './logs';

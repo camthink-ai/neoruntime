@@ -435,6 +435,96 @@ bool json_is_full_medialib(const std::string &raw)
     }
 }
 
+/*
+ * Format names as expected by GStreamer's video/x-raw caps. The JPEG
+ * encoder pipeline is stock GStreamer (hailojpegenc → jpegenc), whose
+ * caps use "RGB"/"GRAY8" — unlike the HW encoder config format strings
+ * ("RGB24"), which never reach caps in that path.
+ */
+static const char *hal_pix_to_gst_format(HalPixelFormat f)
+{
+    switch (f)
+    {
+        case HAL_PIX_FMT_NV12:
+            return "NV12";
+        case HAL_PIX_FMT_NV21:
+            return "NV21";
+        case HAL_PIX_FMT_YUYV:
+            return "YUYV";
+        case HAL_PIX_FMT_RGB24:
+            return "RGB";
+        case HAL_PIX_FMT_GRAY8:
+            return "GRAY8";
+        default:
+            return "NV12";
+    }
+}
+
+/*
+ * Standalone MJPEG config. hailo15 has no SoC JPEG encoder block: the
+ * MediaLibrary jpeg_encoder variant builds a multi-threaded libjpeg
+ * pipeline (hailojpegenc). The value of this path is centralised encode
+ * without cv2/PIL in app images — not hardware offload. Synthesise the
+ * minimal config from HalCodecConfig unless the caller supplied one via
+ * config_path/config_json.
+ */
+static int resolve_hw_jpeg_encoder_json(const HalCodecConfig *cfg, const Hailo15HalCodecPrivExt *ext,
+                                        std::string *out_json, HalCodecConfig *effective_out)
+{
+    std::string raw;
+    uint32_t quality = 0;
+
+    if (ext && ext->config_path && ext->config_path[0])
+    {
+        if (!read_file_all(ext->config_path, &raw))
+        {
+            HAL_LOG_ERROR("hailo15 cfg: failed to read encoder config_path '%s'", ext->config_path);
+            return HAL_ERR_RESULT;
+        }
+    }
+    else if (ext && ext->config_json && ext->config_json[0])
+    {
+        raw = ext->config_json;
+    }
+    else
+    {
+        quality = (cfg->jpeg_quality >= 1u && cfg->jpeg_quality <= 100u) ? cfg->jpeg_quality : 85u;
+        nlohmann::json j;
+        j["version"] = "4.0.0";
+        j["metadata"] = {{"architecture", "hailo15h"},
+                         {"content_hash", ""},
+                         {"description", "HAL v2 standalone JPEG encoder"},
+                         {"generation_timestamp", "1970-01-01T00:00:00Z"}};
+        j["encoding"]["input_stream"] = {
+            {"width", cfg->width ? cfg->width : 1920u},
+            {"height", cfg->height ? cfg->height : 1080u},
+            {"framerate", cfg->framerate ? cfg->framerate : 30u},
+            {"format", hal_pix_to_gst_format(cfg->format)}};
+        j["encoding"]["jpeg_encoder"] = {{"n_threads", 2}, {"quality", quality}};
+        raw = j.dump();
+    }
+
+    if (!raw.empty())
+    {
+        auto j = nlohmann::json::parse(raw, nullptr, false);
+        if (!j.is_discarded())
+        {
+            reverse_fill_codec_from_encoder_json(j, effective_out);
+        }
+    }
+    if (quality != 0u)
+    {
+        effective_out->jpeg_quality = quality;
+    }
+
+    *out_json = std::move(raw);
+    if (out_json->empty())
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    return HAL_OK;
+}
+
 int resolve_hw_encoder_json(const HalCodecConfig *cfg, const Hailo15HalCodecPrivExt *ext, std::string *out_json,
                             HalCodecConfig *effective_out)
 {
@@ -442,14 +532,14 @@ int resolve_hw_encoder_json(const HalCodecConfig *cfg, const Hailo15HalCodecPriv
     {
         return HAL_ERR_INVALID_ARG;
     }
-    if (cfg->packet_type == HAL_PACKET_TYPE_MJPEG)
-    {
-        HAL_LOG_ERROR("hailo15 cfg: HAL_CODEC_TYPE_HW MJPEG not implemented (use FROM_MEDIA JPEG path)");
-        return HAL_ERR_NOT_SUPPORTED;
-    }
 
     *effective_out = *cfg;
     effective_out->type = HAL_CODEC_TYPE_HW;
+
+    if (cfg->packet_type == HAL_PACKET_TYPE_MJPEG)
+    {
+        return resolve_hw_jpeg_encoder_json(cfg, ext, out_json, effective_out);
+    }
 
     std::string raw;
     if (ext && ext->config_path && ext->config_path[0])

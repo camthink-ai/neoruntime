@@ -148,13 +148,36 @@ void test_model_manager() {
 
     ModelManager mgr(loader.infer_ops(), loader.post_ops(), loader.draw_ops(), &loader);
 
-    // Register
-    int rc = mgr.register_model("yolo_test", "/fake/model.hef");
+    // Register with the full identity used by the gRPC path.
+    const std::string variant =
+        R"({"backend_function":"hailo_yolov8n","detection_threshold":0.25})";
+    int rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-a",
+                                true, variant, "detection");
     ASSERT_EQ(rc, 0, "register_model failed");
 
-    // Duplicate register should fail
-    rc = mgr.register_model("yolo_test", "/fake/model.hef");
-    ASSERT_TRUE(rc != 0, "duplicate register should fail");
+    // Same id/path/config from another owner is legitimate co-ownership.
+    rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-b",
+                            true, variant, "detection");
+    ASSERT_EQ(rc, 1, "same-config co-ownership should return existing-entry status");
+
+    // Same id/path but a different decoder identity must collide: accepting
+    // either request would let the gRPC layer rewire the incumbent's shared
+    // postprocess session after register_model returns.
+    std::string why;
+    rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-c",
+                            true, variant, "classification", &why);
+    ASSERT_TRUE(rc != 0, "different model_type should be refused");
+    ASSERT_TRUE(why.find("different configuration") != std::string::npos,
+                "type collision should carry a useful reason");
+
+    why.clear();
+    rc = mgr.register_model(
+        "yolo_test", "/fake/model.hef", "app-d", true,
+        R"({"backend_function":"hailo_yolov8s","detection_threshold":0.25})",
+        "detection", &why);
+    ASSERT_TRUE(rc != 0, "different variant should be refused");
+    ASSERT_TRUE(why.find("different configuration") != std::string::npos,
+                "variant collision should carry a useful reason");
 
     // Get model via snapshot (rehash-safe)
     auto snap = mgr.acquire_model_snapshot("yolo_test");
@@ -201,6 +224,53 @@ void test_model_manager() {
     ASSERT_EQ(rc, 0, "unregister after release should succeed");
 
     ASSERT_TRUE(!mgr.acquire_model_snapshot("yolo_test").has_value(), "model should be gone");
+
+    PASS();
+}
+
+// ─── Test: owner-scoped unregister is transactional ─────────────────────────
+void test_owner_scoped_unregister() {
+    TEST(owner_scoped_unregister);
+
+    g_mock_creates  = 0;
+    g_mock_destroys = 0;
+    HalInferenceOps infer_ops = make_mock_infer_ops();
+    ModelManager mgr(&infer_ops, nullptr, nullptr, nullptr);
+
+    int rc = mgr.register_model("owned", "/fake/owned.hef", "app-a");
+    ASSERT_EQ(rc, 0, "initial owner registration failed");
+    rc = mgr.register_model("owned", "/fake/owned.hef", "app-b");
+    ASSERT_EQ(rc, 1, "second owner should co-own existing entry");
+
+    // A foreign/duplicate scoped release is a no-op, never a force unload.
+    rc = mgr.unregister_model("owned", "not-an-owner");
+    ASSERT_EQ(rc, 1, "absent owner release should keep the physical model");
+    ASSERT_TRUE(mgr.is_owner("owned", "app-a"), "app-a ownership was disturbed");
+    ASSERT_TRUE(mgr.is_owner("owned", "app-b"), "app-b ownership was disturbed");
+    ASSERT_EQ(g_mock_destroys, 0, "absent owner must not destroy the model");
+
+    // Releasing one of two owners keeps the shared registration resident.
+    rc = mgr.unregister_model("owned", "app-a");
+    ASSERT_EQ(rc, 1, "co-owner release should keep the physical model");
+    ASSERT_TRUE(!mgr.is_owner("owned", "app-a"), "app-a should be released");
+    ASSERT_TRUE(mgr.is_owner("owned", "app-b"), "app-b must remain");
+    ASSERT_EQ(g_mock_destroys, 0, "co-owner release must not destroy the model");
+
+    // Busy last-owner release is refused without deleting that ownership.
+    auto snap = mgr.acquire_model_snapshot("owned");
+    ASSERT_TRUE(snap.has_value(), "owned model missing");
+    rc = mgr.unregister_model("owned", "app-b");
+    ASSERT_TRUE(rc != 0, "busy last-owner release should fail");
+    ASSERT_TRUE(mgr.is_owner("owned", "app-b"),
+                "busy refusal must retain the last owner");
+    mgr.release_model("owned");
+
+    // Once idle, the last owner and physical session disappear together.
+    rc = mgr.unregister_model("owned", "app-b");
+    ASSERT_EQ(rc, 0, "idle last-owner release failed");
+    ASSERT_TRUE(!mgr.acquire_model_snapshot("owned").has_value(),
+                "last-owner release must remove the model");
+    ASSERT_EQ(g_mock_destroys, 1, "physical session should be destroyed once");
 
     PASS();
 }
@@ -519,6 +589,7 @@ int main() {
 
     test_hal_loader();
     test_model_manager();
+    test_owner_scoped_unregister();
     test_model_alias_refcount();
     test_session_manager();
     test_session_concurrent_destroy();

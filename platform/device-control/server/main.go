@@ -2166,6 +2166,27 @@ func reconcileLens(ctx context.Context, s *DeviceControlServer, client *lens.Len
 }
 
 func initializeRemoteLens(s *DeviceControlServer, client *lens.LensClient) error {
+	// Leaving READY is not proof of a camera-daemon restart: an overloaded
+	// daemon can also flap the transport transiently. The daemon-side AF0832
+	// bootstrapped flag (in-memory, cleared only by a real restart) and the
+	// MCU home status distinguish the two. When the lens never went away,
+	// skip the mechanical re-home — replaying it on every flap is what moved
+	// the lens to 1.0x/home-focus "by itself" while a page stream loaded.
+	if client.IsAF0832Bootstrapped() {
+		logger.Info("Lens reconnect without daemon restart (AF0832 still bootstrapped); skipping re-home")
+		client.ReplayPersistedConfig()
+		return nil
+	}
+	// Flag absent (post-restart, or a transient IsAF0832Bootstrapped transport
+	// error under load), but the motors may already be homed. Both axes
+	// rz-done means the lens never went away: re-mark and skip the re-home.
+	if zd, fd, err := s.lensHomed(); err == nil && zd && fd {
+		logger.Info("Lens already homed after reconnect (zoom+focus rz-done); re-marking bootstrapped without re-home")
+		_ = client.AF0832MarkBootstrapped()
+		client.ReplayPersistedConfig()
+		return nil
+	}
+
 	if err := client.Init(); err != nil {
 		return fmt.Errorf("remote Init: %w", err)
 	}

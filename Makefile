@@ -503,6 +503,10 @@ _pack-internal: _pack-stage
 		"$(STAGE_DIR)/opt/aipc/etc"
 	@cp -a configs/imaging/. "$(STAGE_DIR)/opt/aipc/etc/imaging/" 2>/dev/null || true
 	@cp -f configs/platform/ir_zoom_lut.csv configs/platform/ir_zoom_lut_fg2009.csv configs/platform/focus_curve_fg2009.csv "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
+	@if grep -Rns --include='*.yaml' '/opt/aipc' "$(STAGE_DIR)/opt/aipc/etc" 2>/dev/null; then \
+		echo "ERROR: staged YAML contains non-canonical /opt/aipc paths (deploy.sh preflight would reject this package)"; \
+		exit 1; \
+	fi
 	@mkdir -p "$(RELEASE_DIR)"
 	tar czf "$(TARBALL)" -C "$(RELEASE_DIR)" "$(PKG_NAME)"
 	@echo "=== Release Package Ready ==="

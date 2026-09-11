@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <queue>
 #include <atomic>
+#include <thread>
 
 #include "dsp/hal_dsp.h"
 #include <hailo/hailodsp.h>

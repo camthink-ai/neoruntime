@@ -195,6 +195,7 @@ set(SOURCES
     src/ai_overlay_subscriber.cpp
     src/audio_service.cpp
     src/dpm_worker.cpp
+    src/dsp_service.cpp
     src/autofocus_controller.cpp
     src/illumination_controller.cpp
     src/daynight_policy.cpp
@@ -294,4 +295,24 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
         ${HAL_V2_INC}
     )
     add_test(NAME fg2009-position-test COMMAND fg2009-position-test)
+
+    add_executable(dsp-service-async-lifecycle-test
+        tests/dsp_service_async_lifecycle_test.cpp
+        src/dsp_service.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_compile_definitions(dsp-service-async-lifecycle-test PRIVATE
+        DSP_SERVICE_TESTING=1
+    )
+    # This standalone test uses assert for both guards and assertions; keep
+    # them active even when the production build type is Release.
+    target_compile_options(dsp-service-async-lifecycle-test PRIVATE -UNDEBUG)
+    target_include_directories(dsp-service-async-lifecycle-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INCLUDE_DIRS}
+    )
+    target_link_libraries(dsp-service-async-lifecycle-test PRIVATE pthread)
+    add_test(NAME dsp-service-async-lifecycle-test
+             COMMAND dsp-service-async-lifecycle-test)
 endif()
