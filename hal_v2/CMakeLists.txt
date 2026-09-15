@@ -805,6 +805,17 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         endif()
         target_compile_options(hal-dmabuf-infer-test PRIVATE -Wall -Wextra -fPIC)
 
+        add_executable(hal-dma-bind-ab-test
+            examples/dma_bind_ab_test/dma_bind_ab_test.cpp
+        )
+        target_include_directories(hal-dma-bind-ab-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-dma-bind-ab-test PRIVATE hal pthread)
+        else()
+            target_link_libraries(hal-dma-bind-ab-test PRIVATE hal-hailo15-model hal-common pthread)
+        endif()
+        target_compile_options(hal-dma-bind-ab-test PRIVATE -Wall -Wextra -fPIC)
+
         add_executable(hal-motion-test examples/motion_test/motion_test.cpp)
         target_include_directories(hal-motion-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
         if(HAL_V2_BUILD_MONOLITHIC)

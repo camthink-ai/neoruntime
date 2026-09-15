@@ -1383,6 +1383,65 @@ static int hailo15_infer_tensor_from_frame(const HalFrameBuffer *frame, HalTenso
     if (!frame || !tensor)
         return HAL_ERR_INVALID_ARG;
 
+    /* ---- P1-1 dma fast path: compact dual-plane NV12 with per-plane
+     * dmabufs binds straight to the NPU (zero CPU pixel copies). The
+     * vendor pool this HAL requests buffers from allocates exactly this
+     * layout (one dmabuf per plane, stride == width — see
+     * MediaLibraryBufferPool's 6-arg ctor delegating with
+     * bytes_per_line=width), so DPM's pre-resized model-geometry inputs
+     * take this path. Geometry-vs-model is still enforced at bind time
+     * (byte_size == frame_size check), so a mismatched frame fails
+     * cleanly exactly like the CPU path did. Anything off-contract
+     * (no fds, padded stride, non-NV12) falls through to memcpy staging. */
+    if (frame->format == HAL_PIX_FMT_NV12 &&
+        frame->num_planes >= 2 &&
+        frame->dma_fds[0] >= 0 && frame->dma_fds[1] >= 0 &&
+        frame->strides[0] == frame->width && frame->strides[1] == frame->width)
+    {
+        HalDmaFrameDesc desc{};
+        desc.fd[0] = frame->dma_fds[0];
+        desc.fd[1] = frame->dma_fds[1];
+        desc.fd[2] = -1; /* plane absent */
+        desc.offset[0] = 0;
+        desc.offset[1] = 0;
+        desc.stride[0] = frame->width;
+        desc.stride[1] = frame->width;
+        desc.bytes_used[0] = frame->width * frame->height;
+        desc.bytes_used[1] = frame->width * frame->height / 2;
+        desc.format = HAL_PIX_FMT_NV12;
+        desc.width = frame->width;
+        desc.height = frame->height;
+        desc.borrowed = 1; /* fds stay owned by the HalFrameBuffer */
+
+        auto *desc_copy = new (std::nothrow) HalDmaFrameDesc(desc);
+        auto *tp = new (std::nothrow) TensorPriv{};
+        if (!desc_copy || !tp)
+        {
+            delete desc_copy;
+            delete tp;
+            return HAL_ERR_NO_MEM;
+        }
+        tp->dma_frame = desc_copy;
+
+        static std::atomic<bool> s_dma_bind_logged{false};
+        if (!s_dma_bind_logged.exchange(true))
+        {
+            HAL_LOG_INFO("hailo15_inference: tensor_from_frame dma direct-bind engaged "
+                         "(%ux%u NV12 dual-fd, zero CPU copies)",
+                         (unsigned)frame->width, (unsigned)frame->height);
+        }
+
+        const uint32_t total = desc.bytes_used[0] + desc.bytes_used[1];
+        std::memset(tensor, 0, sizeof(*tensor));
+        tensor->dma_fd = frame->dma_fds[0]; /* data stays NULL: no CPU pixels */
+        tensor->ndim = 1;
+        tensor->shape[0] = (int32_t)total;
+        tensor->dtype = HAL_DTYPE_UINT8;
+        tensor->byte_size = total;
+        tensor->priv = tp;
+        return HAL_OK;
+    }
+
     uint32_t plane0_sz = 0;
     uint32_t plane1_sz = 0;
     switch (frame->format)
