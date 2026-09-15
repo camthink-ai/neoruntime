@@ -1266,6 +1266,10 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
     auto fps = req->fps_limit() > 0 ? req->fps_limit() : 30;
     auto frame_interval = Milliseconds(1000 / fps);
     uint64_t last_seq = 0;
+    // fps gate anchor: earliest allowed SUBMIT time. Head-to-head (between
+    // submits, not completions) so the cap is exact regardless of pipeline
+    // latency.
+    auto next_allowed = SteadyClock::now();
 
     // Backpressure: limit outstanding inferences to prevent camera-daemon
     // buffer pool exhaustion (shared pool ~15 buffers, 3 per stream leaves headroom)
@@ -1277,27 +1281,41 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
     uint64_t last_write_us = 0;
 
     while (!ctx->IsCancelled()) {
-        if (!session_mgr_->check_fps_limit(session.get())) {
-            std::this_thread::sleep_for(Milliseconds(1));
-            continue;
-        }
-
         pb::StreamInferResponse resp;
 
         if (fd_path) {
             ReceivedFrame frame{};
             {
                 std::unique_lock lock(frame_mu);
-                if (!frame_cv.wait_for(lock, frame_interval,
-                                       [&] { return has_frame || ctx->IsCancelled(); })) {
-                    continue;
-                }
+                // Bounded purely to poll cancellation; frame arrivals wake
+                // this immediately.
+                frame_cv.wait_for(lock, Milliseconds(50),
+                                  [&] { return has_frame || ctx->IsCancelled(); });
                 if (ctx->IsCancelled()) break;
+                if (!has_frame) continue;
                 frame = latest_frame;
                 has_frame = false;
             }
 
             if (frame.sequence == last_seq) continue;
+
+            // Frame-driven fps gate: submit a frame the moment it arrives,
+            // provided one interval passed since the previous SUBMIT; a
+            // frame landing inside the interval is released right away.
+            // Buffering it until a slot opens (the old scheme: 1ms-spin on
+            // check_fps_limit, then newest-buffered) aged every submitted
+            // frame by up to one arrival period — at fps=10 on a 15fps
+            // stream that alone was p50 ~33ms of skew against a ~7ms
+            // compute pipeline. The cap stays a hard ceiling; undershoot
+            // only occurs when the source rate doesn't divide the cap
+            // (15fps capped at 10 submits 7.5fps) — freshness wins.
+            // Re-anchoring after an arrival stall prevents burst credit.
+            if (SteadyClock::now() < next_allowed) {
+                fd_receiver_->release_frame(stream_id, frame.frame_id);
+                continue;
+            }
+            next_allowed = std::max(next_allowed + frame_interval,
+                                    SteadyClock::now());
             last_seq = frame.sequence;
 
             // Backpressure: drop frame if too many in-flight
