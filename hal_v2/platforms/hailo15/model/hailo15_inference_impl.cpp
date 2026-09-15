@@ -281,10 +281,22 @@ static int hailo15_bind_inputs_outputs(Hailo15InferPriv *p, const HalTensor *inp
                           frame_size);
             return HAL_ERR_INVALID_SIZE;
         }
-        hailo_status st = p->bindings.input(name)->set_buffer(hailort::MemoryView(in.data, in.byte_size));
+        hailo_status st;
+        if (in.dma_fd >= 0)
+        {
+            /* Zero-copy: bind the dma-buf fd directly (HailoRT Linux; the
+             * driver maps the buffer into the VDMA channel with no CPU copy).
+             * The underlying memory must stay valid for the transfer lifetime
+             * (sync run returns after completion; async until the callback). */
+            st = p->bindings.input(name)->set_dma_buffer(hailo_dma_buffer_t{in.dma_fd, in.byte_size});
+        }
+        else
+        {
+            st = p->bindings.input(name)->set_buffer(hailort::MemoryView(in.data, in.byte_size));
+        }
         if (HAILO_SUCCESS != st)
         {
-            HAL_LOG_ERROR("hailo15_inference: set input buffer failed (st=%d)", (int)st);
+            HAL_LOG_ERROR("hailo15_inference: set input buffer failed (st=%d, dma_fd=%d)", (int)st, in.dma_fd);
             return HAL_ERR_RESULT;
         }
     }
@@ -1399,8 +1411,43 @@ static int hailo15_infer_tensor_from_frame_ex(HalInferenceSession *session,
         return HAL_ERR_NOT_SUPPORTED;
     }
 
-    /* ---- Fast path: exact match -> verbatim copy ---- */
+    /* ---- Fast path 1: DMABUF frame + exact match -> zero-copy fd binding ----
+     * The tensor borrows the frame's dma-buf: no allocation, no memcpy. The
+     * caller must keep the frame alive until the inference completes (sync
+     * run() returns after completion; run_async until the callback fires). */
     const bool normalize = p->cfg.preprocess.normalize;
+    if (frame->mem_type == HAL_MEM_DMABUF && frame->dma_fds[0] >= 0 &&
+        frame->width == dsh.width && frame->height == dsh.height && !normalize &&
+        ((frame->format == HAL_PIX_FMT_NV12 && dfm.order == HAILO_FORMAT_ORDER_NV12) ||
+         (frame->format == HAL_PIX_FMT_RGB24 && dsh.features == 3 &&
+          (dfm.order == HAILO_FORMAT_ORDER_RGB888 || dfm.order == HAILO_FORMAT_ORDER_NHWC))))
+    {
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < frame->num_planes; ++i)
+        {
+            total += frame->sizes[i];
+        }
+        if (total != 0 && total == st.get_frame_size())
+        {
+            std::memset(tensor, 0, sizeof(*tensor));
+            tensor->data = static_cast<uint8_t *>(frame->planes[0]); /* CPU mapping, borrowed */
+            tensor->dma_fd = frame->dma_fds[0];
+            tensor->ndim = 1;
+            tensor->shape[0] = static_cast<int32_t>(total); /* uint8: elements == bytes */
+            tensor->dtype = HAL_DTYPE_UINT8;
+            tensor->byte_size = total;
+            std::snprintf(tensor->name, sizeof(tensor->name), "%s", name.c_str());
+            tensor->priv = new (std::nothrow) TensorPriv{std::shared_ptr<void>() /* borrowed, owns nothing */
+#if defined(HAL_HAVE_HAILO_POSTPROCESS_TOOLS)
+                                                         ,
+                                                         nullptr
+#endif
+            };
+            return tensor->priv ? HAL_OK : HAL_ERR_NO_MEM;
+        }
+    }
+
+    /* ---- Fast path 2: exact match -> verbatim copy ---- */
     if (frame->width == dsh.width && frame->height == dsh.height && !normalize &&
         ((frame->format == HAL_PIX_FMT_NV12 && dfm.order == HAILO_FORMAT_ORDER_NV12) ||
          (frame->format == HAL_PIX_FMT_RGB24 && dfm.order == HAILO_FORMAT_ORDER_RGB888)))
