@@ -34,6 +34,7 @@
 #include <fcntl.h>     /* fcntl, F_GET_SEALS/F_ADD_SEALS (memfd seals) */
 #include <sys/syscall.h> /* SYS_memfd_create (no _GNU_SOURCE in this TU) */
 #include <linux/memfd.h> /* MFD_*, F_SEAL_* */
+#include <sys/socket.h> /* getsockopt / SO_PEERCRED (quota process identity) */
 
 #include "common/hal_log.h"
 
@@ -963,16 +964,38 @@ int DspService::validate_and_pin(DspJobDesc desc, JobRef& job_out,
     return DSP_SVC_OK;
 }
 
+int DspService::quota_owner_key(int owner_fd) {
+    /* SO_PEERCRED works on any connected UDS socket, but only while the fd
+     * is alive — so translate at charge time, never at forget time. Local
+     * 3-field layout (pid, uid, gid) avoids _GNU_SOURCE churn for
+     * struct ucred; the wire shape is fixed UAPI. */
+    struct {
+        uint32_t pid, uid, gid;
+    } cred;
+    socklen_t len = sizeof(cred);
+    if (owner_fd >= 0 &&
+        ::getsockopt(owner_fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 &&
+        cred.pid > 0) {
+        return -static_cast<int>(cred.pid); /* negative: process namespace */
+    }
+    return owner_fd; /* legacy per-fd bucket (daemon-internal / anonymous) */
+}
+
 bool DspService::quota_try_consume(int owner_fd, double mpix, std::string& why) {
     using clock = std::chrono::steady_clock;
     std::lock_guard<std::mutex> lk(quota_mu_);
-    QuotaBucket& b = quotas_[owner_fd];
+    const int key = quota_owner_key(owner_fd);
+    QuotaBucket& b = quotas_[key];
     const auto now = clock::now();
     const bool first_use = b.last.time_since_epoch().count() == 0;
     double dt = first_use ? 0.0
                           : std::chrono::duration<double>(now - b.last).count();
     if (dt < 0) dt = 0;
     b.last = now;
+    if (first_use && key < 0) {
+        HAL_LOG_INFO("DspService: quota bucket created for process pid=%d",
+                     -key);
+    }
     if (first_use) {
         /* New owner: grant the full 1 s burst up front, so an app's very
          * first job is not rejected (burst = 1 s worth of budget). */
@@ -1001,12 +1024,31 @@ bool DspService::quota_try_consume(int owner_fd, double mpix, std::string& why) 
     }
     b.jobs -= 1.0;
     b.mpix -= mpix;
+    /* Process-keyed buckets are NOT erased on disconnect (a process may
+     * hold several connections; the token bucket refills anyway), so bound
+     * the map: past 256 buckets, drop ones idle for over a minute. */
+    if (quotas_.size() > 256) {
+        for (auto it = quotas_.begin(); it != quotas_.end();) {
+            if (it->first != key &&
+                std::chrono::duration<double>(now - it->second.last).count() > 60.0)
+                it = quotas_.erase(it);
+            else
+                ++it;
+        }
+    }
     return true;
 }
 
 void DspService::quota_forget(int owner_fd) {
+    /* Only legacy per-fd buckets are dropped here. Process-keyed buckets
+     * (negative keys) outlive the connection that happened to be charged:
+     * SO_PEERCRED no longer resolves on a dead fd, another connection of
+     * the same process may still be active, and the bucket self-refills —
+     * the idle sweep in quota_try_consume() reclaims abandoned ones. */
+    if (owner_fd < 0)
+        return; /* daemon-internal shared bucket: keep */
     std::lock_guard<std::mutex> lk(quota_mu_);
-    quotas_.erase(owner_fd);
+    quotas_.erase(quota_owner_key(owner_fd));
 }
 
 DspJobResult DspService::submit_job(const DspJobDesc& desc) {

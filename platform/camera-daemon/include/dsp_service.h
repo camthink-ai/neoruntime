@@ -291,6 +291,13 @@ private:
 
     bool quota_try_consume(int owner_fd, double mpix, std::string& why);
     void quota_forget(int owner_fd);
+    /* Quota identity: translate a client fd into its owning PROCESS via
+     * SO_PEERCRED, so one process with many connections shares a single
+     * bucket (P0-4 — removes the fresh-client-per-call quota dodge).
+     * Returns -pid (negative namespace, cannot collide with fd keys), or
+     * owner_fd unchanged when the peer cannot be resolved (anonymous /
+     * daemon-internal owners keep the legacy per-fd bucket). */
+    int quota_owner_key(int owner_fd);
 
     void worker_loop();
     void execute_job(const JobRef& job);
