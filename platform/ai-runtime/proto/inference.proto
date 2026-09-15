@@ -219,6 +219,34 @@ message StreamInferResponse {
   repeated Tensor outputs = 3;    // Raw tensors (when post-process disabled)
   Status status = 4;
   PostResult post_result = 5;     // Structured results (when post-process enabled)
+
+  // Per-stage timing of the serving pipeline (0 = not measured: failed
+  // frame, stage not implemented yet, or server predates the field).
+  PerfBreakdown perf = 8;
+}
+
+// Segment wall times (microseconds, CLOCK_MONOTONIC deltas) for one
+// streamed inference. Filled in the StreamInfer fd path; simulation mode
+// leaves it unset. Semantics per field:
+//   repack_us   — fd-frame -> tight NV12 CPU buffer copy (drops to 0 once
+//                 dma direct-bind replaces the repack)
+//   dsp_us      — DSP preprocessing stage (0 until stream DSP preprocess
+//                 exists)
+//   queue_us    — scheduler queue wait before the HAL run
+//   infer_us    — HAL run wall time (bind + submit + completion)
+//   hw_infer_us — NPU-only latency; 0 when HW latency measurement is off
+//                 (NV12 models skip the flag on this HAL — known trap)
+//   post_us     — inline post-process in on_complete
+//   write_us    — gRPC Write() cost, reported lagged by one response
+//                 (this response's Write happens after the fields are set)
+message PerfBreakdown {
+  uint64 repack_us   = 1;
+  uint64 dsp_us      = 2;
+  uint64 queue_us    = 3;
+  uint64 infer_us    = 4;
+  uint64 hw_infer_us = 5;
+  uint64 post_us     = 6;
+  uint64 write_us    = 7;
 }
 
 // ============ Session management ============

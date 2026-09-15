@@ -1117,6 +1117,10 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
     constexpr int MAX_IN_FLIGHT = 3;
     auto in_flight = std::make_shared<std::atomic<int>>(0);
 
+    // Cost of the previous response's Write(), reported one response late
+    // (perf fields are finalized before the Write that would carry them).
+    uint64_t last_write_us = 0;
+
     while (!ctx->IsCancelled()) {
         if (!session_mgr_->check_fps_limit(session.get())) {
             std::this_thread::sleep_for(Milliseconds(1));
@@ -1152,6 +1156,9 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             // Build HalTensor from DMA-BUF fd — zero copy
             HalTensor inputs[2] = {};
             int num_inputs = build_nv12_tensors(frame, inputs);
+            // Direct fd bind: no repack stage in this path, so its perf slot
+            // stays 0; the remaining perf fields are filled in on_complete.
+            const uint64_t repack_us = 0;
 
             resp.set_frame_sequence(frame.sequence);
             resp.set_timestamp_ns(frame.timestamp_ns);
@@ -1182,7 +1189,8 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             inf_req->on_complete = [this, promise, stream_resp, pp_session,
                                     enable_post, model_id, stream_id,
                                     frame_id, frame_seq, ts_ns, in_flight,
-                                    fd_receiver = fd_receiver_, session](
+                                    fd_receiver = fd_receiver_, session,
+                                    repack_us](
                 int rc, HalTensor* outputs, int num_outputs,
                 uint64_t infer_us, uint64_t queue_us,
                 bool model_acquired) {
@@ -1192,6 +1200,18 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
 
                 // Record stats (single source of truth)
                 session_mgr_->record_inference(session.get(), infer_us);
+
+                // Perf segments known at completion (also on failure —
+                // partial data beats none when diagnosing a dropped frame).
+                // dsp_us stays 0 (no stream DSP stage yet, P1-3);
+                // hw_infer_us stays 0 (HAL does not expose NPU-only
+                // latency; NV12 models skip the measurement flag);
+                // post_us set at the post branch, write_us lags one
+                // response (set by the writer below).
+                auto* perf = stream_resp->mutable_perf();
+                perf->set_repack_us(repack_us);
+                perf->set_queue_us(queue_us);
+                perf->set_infer_us(infer_us);
 
                 if (rc != 0) {
                     stream_resp->mutable_status()->set_success(false);
@@ -1222,6 +1242,7 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                     // terminate the process via the sync on_complete thread
                     // — mirrors the InferBatch post_task guard at line ~735.
                     HalPostprocessResult post_result{};
+                    const uint64_t post_t0 = now_us();
                     try {
                         if (model_mgr_->post_process(pp_session, outputs,
                                     num_outputs, &post_result) == 0) {
@@ -1237,6 +1258,7 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                             std::string("Postprocess failed: ") + e.what());
                     }
                     model_mgr_->free_post_result(&post_result);
+                    perf->set_post_us(now_us() - post_t0);
                 }
 
                 if (!pp_failed) {
@@ -1293,10 +1315,15 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             resp.mutable_status()->set_message("simulation");
         }
 
+        if (resp.has_perf()) {
+            resp.mutable_perf()->set_write_us(last_write_us);
+        }
+        const uint64_t write_t0 = now_us();
         if (!writer->Write(resp)) {
             LOG_INFO("StreamInfer: client disconnected");
             break;
         }
+        last_write_us = now_us() - write_t0;
     }
 
     if (fd_path) {
