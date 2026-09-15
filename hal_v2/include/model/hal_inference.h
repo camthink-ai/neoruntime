@@ -275,6 +275,47 @@ typedef void (*HalInferenceAsyncCallback)(HalTensor *outputs, int num_outputs, i
 /* ========== Inference Session (opaque handle) ========== */
 typedef struct HalInferenceSession HalInferenceSession;
 
+/* ========== DMA frame direct-bind contract (P0-2) ========== */
+
+/**
+ * @brief Multi-plane DMA-BUF frame descriptor for zero-copy NPU input binding.
+ *
+ * Device-adjudicated on rig (HailoRT 5.3.0, hailo15, 2026-09-15, tools/npu-bind-probe):
+ * - Dual-plane NV12 as two separate dmabufs -> Bindings::InferStream::set_pix_buffer()
+ *   with HAILO_PIX_BUFFER_MEMORY_TYPE_DMABUF: PASS, outputs byte-identical to CPU
+ *   set_buffer() baseline. (The header note "only USERPTR" is stale on this stack.)
+ * - Single compact NV12 dmabuf (Y+UV packed, w*h*3/2) -> set_dma_buffer(): PASS,
+ *   byte-identical, no prior dma_map_dmabuf() required.
+ * - Low-level InputStream::write_async(fd): configure() returns HAILO_NOT_IMPLEMENTED
+ *   on this stack — do not use.
+ *
+ * HailoRT 5.3.0 exposes NO per-plane offset/stride on these paths, therefore
+ * bind_dma_frame() REQUIRES: offset[i] == 0 for every plane, and stride[i] equal
+ * to the compact row pitch (width for both NV12 planes). Same-geometry frames
+ * with padding stride CANNOT be direct-bound and must be rejected — equal
+ * dimensions do not imply bindability.
+ *
+ * Shapes accepted for HAL_PIX_FMT_NV12:
+ * - dual-fd:   fd[0]=Y dmabuf (bytes_used[0]=w*h), fd[1]=UV dmabuf (bytes_used[1]=w*h/2)
+ * - single-fd: fd[0]=compact NV12 dmabuf (bytes_used[0]=w*h*3/2), fd[1] == -1
+ * Other formats/pad shapes: HAL_ERR_NOT_SUPPORTED (callers fall back to CPU paths).
+ */
+typedef struct HalDmaFrameDesc {
+    int32_t  fd[HAL_MAX_PLANES];       /* per-plane dma-buf fd, -1 = plane absent */
+    uint32_t offset[HAL_MAX_PLANES];   /* plane offset within its dmabuf — MUST be 0 */
+    uint32_t stride[HAL_MAX_PLANES];   /* row pitch incl. padding — MUST equal width */
+    uint32_t bytes_used[HAL_MAX_PLANES];
+    HalPixelFormat format;
+    uint32_t width, height;
+    uint8_t  borrowed;                 /* 1 = caller keeps fd ownership; HAL never closes */
+} HalDmaFrameDesc;
+
+/** probe_capability() ids — out receives 1 (supported) / 0 (not). */
+#define HAL_INFER_CAP_PIXBUF_DMABUF   1  /* set_pix_buffer DMABUF multi-plane (dual-fd NV12) */
+#define HAL_INFER_CAP_DMABUF_SINGLE   2  /* set_dma_buffer single compact NV12 fd */
+#define HAL_INFER_CAP_STREAM_ASYNC_FD 3  /* low-level InputStream::write_async(fd) — absent on HailoRT 5.3.0/hailo15 */
+
+
 /* ========== Inference Operations ========== */
 typedef struct HalInferenceOps {
     /**
@@ -424,6 +465,30 @@ typedef struct HalInferenceOps {
      * @return HAL_OK on success, negative HalErrorCode on failure.
      */
     int (*tensor_from_frame_ex)(HalInferenceSession *session, const HalFrameBuffer *frame, HalTensor *tensor);
+
+    /**
+     * @brief Build a zero-copy input tensor from a DMA-BUF frame (P0-2).
+     *
+     * Validates the descriptor against the session's first input stream
+     * (exact NV12 geometry, compact layout — see @ref HalDmaFrameDesc) and
+     * returns a HalTensor with data == NULL and dma_fd = frame->fd[0]. Pass
+     * that tensor to run()/run_async() inputs; the platform re-binds the dma
+     * buffer per submit. The tensor does NOT own the fds (borrowed semantics);
+     * callers must keep the dmabufs alive until the run callback fires.
+     * Output tensors remain CPU memory — this contract never moves outputs.
+     *
+     * @return HAL_OK, or HAL_ERR_INVALID_ARG / HAL_ERR_INVALID_SIZE /
+     *         HAL_ERR_NOT_SUPPORTED (geometry mismatch or padded stride —
+     *         fall back to tensor_from_frame* CPU paths).
+     */
+    int (*bind_dma_frame)(HalInferenceSession *session, const HalDmaFrameDesc *frame, HalTensor *out);
+
+    /**
+     * @brief Static capability probe for the dma-bind paths (no session needed).
+     * @param cap_id one of HAL_INFER_CAP_* — out receives 1/0.
+     * @return HAL_OK, or HAL_ERR_INVALID_ARG / HAL_ERR_NOT_SUPPORTED.
+     */
+    int (*probe_capability)(uint32_t cap_id, int32_t *out);
 } HalInferenceOps;
 
 /* ========== Global Operations Table ========== */

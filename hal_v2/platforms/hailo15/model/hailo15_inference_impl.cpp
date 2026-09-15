@@ -281,23 +281,65 @@ static int hailo15_bind_inputs_outputs(Hailo15InferPriv *p, const HalTensor *inp
                           frame_size);
             return HAL_ERR_INVALID_SIZE;
         }
-        hailo_status st;
-        if (in.dma_fd >= 0)
+        if (!in.data)
         {
-            /* Zero-copy: bind the dma-buf fd directly (HailoRT Linux; the
-             * driver maps the buffer into the VDMA channel with no CPU copy).
-             * The underlying memory must stay valid for the transfer lifetime
-             * (sync run returns after completion; async until the callback). */
-            st = p->bindings.input(name)->set_dma_buffer(hailo_dma_buffer_t{in.dma_fd, in.byte_size});
+            /* DMA-bound input, zero CPU pixels. Preferred route: the
+             * HalDmaFrameDesc from bind_dma_frame() / the tensor_from_frame
+             * dma fast path — it carries the per-plane layout. Fallback: a
+             * bare tensor->dma_fd over one compact buffer. In both cases the
+             * underlying memory must stay valid for the transfer lifetime
+             * (sync run returns after completion; async until the callback).
+             * The descriptor is re-applied on every submit — works under
+             * submit_mtx and with future ping-pong bindings. */
+            auto *tp = static_cast<TensorPriv *>(in.priv);
+            const HalDmaFrameDesc *d = tp ? tp->dma_frame : nullptr;
+            hailo_status st;
+            if (d)
+            {
+                if (d->fd[1] >= 0)
+                {
+                    /* dual-fd NV12: one dmabuf per plane (path A) */
+                    hailo_pix_buffer_t pb = {};
+                    pb.memory_type = HAILO_PIX_BUFFER_MEMORY_TYPE_DMABUF;
+                    pb.number_of_planes = 2;
+                    pb.planes[0].fd = d->fd[0];
+                    pb.planes[0].bytes_used = d->bytes_used[0];
+                    pb.planes[0].plane_size = d->bytes_used[0];
+                    pb.planes[1].fd = d->fd[1];
+                    pb.planes[1].bytes_used = d->bytes_used[1];
+                    pb.planes[1].plane_size = d->bytes_used[1];
+                    st = p->bindings.input(name)->set_pix_buffer(pb);
+                }
+                else
+                {
+                    /* single compact NV12 dmabuf (path B1) */
+                    st = p->bindings.input(name)->set_dma_buffer(
+                        hailo_dma_buffer_t{d->fd[0], (size_t)d->bytes_used[0]});
+                }
+            }
+            else if (in.dma_fd >= 0)
+            {
+                st = p->bindings.input(name)->set_dma_buffer(hailo_dma_buffer_t{in.dma_fd, in.byte_size});
+            }
+            else
+            {
+                return HAL_ERR_INVALID_ARG;
+            }
+            if (HAILO_SUCCESS != st)
+            {
+                HAL_LOG_ERROR("hailo15_inference: dma bind input[%zu] failed (st=%d, dma_fd=%d)", i, (int)st,
+                              in.dma_fd);
+                return HAL_ERR_RESULT;
+            }
         }
         else
         {
-            st = p->bindings.input(name)->set_buffer(hailort::MemoryView(in.data, in.byte_size));
-        }
-        if (HAILO_SUCCESS != st)
-        {
-            HAL_LOG_ERROR("hailo15_inference: set input buffer failed (st=%d, dma_fd=%d)", (int)st, in.dma_fd);
-            return HAL_ERR_RESULT;
+            hailo_status st = p->bindings.input(name)->set_buffer(hailort::MemoryView(in.data, in.byte_size));
+            if (HAILO_SUCCESS != st)
+            {
+                HAL_LOG_ERROR("hailo15_inference: set input buffer failed (st=%d)", (int)st);
+                return HAL_ERR_RESULT;
+            }
         }
     }
 
@@ -1671,6 +1713,116 @@ static int hailo15_infer_tensor_from_frame_ex(HalInferenceSession *session,
 #endif
 }
 
+/* ========== DMA frame direct-bind (P0-2, adjudicated by tools/npu-bind-probe
+ * on rig 2026-09-15: dual-fd set_pix_buffer(DMABUF) and single-compact-fd
+ * set_dma_buffer both PASS with byte-identical outputs) ========== */
+
+static int hailo15_infer_bind_dma_frame(HalInferenceSession *session, const HalDmaFrameDesc *frame, HalTensor *out)
+{
+    if (!session || !frame || !out)
+        return HAL_ERR_INVALID_ARG;
+
+    /* Layout validation is platform-independent. */
+    if (frame->format != HAL_PIX_FMT_NV12)
+        return HAL_ERR_NOT_SUPPORTED;
+    const uint32_t w = frame->width, h = frame->height;
+    if (w == 0 || h == 0 || w > (0xFFFFFFFFu / h))
+        return HAL_ERR_INVALID_ARG;
+    const uint64_t y_len64 = (uint64_t)w * h;
+    const uint64_t nv12_len64 = y_len64 + (y_len64 / 2);
+    if (nv12_len64 > 0xFFFFFFFFu)
+        return HAL_ERR_INVALID_ARG;
+    const uint32_t y_len = (uint32_t)y_len64;
+    const uint32_t uv_len = (uint32_t)(y_len64 / 2);
+
+    const bool dual = frame->fd[1] >= 0;
+    const uint32_t planes = dual ? 2u : 1u;
+    for (uint32_t i = 0; i < planes; i++)
+    {
+        /* HailoRT 5.3.0 has no per-plane offset/stride: compact layout only.
+         * Same geometry with padding stride is NOT bindable (尺寸相同≠可直绑). */
+        if (frame->fd[i] < 0 || frame->offset[i] != 0 || frame->stride[i] != w)
+            return HAL_ERR_NOT_SUPPORTED;
+    }
+    if (dual)
+    {
+        if (frame->bytes_used[0] != y_len || frame->bytes_used[1] != uv_len)
+            return HAL_ERR_INVALID_SIZE;
+    }
+    else
+    {
+        if (frame->bytes_used[0] != y_len + uv_len)
+            return HAL_ERR_INVALID_SIZE;
+    }
+
+#if !defined(HAL_HAVE_HAILORT)
+    (void)session;
+    (void)frame;
+    (void)out;
+    return HAL_ERR_NOT_SUPPORTED;
+#else
+    auto *p = reinterpret_cast<Hailo15InferPriv *>(session);
+    if (p->input_names.empty())
+        return HAL_ERR_INVALID_ARG;
+    const auto &name = p->input_names[0];
+    const size_t frame_size = p->infer_model->input(name)->get_frame_size();
+    if (frame_size != (size_t)nv12_len64)
+    {
+        HAL_LOG_ERROR("hailo15_inference: bind_dma_frame geometry mismatch (desc=%llux%llu -> %llu bytes, input '%s' wants %zu)",
+                      (unsigned long long)w, (unsigned long long)h, (unsigned long long)nv12_len64, name.c_str(), frame_size);
+        return HAL_ERR_INVALID_SIZE;
+    }
+
+    auto *desc_copy = new (std::nothrow) HalDmaFrameDesc(*frame);
+    if (!desc_copy)
+        return HAL_ERR_NO_MEM;
+    auto *tp = new (std::nothrow) TensorPriv{};
+    if (!tp)
+    {
+        delete desc_copy;
+        return HAL_ERR_NO_MEM;
+    }
+    tp->dma_frame = desc_copy;
+
+    std::memset(out, 0, sizeof(*out));
+    out->dma_fd = frame->fd[0]; /* data stays NULL: no CPU pixels on this path */
+    out->ndim = 1;
+    out->shape[0] = (int32_t)nv12_len64;
+    out->dtype = HAL_DTYPE_UINT8;
+    out->byte_size = (uint32_t)nv12_len64;
+    std::snprintf(out->name, sizeof(out->name), "%s", name.c_str());
+    out->priv = tp;
+    return HAL_OK;
+#endif
+}
+
+static int hailo15_infer_probe_capability(uint32_t cap_id, int32_t *out)
+{
+    if (!out)
+        return HAL_ERR_INVALID_ARG;
+#if !defined(HAL_HAVE_HAILORT)
+    (void)cap_id;
+    return HAL_ERR_NOT_SUPPORTED;
+#else
+    /* Static verdicts from the 2026-09-15 device adjudication; the live
+     * authority is tools/npu-bind-probe. */
+    switch (cap_id)
+    {
+    case HAL_INFER_CAP_PIXBUF_DMABUF:
+        *out = 1; /* set_pix_buffer DMABUF dual-plane: PASS, byte-identical */
+        return HAL_OK;
+    case HAL_INFER_CAP_DMABUF_SINGLE:
+        *out = 1; /* set_dma_buffer single compact fd: PASS, byte-identical */
+        return HAL_OK;
+    case HAL_INFER_CAP_STREAM_ASYNC_FD:
+        *out = 0; /* vdev->configure(): HAILO_NOT_IMPLEMENTED on this stack */
+        return HAL_OK;
+    default:
+        return HAL_ERR_INVALID_ARG;
+    }
+#endif
+}
+
 static int hailo15_infer_run(HalInferenceSession *session,
                              const HalTensor *inputs, int num_inputs,
                              HalTensor *outputs, int num_outputs)
@@ -1886,6 +2038,7 @@ static void hailo15_infer_free_tensor(HalTensor *tensor)
     if (tensor->priv)
     {
         auto *tp = static_cast<TensorPriv *>(tensor->priv);
+        delete tp->dma_frame; /* owned desc copy from bind_dma_frame() */
         delete tp;
     }
     std::memset(tensor, 0, sizeof(*tensor));
@@ -2016,6 +2169,9 @@ HalInferenceOps HAL_INFERENCE_OPS = {
     .get_version = hailo15_infer_get_version,
     /* M3 additions (appended at the table tail, after get_version) */
     .tensor_from_frame_ex = hailo15_infer_tensor_from_frame_ex,
+    /* P0-2 additions (DMA direct-bind contract; NULL on platforms without it) */
+    .bind_dma_frame = hailo15_infer_bind_dma_frame,
+    .probe_capability = hailo15_infer_probe_capability,
 };
 
 } // extern "C"
