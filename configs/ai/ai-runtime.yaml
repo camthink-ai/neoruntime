@@ -12,19 +12,14 @@ hal:
   library_path: /data/aipc/lib/hal/libaipc_hal.so
   # library_path: /data/aipc/lib/hal/libaipc_hal.so   # HAL v2 stub for host testing
   device_path: /dev/hailo0
-  # Scheduler config passed to HAL create() as platform_config.
-  # Enables shared VDevice + Round-Robin model scheduling on Hailo-15 NPU.
-  platform_config: |
-    {
-      "scheduler": {
-        "algorithm": "round_robin",
-        "group_id": "aipc",
-        "multi_process_service": true,
-        "threshold": 4,
-        "timeout_ms": 100
-      }
-    }
-  
+  # NPU VDevice scheduling lives in the HAL, not here: libaipc_hal opens its
+  # shared VDevice with group_id = the medialib's hailort.device-id
+  # ("device0") + multi_process_service + ROUND_ROBIN
+  # (hal_v2 kSharedVDeviceGroupId). Any other group makes hailort_server
+  # refuse the attach while AI-ISP is active. The platform_config JSON that
+  # used to sit here (scheduler.group_id "aipc" ...) was never parsed by the
+  # HAL and has been removed; per-model backend_function is spliced by
+  # ModelManager without needing a YAML skeleton.
 # Model repository
 models:
   repository_path: /data/aipc/models

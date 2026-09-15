@@ -29,7 +29,8 @@ struct Config {
     // HAL
     std::string hal_library_path = "/data/aipc/lib/hal/libaipc_hal.so";
     std::string hal_device_path;
-    std::string hal_platform_config;  // JSON scheduler config passed to HAL create()
+    std::string hal_platform_config;  // hal.platform_config passthrough; HAL only reads
+                                       // backend_function (device_id is stored, unused)
 
     // Models
     std::string model_repository_path = "/data/aipc/models";

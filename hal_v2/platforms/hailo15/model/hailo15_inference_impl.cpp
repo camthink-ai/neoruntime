@@ -132,9 +132,11 @@ struct Hailo15InferPriv
  *
  * Cross-process sharing: the VDevice is shared with camera-daemon's medialib
  * AI-ISP by joining its group_id (kSharedVDeviceGroupId = the medialib
- * hailort.device-id "device0") via hailort_server. A mismatched group makes the
- * server refuse ai-runtime's attach with HAILO_DEVICE_IN_USE(73) as soon as a
- * model loads while AI-ISP is active.
+ * hailort.device-id "device0") via hailort_server. A mismatched group makes
+ * the server refuse the attach outright (verified on-device 2026-09-15:
+ * HAILO_OUT_OF_PHYSICAL_DEVICES(74) at VDevice::create — "requested: 1,
+ * found: 0"; DEVICE_IN_USE(73) is the non-service direct-attach code), so
+ * any override must be a deliberate exclusive run.
  *
  * Cached for the process lifetime; only reset_shared_vdevice() clears it (on
  * the connection-lost recovery path). Each model holds a shared_ptr copy, so
@@ -143,38 +145,59 @@ struct Hailo15InferPriv
  */
 static std::mutex g_shared_vdevice_mu;
 static std::shared_ptr<hailort::VDevice> g_shared_vdevice;
+/** Group the singleton was created with (first-wins; sticky across resets so
+ *  a connection-lost rebuild keeps a deliberate override). Read under
+ *  g_shared_vdevice_mu. */
+static std::string g_shared_vdevice_group;
 
 // group_id shared with camera-daemon's medialib AI-ISP VDevice. Must equal the
-// medialib's hailort.device-id ("device0"); a mismatch makes hailort_server
-// refuse the second attach (HAILO_DEVICE_IN_USE 73) and breaks NPU coexistence.
+// medialib's hailort.device-id ("device0"); any other group makes hailort_server
+// refuse this attach (74/73, see above) and breaks NPU coexistence.
 static constexpr const char *kSharedVDeviceGroupId = "device0";
 
-static std::shared_ptr<hailort::VDevice> get_shared_vdevice()
+static std::shared_ptr<hailort::VDevice> get_shared_vdevice(const char *group_override = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_shared_vdevice_mu);
     if (g_shared_vdevice)
+    {
+        if (group_override && group_override[0]
+            && g_shared_vdevice_group != group_override)
+        {
+            // Process-wide singleton: first creation wins. A later caller asking
+            // for a different group gets the existing one — silently switching
+            // would split the scheduler or break the AI-ISP coexistence group.
+            HAL_LOG_WARNING("hailo15_inference: shared VDevice already on group '%s'; "
+                            "ignoring requested group '%s' (first-wins)",
+                            g_shared_vdevice_group.c_str(), group_override);
+        }
         return g_shared_vdevice;
+    }
 
     hailo_vdevice_params_t params = {};
     hailo_init_vdevice_params(&params);
 
     // Join the medialib AI-ISP's group so ai-runtime and AI-ISP share the single NPU
     // via hailort_server. The medialib opens its VDevice with group_id = its hailort.device-id
-    // ("device0"); the former default "aipc" made the server refuse the second attach with
-    // HAILO_DEVICE_IN_USE(73) -> OUT_OF_PHYSICAL_DEVICES(74) as soon as a model loaded while
-    // AI-ISP was active. Same group + multi_process_service lets HailoRT pipeline both
-    // consumers' network groups on the one physical device.
-    params.group_id = kSharedVDeviceGroupId;
+    // ("device0"); a different group (the former default "aipc" did) makes the server refuse
+    // the attach with HAILO_OUT_OF_PHYSICAL_DEVICES(74) while AI-ISP is active. Same group +
+    // multi_process_service lets HailoRT pipeline both consumers' network groups on the one
+    // physical device.
+    params.group_id = (group_override && group_override[0])
+                          ? group_override
+                          : (g_shared_vdevice_group.empty() ? kSharedVDeviceGroupId
+                                                            : g_shared_vdevice_group.c_str());
     params.multi_process_service = true;
     params.scheduling_algorithm = HAILO_SCHEDULING_ALGORITHM_ROUND_ROBIN;
 
     auto exp = hailort::VDevice::create(params);
     if (!exp)
     {
-        HAL_LOG_ERROR("hailo15_inference: shared VDevice create failed (status=%d)", (int)exp.status());
+        HAL_LOG_ERROR("hailo15_inference: shared VDevice create failed (group='%s', status=%d)",
+                      params.group_id, (int)exp.status());
         return nullptr;
     }
     g_shared_vdevice = exp.release();
+    g_shared_vdevice_group = params.group_id;
     HAL_LOG_INFO("hailo15_inference: created shared VDevice (group='%s', multi_process_service=1, scheduler=ROUND_ROBIN)",
                  params.group_id);
     return g_shared_vdevice;
@@ -212,6 +235,10 @@ static inline bool hailo15_vdevice_connection_lost(hailo_status st)
  * nothing cached, so callers can rate-limit logging.
  *
  * Returns true iff the singleton was actually reset.
+ *
+ * g_shared_vdevice_group deliberately survives the reset: a rebuild via
+ * get_shared_vdevice(nullptr) re-uses it, so a deliberate vdevice_group_id
+ * override stays in effect across hailort_server restarts.
  */
 static bool reset_shared_vdevice()
 {
@@ -272,7 +299,7 @@ static int hailo15_bind_inputs_outputs(Hailo15InferPriv *p, const HalTensor *inp
     {
         const auto &name = p->input_names[i];
         const HalTensor &in = inputs[i];
-        if (!in.data || in.byte_size == 0)
+        if (in.byte_size == 0)
             return HAL_ERR_INVALID_ARG;
         const size_t frame_size = p->infer_model->input(name)->get_frame_size();
         if (in.byte_size != frame_size)
@@ -1009,7 +1036,18 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
 
     // Acquire shared VDevice — enables HailoRT ROUND_ROBIN scheduling across
     // all models so the NPU can pipeline inference for multiple network groups.
-    p->vdevice = get_shared_vdevice();
+    // An explicit runtime handle (from runtime_acquire(), possibly carrying a
+    // vdevice_group_id override) reuses the VDevice it was created with; the
+    // handle-less path joins the process singleton on the shared group.
+    if (config->runtime)
+    {
+        auto *runtime_handle = reinterpret_cast<Hailo15RuntimeHandle *>(config->runtime);
+        p->vdevice = runtime_handle->vdevice;
+    }
+    else
+    {
+        p->vdevice = get_shared_vdevice();
+    }
     if (!p->vdevice)
     {
         HAL_LOG_ERROR("hailo15_inference: failed to acquire shared VDevice");
@@ -1995,23 +2033,38 @@ static int hailo15_infer_run_async(HalInferenceSession *session,
 /**
  * Acquire a handle to the shared NPU runtime. The HEAD design shares one
  * ROUND_ROBIN VDevice across every model session, so every acquired runtime
- * is backed by the same scheduler — the @p config is accepted for API
- * compatibility but the singleton's scheduling wins. */
+ * is backed by the same scheduler. A non-empty @p config->vdevice_group_id
+ * seeds the singleton's group at first creation (mirroring the GenAI
+ * implementation); the singleton is process-lifetime, so a later acquire
+ * asking for a different group keeps the existing one (WARN in
+ * get_shared_vdevice). algorithm / multi_process_service stay at the
+ * platform defaults (ROUND_ROBIN + hailort_server) — group is the one knob
+ * this honors, and it must match the medialib hailort.device-id unless the
+ * caller deliberately wants an exclusive run.
+ */
 static HalInferenceRuntime *hailo15_infer_runtime_acquire(const HalInferenceRuntimeConfig *config)
 {
 #if !defined(HAL_HAVE_HAILORT)
     (void)config;
     return nullptr;
 #else
-    (void)config;
-    auto vdev = get_shared_vdevice();
+    const char *group_override = nullptr;
+    if (config && config->vdevice_group_id[0] != '\0')
+        group_override = config->vdevice_group_id;
+    auto vdev = get_shared_vdevice(group_override);
     if (!vdev)
         return nullptr;
     auto *wrapper = new (std::nothrow) Hailo15RuntimeHandle();
     if (!wrapper)
         return nullptr;
     wrapper->vdevice = vdev;
-    HAL_LOG_INFO("hailo15_inference: runtime_acquire group=aipc algorithm=ROUND_ROBIN");
+    std::string group_str;
+    {
+        std::lock_guard<std::mutex> lock(g_shared_vdevice_mu);
+        group_str = g_shared_vdevice_group;
+    }
+    HAL_LOG_INFO("hailo15_inference: runtime_acquire group='%s' algorithm=ROUND_ROBIN multi_process_service=1",
+                 group_str.c_str());
     return reinterpret_cast<HalInferenceRuntime *>(wrapper);
 #endif
 }
