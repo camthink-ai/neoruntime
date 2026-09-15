@@ -211,6 +211,14 @@ message StreamInferRequest {
   uint32 fps_limit = 3;       // Maximum frame rate limit
   string session_id = 4;
   bool   raw_output_only = 5;      // Set true to skip post-processing, return raw tensors
+
+  // On-demand result shaping (additive, server-side, model-agnostic —
+  // applied after post-process; absent fields = legacy behavior).
+  uint32 max_detections  = 6;  // 0 = unlimited; else top-k by confidence
+  float  min_confidence  = 7;  // 0 = no threshold; else drop results below
+  repeated int32 class_filter = 8;  // empty = all classes; else keep listed ids
+  bool   omit_labels     = 9;  // strip label strings (largest wire field)
+  bool   only_nonempty   = 10; // suppress responses whose results are all empty
 }
 
 message StreamInferResponse {
