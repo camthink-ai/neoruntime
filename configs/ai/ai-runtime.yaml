@@ -53,6 +53,17 @@ scheduler:
 fd_receiver:
   socket_path: /run/aipc/camera.sock
 
+# Stream DSP preprocess (opt-in): frames whose geometry doesn't match the model
+# input are resized on the DSP into a private model-geometry dmabuf pool and
+# fd-bound (zero CPU copies). Off or unavailable = direct DMA input; mismatched
+# geometry is rejected by the existing HAL size validation.
+stream_preprocess:
+  enabled: false
+  pool_slots: 4
+  job_timeout_ms: 100
+  # camera-daemon CameraControl gRPC endpoint (SubmitDspJob job plane)
+  job_endpoint: unix:///run/aipc/camera-control.sock
+
 # Performance configuration
 performance:
   # NPU performance mode

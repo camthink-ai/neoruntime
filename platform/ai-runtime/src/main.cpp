@@ -8,6 +8,7 @@
 #include "fd_receiver.h"
 #include "event_bus_client.h"
 #include "grpc_service.h"
+#include "dsp_client.h"
 #include "auto_infer.h"
 
 #include <grpcpp/grpcpp.h>
@@ -133,6 +134,13 @@ int main(int argc, char* argv[]) {
     // ── FD Receiver (zero-copy DMA-BUF from camera-daemon) ───────────────────
     FdReceiver fd_receiver(cfg.fd_socket_path);
 
+    // ── Stream DSP preprocess: camera.sock buffer plane + camera-control
+    // gRPC job plane. Process-lifetime singleton: its UDS connection owns every
+    // DSP buffer id this runtime allocates/imports (disconnect cleanup is the
+    // safety net), and late StreamPreprocessPool leases may outlive a stream.
+    DspClient dsp_client(cfg.fd_socket_path,
+                         cfg.stream_preprocess_job_endpoint);
+
     // ── Event Bus client ─────────────────────────────────────────────────────
     EventBusClient event_bus;
     if (cfg.event_bus_enabled && !cfg.event_bus_endpoint.empty()) {
@@ -144,7 +152,7 @@ int main(int argc, char* argv[]) {
     // ── gRPC server ──────────────────────────────────────────────────────────
     AIRuntimeServiceImpl service(cfg, &model_mgr, &session_mgr,
                                  &scheduler, &fd_receiver, &event_bus,
-                                 &postprocess_pool,
+                                 &postprocess_pool, &dsp_client,
                                  hal_loader.clip_text_enc_ops(),
                                  hal_loader.genai_ops());
 

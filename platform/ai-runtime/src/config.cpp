@@ -297,6 +297,11 @@ Config load_config(const std::string& path) {
             else if (key == "queue_size") cfg.postprocess_queue_size = parse_u32_config(val, "postprocess.queue_size");
         } else if (section == "fd_receiver") {
             if (key == "socket_path") cfg.fd_socket_path = val;
+        } else if (section == "stream_preprocess") {
+            if (key == "enabled")     cfg.stream_dsp_preprocess = (val == "true");
+            else if (key == "pool_slots") cfg.stream_preprocess_slots = parse_u32_config(val, "stream_preprocess.pool_slots");
+            else if (key == "job_timeout_ms") cfg.stream_preprocess_job_ms = parse_u32_config(val, "stream_preprocess.job_timeout_ms");
+            else if (key == "job_endpoint")   cfg.stream_preprocess_job_endpoint = val;
         } else if (section == "performance") {
             if (key == "device_mode") cfg.device_mode = val;
         } else if (section == "event_bus") {

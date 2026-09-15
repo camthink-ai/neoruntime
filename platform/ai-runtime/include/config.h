@@ -52,6 +52,16 @@ struct Config {
     // FD Receiver (zero-copy DMA-BUF)
     std::string fd_socket_path = "/run/aipc/camera.sock";
 
+    // Stream DSP preprocess: when a StreamInfer frame's geometry does not
+    // match the model input, resize it on the DSP into a private model-geometry
+    // dmabuf pool and fd-bind that (zero CPU copies). Opt-in; when disabled or
+    // unavailable, the existing direct DMA path retains HAL size validation.
+    bool     stream_dsp_preprocess    = false;
+    uint32_t stream_preprocess_slots  = 4;     // pool buffers per stream
+    uint32_t stream_preprocess_job_ms = 100;   // DSP job wait timeout
+    // camera-daemon CameraControl gRPC endpoint (SubmitDspJob job plane)
+    std::string stream_preprocess_job_endpoint = "unix:///run/aipc/camera-control.sock";
+
     // Performance
     std::string device_mode = "high";
 
