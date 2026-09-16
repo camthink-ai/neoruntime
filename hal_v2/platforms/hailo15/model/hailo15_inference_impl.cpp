@@ -736,6 +736,16 @@ static void fill_hal_tensor_info_from_stream(HalModelTensorInfo *slot, const hai
     }
 }
 
+/* Some HailoRT APIs return stream names with/without the network prefix;
+ * match either the full name or the basename suffix after the last '/'. */
+static const char *stream_name_suffix(const char *s)
+{
+    if (!s)
+        return "";
+    const char *last = std::strrchr(s, '/');
+    return last ? (last + 1) : s;
+}
+
 /**
  * Override spatial dims from HEF get_*_stream_infos() (matched by stream name).
  *
@@ -752,17 +762,12 @@ static void enrich_tensor_image_size_from_hef_stream_info(HalModelTensorInfo *sl
         is_input ? hef.get_input_stream_infos("") : hef.get_output_stream_infos("");
     if (!exp.has_value())
         return;
-    auto suffix = [](const char *s) -> const char * {
-        if (!s)
-            return "";
-        const char *last = std::strrchr(s, '/');
-        return last ? (last + 1) : s;
-    };
     for (const hailo_stream_info_t &si : exp.value())
     {
         // Some HailoRT APIs return stream names with/without the network prefix.
         // Match either full name or the basename suffix after the last '/'.
-        if (std::strcmp(si.name, slot->name) != 0 && std::strcmp(suffix(si.name), suffix(slot->name)) != 0)
+        if (std::strcmp(si.name, slot->name) != 0 &&
+            std::strcmp(stream_name_suffix(si.name), stream_name_suffix(slot->name)) != 0)
             continue;
         if (hailo_format_order_is_nms_shape_invalid(si.format.order))
             break;
@@ -934,6 +939,35 @@ static void reconcile_input_nv12_dims_from_byte_size(HalModelTensorInfo *slot)
         slot->shape[1] = static_cast<int32_t>(best_h);
         slot->shape[2] = static_cast<int32_t>(best_w);
     }
+}
+
+/**
+ * Pixel geometry for a model input exactly as get_model_info() reports it:
+ * InferStream fill + HEF hw_shape enrichment + byte-size NV12 reconciliation.
+ * Bind-side geometry validation must agree with this derivation — the raw
+ * InferStream shape and even the HEF stream-info shape pack NV12 inputs as
+ * H/2 x W x 3, so validating against either rejects every frame the
+ * reconciled metadata matched. Returns false when the input cannot be
+ * resolved to unambiguous NV12 pixel dims; the caller falls back to the raw
+ * InferStream shape.
+ */
+static bool reconciled_input_pixel_geometry(Hailo15InferPriv *p, const std::string &name,
+                                            uint32_t *w, uint32_t *h)
+{
+    if (!p || !w || !h)
+        return false;
+    auto input_exp = p->infer_model->input(name);
+    if (!input_exp.has_value())
+        return false;
+    HalModelTensorInfo slot{};
+    fill_hal_tensor_info_from_stream(&slot, input_exp.value(), false);
+    enrich_tensor_image_size_from_hef_stream_info(&slot, p->infer_model->hef(), true);
+    reconcile_input_nv12_dims_from_byte_size(&slot);
+    if (slot.is_nv12 == 0 || slot.ndim < 4 || slot.shape[1] <= 0 || slot.shape[2] <= 0)
+        return false;
+    *h = static_cast<uint32_t>(slot.shape[1]);
+    *w = static_cast<uint32_t>(slot.shape[2]);
+    return true;
 }
 #endif
 
@@ -1603,8 +1637,22 @@ static int hailo15_infer_tensor_from_frame_ex(HalInferenceSession *session,
                (frame->num_planes < 2 || frame->strides[1] == 0 || frame->strides[1] == frame->width))
             : (frame->strides[0] == 0 || frame->strides[0] == frame->width * 3);
     const bool normalize = p->cfg.preprocess.normalize;
+    /* Exact-match test uses the reconciled geometry (see bind_dma_frame):
+     * the raw InferStream shape packs NV12 as H/2 x W x 3, so an
+     * exact-match DMABUF frame would otherwise fall through to the staged
+     * conversion path. */
+    uint32_t match_w = dsh.width;
+    uint32_t match_h = dsh.height;
+    {
+        uint32_t hw_w = 0, hw_h = 0;
+        if (reconciled_input_pixel_geometry(p, name, &hw_w, &hw_h))
+        {
+            match_w = hw_w;
+            match_h = hw_h;
+        }
+    }
     if (frame->mem_type == HAL_MEM_DMABUF && frame->dma_fds[0] >= 0 && !nv12_dual_fd && stride_tight &&
-        frame->width == dsh.width && frame->height == dsh.height && !normalize &&
+        frame->width == match_w && frame->height == match_h && !normalize &&
         ((frame->format == HAL_PIX_FMT_NV12 && dfm.order == HAILO_FORMAT_ORDER_NV12) ||
          (frame->format == HAL_PIX_FMT_RGB24 && dsh.features == 3 &&
           (dfm.order == HAILO_FORMAT_ORDER_RGB888 || dfm.order == HAILO_FORMAT_ORDER_NHWC))))
@@ -1922,11 +1970,24 @@ static int hailo15_infer_bind_dma_frame(HalInferenceSession *session, const HalD
                       name.c_str(), static_cast<int>(input_format.order));
         return HAL_ERR_NOT_SUPPORTED;
     }
-    if (input_shape.width != w || input_shape.height != h)
+    /* Validate against the reconciled geometry — the same derivation
+     * get_model_info() reports — not the raw InferStream shape, which packs
+     * NV12 as H/2 x W x 3 and would reject every reconciled-match frame. */
+    uint32_t exp_w = input_shape.width;
+    uint32_t exp_h = input_shape.height;
+    {
+        uint32_t hw_w = 0, hw_h = 0;
+        if (reconciled_input_pixel_geometry(p, name, &hw_w, &hw_h))
+        {
+            exp_w = hw_w;
+            exp_h = hw_h;
+        }
+    }
+    if (exp_w != w || exp_h != h)
     {
         HAL_LOG_ERROR("hailo15_inference: bind_dma_frame geometry mismatch "
                       "(desc=%ux%u input '%s'=%ux%u)",
-                      w, h, name.c_str(), input_shape.width, input_shape.height);
+                      w, h, name.c_str(), exp_w, exp_h);
         return HAL_ERR_INVALID_SIZE;
     }
     const size_t frame_size = input.get_frame_size();
