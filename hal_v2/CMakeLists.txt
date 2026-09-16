@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
 option(HAL_V2_BUILD_MONOLITHIC "Build a single libaipc_hal.so instead of many component .so files" ON)
+option(HAL_V2_BUILD_TESTS "Build HAL v2 native tests" OFF)
 
 if(NOT HAL_PLATFORM)
     set(HAL_PLATFORM "hailo15" CACHE STRING "HAL platform: hailo15 | stub (no vendor media/ISP/OSD)")
@@ -1095,4 +1096,28 @@ elseif(HAL_PLATFORM STREQUAL "stub")
         target_link_libraries(ne503_boot_prep PRIVATE hal-common pthread)
     endif()
     target_compile_options(ne503_boot_prep PRIVATE -Wall -Wextra -fPIC)
+endif()
+
+if(HAL_V2_BUILD_TESTS)
+    include(CTest)
+    find_package(Threads REQUIRED)
+
+    add_executable(hal-hailo15-async-provider-lifecycle-test
+        tests/hailo15_async_provider_lifecycle_test.cpp
+    )
+    target_include_directories(hal-hailo15-async-provider-lifecycle-test PRIVATE
+        ${HAL_V2_ROOT}
+        ${HAL_V2_INC}
+    )
+    target_link_libraries(hal-hailo15-async-provider-lifecycle-test PRIVATE
+        Threads::Threads
+    )
+    target_compile_options(hal-hailo15-async-provider-lifecycle-test PRIVATE
+        -Wall -Wextra -Werror
+    )
+
+    add_test(
+        NAME hailo15_async_provider_lifecycle
+        COMMAND hal-hailo15-async-provider-lifecycle-test
+    )
 endif()

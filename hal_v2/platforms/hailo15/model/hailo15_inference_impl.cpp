@@ -11,6 +11,7 @@
 #include "common/hal_buffer.h"
 #include "common/hal_hailo15_priv.hpp"
 #include "model/hal_inference.h"
+#include "platforms/hailo15/model/hailo15_async_provider_lifecycle.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -26,6 +27,9 @@
 #include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <condition_variable>
+#include <exception>
+#include <new>
 
 #if defined(HAL_HAVE_HAILORT)
 #include "hailo/hailort.hpp"
@@ -76,14 +80,15 @@ struct Hailo15RuntimeHandle
     std::shared_ptr<hailort::VDevice> vdevice;
 };
 
-/** Per-job context for run_async(). Kept alive (held in pending_async and
- *  captured by the HailoRT completion callback) until the NPU reports done. */
-struct Hailo15InferAsyncCtx
+using Hailo15AsyncProviderLifecycle =
+    hal_v2::hailo15::Hailo15AsyncProviderLifecycle;
+
+/** Per-job application payload retained by the lifecycle completion closure. */
+struct Hailo15InferAsyncPayload
 {
     std::vector<HalTensor> outputs;
     HalInferenceAsyncCallback callback = nullptr;
     void *userdata = nullptr;
-    std::unique_ptr<hailort::AsyncInferJob> job;
 };
 
 struct Hailo15InferPriv
@@ -101,20 +106,11 @@ struct Hailo15InferPriv
     std::string nms_name_prefix;
     HalInferenceConfig cfg{};
 
-    // Async inference bookkeeping (run_async). pending_async lets destroy()
-    // flush in-flight jobs before tearing the session down, and lets
-    // query_session_performance_stats report queue depth; fps_mtx /
-    // fps_window_* drive the measured throughput window.
+    // Async lifecycle serializes bind + provider submission, defers inline
+    // completion until submission has unwound, and drains callbacks on destroy.
+    // This protects the shared bindings that set_buffer() rewrites per request.
     std::atomic<uint64_t> total_inferences{0};
-    std::mutex async_mtx;
-    // Serializes bind() + run_async()/run() per session. p->bindings holds the
-    // MemoryViews that set_buffer() rewrites on every call; without this lock,
-    // concurrent workers serving the same session race on the output buffer
-    // pointers HailoRT snapshots at submit time, aliasing buffers so one job's
-    // completion frees an output buffer another job's NPU write is still in
-    // flight (heap-use-after-free under K>=4 concurrency).
-    std::mutex submit_mtx;
-    std::vector<std::shared_ptr<Hailo15InferAsyncCtx>> pending_async;
+    Hailo15AsyncProviderLifecycle async_lifecycle;
     std::mutex fps_mtx;
     uint64_t fps_window_start_ms = 0;
     uint32_t fps_window_count = 0;
@@ -126,6 +122,24 @@ struct Hailo15InferPriv
     std::unique_ptr<hailort::InputTransformContext> transform_ctx;
     uint32_t transform_key[4]{0, 0, 0, 0};
 };
+
+static Hailo15InferPriv *hailo15_new_infer_priv() noexcept
+{
+    try
+    {
+        return new (std::nothrow) Hailo15InferPriv();
+    }
+    catch (const std::exception &e)
+    {
+        HAL_LOG_ERROR("hailo15_inference: session allocation failed: %s",
+                      e.what());
+    }
+    catch (...)
+    {
+        HAL_LOG_ERROR("hailo15_inference: session allocation failed");
+    }
+    return nullptr;
+}
 
 /**
  * Shared VDevice singleton for multi-model parallel inference.
@@ -312,18 +326,18 @@ static int hailo15_bind_inputs_outputs(Hailo15InferPriv *p, const HalTensor *inp
                           frame_size);
             return HAL_ERR_INVALID_SIZE;
         }
-        if (!in.data)
+        auto *tp = static_cast<TensorPriv *>(in.priv);
+        const HalDmaFrameDesc *d = tp ? tp->dma_frame : nullptr;
+        if (d || in.dma_fd >= 0)
         {
-            /* DMA-bound input, zero CPU pixels. Preferred route: the
+            /* DMA-bound input. Preferred route: the
              * HalDmaFrameDesc from bind_dma_frame() / the tensor_from_frame
              * dma fast path — it carries the per-plane layout. Fallback: a
              * bare tensor->dma_fd over one compact buffer. In both cases the
              * underlying memory must stay valid for the transfer lifetime
              * (sync run returns after completion; async until the callback).
-             * The descriptor is re-applied on every submit — works under
-             * submit_mtx and with future ping-pong bindings. */
-            auto *tp = static_cast<TensorPriv *>(in.priv);
-            const HalDmaFrameDesc *d = tp ? tp->dma_frame : nullptr;
+             * The descriptor is re-applied on every submit under the lifecycle
+             * helper's serialized vendor-submission section. */
             hailo_status st;
             if (d)
             {
@@ -494,24 +508,6 @@ static void hailo15_attach_postprocess_roi(Hailo15InferPriv *p, HalTensor *outpu
 #endif
 }
 
-/** Block until every in-flight async job for this session has completed.
- *  Called from destroy() so the completion callbacks (which capture p) never
- *  fire after the session is freed. */
-static void hailo15_wait_pending_async(Hailo15InferPriv *p)
-{
-    std::vector<std::shared_ptr<Hailo15InferAsyncCtx>> snapshot;
-    {
-        std::lock_guard<std::mutex> lock(p->async_mtx);
-        snapshot.swap(p->pending_async);
-    }
-    const uint32_t timeout_ms = p->cfg.timeout_ms ? p->cfg.timeout_ms : 10000;
-    for (auto &ctx : snapshot)
-    {
-        if (ctx->job)
-            ctx->job->wait(std::chrono::milliseconds(timeout_ms));
-    }
-    snapshot.clear();
-}
 #endif
 
 static inline bool str_has_json_object_prefix(const char *s)
@@ -1024,7 +1020,7 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
     HAL_LOG_WARNING("hailo15_inference: built without HailoRT; returning NULL");
     return nullptr;
 #else
-    auto *p = new (std::nothrow) Hailo15InferPriv();
+    auto *p = hailo15_new_infer_priv();
     if (!p)
         return nullptr;
     p->cfg = *config;
@@ -1192,7 +1188,7 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
             // Drop the priv that already holds the broken infer_model and start fresh.
             delete p;
 
-            p = new (std::nothrow) Hailo15InferPriv();
+            p = hailo15_new_infer_priv();
             if (!p)
             {
                 HAL_LOG_ERROR("hailo15_inference: OOM retrying without latency flag");
@@ -1280,9 +1276,14 @@ static void hailo15_infer_destroy(HalInferenceSession *session)
     (void)session;
 #else
     auto *p = reinterpret_cast<Hailo15InferPriv *>(session);
-    // Drain in-flight async jobs first: their completion callbacks capture p,
-    // so freeing the session underneath a pending job would use-after-free.
-    hailo15_wait_pending_async(p);
+    // Completion code captures p, so release it only after every accepted
+    // callback has returned. Destruction from one of those callbacks is rejected
+    // without aborting or self-deadlocking; the caller must retry externally.
+    if (!p->async_lifecycle.close_and_wait())
+    {
+        HAL_LOG_ERROR("hailo15_inference: destroy called from its own async callback; session remains alive");
+        return;
+    }
     delete p;
 #endif
 }
@@ -1909,11 +1910,32 @@ static int hailo15_infer_bind_dma_frame(HalInferenceSession *session, const HalD
     if (p->input_names.empty())
         return HAL_ERR_INVALID_ARG;
     const auto &name = p->input_names[0];
-    const size_t frame_size = p->infer_model->input(name)->get_frame_size();
-    if (frame_size != (size_t)nv12_len64)
+    auto input_exp = p->infer_model->input(name);
+    if (!input_exp.has_value())
+        return HAL_ERR_NOT_SUPPORTED;
+    const auto &input = input_exp.value();
+    const hailo_3d_image_shape_t input_shape = input.shape();
+    const hailo_format_t input_format = input.format();
+    if (input_format.order != HAILO_FORMAT_ORDER_NV12)
     {
-        HAL_LOG_ERROR("hailo15_inference: bind_dma_frame geometry mismatch (desc=%llux%llu -> %llu bytes, input '%s' wants %zu)",
-                      (unsigned long long)w, (unsigned long long)h, (unsigned long long)nv12_len64, name.c_str(), frame_size);
+        HAL_LOG_ERROR("hailo15_inference: bind_dma_frame input '%s' is not NV12 (order=%d)",
+                      name.c_str(), static_cast<int>(input_format.order));
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+    if (input_shape.width != w || input_shape.height != h)
+    {
+        HAL_LOG_ERROR("hailo15_inference: bind_dma_frame geometry mismatch "
+                      "(desc=%ux%u input '%s'=%ux%u)",
+                      w, h, name.c_str(), input_shape.width, input_shape.height);
+        return HAL_ERR_INVALID_SIZE;
+    }
+    const size_t frame_size = input.get_frame_size();
+    if (frame_size != static_cast<size_t>(nv12_len64))
+    {
+        HAL_LOG_ERROR("hailo15_inference: bind_dma_frame size mismatch "
+                      "(desc=%llu input '%s'=%zu)",
+                      static_cast<unsigned long long>(nv12_len64),
+                      name.c_str(), frame_size);
         return HAL_ERR_INVALID_SIZE;
     }
 
@@ -1999,24 +2021,26 @@ static int hailo15_infer_run(HalInferenceSession *session,
     }
 
     std::unique_ptr<hailort::AsyncInferJob> job;
-    {
-        // Bind + submit must be atomic per session: p->bindings is shared state.
-        std::lock_guard<std::mutex> lk(p->submit_mtx);
-
+    const int submit_rc = p->async_lifecycle.serialize_vendor_submission([&]() -> int {
         const int bind_rc = hailo15_bind_inputs_outputs(p, inputs, outputs);
         if (bind_rc != HAL_OK)
             return bind_rc;
 
-        auto job_exp = p->configured.run_async(p->bindings, [](const hailort::AsyncInferCompletionInfo &) {});
+        auto job_exp = p->configured.run_async(
+            p->bindings, [](const hailort::AsyncInferCompletionInfo &) {});
         if (!job_exp)
         {
-            HAL_LOG_ERROR("hailo15_inference: run_async failed (status=%d)", (int)job_exp.status());
+            HAL_LOG_ERROR("hailo15_inference: run_async failed (status=%d)",
+                          static_cast<int>(job_exp.status()));
             if (hailo15_vdevice_connection_lost(job_exp.status()))
                 hailo15_notify_vdevice_lost(job_exp.status(), "run_async");
             return HAL_ERR_RESULT;
         }
         job = std::make_unique<hailort::AsyncInferJob>(job_exp.release());
-    }
+        return HAL_OK;
+    });
+    if (submit_rc != HAL_OK)
+        return submit_rc;
     hailo_status st = job->wait(std::chrono::milliseconds(p->cfg.timeout_ms ? p->cfg.timeout_ms : 10000));
     if (HAILO_SUCCESS != st)
     {
@@ -2033,17 +2057,17 @@ static int hailo15_infer_run(HalInferenceSession *session,
 }
 
 /**
- * Submit one inference without blocking. The caller's output buffers must stay
- * valid until the callback fires (HailoRT snapshots the MemoryView pointers at
- * submission time, the NPU writes them asynchronously). The completion ctx is
- * shared between pending_async (so destroy() can drain it) and the HailoRT
- * callback, which keeps it alive until the NPU reports done. */
+ * Submit one inference without blocking. The lifecycle helper serializes shared
+ * binding updates, atomically arbitrates callback ownership versus rejection,
+ * and retains the output snapshot and userdata through callback return.
+ */
 static int hailo15_infer_run_async(HalInferenceSession *session,
                                    const HalTensor *inputs, int num_inputs,
                                    HalTensor *outputs, int num_outputs,
                                    HalInferenceAsyncCallback callback, void *userdata)
 {
-    if (!session || !inputs || num_inputs <= 0 || !outputs || num_outputs <= 0 || !callback)
+    if (!session || !inputs || num_inputs <= 0 || !outputs ||
+        num_outputs <= 0 || !callback)
         return HAL_ERR_INVALID_ARG;
 
 #if !defined(HAL_HAVE_HAILORT)
@@ -2056,83 +2080,132 @@ static int hailo15_infer_run_async(HalInferenceSession *session,
     auto *p = reinterpret_cast<Hailo15InferPriv *>(session);
     const size_t want_in = p->input_names.size();
     const size_t want_out = p->output_names.size();
-    if (static_cast<size_t>(num_inputs) < want_in || static_cast<size_t>(num_outputs) < want_out)
+    if (static_cast<size_t>(num_inputs) < want_in ||
+        static_cast<size_t>(num_outputs) < want_out)
         return HAL_ERR_INSUFFICIENT_BUFFER;
 
-    auto ready = p->configured.wait_for_async_ready(std::chrono::milliseconds(p->cfg.timeout_ms ? p->cfg.timeout_ms : 1000));
-    if (HAILO_SUCCESS != ready)
+    std::shared_ptr<Hailo15InferAsyncPayload> payload;
+    try
     {
-        if (hailo15_vdevice_connection_lost(ready))
-            hailo15_notify_vdevice_lost(ready, "wait_for_async_ready");
-        return HAL_ERR_TIMEOUT;
+        payload = std::make_shared<Hailo15InferAsyncPayload>();
+        payload->callback = callback;
+        payload->userdata = userdata;
+    }
+    catch (const std::bad_alloc &)
+    {
+        return HAL_ERR_NO_MEM;
+    }
+    catch (...)
+    {
+        return HAL_ERR_RESULT;
     }
 
-    // Bind + submit must be atomic per session: p->bindings is shared state
-    // rewritten by set_buffer() on every call. Without this lock, concurrent
-    // workers serving the same session race on the output buffer pointers
-    // HailoRT snapshots at submit time, aliasing buffers so one job's
-    // completion frees an output buffer another job's NPU write is still in
-    // flight (heap-use-after-free under K>=4 concurrency). The completion
-    // callback (below) and destroy()'s drain only ever take async_mtx, never
-    // submit_mtx, so nesting is deadlock-free.
-    std::shared_ptr<Hailo15InferAsyncCtx> ctx;
-    {
-        std::lock_guard<std::mutex> lk(p->submit_mtx);
+    using Attempt = Hailo15AsyncProviderLifecycle::Attempt;
+    using Result = Hailo15AsyncProviderLifecycle::SubmissionResult;
+    const int rc = p->async_lifecycle.submit(
+        [p, inputs, outputs, payload, want_out](Attempt attempt) -> Result {
+            const auto ready_timeout = std::chrono::milliseconds(
+                p->cfg.timeout_ms ? p->cfg.timeout_ms : 1000);
+            const hailo_status ready =
+                p->configured.wait_for_async_ready(ready_timeout);
+            if (HAILO_SUCCESS != ready)
+            {
+                if (hailo15_vdevice_connection_lost(ready))
+                    hailo15_notify_vdevice_lost(
+                        ready, "wait_for_async_ready");
+                return Result::rejected(HAL_ERR_TIMEOUT);
+            }
 
-        const int bind_rc = hailo15_bind_inputs_outputs(p, inputs, outputs);
-        if (bind_rc != HAL_OK)
-            return bind_rc;
+            const int bind_rc =
+                hailo15_bind_inputs_outputs(p, inputs, outputs);
+            if (bind_rc != HAL_OK)
+                return Result::rejected(bind_rc);
 
-        // Snapshot the output tensors for the callback. ctx is held by both
-        // pending_async (so destroy() can flush it) and the HailoRT completion
-        // callback, keeping it — and the AsyncInferJob it owns — alive until
-        // the NPU reports done.
-        ctx = std::make_shared<Hailo15InferAsyncCtx>();
-        ctx->outputs.assign(outputs, outputs + want_out);
-        ctx->callback = callback;
-        ctx->userdata = userdata;
+            try
+            {
+                payload->outputs.assign(outputs, outputs + want_out);
+            }
+            catch (const std::bad_alloc &)
+            {
+                return Result::rejected(HAL_ERR_NO_MEM);
+            }
+            catch (...)
+            {
+                return Result::rejected(HAL_ERR_RESULT);
+            }
 
-        // Register ctx BEFORE submitting so a callback that fires before
-        // run_async returns still finds (and erases) it. Without this, a
-        // fast-completing job would strand ctx in pending_async and block
-        // destroy()'s drain.
-        {
-            std::lock_guard<std::mutex> lock(p->async_mtx);
-            p->pending_async.push_back(ctx);
-        }
+            auto job_exp = p->configured.run_async(
+                p->bindings,
+                [attempt](const hailort::AsyncInferCompletionInfo &info) noexcept {
+                    const int status = info.status == HAILO_SUCCESS
+                        ? HAL_OK
+                        : HAL_ERR_RESULT;
+                    attempt.complete(status);
+                });
+            if (!job_exp)
+            {
+                const hailo_status status = job_exp.status();
+                HAL_LOG_ERROR(
+                    "hailo15_inference: run_async failed (status=%d)",
+                    static_cast<int>(status));
+                if (hailo15_vdevice_connection_lost(status))
+                    hailo15_notify_vdevice_lost(status, "run_async");
+                return Result::rejected(HAL_ERR_RESULT);
+            }
 
-        auto job_exp = p->configured.run_async(
-            p->bindings,
-            [p, ctx, want_out](const hailort::AsyncInferCompletionInfo &info) {
-                const int status = (info.status == HAILO_SUCCESS) ? HAL_OK : HAL_ERR_RESULT;
-                if (status == HAL_OK)
+            // A successful Expected transfers the eventual callback obligation.
+            // Mark it before release/detach so any later exception still reports
+            // acceptance instead of allowing caller-side fallback.
+            attempt.mark_vendor_accepted();
+            auto job = job_exp.release();
+            job.detach();
+            return Result::accepted();
+        },
+        [p, payload, want_out](int status) noexcept {
+            if (status == HAL_OK)
+            {
+                try
                 {
                     hailo15_record_inference(p);
-                    hailo15_attach_postprocess_roi(p, ctx->outputs.data(), want_out);
+                    hailo15_attach_postprocess_roi(
+                        p, payload->outputs.data(), want_out);
                 }
+                catch (const std::exception &e)
                 {
-                    std::lock_guard<std::mutex> lock(p->async_mtx);
-                    auto &vec = p->pending_async;
-                    vec.erase(std::remove(vec.begin(), vec.end(), ctx), vec.end());
+                    status = HAL_ERR_RESULT;
+                    HAL_LOG_ERROR(
+                        "hailo15_inference: async completion processing threw: %s",
+                        e.what());
                 }
-                if (ctx->callback)
-                    ctx->callback(ctx->outputs.data(), static_cast<int>(want_out), status, ctx->userdata);
-            });
-        if (!job_exp)
-        {
-            HAL_LOG_ERROR("hailo15_inference: run_async failed (status=%d)", (int)job_exp.status());
-            if (hailo15_vdevice_connection_lost(job_exp.status()))
-                hailo15_notify_vdevice_lost(job_exp.status(), "run_async");
-            // Roll back the pre-registration above: no job was created, so no
-            // completion callback will ever fire to remove ctx.
-            std::lock_guard<std::mutex> lock(p->async_mtx);
-            p->pending_async.erase(std::remove(p->pending_async.begin(), p->pending_async.end(), ctx),
-                                   p->pending_async.end());
-            return HAL_ERR_RESULT;
-        }
-        ctx->job = std::make_unique<hailort::AsyncInferJob>(job_exp.release());
-    }
-    return HAL_OK;
+                catch (...)
+                {
+                    status = HAL_ERR_RESULT;
+                    HAL_LOG_ERROR(
+                        "hailo15_inference: async completion processing threw");
+                }
+            }
+
+            try
+            {
+                payload->callback(payload->outputs.data(),
+                                  static_cast<int>(want_out), status,
+                                  payload->userdata);
+            }
+            catch (const std::exception &e)
+            {
+                HAL_LOG_ERROR("hailo15_inference: async callback threw: %s",
+                              e.what());
+            }
+            catch (...)
+            {
+                HAL_LOG_ERROR("hailo15_inference: async callback threw");
+            }
+        });
+
+    if (rc != HAL_OK)
+        HAL_LOG_ERROR("hailo15_inference: async submission rejected (rc=%d)",
+                      rc);
+    return rc;
 #endif
 }
 
@@ -2241,10 +2314,8 @@ static int hailo15_infer_query_session_performance_stats(HalInferenceSession *se
     // GetStats report how many jobs are outstanding even when callers no
     // longer query stats per-inference.
     out->total_inferences = p->total_inferences.load(std::memory_order_relaxed);
-    {
-        std::lock_guard<std::mutex> lock(p->async_mtx);
-        out->pending_async_jobs = static_cast<uint32_t>(p->pending_async.size());
-    }
+    out->pending_async_jobs = static_cast<uint32_t>(
+        p->async_lifecycle.pending_count());
     auto q_exp = p->configured.get_async_queue_size();
     if (q_exp)
         out->async_queue_size = static_cast<uint32_t>(*q_exp);

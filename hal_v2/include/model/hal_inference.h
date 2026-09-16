@@ -387,10 +387,27 @@ typedef struct HalInferenceOps {
     /**
      * @brief Run inference asynchronously (non-blocking).
      *
-     * Caller must provide output tensor slots (same ownership rules as @c run). Input/output
-     * buffers must remain valid until @p callback is invoked.
+     * Caller must provide output tensor slots with the same ownership rules as
+     * @c run. The implementation may invoke @p callback inline, before this
+     * function returns.
      *
-     * @return HAL_OK if the job was queued, or an error code immediately.
+     * A HAL_OK return transfers exactly one completion obligation to the
+     * implementation: it must eventually invoke @p callback exactly once. A
+     * non-HAL_OK return transfers no future obligation; before returning, the
+     * implementation must ensure that any callback it already started, and all
+     * accesses to @p userdata, have fully finished. Implementations must contain
+     * provider and callback exceptions so none cross this C ABI boundary.
+     *
+     * Input/output buffers and @p userdata must remain valid until the callback
+     * fully returns, not merely until it is entered. The caller must externally
+     * serialize destroy() against entry into every operation on the same session;
+     * once destruction begins, no new session operation may start. destroy()
+     * waits for every accepted callback to fully return before releasing the
+     * session. A callback must not call destroy() on its own session; it must
+     * hand destruction off to another execution context after returning.
+     *
+     * @return HAL_OK if the job was accepted, or a HAL error after callback
+     *         quiescence.
      */
     int (*run_async)(HalInferenceSession *session,
                      const HalTensor *inputs, int num_inputs,
