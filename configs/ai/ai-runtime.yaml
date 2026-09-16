@@ -52,6 +52,17 @@ scheduler:
 # FD Receiver (zero-copy DMA-BUF from camera-daemon)
 fd_receiver:
   socket_path: /run/aipc/camera.sock
+  # Test-only synthetic responses when camera frames are unavailable.
+  simulation_enabled: false
+
+# Admission limits for long-lived StreamInfer RPCs and their async work.
+# Zero disables an individual limit; production defaults remain bounded.
+stream_infer:
+  max_active_rpcs: 16
+  max_active_rpcs_per_peer: 16
+  max_subscribers_per_stream: 4
+  max_in_flight_total: 12
+  max_in_flight_per_rpc: 3
 
 # Stream DSP preprocess (opt-in): frames whose geometry doesn't match the model
 # input are resized on the DSP into a private model-geometry dmabuf pool and
@@ -60,6 +71,9 @@ fd_receiver:
 stream_preprocess:
   enabled: false
   pool_slots: 4
+  # Bound simultaneous model geometries so one client cannot reserve all
+  # camera-daemon DSP buffers with idle mismatched streams.
+  max_pools: 4
   job_timeout_ms: 100
   # camera-daemon CameraControl gRPC endpoint (SubmitDspJob job plane)
   job_endpoint: unix:///run/aipc/camera-control.sock

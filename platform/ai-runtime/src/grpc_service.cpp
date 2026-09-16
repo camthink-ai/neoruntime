@@ -2,18 +2,24 @@
 #include "log.h"
 #include "common.h"
 #include "dsp_client.h"
+#include "stream_infer_utils.h"
 
 #include "hal_inference.h"
 #include "hal_postprocess.h"
+#include "common/hal_common.h"
 
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include <sstream>
 #include <atomic>
+#include <unordered_set>
 #include <thread>
 #include <condition_variable>
+#include <exception>
 #include <future>
+#include <limits>
 #include <unistd.h>
 
 namespace aipc::ai_runtime {
@@ -33,6 +39,12 @@ AIRuntimeServiceImpl::AIRuntimeServiceImpl(
     const HalClipTextEncoderOps* clip_enc_ops,
     const HalGenaiOps* genai_ops)
     : cfg_(cfg)
+    , stream_admission_(
+          cfg.stream_max_active_rpcs,
+          cfg.stream_max_active_rpcs_per_peer,
+          cfg.stream_max_subscribers_per_stream,
+          cfg.stream_max_in_flight_total,
+          cfg.stream_max_in_flight_per_rpc)
     , model_mgr_(model_mgr)
     , session_mgr_(session_mgr)
     , scheduler_(scheduler)
@@ -42,6 +54,85 @@ AIRuntimeServiceImpl::AIRuntimeServiceImpl(
     , dsp_client_(dsp_client)
     , clip_enc_ops_(clip_enc_ops)
     , genai_ops_(genai_ops) {}
+
+std::shared_ptr<StreamPreprocessPool>
+AIRuntimeServiceImpl::acquire_stream_preprocess_pool(uint32_t width,
+                                                     uint32_t height) {
+    if (!dsp_client_ || width == 0 || height == 0 ||
+        cfg_.stream_preprocess_max_pools == 0) {
+        return nullptr;
+    }
+
+    const uint64_t key = (static_cast<uint64_t>(width) << 32) | height;
+    std::shared_future<StreamPoolPtr> pending;
+    std::shared_ptr<std::promise<StreamPoolPtr>> initializer;
+    {
+        std::lock_guard lock(dsp_pool_mu_);
+        for (auto it = dsp_pools_.begin(); it != dsp_pools_.end();) {
+            if (it->second.expired())
+                it = dsp_pools_.erase(it);
+            else
+                ++it;
+        }
+        dsp_pool_instances_.erase(
+            std::remove_if(dsp_pool_instances_.begin(),
+                           dsp_pool_instances_.end(),
+                           [](const auto& pool) { return pool.expired(); }),
+            dsp_pool_instances_.end());
+
+        auto found = dsp_pools_.find(key);
+        if (found != dsp_pools_.end()) {
+            auto pool = found->second.lock();
+            if (pool && pool->usable()) return pool;
+            dsp_pools_.erase(found);
+        }
+
+        auto in_progress = dsp_pool_inits_.find(key);
+        if (in_progress != dsp_pool_inits_.end()) {
+            pending = in_progress->second;
+        } else {
+            const size_t reserved =
+                dsp_pool_instances_.size() + dsp_pool_inits_.size();
+            if (reserved >= cfg_.stream_preprocess_max_pools) {
+                LOG_WARN("StreamInfer: dsp preprocess geometry limit reached "
+                         "(%zu/%u)",
+                         reserved,
+                         (unsigned)cfg_.stream_preprocess_max_pools);
+                return nullptr;
+            }
+            initializer = std::make_shared<std::promise<StreamPoolPtr>>();
+            pending = initializer->get_future().share();
+            dsp_pool_inits_.emplace(key, pending);
+        }
+    }
+
+    if (!initializer) return pending.get();
+
+    StreamPoolPtr pool;
+    try {
+        auto candidate = std::make_shared<StreamPreprocessPool>(
+            *dsp_client_, model_mgr_, cfg_.stream_preprocess_job_ms);
+        if (candidate->init(width, height, cfg_.stream_preprocess_slots) == 0 &&
+            candidate->usable()) {
+            pool = std::move(candidate);
+        }
+    } catch (const std::exception& e) {
+        LOG_WARN("StreamInfer: dsp preprocess pool init failed: %s", e.what());
+    } catch (...) {
+        LOG_WARN("StreamInfer: dsp preprocess pool init failed");
+    }
+
+    {
+        std::lock_guard lock(dsp_pool_mu_);
+        dsp_pool_inits_.erase(key);
+        if (pool) {
+            dsp_pools_[key] = pool;
+            dsp_pool_instances_.push_back(pool);
+        }
+    }
+    initializer->set_value(pool);
+    return pool;
+}
 
 // ─── Type conversions ─────────────────────────────────────────────────────────
 
@@ -497,105 +588,45 @@ static void fill_proto_post_result(pb::PostResult* out, const HalPostprocessResu
     }
 }
 
-// ─── Helper: on-demand result shaping (P1-5) ────────────────────────────
-// Filter / truncate / strip an already-filled proto PostResult per the
-// stream request's shaping fields. Model-agnostic, applied AFTER
-// post-process so it works for every plugin. Returns whether any result
-// survived (the only_nonempty decision).
-static bool apply_result_filters(pb::PostResult* pr,
-                                 uint32_t max_results,
-                                 float min_confidence,
-                                 const std::vector<int32_t>& class_filter,
-                                 bool omit_labels) {
-    if (pr == nullptr) return false;
-    const bool has_conf_gate = min_confidence > 0.0f;
-    const bool has_class_gate = !class_filter.empty();
-    auto class_ok = [&](int32_t cid) {
-        return !has_class_gate ||
-               std::find(class_filter.begin(), class_filter.end(), cid)
-                   != class_filter.end();
-    };
-    auto conf_ok = [&](float c) {
-        return !has_conf_gate || c >= min_confidence;
-    };
-    // Confidence-descending order for top-k truncation.
-    auto by_conf_desc = [](const auto& a, const auto& b) {
-        return a.confidence() > b.confidence();
-    };
+namespace {
 
-    // detections: confidence + class gates
-    {
-        auto* dets = pr->mutable_detections();
-        dets->erase(std::remove_if(dets->begin(), dets->end(),
-                                   [&](const pb::Detection& d) {
-                                       return !conf_ok(d.confidence()) ||
-                                              !class_ok(d.class_id());
-                                   }),
-                    dets->end());
-        if (max_results > 0) {
-            std::stable_sort(dets->begin(), dets->end(), by_conf_desc);
-            if (static_cast<uint32_t>(dets->size()) > max_results)
-                dets->DeleteSubrange(static_cast<int>(max_results),
-                                     static_cast<int>(dets->size()) -
-                                         static_cast<int>(max_results));
-        }
-        if (omit_labels)
-            for (auto& d : *dets) d.clear_label();
-    }
-    // classifications: confidence + class gates
-    {
-        auto* clss = pr->mutable_classifications();
-        clss->erase(std::remove_if(clss->begin(), clss->end(),
-                                   [&](const pb::Classification& c) {
-                                       return !conf_ok(c.confidence()) ||
-                                              !class_ok(c.class_id());
-                                   }),
-                    clss->end());
-        if (max_results > 0) {
-            std::stable_sort(clss->begin(), clss->end(), by_conf_desc);
-            if (static_cast<uint32_t>(clss->size()) > max_results)
-                clss->DeleteSubrange(static_cast<int>(max_results),
-                                     static_cast<int>(clss->size()) -
-                                         static_cast<int>(max_results));
-        }
-        if (omit_labels)
-            for (auto& c : *clss) c.clear_label();
-    }
-    // segmentation masks: class gate (no confidence on the proto mask)
-    {
-        auto* masks = pr->mutable_masks();
-        masks->erase(std::remove_if(masks->begin(), masks->end(),
-                                    [&](const pb::SegmentationMask& m) {
-                                        return !class_ok(m.class_id());
-                                    }),
-                     masks->end());
-        if (omit_labels)
-            for (auto& m : *masks) m.clear_label();
-    }
-    // ocr lines: confidence gate only (no class id)
-    {
-        auto* lines = pr->mutable_ocr_lines();
-        lines->erase(std::remove_if(lines->begin(), lines->end(),
-                                    [&](const pb::OcrLine& l) {
-                                        return !conf_ok(l.confidence());
-                                    }),
-                     lines->end());
-        if (max_results > 0) {
-            std::stable_sort(lines->begin(), lines->end(), by_conf_desc);
-            if (static_cast<uint32_t>(lines->size()) > max_results)
-                lines->DeleteSubrange(static_cast<int>(max_results),
-                                      static_cast<int>(lines->size()) -
-                                          static_cast<int>(max_results));
-        }
-    }
-    // landmarks / embeddings / depth maps carry no per-result confidence or
-    // class identity — left unfiltered (shaping those is out of scope).
+constexpr int kMaxInferBatchRequests = 64;
+constexpr uint64_t kMaxInferBatchInputBytes = 32ULL * 1024ULL * 1024ULL;
 
-    return pr->detections_size() > 0 || pr->classifications_size() > 0 ||
-           pr->landmarks_size() > 0 || pr->masks_size() > 0 ||
-           pr->ocr_lines_size() > 0 || pr->embeddings_size() > 0 ||
-           pr->depth_maps_size() > 0;
+bool validate_infer_inputs(const pb::InferRequest& request,
+                           std::string* error) {
+    const int count = request.inputs_size();
+    if (count <= 0 || count > HAL_MAX_TENSORS) {
+        if (error) *error = "input count must be within HAL tensor limits";
+        return false;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        const auto& tensor = request.inputs(i);
+        if (tensor.dma_fd() != 0) {
+            if (error) *error = "numeric dma_fd cannot cross gRPC";
+            return false;
+        }
+        if (tensor.shape_size() <= 0 ||
+            tensor.shape_size() > HAL_MAX_TENSOR_DIMS) {
+            if (error) *error = "input rank must be within HAL tensor limits";
+            return false;
+        }
+        for (int d = 0; d < tensor.shape_size(); ++d) {
+            if (tensor.shape(d) <= 0) {
+                if (error) *error = "input dimensions must be positive";
+                return false;
+            }
+        }
+        if (tensor.data().size() > std::numeric_limits<uint32_t>::max()) {
+            if (error) *error = "input payload exceeds HAL byte-size limits";
+            return false;
+        }
+    }
+    return true;
 }
+
+}  // namespace
 
 // ─── Infer (synchronous single-shot) ─────────────────────────────────────────
 
@@ -606,26 +637,42 @@ grpc::Status AIRuntimeServiceImpl::Infer(
 
     LOG_DEBUG("Infer: model_id=%s", req->model_id().c_str());
 
-    // Ensure an implicit session exists for stats tracking on the Infer() path.
-    std::string implicit_session_id = "implicit-" + req->model_id();
-    session_mgr_->create_named_session(
-        implicit_session_id, "implicit", "infer", req->model_id(),
-        0 /*fps_limit*/, 0 /*max_qps*/, 5 /*priority*/);
-    auto infer_session = session_mgr_->get_session(implicit_session_id);
+    std::string input_error;
+    if (!validate_infer_inputs(*req, &input_error)) {
+        resp->mutable_status()->set_success(false);
+        resp->mutable_status()->set_message(std::move(input_error));
+        return grpc::Status::OK;
+    }
 
     try {
-    // Acquire model snapshot for post_session/num_outputs.
-    // ModelGuard releases this ref when Infer() returns. The scheduler's
-    // own acquire (inside worker_loop) is released by on_complete.
+    // Prepare the guard before acquisition so copying the model id cannot leak
+    // a live ref if allocation throws. The scheduler acquires its own ref.
+    ModelGuard model_guard{model_mgr_, req->model_id()};
     auto snap = model_mgr_->acquire_model_snapshot(req->model_id());
     if (!snap) {
         resp->mutable_status()->set_success(false);
         resp->mutable_status()->set_message("Model not found");
         return grpc::Status::OK;
     }
-    ModelGuard model_guard{model_mgr_, req->model_id()};
+    model_guard.arm();
+
+    // Ensure an implicit session exists for stats tracking on the Infer()
+    // path. Created only after the model snapshot resolves so requests for
+    // nonexistent model ids cannot accumulate registry entries. A rejected
+    // create (invalid id / session caps) returns "" and every infer_session
+    // use below is null-checked — stats are skipped, inference proceeds.
+    std::string implicit_session_id = "implicit-" + req->model_id();
+    session_mgr_->create_named_session(
+        implicit_session_id, "implicit", "infer", req->model_id(),
+        0 /*fps_limit*/, 0 /*max_qps*/, 5 /*priority*/);
+    auto infer_session = session_mgr_->get_session(implicit_session_id);
 
     int num_inputs = req->inputs_size();
+    if (num_inputs != snap->model_info.num_inputs) {
+        resp->mutable_status()->set_success(false);
+        resp->mutable_status()->set_message("Input count does not match model");
+        return grpc::Status::OK;
+    }
 
     int max_outputs = snap->num_outputs;
     auto post_session = snap->post_session;
@@ -656,16 +703,12 @@ grpc::Status AIRuntimeServiceImpl::Infer(
         auto& ht   = (*input_tensors)[i];
         std::memset(&ht, 0, sizeof(HalTensor));
 
-        if (pb_t.dma_fd() > 0) {
-            ht.dma_fd = pb_t.dma_fd();
-            ht.data   = nullptr;
-        } else {
-            // Assign to pre-allocated slot — no reallocation
-            (*input_data_holder)[i] = pb_t.data();
-            ht.data      = const_cast<char*>((*input_data_holder)[i].data());
-            ht.byte_size = static_cast<uint32_t>((*input_data_holder)[i].size());
-            ht.dma_fd    = -1;
-        }
+        // Assign to pre-allocated storage so the payload outlives the RPC.
+        // Numeric FDs are rejected at the gRPC boundary above.
+        (*input_data_holder)[i] = pb_t.data();
+        ht.data      = const_cast<char*>((*input_data_holder)[i].data());
+        ht.byte_size = static_cast<uint32_t>((*input_data_holder)[i].size());
+        ht.dma_fd    = -1;
 
         ht.dtype = proto_dtype_to_hal(pb_t.dtype());
         ht.ndim  = static_cast<int32_t>(pb_t.shape_size());
@@ -685,82 +728,124 @@ grpc::Status AIRuntimeServiceImpl::Infer(
     inf_req->resource_holder = input_data_holder;  // keep inputs alive
 
     inf_req->on_complete = [this, promise, response_ptr, post_session,
-                            enable_post, model_id, infer_session,
-                            input_tensors, session_id](
+                            enable_post, model_id, infer_session](
         int rc, HalTensor* outputs, int num_outputs,
         uint64_t infer_us, uint64_t queue_us,
         bool model_acquired) {
 
-        // Record stats (single source of truth)
-        if (infer_session) {
-            session_mgr_->record_inference(infer_session.get(), infer_us);
-        }
+        struct CallbackCleanup {
+            ModelManager* mgr;
+            HalTensor* outputs;
+            int num_outputs;
+            std::string model_id;
+            bool model_acquired;
+            std::shared_ptr<std::promise<bool>> promise;
+            bool promise_value = false;
 
-        if (rc != 0) {
-            response_ptr->mutable_status()->set_success(false);
-            response_ptr->mutable_status()->set_message(
-                "Inference failed: " + std::to_string(rc));
-            if (outputs) model_mgr_->free_outputs(outputs, num_outputs);
-            if (model_acquired) model_mgr_->release_model(model_id);
-            promise->set_value(false);
-            return;
-        }
-
-        // Fill raw outputs into the shared response
-        for (int i = 0; i < num_outputs; i++) {
-            auto* pt = response_ptr->add_outputs();
-            pt->set_dtype(hal_dtype_to_proto(outputs[i].dtype));
-            for (int d = 0; d < outputs[i].ndim; d++) {
-                pt->add_shape(outputs[i].shape[d]);
-            }
-            if (outputs[i].data && outputs[i].byte_size > 0) {
-                pt->set_data(outputs[i].data, outputs[i].byte_size);
-            }
-        }
-
-        // Post-processing. Wrapped in try/catch: a throwing backend (e.g.
-        // an invalid config_json / HEF tensor-name mismatch) must NOT
-        // terminate the process via the single-Infer on_complete thread —
-        // mirrors the InferBatch post_task guard at line ~735.
-        bool pp_failed = false;
-        if (enable_post && post_session) {
-            HalPostprocessResult post_result{};
-            try {
-                if (model_mgr_->post_process(post_session, outputs,
-                                              num_outputs, &post_result) == 0) {
-                    fill_proto_post_result(response_ptr->mutable_post_result(),
-                                           post_result);
-
-                    if (event_bus_ && event_bus_->connected() &&
-                        cfg_.event_bus_auto_publish) {
-                        auto ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        publish_result("app-infer", model_id, 0, ts_ns,
-                                       response_ptr->post_result());
-                    }
+            ~CallbackCleanup() noexcept {
+                try {
+                    if (outputs) mgr->free_outputs(outputs, num_outputs);
+                } catch (...) {
+                    LOG_ERROR("Infer: output cleanup threw");
                 }
-            } catch (const std::exception& e) {
-                LOG_ERROR("Postprocess failed for model '%s': %s",
-                          model_id.c_str(), e.what());
-                pp_failed = true;
+                try {
+                    if (model_acquired) mgr->release_model(model_id);
+                } catch (...) {
+                    LOG_ERROR("Infer: model release threw");
+                }
+                try {
+                    promise->set_value(promise_value);
+                } catch (...) {
+                    LOG_ERROR("Infer: promise completion threw");
+                }
+            }
+        } cleanup{model_mgr_, outputs, num_outputs, model_id,
+                  model_acquired, promise};
+
+        try {
+            if (infer_session) {
+                session_mgr_->record_inference(infer_session.get(), infer_us);
+            }
+
+            if (rc != 0) {
                 response_ptr->mutable_status()->set_success(false);
                 response_ptr->mutable_status()->set_message(
-                    std::string("Postprocess failed: ") + e.what());
+                    "Inference failed: " + std::to_string(rc));
+                return;
             }
-            model_mgr_->free_post_result(&post_result);
+
+            for (int i = 0; i < num_outputs; i++) {
+                auto* pt = response_ptr->add_outputs();
+                pt->set_dtype(hal_dtype_to_proto(outputs[i].dtype));
+                for (int d = 0; d < outputs[i].ndim; d++) {
+                    pt->add_shape(outputs[i].shape[d]);
+                }
+                if (outputs[i].data && outputs[i].byte_size > 0) {
+                    pt->set_data(outputs[i].data, outputs[i].byte_size);
+                }
+            }
+
+            bool pp_failed = false;
+            if (enable_post && post_session) {
+                HalPostprocessResult post_result{};
+                struct PostResultGuard {
+                    ModelManager* mgr;
+                    HalPostprocessResult* result;
+                    ~PostResultGuard() noexcept {
+                        try {
+                            mgr->free_post_result(result);
+                        } catch (...) {
+                            LOG_ERROR("Infer: post-result cleanup threw");
+                        }
+                    }
+                } post_guard{model_mgr_, &post_result};
+
+                try {
+                    if (model_mgr_->post_process(post_session, outputs,
+                                                  num_outputs, &post_result) == 0) {
+                        fill_proto_post_result(response_ptr->mutable_post_result(),
+                                               post_result);
+
+                        if (event_bus_ && event_bus_->connected() &&
+                            cfg_.event_bus_auto_publish) {
+                            auto ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+                            publish_result("app-infer", model_id, 0, ts_ns,
+                                           response_ptr->post_result());
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Postprocess failed for model '%s': %s",
+                              model_id.c_str(), e.what());
+                    pp_failed = true;
+                    response_ptr->mutable_status()->set_success(false);
+                    response_ptr->mutable_status()->set_message(
+                        std::string("Postprocess failed: ") + e.what());
+                }
+            }
+
+            response_ptr->set_infer_time_us(infer_us);
+            response_ptr->set_queue_time_us(queue_us);
+            if (!pp_failed) response_ptr->mutable_status()->set_success(true);
+            cleanup.promise_value = !pp_failed;
+        } catch (const std::exception& e) {
+            LOG_ERROR("Infer completion failed for model '%s': %s",
+                      model_id.c_str(), e.what());
+            try {
+                response_ptr->mutable_status()->set_success(false);
+                response_ptr->mutable_status()->set_message(
+                    "Inference completion failed");
+            } catch (...) {
+            }
+        } catch (...) {
+            LOG_ERROR("Infer completion failed for model '%s'", model_id.c_str());
+            try {
+                response_ptr->mutable_status()->set_success(false);
+                response_ptr->mutable_status()->set_message(
+                    "Inference completion failed");
+            } catch (...) {
+            }
         }
-
-        response_ptr->set_infer_time_us(infer_us);
-        response_ptr->set_queue_time_us(queue_us);
-        if (!pp_failed) {
-            response_ptr->mutable_status()->set_success(true);
-        }
-
-        // Free outputs + release scheduler's model ref
-        model_mgr_->free_outputs(outputs, num_outputs);
-        model_mgr_->release_model(model_id);
-
-        promise->set_value(true);
     };
 
     if (!scheduler_->submit(std::move(inf_req))) {
@@ -826,6 +911,7 @@ struct InferBatchItemCtx {
     std::shared_ptr<Session>       infer_session;
     SteadyClock::time_point        start;
     std::atomic<bool>              done{false};
+    std::atomic<bool>              finishing{false};
     std::atomic<bool>              released{false};  // model ref released?
     bool                           success = false;
 };
@@ -840,135 +926,251 @@ struct InferBatchSyncState {
     explicit InferBatchSyncState(int n) : remaining(n) {}
 };
 
-// Bundle threaded through the HAL callback via userdata. The callback owns it
-// (new/delete) and releases the shared_ptrs when it returns. Model ref_count
-// is released by the callback/post_task itself (self-sufficient), NOT by the
-// InferBatch RPC thread — this avoids UAF if the RPC times out and the model
-// is unregistered while a late post_task is still pending.
+// Bundle threaded through the HAL callback via userdata. The submitter and the
+// callback each hold one intrusive reference because a backend may invoke the
+// callback before run_async() returns. Model ref_count is released by the
+// callback/post_task itself, not by the InferBatch RPC waiter.
 struct InferBatchCbState {
+    std::atomic<int>                      owners{2};
+    AsyncSubmissionGate                   gate;
+    int                                   callback_status = HAL_ERROR;
+    int                                   callback_num_outputs = 0;
     ModelManager*                         mgr = nullptr;
     SessionManager*                       smgr = nullptr;
     PostprocessPool*                      pool = nullptr;
+    InferenceScheduler*                   scheduler = nullptr;
+    pb::DataType (*dtype_to_proto)(HalDataType) = nullptr;
     std::shared_ptr<InferBatchItemCtx>    ctx;
     std::shared_ptr<InferBatchSyncState>  sync;
+
+    void release_owner() noexcept {
+        if (owners.fetch_sub(1, std::memory_order_acq_rel) == 1) delete this;
+    }
+};
+
+void finish_batch_item(ModelManager* mgr,
+                       InferenceScheduler* scheduler,
+                       const std::shared_ptr<InferBatchItemCtx>& ctx,
+                       const std::shared_ptr<InferBatchSyncState>& sync,
+                       int max_outputs) noexcept {
+    if (ctx->finishing.exchange(true, std::memory_order_acq_rel)) return;
+
+    try {
+        mgr->free_outputs(ctx->outputs.data(), max_outputs);
+    } catch (...) {
+        LOG_ERROR("InferBatch: output cleanup threw");
+    }
+    try {
+        if (!ctx->released.exchange(true)) mgr->release_model(ctx->model_id);
+    } catch (...) {
+        LOG_ERROR("InferBatch: model release threw");
+    }
+
+    ctx->done.store(true);
+    try {
+        std::lock_guard<std::mutex> lock(sync->mtx);
+        if (--sync->remaining <= 0) sync->cv.notify_all();
+    } catch (...) {
+        LOG_ERROR("InferBatch: completion signaling threw");
+    }
+    if (scheduler) scheduler->complete_external_async();
+}
+
+struct BatchFinishGuard {
+    ModelManager* mgr;
+    InferenceScheduler* scheduler;
+    std::shared_ptr<InferBatchItemCtx> ctx;
+    std::shared_ptr<InferBatchSyncState> sync;
+    int max_outputs;
+    bool armed = true;
+
+    void disarm() noexcept { armed = false; }
+
+    ~BatchFinishGuard() noexcept {
+        if (armed) finish_batch_item(mgr, scheduler, ctx, sync, max_outputs);
+    }
+};
+
+struct BatchModelRefGuard {
+    ModelManager* mgr;
+    std::shared_ptr<InferBatchItemCtx> ctx;
+    bool armed = true;
+
+    void disarm() noexcept { armed = false; }
+
+    ~BatchModelRefGuard() noexcept {
+        if (!armed || !ctx->acquired || ctx->released.exchange(true)) return;
+        try {
+            mgr->release_model(ctx->model_id);
+        } catch (...) {
+            LOG_ERROR("InferBatch: model release threw");
+        }
+    }
 };
 
 }  // namespace
 
-void AIRuntimeServiceImpl::InferBatchCallback(HalTensor* /*outputs*/, int /*num_outputs*/,
-                                              int status, void* userdata) {
-    auto* st = static_cast<InferBatchCbState*>(userdata);
-    if (!st) return;
-    auto& c = st->ctx;
+static void complete_infer_batch_callback(
+    InferBatchCbState* state) noexcept {
+    struct CallbackOwnerGuard {
+        InferBatchCbState* state;
+        ~CallbackOwnerGuard() noexcept { state->release_owner(); }
+    } callback_owner{state};
 
-    if (status != 0) {
-        // Failure path: no post-processing needed, handle synchronously.
-        st->mgr->free_outputs(c->outputs.data(), c->max_outputs);
-        // Release model ref (self-sufficient, same as success post_task path)
-        if (!c->released.exchange(true)) {
-            st->mgr->release_model(c->model_id);
-        }
-        c->response.mutable_status()->set_success(false);
-        c->response.mutable_status()->set_message(
-            "Inference failed: " + std::to_string(status));
-        c->done.store(true);
-        c->success = false;
-        {
-            std::lock_guard<std::mutex> lk(st->sync->mtx);
-            if (--st->sync->remaining <= 0)
-                st->sync->cv.notify_all();
-        }
-        delete st;
-        return;
-    }
+    auto ctx = state->ctx;
+    auto sync = state->sync;
+    auto* mgr = state->mgr;
+    auto* smgr = state->smgr;
+    auto* scheduler = state->scheduler;
+    const int max_outputs = ctx->max_outputs;
+    const int result_outputs = state->callback_num_outputs;
+    BatchFinishGuard immediate_finish{
+        mgr, scheduler, ctx, sync, max_outputs};
 
-    // Success: offload output serialization + post-processing to the
-    // PostprocessPool so the HailoRT completion thread can immediately
-    // service the next async inference callback.
-    auto elapsed = std::chrono::duration_cast<Microseconds>(
-        SteadyClock::now() - c->start);
-
-    // Capture shared_ptrs so ctx/sync outlive st (deleted below).
-    auto ctx  = c;
-    auto sync = st->sync;
-    auto* mgr  = st->mgr;
-    auto* smgr = st->smgr;
-    int  max_out = c->max_outputs;
-
-    PostprocessPool::Task post_task = [ctx, sync, mgr, smgr, max_out, elapsed]() {
-        // Snapshot raw outputs to proto.
-        for (int k = 0; k < max_out; k++) {
-            auto* pt = ctx->response.add_outputs();
-            pt->set_dtype(hal_dtype_to_proto(ctx->outputs[k].dtype));
-            for (int d = 0; d < ctx->outputs[k].ndim; d++)
-                pt->add_shape(ctx->outputs[k].shape[d]);
-            if (ctx->outputs[k].data && ctx->outputs[k].byte_size > 0)
-                pt->set_data(ctx->outputs[k].data, ctx->outputs[k].byte_size);
+    try {
+        if (state->callback_status != 0) {
+            ctx->response.mutable_status()->set_success(false);
+            ctx->response.mutable_status()->set_message(
+                "Inference failed: " +
+                std::to_string(state->callback_status));
+            ctx->success = false;
+            return;
         }
 
-        // Post-processing. The Hailo SDK postprocess library may throw
-        // std::invalid_argument when the HEF's nms output tensor name does
-        // not match the postprocess config (e.g. a misconfigured/renamed
-        // model registered under the wrong type). Catch here so a bad model
-        // degrades to a failed inference instead of:
-        //   • propagating out of the synchronous fallback path (→ terminate
-        //     → SIGABRT, core.grpcpp_sync_ser), and
-        //   • leaving ctx->done=false on the pool path (→ batch timeout +
-        //     model ref leak).
-        bool pp_failed = false;
-        if (mgr->has_post_ops() && ctx->snap->post_session) {
-            HalPostprocessResult post_result{};
-            try {
-                if (mgr->post_process(ctx->snap->post_session,
-                                      ctx->outputs.data(), max_out,
-                                      &post_result) == 0) {
-                    fill_proto_post_result(ctx->response.mutable_post_result(),
-                                           post_result);
+        const auto elapsed = std::chrono::duration_cast<Microseconds>(
+            SteadyClock::now() - ctx->start);
+
+        const auto dtype_to_proto = state->dtype_to_proto;
+        PostprocessPool::Task post_task =
+            [ctx, sync, mgr, smgr, scheduler, dtype_to_proto, max_outputs,
+             result_outputs, elapsed]() noexcept {
+                BatchFinishGuard finish{
+                    mgr, scheduler, ctx, sync, max_outputs};
+
+                try {
+                    for (int k = 0; k < result_outputs; k++) {
+                        auto* pt = ctx->response.add_outputs();
+                        pt->set_dtype(dtype_to_proto(ctx->outputs[k].dtype));
+                        for (int d = 0; d < ctx->outputs[k].ndim; d++) {
+                            pt->add_shape(ctx->outputs[k].shape[d]);
+                        }
+                        if (ctx->outputs[k].data &&
+                            ctx->outputs[k].byte_size > 0) {
+                            pt->set_data(ctx->outputs[k].data,
+                                         ctx->outputs[k].byte_size);
+                        }
+                    }
+
+                    bool post_failed = false;
+                    if (mgr->has_post_ops() && ctx->snap->post_session) {
+                        HalPostprocessResult post_result{};
+                        struct PostResultGuard {
+                            ModelManager* mgr;
+                            HalPostprocessResult* result;
+                            ~PostResultGuard() noexcept {
+                                try {
+                                    mgr->free_post_result(result);
+                                } catch (...) {
+                                    LOG_ERROR(
+                                        "InferBatch: post-result cleanup threw");
+                                }
+                            }
+                        } post_guard{mgr, &post_result};
+
+                        try {
+                            if (mgr->post_process(
+                                    ctx->snap->post_session,
+                                    ctx->outputs.data(), result_outputs,
+                                    &post_result) == 0) {
+                                fill_proto_post_result(
+                                    ctx->response.mutable_post_result(),
+                                    post_result);
+                            }
+                        } catch (const std::exception& e) {
+                            LOG_ERROR(
+                                "Postprocess failed for model '%s': %s",
+                                ctx->model_id.c_str(), e.what());
+                            post_failed = true;
+                            ctx->response.mutable_status()->set_success(false);
+                            ctx->response.mutable_status()->set_message(
+                                std::string("Postprocess failed: ") + e.what());
+                        }
+                    }
+
+                    if (!post_failed) {
+                        ctx->response.mutable_status()->set_success(true);
+                        ctx->success = true;
+                    }
+                    ctx->response.set_infer_time_us(
+                        static_cast<uint64_t>(elapsed.count()));
+                    if (ctx->infer_session) {
+                        smgr->record_inference(
+                            ctx->infer_session.get(),
+                            static_cast<uint64_t>(elapsed.count()));
+                    }
+                } catch (const std::exception& e) {
+                    LOG_ERROR(
+                        "InferBatch completion failed for model '%s': %s",
+                        ctx->model_id.c_str(), e.what());
+                    ctx->success = false;
+                    try {
+                        ctx->response.mutable_status()->set_success(false);
+                        ctx->response.mutable_status()->set_message(
+                            "Inference completion failed");
+                    } catch (...) {
+                    }
+                } catch (...) {
+                    LOG_ERROR("InferBatch completion failed for model '%s'",
+                              ctx->model_id.c_str());
+                    ctx->success = false;
+                    try {
+                        ctx->response.mutable_status()->set_success(false);
+                        ctx->response.mutable_status()->set_message(
+                            "Inference completion failed");
+                    } catch (...) {
+                    }
                 }
-            } catch (const std::exception& e) {
-                LOG_ERROR("Postprocess failed for model '%s': %s",
-                          ctx->model_id.c_str(), e.what());
-                pp_failed = true;
-                ctx->response.mutable_status()->set_success(false);
-                ctx->response.mutable_status()->set_message(
-                    std::string("Postprocess failed: ") + e.what());
-            }
-            mgr->free_post_result(&post_result);
+            };
+
+        // From this point the task owns finish_batch_item(), whether queued or
+        // executed synchronously as the bounded-pool fallback.
+        immediate_finish.disarm();
+        if (!state->pool || !state->pool->submit(post_task)) post_task();
+    } catch (const std::exception& e) {
+        LOG_ERROR("InferBatch callback setup failed for model '%s': %s",
+                  ctx->model_id.c_str(), e.what());
+        ctx->success = false;
+        try {
+            ctx->response.mutable_status()->set_success(false);
+            ctx->response.mutable_status()->set_message(
+                "Inference completion failed");
+        } catch (...) {
         }
-
-        mgr->free_outputs(ctx->outputs.data(), max_out);
-        if (!pp_failed) {
-            ctx->response.mutable_status()->set_success(true);
-            ctx->success = true;
+    } catch (...) {
+        LOG_ERROR("InferBatch callback setup failed for model '%s'",
+                  ctx->model_id.c_str());
+        ctx->success = false;
+        try {
+            ctx->response.mutable_status()->set_success(false);
+            ctx->response.mutable_status()->set_message(
+                "Inference completion failed");
+        } catch (...) {
         }
-        ctx->response.set_infer_time_us(static_cast<uint64_t>(elapsed.count()));
-
-        if (ctx->infer_session)
-            smgr->record_inference(ctx->infer_session.get(),
-                                   static_cast<uint64_t>(elapsed.count()));
-
-        // Release model ref here (self-sufficient: works even if RPC timed out).
-        // Atomic exchange prevents double-release if the RPC thread also tries.
-        if (!ctx->released.exchange(true)) {
-            mgr->release_model(ctx->model_id);
-        }
-
-        ctx->done.store(true);
-        {
-            std::lock_guard<std::mutex> lk(sync->mtx);
-            if (--sync->remaining <= 0)
-                sync->cv.notify_all();
-        }
-    };
-
-    if (!st->pool || !st->pool->submit(post_task)) {
-        // Queue full or no pool — run synchronously (still off the NPU thread)
-        // post_task is NOT moved-from because submit takes Task&
-        post_task();
     }
+}
 
-    delete st;  // releases this callback's ctx/sync shared_ptrs
-    // (ctx/sync kept alive by the lambda's captures)
+void AIRuntimeServiceImpl::InferBatchCallback(
+    HalTensor* /*outputs*/, int num_outputs, int status,
+    void* userdata) noexcept {
+    auto* state = static_cast<InferBatchCbState*>(userdata);
+    if (!state) return;
+
+    state->callback_status = status;
+    state->callback_num_outputs =
+        std::max(0, std::min(num_outputs, state->ctx->max_outputs));
+    const auto action = state->gate.on_callback();
+    if (action == AsyncCallbackAction::CompleteHere)
+        complete_infer_batch_callback(state);
 }
 
 // ─── InferBatch (parallel multi-model inference) ──────────────────────────────
@@ -979,10 +1181,30 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
     pb::InferBatchResponse* resp) {
 
     int num_requests = req->requests_size();
-    if (num_requests == 0) {
+    if (num_requests == 0 || num_requests > kMaxInferBatchRequests) {
         resp->mutable_status()->set_success(false);
-        resp->mutable_status()->set_message("Empty batch");
+        resp->mutable_status()->set_message(
+            num_requests == 0 ? "Empty batch" : "Batch exceeds 64 requests");
         return grpc::Status::OK;
+    }
+
+    uint64_t aggregate_input_bytes = 0;
+    for (const auto& item : req->requests()) {
+        std::string input_error;
+        if (!validate_infer_inputs(item, &input_error)) {
+            resp->mutable_status()->set_success(false);
+            resp->mutable_status()->set_message(std::move(input_error));
+            return grpc::Status::OK;
+        }
+        for (const auto& tensor : item.inputs()) {
+            aggregate_input_bytes += tensor.data().size();
+            if (aggregate_input_bytes > kMaxInferBatchInputBytes) {
+                resp->mutable_status()->set_success(false);
+                resp->mutable_status()->set_message(
+                    "Batch input payload exceeds 32 MiB");
+                return grpc::Status::OK;
+            }
+        }
     }
 
     LOG_DEBUG("InferBatch: %d requests", num_requests);
@@ -1012,13 +1234,6 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
         c->model_id = infer_req.model_id();
         c->start    = SteadyClock::now();
 
-        // Idempotent implicit session for stats tracking (one per model).
-        std::string implicit_session_id = "implicit-" + infer_req.model_id();
-        session_mgr_->create_named_session(
-            implicit_session_id, "implicit", "infer", infer_req.model_id(),
-            0, 0, 5);
-        c->infer_session = session_mgr_->get_session(implicit_session_id);
-
         c->snap = model_mgr_->acquire_model_snapshot(infer_req.model_id());
         if (!c->snap) {
             c->response.mutable_status()->set_success(false);
@@ -1027,7 +1242,27 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
             complete_now();
             continue;
         }
+        // Idempotent implicit session for stats tracking (one per model),
+        // created only after the model snapshot resolves (same ordering and
+        // ""-tolerance as the Infer() path above).
+        std::string implicit_session_id = "implicit-" + infer_req.model_id();
+        session_mgr_->create_named_session(
+            implicit_session_id, "implicit", "infer", infer_req.model_id(),
+            0, 0, 5);
+        c->infer_session = session_mgr_->get_session(implicit_session_id);
         c->acquired = true;  // ref_count bumped; released after the callback fires
+        BatchModelRefGuard model_ref_guard{model_mgr_, c};
+        if (infer_req.inputs_size() != c->snap->model_info.num_inputs) {
+            c->response.mutable_status()->set_success(false);
+            c->response.mutable_status()->set_message(
+                "Input count does not match model");
+            if (!c->released.exchange(true)) {
+                model_mgr_->release_model(c->model_id);
+            }
+            c->done.store(true);
+            complete_now();
+            continue;
+        }
 
         // Convert proto tensors → HalTensor. CPU payloads are copied into
         // ctx-owned storage so the buffers outlive the RPC for late callbacks.
@@ -1038,15 +1273,10 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
             const auto& pb_t = infer_req.inputs(j);
             HalTensor&  ht   = c->inputs[j];
             std::memset(&ht, 0, sizeof(HalTensor));
-            if (pb_t.dma_fd() > 0) {
-                ht.dma_fd = pb_t.dma_fd();
-                ht.data   = nullptr;
-            } else {
-                c->input_data[j].assign(pb_t.data().data(), pb_t.data().size());
-                ht.data      = const_cast<char*>(c->input_data[j].data());
-                ht.byte_size = static_cast<uint32_t>(c->input_data[j].size());
-                ht.dma_fd    = -1;
-            }
+            c->input_data[j].assign(pb_t.data().data(), pb_t.data().size());
+            ht.data      = const_cast<char*>(c->input_data[j].data());
+            ht.byte_size = static_cast<uint32_t>(c->input_data[j].size());
+            ht.dma_fd    = -1;
             ht.dtype = proto_dtype_to_hal(pb_t.dtype());
             ht.ndim  = static_cast<int32_t>(pb_t.shape_size());
             for (int d = 0; d < ht.ndim && d < HAL_MAX_TENSOR_DIMS; d++)
@@ -1056,30 +1286,76 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
         c->max_outputs = c->snap->num_outputs;
         c->outputs.assign(c->max_outputs, HalTensor{});
 
-        // Bundle per-item state for the HAL callback (threaded via userdata).
-        // The callback owns it and deletes it once it has fired.
-        auto* cb_state = new InferBatchCbState{model_mgr_, session_mgr_,
-                                              postprocess_pool_, c, sync};
+        InferBatchCbState* cb_state = nullptr;
+        try {
+            auto setup_state = std::make_unique<InferBatchCbState>();
+            setup_state->mgr = model_mgr_;
+            setup_state->smgr = session_mgr_;
+            setup_state->pool = postprocess_pool_;
+            setup_state->scheduler = scheduler_;
+            setup_state->dtype_to_proto =
+                &AIRuntimeServiceImpl::hal_dtype_to_proto;
+            setup_state->ctx = c;
+            setup_state->sync = sync;
+            cb_state = setup_state.release();
+        } catch (const std::exception& e) {
+            LOG_ERROR("InferBatch callback-state allocation failed: %s",
+                      e.what());
+            c->response.mutable_status()->set_success(false);
+            c->response.mutable_status()->set_message(
+                "Inference submission setup failed");
+            c->done.store(true);
+            complete_now();
+            continue;
+        } catch (...) {
+            LOG_ERROR("InferBatch callback-state allocation failed");
+            c->response.mutable_status()->set_success(false);
+            c->response.mutable_status()->set_message(
+                "Inference submission setup failed");
+            c->done.store(true);
+            complete_now();
+            continue;
+        }
 
-        int rc = model_mgr_->run_async(c->snap->infer_session,
-                                       c->inputs.data(), num_inputs,
-                                       c->outputs.data(), c->max_outputs,
-                                       &AIRuntimeServiceImpl::InferBatchCallback,
-                                       cb_state);
-        if (rc != 0) {
-            // Submission failed: no callback will fire. Clean up + signal.
-            delete cb_state;
-            model_mgr_->free_outputs(c->outputs.data(), c->max_outputs);
-            // Release model ref (no callback will release it)
-            if (!c->released.exchange(true)) {
-                model_mgr_->release_model(c->model_id);
-            }
+        scheduler_->begin_external_async();
+        int rc = HAL_ERROR;
+        try {
+            rc = model_mgr_->run_async(
+                c->snap->infer_session, c->inputs.data(), num_inputs,
+                c->outputs.data(), c->max_outputs,
+                &AIRuntimeServiceImpl::InferBatchCallback, cb_state);
+        } catch (const std::exception& e) {
+            LOG_ERROR("InferBatch submission threw for model '%s': %s",
+                      c->model_id.c_str(), e.what());
+        } catch (...) {
+            LOG_ERROR("InferBatch submission threw for model '%s'",
+                      c->model_id.c_str());
+        }
+
+        const auto action = cb_state->gate.on_return(rc == HAL_OK);
+        if (action == AsyncReturnAction::AwaitCallback) {
+            model_ref_guard.disarm();
+            cb_state->release_owner();  // submitter owner
+            continue;
+        }
+        if (action == AsyncReturnAction::CompleteHere) {
+            model_ref_guard.disarm();
+            complete_infer_batch_callback(cb_state);
+            cb_state->release_owner();  // submitter owner
+            continue;
+        }
+
+        try {
             c->response.mutable_status()->set_success(false);
             c->response.mutable_status()->set_message(
                 "Inference submission failed: " + std::to_string(rc));
-            c->done.store(true);
-            complete_now();
+        } catch (...) {
+            LOG_ERROR("InferBatch: failed to build submission error");
         }
+        c->success = false;
+        finish_batch_item(model_mgr_, scheduler_, c, sync, c->max_outputs);
+        cb_state->release_owner();  // unused callback owner
+        cb_state->release_owner();  // submitter owner
     }
 
     // Wait for callbacks with a single timeout. Items not done by
@@ -1154,16 +1430,45 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
     const pb::StreamInferRequest* req,
     grpc::ServerWriter<pb::StreamInferResponse>* writer) {
 
+    try {
+    if (!valid_stream_id(req->stream_id())) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "stream_id must be 1-63 alphanumeric, '_' or '-'");
+    }
+
     LOG_INFO("StreamInfer: stream_id=%s model_id=%s fps_limit=%u",
              req->stream_id().c_str(), req->model_id().c_str(), req->fps_limit());
 
-    // Acquire model snapshot — safe to use after lock release
+    if (!valid_stream_class_filter_size(req->class_filter_size())) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "class_filter exceeds 256 entries");
+    }
+    if (!valid_stream_min_confidence(req->min_confidence())) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "min_confidence must be finite and within [0,1]");
+    }
+    if (!valid_stream_fps(req->fps_limit())) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "fps_limit exceeds 120");
+    }
+
+    std::string peer = ctx->peer();
+    if (peer.empty()) peer = "<unknown>";
+    auto rpc_permit = stream_admission_.try_acquire_rpc(
+        peer, req->stream_id());
+    if (!rpc_permit) {
+        return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                            "stream admission limit reached");
+    }
+
+    // Prepare the guard before acquisition so copying the model id cannot leak
+    // a live ref if allocation throws.
+    ModelGuard model_guard{model_mgr_, req->model_id()};
     auto snap = model_mgr_->acquire_model_snapshot(req->model_id());
     if (!snap) {
         return grpc::Status(grpc::StatusCode::NOT_FOUND, "Model not found");
     }
-
-    ModelGuard model_guard{model_mgr_, req->model_id()};
+    model_guard.arm();
 
     // Create session
     std::string session_id = session_mgr_->create_session(
@@ -1177,7 +1482,9 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
 
     auto session = session_mgr_->get_session(session_id);
     if (!session) {
-        return grpc::Status(grpc::StatusCode::INTERNAL, "Session creation failed");
+        return grpc::Status(
+            grpc::StatusCode::RESOURCE_EXHAUSTED,
+            "session creation failed (invalid id or session limit reached)");
     }
 
     HalPostprocessSession* pp_session = snap->post_session;
@@ -1191,90 +1498,146 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
     // wire-compatible with older clients that never set them.
     const uint32_t flt_max_results = req->max_detections();
     const float flt_min_confidence = req->min_confidence();
-    const std::vector<int32_t> flt_class_filter(req->class_filter().begin(),
-                                                req->class_filter().end());
+    const auto flt_class_filter =
+        std::make_shared<const std::unordered_set<int32_t>>(
+            req->class_filter().begin(), req->class_filter().end());
     const bool flt_omit_labels = req->omit_labels();
     const bool flt_only_nonempty = req->only_nonempty();
     uint32_t suppressed_responses = 0;  // only_nonempty drops (logged at end)
 
-    // Subscribe to FdReceiver for zero-copy DMA-BUF frames
-    std::mutex frame_mu;
-    std::condition_variable frame_cv;
-    ReceivedFrame latest_frame{};
-    bool has_frame = false;
+    // Subscribe to FdReceiver for zero-copy DMA-BUF frames. The buffer state is
+    // shared with the receive callback: on close it is quiesced (reject new
+    // frames + acknowledge the buffered one) BEFORE the bounded unsubscribe, so
+    // an in-flight callback after the deadline only holds state that
+    // acknowledges instead of buffering — teardown never races the receiver.
+    struct StreamFrameState {
+        std::mutex mu;
+        std::condition_variable cv;
+        ReceivedFrame latest_frame{};
+        bool has_frame = false;
+        bool accepting_frames = true;
+    };
+    auto frame_state = std::make_shared<StreamFrameState>();
 
     bool fd_path = fd_receiver_->subscribe(
         stream_id,
         session_id,  // unique per gRPC call — enables multicast
-        [&](const ReceivedFrame& frame) {
-            std::lock_guard lock(frame_mu);
-            // Release previously buffered frame if unconsumed (backpressure)
-            if (has_frame && latest_frame.frame_id != 0) {
-                fd_receiver_->release_frame(stream_id, latest_frame.frame_id);
+        [frame_state](const ReceivedFrame& frame) {
+            std::lock_guard lock(frame_state->mu);
+            if (!frame_state->accepting_frames) {
+                frame.delivery.acknowledge();
+                return;
             }
-            latest_frame = frame;
-            has_frame = true;
-            frame_cv.notify_one();
+            // Release previously buffered frame if unconsumed (backpressure)
+            if (frame_state->has_frame &&
+                frame_state->latest_frame.frame_id != 0) {
+                frame_state->latest_frame.delivery.acknowledge();
+            }
+            frame_state->latest_frame = frame;
+            frame_state->has_frame = true;
+            frame_state->cv.notify_one();
         });
 
+    struct SubscriptionGuard {
+        FdReceiver* receiver;
+        std::string stream_id;
+        std::string subscriber_id;
+        std::shared_ptr<StreamFrameState> state;
+        bool active;
+
+        void close() noexcept {
+            if (!active) return;
+            active = false;
+            // 1. Quiesce callback state: reject new frames, release the
+            //    buffered delivery. After this, an in-flight callback only
+            //    acknowledges; it cannot extend the drain.
+            {
+                std::lock_guard lock(state->mu);
+                state->accepting_frames = false;
+                if (state->has_frame &&
+                    state->latest_frame.frame_id != 0) {
+                    state->latest_frame.delivery.acknowledge();
+                }
+                state->latest_frame = {};
+                state->has_frame = false;
+                state->cv.notify_all();
+            }
+            // 2. Bounded unsubscribe. The subscriber is removed from the live
+            //    set first; a false return means a delivery is still retained
+            //    elsewhere (e.g. a completion lambda). Those holders release
+            //    through their own acknowledgement, and the shared state
+            //    above keeps any late callback safe without blocking this RPC
+            //    (or the process shutdown's own bounded drain) indefinitely.
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(5);
+            if (!receiver->unsubscribe_until(stream_id, subscriber_id,
+                                             deadline)) {
+                LOG_ERROR("StreamInfer: unsubscribe for stream '%s' did not "
+                          "quiesce before the deadline",
+                          stream_id.c_str());
+            }
+        }
+        ~SubscriptionGuard() { close(); }
+    } subscription{fd_receiver_, stream_id, session_id, frame_state,
+                   fd_path};
+
     if (!fd_path) {
-        LOG_WARN("StreamInfer: FdReceiver unavailable for %s, zero-copy disabled",
+        if (!cfg_.stream_simulation_enabled) {
+            LOG_WARN("StreamInfer: FdReceiver unavailable for %s",
+                     stream_id.c_str());
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                                "camera frame source unavailable");
+        }
+        LOG_WARN("StreamInfer: FdReceiver unavailable for %s; "
+                 "test-only simulation enabled",
                  stream_id.c_str());
     }
 
     // ── DSP preprocess pool (opt-in via cfg.stream_dsp_preprocess) ──────────
-    // Frames whose geometry does not match the model input can be resized on
-    // the camera-daemon DSP into this private model-geometry pool and fd-bound
-    // with zero CPU pixel copies. Matching-geometry frames keep #62's direct
-    // DMA path. The pool is destroyed at stream exit after the bounded drain;
-    // leases that outlive a drain timeout self-clean (see StreamPreprocessPool).
-    std::optional<StreamPreprocessPool> dsp_pool_storage;
-    StreamPreprocessPool* dsp_pool = nullptr;
-    if (cfg_.stream_dsp_preprocess && dsp_client_ && fd_path) {
+    // Record trusted model geometry now, but allocate no daemon buffers until
+    // the first mismatched frame. Pools are shared by geometry across streams,
+    // so matching/idle RPCs reserve nothing and concurrent models with the same
+    // input shape draw from one bounded slot set.
+    uint32_t model_in_w = 0;
+    uint32_t model_in_h = 0;
+    std::shared_ptr<StreamPreprocessPool> dsp_pool;
+    auto next_dsp_pool_retry = SteadyClock::time_point::min();
+    constexpr auto kDspPoolRetryDelay = std::chrono::seconds(1);
+    if (fd_path) {
         const auto& mi = snap->model_info;
         // Model input geometry is only trusted when the NV12 reconciliation
-        // in the HAL left an unambiguous shape[1]/shape[2] that multiplies
-        // out to byte_size (guards against odd metadata → wrong pool size).
-        if (mi.num_inputs >= 1 && mi.inputs[0].is_nv12 &&
+        // in the HAL left one logical input with unambiguous shape[1]/shape[2]
+        // that multiplies out to byte_size.
+        if (mi.num_inputs == 1 && mi.inputs[0].is_nv12 &&
             mi.inputs[0].ndim >= 4 &&
             mi.inputs[0].shape[1] > 0 && mi.inputs[0].shape[2] > 0 &&
             static_cast<uint64_t>(static_cast<uint64_t>(mi.inputs[0].shape[2]) *
                                   static_cast<uint64_t>(mi.inputs[0].shape[1]) *
                                   3 / 2) ==
                 static_cast<uint64_t>(mi.inputs[0].byte_size)) {
-            const uint32_t model_in_w = static_cast<uint32_t>(mi.inputs[0].shape[2]);
-            const uint32_t model_in_h = static_cast<uint32_t>(mi.inputs[0].shape[1]);
-            dsp_pool_storage.emplace(*dsp_client_, model_mgr_,
-                                     cfg_.stream_preprocess_job_ms);
-            if (dsp_pool_storage->init(model_in_w, model_in_h,
-                                       cfg_.stream_preprocess_slots) == 0 &&
-                dsp_pool_storage->usable()) {
-                dsp_pool = &*dsp_pool_storage;
-                LOG_INFO("StreamInfer: dsp preprocess armed (model %ux%u NV12, "
-                         "%u slot(s), timeout %ums)",
-                         (unsigned)model_in_w, (unsigned)model_in_h,
-                         (unsigned)cfg_.stream_preprocess_slots,
-                         (unsigned)cfg_.stream_preprocess_job_ms);
-            } else {
-                LOG_WARN("StreamInfer: dsp preprocess pool unusable (alloc or "
-                         "layout); mismatched frames remain on direct DMA");
-            }
+            model_in_w = static_cast<uint32_t>(mi.inputs[0].shape[2]);
+            model_in_h = static_cast<uint32_t>(mi.inputs[0].shape[1]);
         }
     }
 
-    // FPS interval
-    auto fps = req->fps_limit() > 0 ? req->fps_limit() : 30;
-    auto frame_interval = Milliseconds(1000 / fps);
+    // A zero fps_limit preserves the legacy unlimited fd-frame path. Positive
+    // limits use a ceiling nanosecond interval so the gate never overshoots.
+    const uint32_t fps = req->fps_limit();
+    const bool has_fps_limit = fps > 0;
+    const auto frame_interval = has_fps_limit
+        ? std::chrono::nanoseconds((1000000000ULL + fps - 1) / fps)
+        : std::chrono::nanoseconds::zero();
+    const auto simulation_interval = has_fps_limit
+        ? frame_interval : std::chrono::milliseconds(33);
+    FrameRateGate fps_gate(fps);
+    // Sequence-zero is a valid first frame; track "seen" separately from the
+    // value so it is never dropped as a phantom duplicate.
     uint64_t last_seq = 0;
-    // fps gate anchor: earliest allowed SUBMIT time. Head-to-head (between
-    // submits, not completions) so the cap is exact regardless of pipeline
-    // latency.
-    auto next_allowed = SteadyClock::now();
+    bool has_last_seq = false;
 
-    // Backpressure: limit outstanding inferences to prevent camera-daemon
-    // buffer pool exhaustion (shared pool ~15 buffers, 3 per stream leaves headroom)
-    constexpr int MAX_IN_FLIGHT = 3;
-    auto in_flight = std::make_shared<std::atomic<int>>(0);
+    // Per-RPC count is paired with the service-wide admission controller. A
+    // permit remains held through late completion cleanup, not just submission.
+    auto in_flight = std::make_shared<std::atomic<uint32_t>>(0);
 
     // Cost of the previous response's Write(), reported one response late
     // (perf fields are finalized before the Write that would carry them).
@@ -1286,18 +1649,30 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
         if (fd_path) {
             ReceivedFrame frame{};
             {
-                std::unique_lock lock(frame_mu);
+                std::unique_lock lock(frame_state->mu);
                 // Bounded purely to poll cancellation; frame arrivals wake
                 // this immediately.
-                frame_cv.wait_for(lock, Milliseconds(50),
-                                  [&] { return has_frame || ctx->IsCancelled(); });
+                frame_state->cv.wait_for(
+                    lock, Milliseconds(50),
+                    [&] { return frame_state->has_frame || ctx->IsCancelled(); });
                 if (ctx->IsCancelled()) break;
-                if (!has_frame) continue;
-                frame = latest_frame;
-                has_frame = false;
+                if (!frame_state->has_frame) {
+                    if (!fd_receiver_->stream_connected(stream_id)) {
+                        LOG_WARN("StreamInfer: publisher connection lost for %s",
+                                 stream_id.c_str());
+                        break;
+                    }
+                    continue;
+                }
+                frame = frame_state->latest_frame;
+                frame_state->latest_frame = {};
+                frame_state->has_frame = false;
             }
 
-            if (frame.sequence == last_seq) continue;
+            if (has_last_seq && frame.sequence == last_seq) {
+                frame.delivery.acknowledge();
+                continue;
+            }
 
             // Frame-driven fps gate: submit a frame the moment it arrives,
             // provided one interval passed since the previous SUBMIT; a
@@ -1310,54 +1685,117 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             // only occurs when the source rate doesn't divide the cap
             // (15fps capped at 10 submits 7.5fps) — freshness wins.
             // Re-anchoring after an arrival stall prevents burst credit.
-            if (SteadyClock::now() < next_allowed) {
-                fd_receiver_->release_frame(stream_id, frame.frame_id);
+            const auto submit_now = SteadyClock::now();
+            if (!fps_gate.allow(submit_now)) {
+                frame.delivery.acknowledge();
                 continue;
             }
-            next_allowed = std::max(next_allowed + frame_interval,
-                                    SteadyClock::now());
             last_seq = frame.sequence;
+            has_last_seq = true;
 
-            // Backpressure: drop frame if too many in-flight
-            if (in_flight->load() >= MAX_IN_FLIGHT) {
-                fd_receiver_->release_frame(stream_id, frame.frame_id);
-                LOG_DEBUG("StreamInfer: backpressure drop (in_flight=%d)",
+            auto work_permit =
+                stream_admission_.try_acquire_work(in_flight);
+            if (!work_permit) {
+                frame.delivery.acknowledge();
+                LOG_DEBUG("StreamInfer: admission drop (rpc_in_flight=%u)",
                           in_flight->load());
                 continue;
             }
 
-            // Matching geometry uses #62's direct DMA path. A mismatched NV12
-            // frame may instead be resized into a private model-geometry DSP
-            // slot and bound through the HAL DMA-frame contract. If the DSP
-            // pool cannot prepare or bind a slot, keep the direct DMA inputs so
-            // the existing HAL validation reports the original geometry error;
-            // never fall back to a CPU repack.
-            HalTensor inputs[2] = {};
-            int num_inputs = build_nv12_tensors(frame, inputs);
-            constexpr uint32_t kStreamPixFmtNv12 = 0;  // HalPixelFormat NV12
+            // One NV12 model input is one logical HAL tensor even when the
+            // camera supplies Y and UV in separate dma-bufs. Build that tensor
+            // through bind_dma_frame(); never submit the two physical planes as
+            // two model inputs. Mismatched frames first try a private DSP slot.
+            HalTensor inputs[HAL_MAX_TENSORS] = {};
+            int num_inputs = 0;
+            std::shared_ptr<void> input_owner;
             std::shared_ptr<StreamPreprocessPool::SlotLease> pp_lease;
-            bool dsp_arm = false;
+            std::shared_ptr<StreamDmaInputLease> direct_lease;
             bool early_released = false;
             uint64_t dsp_us = 0;
             const uint64_t repack_us = 0;
 
-            if (dsp_pool && frame.format == kStreamPixFmtNv12 &&
-                (frame.width != dsp_pool->width() ||
-                 frame.height != dsp_pool->height())) {
-                pp_lease = dsp_pool->prepare(frame, &dsp_us);
+            const bool nv12_model = model_in_w > 0 && model_in_h > 0;
+            const bool nv12_frame = frame.format == HAL_PIX_FMT_NV12;
+            const bool geometry_mismatch = nv12_model && nv12_frame &&
+                (frame.width != model_in_w || frame.height != model_in_h);
+
+            if (geometry_mismatch && cfg_.stream_dsp_preprocess && dsp_client_) {
+                const auto pool_now = SteadyClock::now();
+                if (dsp_pool && !dsp_pool->usable()) {
+                    dsp_pool.reset();
+                    next_dsp_pool_retry = pool_now + kDspPoolRetryDelay;
+                }
+                if (!dsp_pool && pool_now >= next_dsp_pool_retry) {
+                    dsp_pool = acquire_stream_preprocess_pool(model_in_w,
+                                                              model_in_h);
+                    next_dsp_pool_retry = pool_now + kDspPoolRetryDelay;
+                    if (dsp_pool) {
+                        LOG_INFO("StreamInfer: shared dsp preprocess armed "
+                                 "(model %ux%u NV12, %u slot(s), timeout %ums)",
+                                 (unsigned)model_in_w, (unsigned)model_in_h,
+                                 (unsigned)cfg_.stream_preprocess_slots,
+                                 (unsigned)cfg_.stream_preprocess_job_ms);
+                    } else {
+                        LOG_WARN("StreamInfer: dsp preprocess pool unavailable; "
+                                 "validating mismatched frame through direct DMA");
+                    }
+                }
+                if (dsp_pool) {
+                    pp_lease = dsp_pool->prepare(frame, &dsp_us);
+                    if (!pp_lease && !dsp_pool->usable()) {
+                        dsp_pool.reset();
+                        next_dsp_pool_retry =
+                            SteadyClock::now() + kDspPoolRetryDelay;
+                    }
+                }
                 if (pp_lease &&
                     dsp_pool->bind(snap->infer_session, pp_lease.get(),
                                    &inputs[0])) {
-                    dsp_arm = true;
                     num_inputs = 1;
-                    // The resized pixels now live in the private DSP slot.
-                    // Return the source frame immediately; the slot lease rides
-                    // the inference request until the NPU read completes.
-                    fd_receiver_->release_frame(stream_id, frame.frame_id);
+                    input_owner = pp_lease;
+                    // The resized pixels now live in the shared DSP slot.
+                    frame.delivery.acknowledge();
                     early_released = true;
                 } else {
                     pp_lease.reset();
                 }
+            }
+
+            if (num_inputs == 0 && nv12_model && nv12_frame) {
+                int bind_status = HAL_ERR_INVALID_ARG;
+                direct_lease = bind_stream_nv12_input(
+                    snap->infer_session, model_mgr_->infer_ops(), frame,
+                    &bind_status);
+
+                // On a mismatch, bind_dma_frame is the direct-DMA geometry
+                // validation fallback. It must reject the source geometry; do
+                // not run a mismatched frame even if an older backend accepts
+                // equal-byte-size dimensions.
+                if (!direct_lease || geometry_mismatch) {
+                    if (direct_lease) {
+                        direct_lease.reset();
+                        bind_status = HAL_ERR_INVALID_SIZE;
+                    }
+                    frame.delivery.acknowledge();
+                    resp.set_frame_sequence(frame.sequence);
+                    resp.set_timestamp_ns(frame.timestamp_ns);
+                    resp.mutable_status()->set_success(false);
+                    resp.mutable_status()->set_message(
+                        "DMA input rejected: " + std::to_string(bind_status));
+                    resp.mutable_perf()->set_repack_us(repack_us);
+                    resp.mutable_perf()->set_dsp_us(dsp_us);
+                    if (!writer->Write(resp)) break;
+                    continue;
+                }
+
+                inputs[0] = direct_lease->tensor();
+                num_inputs = 1;
+                input_owner = direct_lease;
+            } else if (num_inputs == 0) {
+                // Preserve the pre-existing non-NV12/unknown-model fallback.
+                num_inputs = build_nv12_tensors(frame, inputs);
+                input_owner = frame.fd_group;
             }
 
             resp.set_frame_sequence(frame.sequence);
@@ -1382,22 +1820,20 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             std::memcpy(inf_req->inputs, inputs, sizeof(HalTensor) * num_inputs);
             inf_req->priority   = 5;
             inf_req->timeout_ms = 1000;
-            // What must outlive the NPU read: the DSP slot lease (which
-            // frees the bound tensor and returns the slot) on the dsp arm,
-            // the source frame's fd dups on the direct DMA arm.
-            inf_req->resource_holder =
-                dsp_arm ? std::shared_ptr<void>(pp_lease)
-                        : std::shared_ptr<void>(frame.fd_group);
+            // Keep either the bound direct-DMA tensor (and its borrowed source
+            // FDs) or the DSP slot lease alive until the NPU read completes.
+            inf_req->resource_holder = std::move(input_owner);
             inf_req->owns_outputs = true;
 
             auto frame_id = frame.frame_id;
+            auto frame_delivery = frame.delivery;
             auto frame_seq = frame.sequence;
             auto ts_ns = frame.timestamp_ns;
 
             inf_req->on_complete = [this, promise, stream_resp, pp_session,
                                     enable_post, model_id, stream_id,
-                                    frame_id, frame_seq, ts_ns, in_flight,
-                                    fd_receiver = fd_receiver_, session,
+                                    frame_delivery, frame_seq, ts_ns,
+                                    work_permit, session,
                                     repack_us, dsp_us, early_released,
                                     flt_max_results, flt_min_confidence,
                                     flt_class_filter, flt_omit_labels,
@@ -1406,11 +1842,53 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                 uint64_t infer_us, uint64_t queue_us,
                 bool model_acquired) {
 
+                struct CallbackCleanup {
+                    ModelManager* model_mgr;
+                    FrameDelivery frame_delivery;
+                    HalTensor* outputs;
+                    int num_outputs;
+                    std::string model_id;
+                    bool model_acquired;
+                    bool release_frame;
+                    std::shared_ptr<StreamAdmissionController::WorkPermit>
+                        work_permit;
+                    std::shared_ptr<std::promise<bool>> promise;
+                    bool promise_value = false;
+
+                    ~CallbackCleanup() noexcept {
+                        if (release_frame)
+                            frame_delivery.acknowledge();
+                        try {
+                            if (outputs)
+                                model_mgr->free_outputs(outputs, num_outputs);
+                        } catch (...) {
+                            LOG_ERROR("StreamInfer: output cleanup threw");
+                        }
+                        try {
+                            if (model_acquired)
+                                model_mgr->release_model(model_id);
+                        } catch (...) {
+                            LOG_ERROR("StreamInfer: model release threw");
+                        }
+                        work_permit.reset();
+                        try {
+                            promise->set_value(promise_value);
+                        } catch (...) {
+                            LOG_ERROR("StreamInfer: completion promise failed");
+                        }
+                    }
+                } cleanup{model_mgr_, frame_delivery, outputs, num_outputs,
+                          model_id, model_acquired, !early_released,
+                          work_permit, promise};
+
+                try {
                 // Release frame back to camera-daemon — unless the DSP
                 // preprocess arm already returned it right after the resize
                 // (exactly-once).
-                if (!early_released)
-                    fd_receiver->release_frame(stream_id, frame_id);
+                if (cleanup.release_frame) {
+                    cleanup.frame_delivery.acknowledge();
+                    cleanup.release_frame = false;
+                }
 
                 // Record stats (single source of truth)
                 session_mgr_->record_inference(session.get(), infer_us);
@@ -1432,10 +1910,6 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                     stream_resp->mutable_status()->set_success(false);
                     stream_resp->mutable_status()->set_message(
                         "Inference failed: " + std::to_string(rc));
-                    if (outputs) model_mgr_->free_outputs(outputs, num_outputs);
-                    if (model_acquired) model_mgr_->release_model(model_id);
-                    in_flight->fetch_sub(1);
-                    promise->set_value(false);
                     return;
                 }
 
@@ -1457,6 +1931,17 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                     // terminate the process via the sync on_complete thread
                     // — mirrors the InferBatch post_task guard at line ~735.
                     HalPostprocessResult post_result{};
+                    struct PostResultGuard {
+                        ModelManager* model_mgr;
+                        HalPostprocessResult* result;
+                        ~PostResultGuard() noexcept {
+                            try {
+                                model_mgr->free_post_result(result);
+                            } catch (...) {
+                                LOG_ERROR("StreamInfer: post-result cleanup threw");
+                            }
+                        }
+                    } post_guard{model_mgr_, &post_result};
                     const uint64_t post_t0 = now_us();
                     try {
                         if (model_mgr_->post_process(pp_session, outputs,
@@ -1472,7 +1957,6 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                         stream_resp->mutable_status()->set_message(
                             std::string("Postprocess failed: ") + e.what());
                     }
-                    model_mgr_->free_post_result(&post_result);
                     perf->set_post_us(now_us() - post_t0);
                 }
 
@@ -1487,7 +1971,7 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                 if (enable_post && stream_resp->has_post_result()) {
                     const bool any_result = apply_result_filters(
                         stream_resp->mutable_post_result(), flt_max_results,
-                        flt_min_confidence, flt_class_filter,
+                        flt_min_confidence, *flt_class_filter,
                         flt_omit_labels);
                     if (!any_result && flt_only_nonempty)
                         resp_suppressed->store(true);
@@ -1503,22 +1987,35 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                                    stream_resp->post_result());
                 }
 
-                // Free outputs + release scheduler's model ref
-                model_mgr_->free_outputs(outputs, num_outputs);
-                model_mgr_->release_model(model_id);
-                in_flight->fetch_sub(1);
-
-                promise->set_value(true);
+                cleanup.promise_value = true;
+                } catch (const std::exception& e) {
+                    LOG_ERROR("StreamInfer completion failed for model '%s': %s",
+                              model_id.c_str(), e.what());
+                    try {
+                        stream_resp->mutable_status()->set_success(false);
+                        stream_resp->mutable_status()->set_message(
+                            "stream completion failed");
+                    } catch (...) {
+                        LOG_ERROR("StreamInfer: failed to record completion error");
+                    }
+                } catch (...) {
+                    LOG_ERROR("StreamInfer completion failed for model '%s'",
+                              model_id.c_str());
+                    try {
+                        stream_resp->mutable_status()->set_success(false);
+                        stream_resp->mutable_status()->set_message(
+                            "stream completion failed");
+                    } catch (...) {
+                        LOG_ERROR("StreamInfer: failed to record completion error");
+                    }
+                }
             };
-
-            in_flight->fetch_add(1);
 
             if (!scheduler_->submit(std::move(inf_req))) {
                 // (early_released guard: the dsp arm already returned the
                 // source; inf_req destruction releases the slot lease.)
                 if (!early_released)
-                    fd_receiver_->release_frame(stream_id, frame_id);
-                in_flight->fetch_sub(1);
+                    frame_delivery.acknowledge();
                 resp.mutable_status()->set_success(false);
                 resp.mutable_status()->set_message("Scheduler queue full");
                 if (!writer->Write(resp)) break;
@@ -1526,13 +2023,13 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             }
 
             // Wait with timeout. On timeout, on_complete still fires
-            // later and does its own free/release — no leak, and
-            // in_flight is decremented by on_complete (not here).
+            // later and does its own free/release — no leak, and its
+            // admission permit is released by on_complete (not here).
             uint32_t stream_timeout_ms = 5000;
             if (future.wait_for(std::chrono::milliseconds(stream_timeout_ms))
                 != std::future_status::ready) {
                 LOG_WARN("StreamInfer: inference timeout, skipping frame");
-                // Do NOT decrement in_flight here — on_complete will do it.
+                // Do not release admission here; on_complete still owns it.
                 // Do NOT touch stream_resp — on_complete owns it.
                 continue;
             }
@@ -1548,7 +2045,7 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             }
         } else {
             // Simulation mode (no frame source)
-            std::this_thread::sleep_for(frame_interval);
+            std::this_thread::sleep_for(simulation_interval);
             resp.set_frame_sequence(++last_seq);
             resp.set_timestamp_ns(now_ns());
             resp.mutable_status()->set_success(true);
@@ -1566,9 +2063,7 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
         last_write_us = now_us() - write_t0;
     }
 
-    if (fd_path) {
-        fd_receiver_->unsubscribe(stream_id, session_id);
-    }
+    subscription.close();
 
     // Bounded drain: wait for in-flight tasks to complete, but don't
     // block forever if a HAL job is stuck. Late callbacks self-clean
@@ -1577,7 +2072,7 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
         auto deadline = SteadyClock::now() + Milliseconds(5000);
         while (in_flight->load() > 0) {
             if (SteadyClock::now() >= deadline) {
-                LOG_WARN("StreamInfer: drain timeout, %d orphan job(s) — "
+                LOG_WARN("StreamInfer: drain timeout, %u orphan job(s) — "
                          "late callbacks will self-clean",
                          in_flight->load());
                 break;
@@ -1593,6 +2088,17 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
     LOG_INFO("StreamInfer: ended for %s (subscriber=%s)",
              stream_id.c_str(), session_id.c_str());
     return grpc::Status::OK;
+    } catch (const std::exception& e) {
+        LOG_ERROR("StreamInfer exception: stream_id=%s model_id=%s what=%s",
+                  req->stream_id().c_str(), req->model_id().c_str(), e.what());
+        return grpc::Status(grpc::StatusCode::INTERNAL,
+                            "stream inference failed");
+    } catch (...) {
+        LOG_ERROR("StreamInfer unknown exception: stream_id=%s model_id=%s",
+                  req->stream_id().c_str(), req->model_id().c_str());
+        return grpc::Status(grpc::StatusCode::INTERNAL,
+                            "stream inference failed");
+    }
 }
 
 // ─── CreateSession ────────────────────────────────────────────────────────────
@@ -1605,6 +2111,13 @@ grpc::Status AIRuntimeServiceImpl::CreateSession(
     auto sid = session_mgr_->create_session(
         req->app_id(), "", "",
         0, req->max_qps(), req->priority());
+    if (sid.empty()) {
+        resp->set_session_id("");
+        resp->mutable_status()->set_success(false);
+        resp->mutable_status()->set_message(
+            "session creation failed (invalid app id or session limit reached)");
+        return grpc::Status::OK;
+    }
 
     resp->set_session_id(sid);
     resp->mutable_status()->set_success(true);
@@ -1805,23 +2318,27 @@ grpc::Status AIRuntimeServiceImpl::GenaiCreateSession(
         return grpc::Status::OK;
     }
 
-    // Destroy any existing GenAI sessions first to release KV-Cache.
-    // This handles the case where the app container was restarted and lost
-    // track of its previous session_id, but ai-runtime still holds the session.
+    // Regular inference and GenAI cannot share the NPU. Refuse atomically when
+    // any model is still in use; the registry and existing GenAI sessions remain
+    // untouched so active work is never invalidated to satisfy this request.
+    if (!model_mgr_->force_unregister_all()) {
+        resp->mutable_status()->set_code(9);
+        resp->mutable_status()->set_message(
+            "Regular inference is still active; retry GenAI session creation");
+        return grpc::Status::OK;
+    }
+
+    // Destroy stale GenAI sessions only after regular-model unload succeeded.
+    // This handles an app restart that lost its previous session id.
     {
         std::lock_guard<std::mutex> lock(genai_mu_);
         for (auto& [sid, session] : genai_sessions_) {
-            if (genai_ops_ && genai_ops_->destroy && session) {
+            if (genai_ops_ && genai_ops_->destroy && session)
                 genai_ops_->destroy(session);
-            }
         }
         genai_sessions_.clear();
     }
 
-    // Force-release all loaded models to free NPU memory for the GenAI model.
-    // GenAI models (especially VLMs like Qwen3-VL) are too large to coexist
-    // with regular inference models on the NPU.
-    model_mgr_->force_unregister_all();
     // force_unregister_all drains every pending InferBatch callback (via HAL
     // destroy's wait_pending_async) before returning, so the implicit
     // "implicit-{model_id}" sessions can no longer be touched by a late

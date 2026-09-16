@@ -221,6 +221,7 @@ set(SOURCES
     src/event_bus_client.cpp
     src/config.cpp
     src/grpc_service.cpp
+    src/stream_infer_utils.cpp
     src/auto_infer.cpp
 )
 

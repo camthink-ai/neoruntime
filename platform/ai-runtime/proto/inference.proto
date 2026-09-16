@@ -236,8 +236,8 @@ message StreamInferResponse {
 // Segment wall times (microseconds, CLOCK_MONOTONIC deltas) for one
 // streamed inference. Filled in the StreamInfer fd path; simulation mode
 // leaves it unset. Semantics per field:
-//   repack_us   — fd-frame -> tight NV12 CPU buffer copy (drops to 0 once
-//                 dma direct-bind replaces the repack)
+//   repack_us   — legacy CPU-repack stage; always 0 on the direct-DMA and
+//                 DSP-slot paths retained by this server
 //   dsp_us      — DSP preprocessing stage (0 until stream DSP preprocess
 //                 exists)
 //   queue_us    — scheduler queue wait before the HAL run
