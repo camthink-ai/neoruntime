@@ -1553,9 +1553,23 @@ static int hailo15_infer_tensor_from_frame_ex(HalInferenceSession *session,
     /* ---- Fast path 1: DMABUF frame + exact match -> zero-copy fd binding ----
      * The tensor borrows the frame's dma-buf: no allocation, no memcpy. The
      * caller must keep the frame alive until the inference completes (sync
-     * run() returns after completion; run_async until the callback fires). */
+     * run() returns after completion; run_async until the callback fires).
+     * Single compact dmabuf only: a dual-fd NV12 frame (one dmabuf per plane,
+     * the vendor MediaLibraryBufferPool layout) must not bind here — dma_fds[0]
+     * covers only the Y plane while byte_size spans both, so the bare-fd bind
+     * would map the wrong extent. Those frames fall through to Fast path 2 ->
+     * tensor_from_frame, whose dma fast path builds the per-plane
+     * HalDmaFrameDesc and binds via set_pix_buffer instead. The row pitch must
+     * be tight as well: a padded stride cannot be re-expressed by one
+     * contiguous fd binding (stride 0 = derived = tight). */
+    const bool nv12_dual_fd = (frame->format == HAL_PIX_FMT_NV12 && frame->dma_fds[1] >= 0);
+    const bool stride_tight =
+        (frame->format == HAL_PIX_FMT_NV12)
+            ? ((frame->strides[0] == 0 || frame->strides[0] == frame->width) &&
+               (frame->num_planes < 2 || frame->strides[1] == 0 || frame->strides[1] == frame->width))
+            : (frame->strides[0] == 0 || frame->strides[0] == frame->width * 3);
     const bool normalize = p->cfg.preprocess.normalize;
-    if (frame->mem_type == HAL_MEM_DMABUF && frame->dma_fds[0] >= 0 &&
+    if (frame->mem_type == HAL_MEM_DMABUF && frame->dma_fds[0] >= 0 && !nv12_dual_fd && stride_tight &&
         frame->width == dsh.width && frame->height == dsh.height && !normalize &&
         ((frame->format == HAL_PIX_FMT_NV12 && dfm.order == HAILO_FORMAT_ORDER_NV12) ||
          (frame->format == HAL_PIX_FMT_RGB24 && dsh.features == 3 &&
