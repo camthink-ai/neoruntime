@@ -32,7 +32,11 @@ message TensorSpec {
   repeated int32 shape = 1;
   DataType dtype = 2;
   string name = 3;
-  string layout = 4;  // "NHWC", "NCHW", "HWC", "CHW", "NC", "HW", etc.
+  string layout = 4;  // "NHWC", "NCHW", "HWC", "CHW", "NC", "HW", or "NV12" for
+                      // image-plane inputs (NV12/NV21/I420; see byte_size).
+  uint32 byte_size = 5;  // Host buffer size from the backend. Authoritative when
+                         // set: NV12-like inputs report an RGB-like shape whose
+                         // product is not the frame size (W*H*3/2 is).
 }
 
 message Tensor {
@@ -61,6 +65,14 @@ message ModelRegisterRequest {
   // Post-process configuration
   string model_type = 13;       // Model type: detection, landmarks, segmentation, classification
   string model_variant = 14;    // Variant: yolov8n, yolov8s, etc. (for detection models)
+
+  bool transient = 15;          // App-bundled model (extracted from an app image): hidden from the model page, never persisted to platform.db
+
+  // Explicit opt-in for transient registrations that intentionally carry no
+  // model_type: the app wants raw tensors (no postprocess session) and will
+  // decode them itself. Distinguishes "package forgot the type" (rejected)
+  // from "package chose raw output" (allowed).
+  bool raw_output_only = 16;
 }
 
 message ModelRegisterResponse {
@@ -81,6 +93,7 @@ message ModelInfo {
   uint32 estimated_memory = 11;
   uint64 load_timestamp = 12;
   string owner_id = 13;         // Used during UnregisterModel to specify the caller's identity
+  bool transient = 14;          // True for app-bundled models (see ModelRegisterRequest.transient)
 }
 
 message ModelListResponse {

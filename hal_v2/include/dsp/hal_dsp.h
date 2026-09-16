@@ -123,12 +123,22 @@ typedef struct {
 } HalDspMultiCropOutput;
 
 /**
+ * Maximum number of crop outputs supported by multi_crop_and_resize.
+ *
+ * The vendor header documents 260, but on-device measurement (2026-09-01)
+ * showed batches above 128 are silently truncated by the firmware with a
+ * success status. Batches above this constant are rejected with
+ * HAL_ERR_INVALID_ARG instead of being truncated.
+ */
+#define HAL_DSP_MULTI_CROP_MAX_OUTPUTS (128)
+
+/**
  * Parameters for multi crop+resize on one source frame.
  */
 typedef struct {
     const HalFrameBuffer   *src;
     HalDspMultiCropOutput  *outputs;
-    uint32_t                output_count;
+    uint32_t                output_count;  /* 1..HAL_DSP_MULTI_CROP_MAX_OUTPUTS */
     HalDspInterpolation     interpolation;
 } HalDspMultiCropResizeParams;
 

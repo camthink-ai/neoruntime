@@ -64,6 +64,8 @@ class EncodedPublisher;
 class AiOverlaySubscriber;
 class AudioService;
 class DpmWorker;
+class DspService;
+#include "dsp_service.h"
 struct AudioCfg;
 
 #ifdef HAS_GRPC
@@ -160,6 +162,9 @@ struct DaemonConfig {
     uint32_t    watchdog_scan_ms;
     uint32_t    watchdog_timeout_ms;
     uint32_t    watchdog_warn_ms;
+
+    // DSP offload service (P2: `dsp:` YAML section; defaults in dsp_service.h)
+    DspServiceConfig dsp;
 
     // RTSP
     bool        rtsp_enabled;
@@ -551,6 +556,8 @@ public:
     /** Access HAL loader for peripheral ops (env_ctrl, alarm, rs485). */
     HalLoader* hal_loader() const { return hal_loader_.get(); }
     AudioService* audio_service() const { return audio_service_.get(); }
+    /** App-facing DSP offload service (null when HAL lacks DSP/buffer ops). */
+    DspService* dsp_service() const { return dsp_service_.get(); }
 
 #ifdef HAS_GRPC
     /**
@@ -643,6 +650,7 @@ private:
     std::unique_ptr<OsdManager>     osd_mgr_;
     std::unique_ptr<EncoderManager> encoder_mgr_;
     std::unique_ptr<FdPublisher>    fd_pub_;
+    std::unique_ptr<DspService>     dsp_service_;
     std::shared_ptr<RtspServer>     rtsp_server_;
     std::unique_ptr<EncodedPublisher> encoded_pub_;
     std::unique_ptr<AiOverlaySubscriber> ai_overlay_;

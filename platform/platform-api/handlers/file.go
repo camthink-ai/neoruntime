@@ -58,6 +58,25 @@ func (h *FileHandler) validatePath(rawPath string) (string, error) {
 	return "", fmt.Errorf("access denied: path %s is outside allowed directories", cleaned)
 }
 
+func isCanonicalManifestPath(path string) bool {
+	root := filepath.Join(constants.RootPath(), "apps", "manifests")
+	clean := filepath.Clean(path)
+	// Deleting an ancestor such as <root>/apps would also erase every live
+	// manifest, even though the selected path is not itself an app.yaml.
+	if clean != filepath.Clean(constants.RootPath()) && strings.HasPrefix(root, clean+string(os.PathSeparator)) {
+		return true
+	}
+	rel, err := filepath.Rel(root, clean)
+	if err != nil {
+		return false
+	}
+	parts := splitCleanPath(rel)
+	// Removing the manifests root, an app directory, or its app.yaml would all
+	// delete a canonical manifest. Other deeper files remain generic-file API
+	// territory.
+	return len(parts) == 0 || len(parts) == 1 || (len(parts) == 2 && parts[1] == "app.yaml")
+}
+
 // List returns directory contents.
 func (h *FileHandler) List(c *gin.Context) {
 	dirPath := c.DefaultQuery("path", h.defaultPath)
@@ -244,6 +263,11 @@ func (h *FileHandler) Delete(c *gin.Context) {
 		return
 	}
 
+	if isCanonicalManifestPath(safePath) {
+		Resp(c).FailMsg(CodeAccessDenied, "canonical app manifests cannot be deleted through the generic file API")
+		return
+	}
+
 	// Prevent deleting root allowed directories
 	for _, root := range h.allowedRoots {
 		if safePath == root {
@@ -335,6 +359,11 @@ func (h *FileHandler) BatchDelete(c *gin.Context) {
 		safePath, err := h.validatePath(path)
 		if err != nil {
 			Resp(c).FailMsg(CodeAccessDenied, fmt.Sprintf("invalid path %s: %s", path, err.Error()))
+			return
+		}
+
+		if isCanonicalManifestPath(safePath) {
+			Resp(c).FailMsg(CodeAccessDenied, fmt.Sprintf("canonical app manifest cannot be deleted: %s", safePath))
 			return
 		}
 

@@ -1,16 +1,16 @@
 package handlers
 
 import (
-	"aipc/platform/common/constants"
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gopkg.in/yaml.v3"
 
+	"aipc/platform/app-manager/manifest"
 	apppb "aipc/platform/app-manager/proto"
 )
 
@@ -32,6 +32,12 @@ func (h *APIHandlers) WizardInstall(c *gin.Context) {
 		Resp(c).FailMsg(CodeInvalidRequest, "metadata.id is required")
 		return
 	}
+	// The ID becomes a directory name under apps/manifests — reject path
+	// segments before any MkdirAll/WriteFile happens.
+	if err := requireSafeAppID(req.Metadata.ID); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, err.Error())
+		return
+	}
 	if req.Metadata.Name == "" {
 		Resp(c).FailMsg(CodeInvalidRequest, "metadata.name is required")
 		return
@@ -45,18 +51,22 @@ func (h *APIHandlers) WizardInstall(c *gin.Context) {
 	}
 
 	// Generate YAML content
-	yamlContent := h.generateAppYAML(&req)
-
-	// Create persistent manifest directory
-	manifestDir := fmt.Sprintf(constants.RootPath()+"/apps/manifests/%s", req.Metadata.ID)
-	if err := os.MkdirAll(manifestDir, 0755); err != nil {
-		Resp(c).FailMsg(CodeServiceError, "Failed to create manifest directory: "+err.Error())
+	yamlData, err := h.generateAppYAML(&req)
+	if err != nil {
+		Resp(c).FailMsg(CodeServiceError, "Failed to generate manifest: "+err.Error())
 		return
 	}
 
-	// Write to persistent manifest file
+	// Generate into request-private staging; app-manager publishes the canonical
+	// manifest only after the install has passed validation.
+	manifestDir, err := newAppStagingDir()
+	if err != nil {
+		Resp(c).FailMsg(CodeServiceError, "Failed to create staging directory: "+err.Error())
+		return
+	}
 	manifestFile := filepath.Join(manifestDir, "app.yaml")
-	if err := os.WriteFile(manifestFile, []byte(yamlContent), 0644); err != nil {
+	if err := os.WriteFile(manifestFile, yamlData, 0644); err != nil {
+		os.RemoveAll(manifestDir)
 		Resp(c).FailMsg(CodeServiceError, "Failed to create manifest file: "+err.Error())
 		return
 	}
@@ -88,6 +98,7 @@ func (h *APIHandlers) WizardInstall(c *gin.Context) {
 		Force:        req.Force,
 	})
 	if err != nil {
+		os.RemoveAll(manifestDir)
 		Resp(c).FailMsg(CodeAppInstallFailed, err.Error())
 		return
 	}
@@ -108,6 +119,12 @@ type WizardRequest struct {
 	RestartPolicy string            `json:"restart_policy,omitempty"`
 	Security      WizardSecurity    `json:"security,omitempty"`
 	Force         bool              `json:"force,omitempty"`
+
+	// Models is the declarative model dependency map (spec.models): alias →
+	// model id (+ optional in-image path/type, required flag). The web wizard's
+	// 模型依赖 editor sends this; permissions.inference.models stays as the
+	// legacy authorization list and is no longer sent by the wizard.
+	Models map[string]manifest.ModelMapping `json:"models,omitempty"`
 }
 
 type WizardMetadata struct {
@@ -131,6 +148,9 @@ type WizardPermissions struct {
 }
 
 type WizardInference struct {
+	// Models is the legacy authorization list. The web wizard now sends the
+	// declarative top-level `models` map instead; this field stays accepted so
+	// older API clients keep installing.
 	Models        []string `json:"models,omitempty"`
 	MaxQPS        int      `json:"max_qps,omitempty"`
 	MaxConcurrent int      `json:"max_concurrent,omitempty"`
@@ -170,166 +190,97 @@ type WizardSecurity struct {
 	ReadonlyRootfs  *bool `json:"readonly_rootfs,omitempty"`
 }
 
-// generateAppYAML generates app.yaml content from wizard request
-func (h *APIHandlers) generateAppYAML(req *WizardRequest) string {
-	var sb strings.Builder
-
-	// API Version and Kind
-	sb.WriteString("apiVersion: v1\n")
-	sb.WriteString("kind: Application\n\n")
-
-	// Metadata
-	sb.WriteString("metadata:\n")
-	sb.WriteString("  id: " + req.Metadata.ID + "\n")
-	sb.WriteString("  name: " + req.Metadata.Name + "\n")
-	sb.WriteString("  version: " + req.Metadata.Version + "\n")
-	if req.Metadata.Description != "" {
-		sb.WriteString("  description: " + req.Metadata.Description + "\n")
+// wizardRequestToManifest maps a WizardRequest onto the canonical manifest
+// struct. Wizard pointer semantics pass through untouched: SecuritySpec uses
+// the same *bool convention (nil = platform default), so an unset field stays
+// nil instead of becoming an explicit false.
+func wizardRequestToManifest(req *WizardRequest) *manifest.AppManifest {
+	m := &manifest.AppManifest{
+		APIVersion: "v1",
+		Kind:       "Application",
+		Metadata: manifest.Metadata{
+			ID:          req.Metadata.ID,
+			Name:        req.Metadata.Name,
+			Version:     req.Metadata.Version,
+			Description: req.Metadata.Description,
+		},
+		Spec: manifest.Spec{
+			Image:         req.Image,
+			Autostart:     req.Autostart,
+			RestartPolicy: req.RestartPolicy,
+		},
 	}
-	sb.WriteString("\n")
 
-	// Spec
-	sb.WriteString("spec:\n")
-	sb.WriteString("  image: " + req.Image + "\n")
-	sb.WriteString("\n")
-
-	// Resources
 	if req.Resources.CPU != "" || req.Resources.Memory != "" {
-		sb.WriteString("  resources:\n")
-		if req.Resources.CPU != "" {
-			sb.WriteString("    cpu: \"" + req.Resources.CPU + "\"\n")
+		m.Spec.Resources = manifest.Resources{
+			CPU:    req.Resources.CPU,
+			Memory: req.Resources.Memory,
 		}
-		if req.Resources.Memory != "" {
-			sb.WriteString("    memory: \"" + req.Resources.Memory + "\"\n")
-		}
-		sb.WriteString("\n")
 	}
 
-	// Permissions
-	hasPermissions := len(req.Permissions.Video) > 0 ||
-		req.Permissions.Inference != nil ||
-		req.Permissions.Events != nil ||
-		req.Permissions.Device != nil ||
-		req.Permissions.Network != nil
-
-	if hasPermissions {
-		sb.WriteString("  permissions:\n")
-
-		if len(req.Permissions.Video) > 0 {
-			sb.WriteString("    video:\n")
-			for _, v := range req.Permissions.Video {
-				sb.WriteString("      - " + v + "\n")
-			}
-		}
-
-		if req.Permissions.Inference != nil {
-			sb.WriteString("    inference:\n")
-			if len(req.Permissions.Inference.Models) > 0 {
-				sb.WriteString("      models:\n")
-				for _, m := range req.Permissions.Inference.Models {
-					sb.WriteString("        - " + m + "\n")
-				}
-			}
-			if req.Permissions.Inference.MaxQPS > 0 {
-				sb.WriteString(fmt.Sprintf("      max_qps: %d\n", req.Permissions.Inference.MaxQPS))
-			}
-			if req.Permissions.Inference.MaxConcurrent > 0 {
-				sb.WriteString(fmt.Sprintf("      max_concurrent: %d\n", req.Permissions.Inference.MaxConcurrent))
-			}
-			if req.Permissions.Inference.AllowRegister {
-				sb.WriteString("      allow_register_model: true\n")
-			}
-		}
-
-		if req.Permissions.Events != nil {
-			sb.WriteString("    events:\n")
-			if len(req.Permissions.Events.Publish) > 0 {
-				sb.WriteString("      publish:\n")
-				for _, p := range req.Permissions.Events.Publish {
-					sb.WriteString("        - " + p + "\n")
-				}
-			}
-			if len(req.Permissions.Events.Subscribe) > 0 {
-				sb.WriteString("      subscribe:\n")
-				for _, s := range req.Permissions.Events.Subscribe {
-					sb.WriteString("        - " + s + "\n")
-				}
-			}
-		}
-
-		if req.Permissions.Device != nil {
-			hasDevice := req.Permissions.Device.Light || req.Permissions.Device.IrCut || req.Permissions.Device.PTZ || req.Permissions.Device.Lens
-			if hasDevice {
-				sb.WriteString("    device:\n")
-				if req.Permissions.Device.Light {
-					sb.WriteString("      light: true\n")
-				}
-				if req.Permissions.Device.IrCut {
-					sb.WriteString("      ir_cut: true\n")
-				}
-				if req.Permissions.Device.PTZ {
-					sb.WriteString("      ptz: true\n")
-				}
-				if req.Permissions.Device.Lens {
-					sb.WriteString("      lens: true\n")
-				}
-			}
-		}
-
-		if req.Permissions.Network != nil && req.Permissions.Network.Mode != "" {
-			sb.WriteString("    network:\n")
-			sb.WriteString("      mode: " + req.Permissions.Network.Mode + "\n")
-			if len(req.Permissions.Network.Inbound) > 0 {
-				sb.WriteString("      inbound:\n")
-				for _, port := range req.Permissions.Network.Inbound {
-					sb.WriteString(fmt.Sprintf("        - %d\n", port))
-				}
-			}
-		}
-		sb.WriteString("\n")
+	// Model dependencies land in spec.models verbatim — including path/type/
+	// required subfields the form itself may not edit but must not drop.
+	if len(req.Models) > 0 {
+		m.Spec.Models = req.Models
 	}
 
-	// Environment variables
-	if len(req.Env) > 0 {
-		sb.WriteString("  env:\n")
-		for _, e := range req.Env {
-			sb.WriteString(fmt.Sprintf("    - name: %s\n      value: \"%s\"\n", e.Name, e.Value))
-		}
-		sb.WriteString("\n")
-	}
-
-	// Volumes
-	if len(req.Volumes) > 0 {
-		sb.WriteString("  volumes:\n")
-		for _, v := range req.Volumes {
-			sb.WriteString(fmt.Sprintf("    - host: %s\n      container: %s\n", v.Host, v.Container))
-			if v.ReadOnly {
-				sb.WriteString("      readonly: true\n")
+	if p := req.Permissions; p.Video != nil || p.Inference != nil || p.Events != nil || p.Device != nil || p.Network != nil {
+		perms := manifest.Permissions{Video: p.Video}
+		if p.Inference != nil {
+			perms.Inference = manifest.InferencePerms{
+				Models:        p.Inference.Models,
+				MaxQPS:        p.Inference.MaxQPS,
+				MaxConcurrent: p.Inference.MaxConcurrent,
+				AllowRegister: p.Inference.AllowRegister,
 			}
 		}
-		sb.WriteString("\n")
+		if p.Events != nil {
+			perms.Events = manifest.EventPerms{
+				Publish:   p.Events.Publish,
+				Subscribe: p.Events.Subscribe,
+			}
+		}
+		if p.Device != nil {
+			perms.Device = manifest.DevicePerms{
+				Light: p.Device.Light,
+				IrCut: p.Device.IrCut,
+				PTZ:   p.Device.PTZ,
+				Lens:  p.Device.Lens,
+			}
+		}
+		// Mirror the old emitter: network is only meaningful with a mode.
+		if p.Network != nil && p.Network.Mode != "" {
+			perms.Network = manifest.NetworkPerms{
+				Mode:    p.Network.Mode,
+				Inbound: p.Network.Inbound,
+			}
+		}
+		m.Spec.Permissions = perms
 	}
 
-	// Autostart
-	if req.Autostart {
-		sb.WriteString("  autostart: true\n")
+	for _, e := range req.Env {
+		m.Spec.Env = append(m.Spec.Env, manifest.EnvVar{Name: e.Name, Value: e.Value})
 	}
-
-	// Restart policy
-	if req.RestartPolicy != "" {
-		sb.WriteString("  restart_policy: " + req.RestartPolicy + "\n")
+	for _, v := range req.Volumes {
+		m.Spec.Volumes = append(m.Spec.Volumes, manifest.Volume{
+			Host:      v.Host,
+			Container: v.Container,
+			Readonly:  v.ReadOnly,
+		})
 	}
-
-	// Security overrides
 	if req.Security.NoNewPrivileges != nil || req.Security.ReadonlyRootfs != nil {
-		sb.WriteString("  security:\n")
-		if req.Security.NoNewPrivileges != nil {
-			sb.WriteString(fmt.Sprintf("    no_new_privileges: %v\n", *req.Security.NoNewPrivileges))
-		}
-		if req.Security.ReadonlyRootfs != nil {
-			sb.WriteString(fmt.Sprintf("    readonly_rootfs: %v\n", *req.Security.ReadonlyRootfs))
+		m.Spec.Security = manifest.SecuritySpec{
+			NoNewPrivileges: req.Security.NoNewPrivileges,
+			ReadonlyRootfs:  req.Security.ReadonlyRootfs,
 		}
 	}
 
-	return sb.String()
+	return m
+}
+
+// generateAppYAML renders the wizard request as app.yaml bytes. yaml.Marshal
+// owns all quoting and escaping, so values containing ':', '#' or quotes
+// produce valid YAML (the hand-built string version did not).
+func (h *APIHandlers) generateAppYAML(req *WizardRequest) ([]byte, error) {
+	return yaml.Marshal(wizardRequestToManifest(req))
 }

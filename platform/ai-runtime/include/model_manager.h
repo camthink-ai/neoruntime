@@ -24,6 +24,22 @@ struct ModelEntry {
     std::string  name;                  // Display name for the model
     std::string  path;
 
+    // Registration identity (model_type + variant exactly as registered).
+    // Co-ownership of the same id+path is only valid while these match: a
+    // differing re-registration would have the gRPC layer's
+    // init_post_process rewire the shared postprocess session to the new
+    // configuration, corrupting decode for the incumbent owner(s).
+    std::string  model_type;
+    std::string  variant;
+
+    // App-bundled model (extracted from an app image by app-manager).
+    // Transient models are hidden from the model page: platform-api's
+    // syncRuntimeModelsToDB skips them, so they never reach platform.db.
+    // Set at first registration; co-ownership re-registrations keep the
+    // stored value (a model already loaded under a visibility contract
+    // keeps it).
+    bool         transient = false;
+
     HalInferenceSession* infer_session = nullptr;  // HAL v2 inference session
     PostprocessSession   post_session;              // HAL v2 postprocess session
 
@@ -53,13 +69,34 @@ public:
     ~ModelManager();
 
     /// Register (load) a model. If owner_id is non-empty, it tracks ownership.
-    /// If the model is already loaded by another owner, this just adds co-ownership.
-    /// Returns 0 on success, <0 on error.
+    /// If the model is already loaded by another owner from the SAME path,
+    /// this just adds co-ownership; the same id under a different path is a
+    /// collision and is refused (the incumbent's weights must not silently
+    /// serve the new registrant). So is the same id+path with a different
+    /// registration identity (model_type/variant): re-initializing the
+    /// shared postprocess session to the new configuration would corrupt
+    /// decode for the incumbent owner(s).
+    /// transient marks an app-bundled model (hidden from the model page).
+    /// variant is the model's postprocess variant blob; for detections its
+    /// backend_function is forwarded to the HAL inference session so NMS output
+    /// tensors are named after the selected vendor function, not the file path.
+    /// Returns 0 for a fresh registration, 1 when the identical entry was
+    /// already loaded and only ownership changed, <0 on error; why (optional)
+    /// carries the human-readable refusal reason.
     int register_model(const std::string& model_id, const std::string& model_path,
-                       const std::string& owner_id = "");
+                       const std::string& owner_id = "",
+                       bool transient = false,
+                       const std::string& variant = "",
+                       const std::string& model_type = "",
+                       std::string* why = nullptr);
 
-    /// Unregister (unload) a model. If owner_id is given, only removes that owner.
-    /// The model is physically unloaded only when no owners remain AND ref_count == 0.
+    /// Unregister (unload) a model. With owner_id, an absent owner is an
+    /// idempotent no-op; other owners keep the model resident; the last owner
+    /// is removed atomically with physical unload and is retained when a live
+    /// inference ref_count refuses that unload. An empty owner_id requests a
+    /// system-level unload but still respects ref_count. Returns 0 only when
+    /// the physical model was removed, 1 for an idempotent/co-owner logical
+    /// release that leaves it resident, and <0 on refusal.
     int unregister_model(const std::string& model_id, const std::string& owner_id = "");
 
     /// Force unregister all models, ignoring ref_count.

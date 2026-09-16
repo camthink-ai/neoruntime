@@ -7,6 +7,29 @@
 
 namespace aipc::ai_runtime {
 
+namespace {
+
+// Best-effort extraction of "backend_function":"<name>" from a detection
+// variant blob. The blob is machine-composed (platform-api's variant JSON or
+// the default-blob composer in init_post_process), so the canonical quoting is
+// reliable. Returns "" for bare-name (non-JSON) variants or a missing key —
+// both mean "no function to forward".
+std::string variant_backend_function(const std::string& variant) {
+    if (variant.empty() || variant.front() != '{') return "";
+    const std::string key = "\"backend_function\"";
+    const size_t k = variant.find(key);
+    if (k == std::string::npos) return "";
+    const size_t colon = variant.find(':', k + key.size());
+    if (colon == std::string::npos) return "";
+    const size_t q1 = variant.find('"', colon + 1);
+    if (q1 == std::string::npos) return "";
+    const size_t q2 = variant.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return variant.substr(q1 + 1, q2 - q1 - 1);
+}
+
+} // namespace
+
 // ============================================================
 // Constructor / Destructor
 // ============================================================
@@ -73,20 +96,73 @@ bool ModelManager::has_async() const {
 
 int ModelManager::register_model(const std::string& model_id,
                                  const std::string& model_path,
-                                 const std::string& owner_id) {
+                                 const std::string& owner_id,
+                                 bool transient,
+                                 const std::string& variant,
+                                 const std::string& model_type,
+                                 std::string* why) {
     std::unique_lock lock(mu_);
 
     if (models_.count(model_id)) {
-        // Model already loaded — add co-ownership if owner_id is provided
+        if (models_[model_id].path != model_path) {
+            // Same id under a different file is a collision, not
+            // co-ownership: accepting it would serve the incumbent's
+            // weights to the new registrant, and the caller's
+            // init_post_process would then rewire the incumbent's
+            // postprocess session to the new variant. Two apps bundling
+            // their own model under the same id must collide loudly.
+            LOG_ERROR("Model %s: refusing registration from %s — already "
+                      "registered from %s",
+                      model_id.c_str(), model_path.c_str(),
+                      models_[model_id].path.c_str());
+            if (why) {
+                *why = "model id '" + model_id +
+                       "' is already registered from a different path (" +
+                       models_[model_id].path + ")";
+            }
+            return -1;
+        }
+        if (models_[model_id].model_type != model_type ||
+            models_[model_id].variant != variant) {
+            // Same id and file but a different decoding configuration is
+            // equally a collision: accepting it as co-ownership would let
+            // the gRPC layer's init_post_process rewire the shared
+            // postprocess session to this variant/type — at least one owner
+            // would then read mis-decoded output. The refusal names both
+            // configurations so the operator can see what clashed.
+            LOG_ERROR("Model %s: refusing registration from owner '%s' — "
+                      "already registered with a different configuration "
+                      "(type='%s' variant='%s' vs type='%s' variant='%s')",
+                      model_id.c_str(), owner_id.c_str(),
+                      models_[model_id].model_type.c_str(),
+                      models_[model_id].variant.c_str(),
+                      model_type.c_str(), variant.c_str());
+            if (why) {
+                *why = "model id '" + model_id +
+                       "' is already registered with a different "
+                       "configuration (type='" + models_[model_id].model_type +
+                       "' variant='" + models_[model_id].variant + "')";
+            }
+            return -1;
+        }
+        // Model already loaded — add co-ownership if owner_id is provided.
+        // The stored transient flag wins: a model already registered under a
+        // visibility contract (e.g. system-visible) keeps it even when a
+        // transient re-registration arrives for the same id.
+        if (transient != models_[model_id].transient) {
+            LOG_INFO("Model %s: registration transient=%d differs from stored "
+                     "transient=%d, keeping stored flag",
+                     model_id.c_str(), transient, models_[model_id].transient);
+        }
         if (!owner_id.empty()) {
             owners_[model_id].insert(owner_id);
             LOG_INFO("Model %s: added co-owner '%s' (total owners: %zu)",
                      model_id.c_str(), owner_id.c_str(), owners_[model_id].size());
-            return 0;
+            return 1;  // existing entry: gRPC must not reinitialize postprocess
         }
 
         LOG_INFO("Model %s already loaded, skipping", model_id.c_str());
-        return 0;
+        return 1;  // existing entry: gRPC must not reinitialize postprocess
     }
 
     // Check if the same file is already loaded under a different model_id
@@ -100,8 +176,11 @@ int ModelManager::register_model(const std::string& model_id,
             HalInferenceSession*   shared_infer = entry.infer_session;
             HalPostprocessSession* shared_post  = entry.post_session.session;
             ModelEntry alias = entry;
-            alias.id   = model_id;   // alias must carry its own id, not the original's
-            alias.name = model_id;   // display name must match the alias id
+            alias.id        = model_id;   // alias must carry its own id, not the original's
+            alias.name      = model_id;   // display name must match the alias id
+            alias.transient = transient;  // visibility is per-id, follows this registration
+            alias.model_type = model_type; // decoding identity is per-id too: init_post_process
+            alias.variant    = variant;    // gives the alias its own postprocess session
             models_.emplace(model_id, alias);
             add_infer_locked(shared_infer);
             add_post_locked(shared_post);
@@ -119,8 +198,44 @@ int ModelManager::register_model(const std::string& model_id,
     infer_cfg.timeout_ms = 5000;
     infer_cfg.use_dma = true;
 
-    // Pass scheduler config for shared VDevice + round-robin scheduling
-    if (!hal_platform_config_.empty()) {
+    // Pass scheduler config for shared VDevice + round-robin scheduling.
+    // When the variant names a backend_function, overlay it onto the platform
+    // config JSON: the HAL inference session uses it to name NMS output
+    // tensors after the selected vendor function ("<family>/yolov8_nms_postprocess")
+    // instead of the HEF file basename — app-bundled HEFs live at arbitrary
+    // paths whose basename the vendor plugin would not recognize. The local
+    // string only needs to outlive create(), which copies what it needs.
+    std::string infer_platform_config;
+    {
+        const std::string backend_function = variant_backend_function(variant);
+        if (!backend_function.empty()) {
+            std::string base;
+            if (!hal_platform_config_.empty() && hal_platform_config_.front() == '{') {
+                // Splice: drop the closing brace, append the key, re-close.
+                base = hal_platform_config_;
+                const size_t close = base.rfind('}');
+                if (close != std::string::npos) base.resize(close);
+                while (!base.empty() &&
+                       (base.back() == ' ' || base.back() == '\t' ||
+                        base.back() == '\r' || base.back() == '\n')) {
+                    base.pop_back();
+                }
+                if (!base.empty() && base.back() == ',') base.pop_back();
+            }
+            if (base.size() > 1) {
+                infer_platform_config =
+                    base + ",\"backend_function\":\"" + backend_function + "\"}";
+            } else {
+                infer_platform_config =
+                    "{\"backend_function\":\"" + backend_function + "\"}";
+            }
+            LOG_INFO("Model %s: NMS tensor naming follows backend_function '%s'",
+                     model_id.c_str(), backend_function.c_str());
+        }
+    }
+    if (!infer_platform_config.empty()) {
+        infer_cfg.platform_config = infer_platform_config.c_str();
+    } else if (!hal_platform_config_.empty()) {
         infer_cfg.platform_config = hal_platform_config_.c_str();
     }
 
@@ -132,19 +247,22 @@ int ModelManager::register_model(const std::string& model_id,
 
     // Get model info and create entry
     ModelEntry entry;
-    entry.id        = model_id;
-    entry.name      = model_id;
-    entry.path      = model_path;
-    entry.ref_count = 0;
-    entry.load_time = std::time(nullptr);
+    entry.id         = model_id;
+    entry.name       = model_id;
+    entry.path       = model_path;
+    entry.transient  = transient;
+    entry.model_type = model_type;
+    entry.variant    = variant;
+    entry.ref_count  = 0;
+    entry.load_time  = std::time(nullptr);
 
     entry.infer_session = session;
     if (infer_ops_->get_model_info) {
         infer_ops_->get_model_info(session, &entry.model_info);
     }
-    LOG_INFO("Model registered: %s (session=%p, owner=%s)",
+    LOG_INFO("Model registered: %s (session=%p, owner=%s, transient=%d)",
              model_id.c_str(), (void*)session,
-             owner_id.empty() ? "<system>" : owner_id.c_str());
+             owner_id.empty() ? "<system>" : owner_id.c_str(), transient);
 
     models_.emplace(model_id, std::move(entry));
     add_infer_locked(session);  // first reference to the freshly created session
@@ -262,8 +380,8 @@ int ModelManager::init_post_process(const std::string& model_id,
     // /home/root/apps/shared/resources/configs/yolov8.json). Two accepted
     // shapes for `variant`:
     //   1. Full JSON blob (first char '{') → used verbatim as config_json.
-    //   2. Bare backend_function name → legacy {"backend_function":"<name>"}
-    //      (schema-invalid; kept for backward compat, logs a warning).
+    //   2. Bare backend_function name → a full default blob is composed around
+    //      it (schema-valid; tuning reused from pp_cfg).
     // The local string only needs to outlive the create() call below, which
     // copies what it needs into merged_vendor_json.
     std::string detection_cfg_json;
@@ -271,13 +389,38 @@ int ModelManager::init_post_process(const std::string& model_id,
         if (variant.front() == '{') {
             detection_cfg_json = variant;
         } else {
+            // Compose a FULL schema-valid blob around the bare backend_function
+            // name. The legacy stub {"backend_function":"<name>"} is rejected by
+            // the plugin's schema validation ("Invalid keyword: required") after
+            // HAL strips the backend_* loader keys, silently falling back to the
+            // hailo_yolov8n default. Field set mirrors the device reference
+            // /home/root/apps/shared/resources/configs/yolov8.json; tuning
+            // values reuse the pp_cfg already set for this model. labels is the
+            // plugin's compiled-in table — output class_id semantics (model
+            // class index + 1) are unchanged; consumers map ids themselves.
+            char cfg_buf[512];
+            snprintf(cfg_buf, sizeof(cfg_buf),
+                     "{\"backend_function\":\"%s\","
+                     "\"iou_threshold\":%.4f,"
+                     "\"detection_threshold\":%.4f,"
+                     "\"output_activation\":\"none\","
+                     "\"label_offset\":1,"
+                     "\"max_boxes\":%u,"
+                     "\"labels\":[\"unlabeled\",\"person\",\"vehicle\","
+                     "\"face\",\"license_plate\"]}",
+                     variant.c_str(),
+                     pp_cfg.config.detection.nms_threshold,
+                     pp_cfg.config.detection.confidence_threshold,
+                     pp_cfg.config.detection.max_detections);
+            detection_cfg_json = cfg_buf;
             LOG_WARN("init_post_process: variant='%s' is a bare backend_function "
-                     "name — config_json {\"backend_function\":\"%s\"} is "
-                     "schema-invalid for the YOLO plugin (will fall back to "
-                     "hailo_yolov8n). Pass a full config_json blob instead.",
-                     variant.c_str(), variant.c_str());
-            detection_cfg_json = std::string("{\"backend_function\":\"") +
-                                 variant + "\"}";
+                     "name — injecting a full default config_json around it "
+                     "(detection_threshold=%.2f iou_threshold=%.2f "
+                     "max_boxes=%u).",
+                     variant.c_str(),
+                     pp_cfg.config.detection.confidence_threshold,
+                     pp_cfg.config.detection.nms_threshold,
+                     pp_cfg.config.detection.max_detections);
         }
         pp_cfg.config.detection.config_json = detection_cfg_json.c_str();
     }
@@ -369,25 +512,35 @@ int ModelManager::unregister_model(const std::string& model_id,
     auto it = models_.find(model_id);
     if (it == models_.end()) return -1;
 
-    // If owner_id is provided, remove only that owner
+    // Owner-scoped release must be transactional with physical unload.
+    // A request for an owner that is not present is an idempotent no-op — it
+    // must never fall through and unload somebody else's registration. If
+    // this is the last owner, retain it while an active inference prevents
+    // unload so a refused request does not leave an ownerless live model.
     if (!owner_id.empty()) {
         auto oit = owners_.find(model_id);
-        if (oit != owners_.end()) {
+        if (oit == owners_.end() || oit->second.count(owner_id) == 0) {
+            LOG_INFO("Model %s: owner '%s' already absent, scoped unregister is a no-op",
+                     model_id.c_str(), owner_id.c_str());
+            return 1;  // logical success; physical model remains unchanged
+        }
+        if (oit->second.size() > 1) {
             oit->second.erase(owner_id);
             LOG_INFO("Model %s: removed owner '%s' (remaining owners: %zu)",
                      model_id.c_str(), owner_id.c_str(), oit->second.size());
-
-            // If other owners remain, don't unload
-            if (!oit->second.empty()) {
-                return 0;
-            }
-            // Clean up empty owner set
-            owners_.erase(oit);
+            return 1;  // logical success; co-owners keep the physical model
         }
-    }
-
-    // Check ref_count before physical unload
-    if (it->second.ref_count > 0) {
+        if (it->second.ref_count > 0) {
+            LOG_ERROR("Cannot unregister %s for last owner '%s': ref_count=%d "
+                      "(still in use by active sessions)",
+                      model_id.c_str(), owner_id.c_str(), it->second.ref_count);
+            return -1;
+        }
+        oit->second.erase(owner_id);
+        owners_.erase(oit);
+    } else if (it->second.ref_count > 0) {
+        // Ownerless requests are the system-level force-unload path, but still
+        // respect live inference references.
         LOG_ERROR("Cannot unregister %s: ref_count=%d (still in use by active sessions)",
                   model_id.c_str(), it->second.ref_count);
         return -1;
