@@ -155,6 +155,7 @@ else()
             OUTPUT ${CAMERA_PB_CC} ${CAMERA_PB_H} ${CAMERA_GRPC_CC} ${CAMERA_GRPC_H}
             COMMAND ${_PROTOC}
                 --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/../camera-daemon/proto
+                --experimental_allow_proto3_optional
                 --cpp_out=${PROTO_GEN_DIR}
                 --grpc_out=${PROTO_GEN_DIR}
                 --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
