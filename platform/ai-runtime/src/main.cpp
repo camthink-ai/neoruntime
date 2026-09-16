@@ -14,6 +14,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <atomic>
 #include <thread>
@@ -193,8 +194,53 @@ int main(int argc, char* argv[]) {
     // ── Auto-inference pipelines ─────────────────────────────────────────────
     AutoInfer auto_infer(&model_mgr, &fd_receiver, &event_bus, &scheduler,
                           &session_mgr, &postprocess_pool, cfg);
-    if (cfg.auto_infer_enabled) {
-        auto_infer.start();
+    // Declared before the AutoInfer startup check so the ordered-shutdown
+    // helper below can join it on every exit path; assigned once Wait() starts.
+    std::thread server_thread;
+
+    // ── Ordered shutdown, shared by every exit path ──────────────────────────
+    // The gRPC server is already accepting requests when AutoInfer starts, so
+    // a startup failure can leave live async work. Run the same sequence as a
+    // signal shutdown: stop producers first, then quiesce async HAL callbacks
+    // (which own raw scheduler/service dependencies); if the bounded drain
+    // cannot quiesce them, terminate without running destructors rather than
+    // risk a use-after-free.
+    auto shutdown_runtime = [&](int exit_code) -> int {
+        server->Shutdown();
+        if (server_thread.joinable()) server_thread.join();
+        // 1. Stop auto-infer pipelines (no new frames submitted)
+        auto_infer.stop();
+        // 2. Stop scheduler workers (drain queued tasks, stop worker threads).
+        //    Async HAL callbacks for in-flight jobs may still fire after this.
+        scheduler.stop();
+        // 3. Bounded drain of all tracked asynchronous inference work. Scheduler
+        //    requests decrement the tracker from their HAL callbacks; InferBatch
+        //    extends the same tracker through completion of its postprocess task.
+        int orphaned = scheduler.drain_async(5000);
+        if (orphaned > 0) {
+            LOG_FATAL("Shutdown: %d scheduler async job(s) still in-flight; "
+                      "terminating without destroying callback dependencies",
+                      orphaned);
+            // A late callback owns raw scheduler/service dependencies. Running
+            // C++ destructors after the bounded drain would create a
+            // use-after-free; let the OS reclaim process resources instead.
+            std::_Exit(EXIT_FAILURE);
+        }
+        // 4. Stop postprocess pool (drain all post-process tasks so
+        //    free_outputs/release_model complete and model refs reach zero)
+        postprocess_pool.stop();
+        // 5. FD receiver + event bus
+        fd_receiver.stop_all();
+        event_bus.disconnect();
+        // model_mgr destructor handles HAL deinit
+        // hal_loader destructor handles dlclose
+        ::unlink(listen_addr.c_str());
+        return exit_code;
+    };
+
+    if (cfg.auto_infer_enabled && !auto_infer.start()) {
+        LOG_FATAL("AutoInfer startup failed; shutting down ai-runtime");
+        return shutdown_runtime(EXIT_FAILURE);
     }
 
     // ── Signal handling ──────────────────────────────────────────────────────
@@ -206,59 +252,25 @@ int main(int argc, char* argv[]) {
     // ── Wait for shutdown in a separate thread ───────────────────────────────
     // This avoids the deadlock that occurs when calling Shutdown() from signal
     // handler while Wait() holds the internal mutex.
-    std::thread server_thread([&server]() {
+    server_thread = std::thread([&server]() {
         server->Wait();
     });
 
     // ── Main loop: poll for shutdown signal ──────────────────────────────────
     while (!g_shutdown) {
+        // A started pipeline that exits unexpectedly makes the whole runtime
+        // unusable; shut down in the same controlled order as a signal.
+        if (cfg.auto_infer_enabled && auto_infer.failed()) {
+            LOG_FATAL("AutoInfer pipeline exited unexpectedly; "
+                      "shutting down ai-runtime");
+            return shutdown_runtime(EXIT_FAILURE);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     // ── Graceful shutdown ────────────────────────────────────────────────────
     LOG_INFO("Received shutdown signal, stopping server...");
-    server->Shutdown();  // Safe to call here, not in signal handler
-    server_thread.join();
-
-    // ── Cleanup (order matters) ──────────────────────────────────────────────
-    // 1. Stop auto-infer pipelines (no new frames submitted)
-    auto_infer.stop();
-    // 2. Stop scheduler workers (drain queued tasks, stop worker threads).
-    //    Async HAL callbacks for in-flight jobs may still fire after this.
-    scheduler.stop();
-    // 3. Bounded drain of in-flight async HAL callbacks submitted via
-    //    the scheduler. This covers Infer/StreamInfer/AutoInfer paths.
-    //
-    //    KNOWN LIMITATION (accepted for now, blocks strong-shutdown safety):
-    //    InferBatch calls model_mgr_->run_async() directly (not via
-    //    scheduler), so its in-flight jobs are NOT tracked by
-    //    async_in_flight_. If a batch RPC timed out with a late callback
-    //    still pending, drain_async() returns 0 (no scheduler jobs
-    //    pending) and we proceed to destroy postprocess_pool_ / model_mgr_.
-    //    The late callback may then access freed objects (UAF).
-    //
-    //    This is an architectural gap, not a mitigated risk. It is
-    //    accepted on the assumption that HAL callbacks complete in
-    //    milliseconds (pathological NPU hang is the only trigger).
-    //    To fully fix: route InferBatch through the scheduler, or
-    //    implement HAL job cancellation, or use shared_ptr lifetime
-    //    for tracker/dependency objects.
-    int orphaned = scheduler.drain_async(5000);
-    if (orphaned > 0) {
-        LOG_ERROR("Shutdown: %d scheduler async job(s) still in-flight. "
-                  "InferBatch jobs are NOT tracked — proceeding is unsafe "
-                  "if any batch callback is still pending.", orphaned);
-    }
-    // 4. Stop postprocess pool (drain all post-process tasks → free_outputs +
-    //    release_model complete; model refs reach zero, HAL sessions destroyed)
-    postprocess_pool.stop();
-    // 5. FD receiver + event bus
-    fd_receiver.stop_all();
-    event_bus.disconnect();
-    // model_mgr destructor handles HAL deinit
-    // hal_loader destructor handles dlclose
-
-    ::unlink(listen_addr.c_str());
+    shutdown_runtime(0);
     LOG_INFO("Shutdown complete");
     return 0;
 }

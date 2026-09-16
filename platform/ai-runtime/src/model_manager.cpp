@@ -561,18 +561,26 @@ int ModelManager::unregister_model(const std::string& model_id,
 // Force unregister all
 // ============================================================
 
-void ModelManager::force_unregister_all() {
+bool ModelManager::force_unregister_all() {
     std::unique_lock lock(mu_);
+    for (const auto& [id, entry] : models_) {
+        if (entry.ref_count > 0) {
+            LOG_ERROR("Cannot unload models for GenAI: model %s has %d live "
+                      "reference(s)", id.c_str(), entry.ref_count);
+            return false;
+        }
+    }
+
     for (auto& [id, entry] : models_) {
         release_post_locked(entry.post_session.session);
         release_infer_locked(entry.infer_session);
-        LOG_INFO("Force unloaded model %s (ref_count was %d)",
-                 id.c_str(), entry.ref_count);
+        LOG_INFO("Unloaded model %s for GenAI", id.c_str());
     }
     models_.clear();
     owners_.clear();
     infer_refs_.clear();
     post_refs_.clear();
+    return true;
 }
 
 // ============================================================
@@ -669,18 +677,20 @@ int ModelManager::tensor_from_frame(const HalFrameBuffer* frame, HalTensor* tens
 
 void ModelManager::free_tensor(HalTensor* tensor) {
     if (!infer_ops_ || !infer_ops_->free_tensor) return;
-    if (tensor && tensor->data) {
+    if (tensor && (tensor->data || tensor->priv)) {
         infer_ops_->free_tensor(tensor);
         tensor->data = nullptr;
+        tensor->priv = nullptr;
     }
 }
 
 void ModelManager::free_outputs(HalTensor* outputs, int num_outputs) {
     if (!infer_ops_ || !infer_ops_->free_tensor) return;
     for (int i = 0; i < num_outputs; i++) {
-        if (outputs[i].data != nullptr) {
+        if (outputs[i].data != nullptr || outputs[i].priv != nullptr) {
             infer_ops_->free_tensor(&outputs[i]);
             outputs[i].data = nullptr;
+            outputs[i].priv = nullptr;
         }
     }
 }
@@ -719,9 +729,10 @@ int ModelManager::query_session_stats(const std::string& model_id,
                                        HalInferenceSessionPerfStats* out) {
     if (!infer_ops_ || !infer_ops_->query_session_performance_stats || !out)
         return -1;
+    ModelGuard guard(this, model_id);
     auto snap = acquire_model_snapshot(model_id);
     if (!snap) return -1;
-    ModelGuard guard(this, model_id);
+    guard.arm();
     return infer_ops_->query_session_performance_stats(
         snap->infer_session, sampling_ms, out);
 }

@@ -99,10 +99,10 @@ public:
     /// release that leaves it resident, and <0 on refusal.
     int unregister_model(const std::string& model_id, const std::string& owner_id = "");
 
-    /// Force unregister all models, ignoring ref_count.
-    /// Destroys all HAL sessions and clears model registry.
+    /// Unregister all models atomically when none has a live inference ref.
+    /// Returns false without changing any registry state if any model is busy.
     /// Used before GenAI session creation to free NPU resources.
-    void force_unregister_all();
+    bool force_unregister_all();
 
     /// Check if a specific owner has ownership of a model.
     bool is_owner(const std::string& model_id, const std::string& owner_id) const;
@@ -139,7 +139,10 @@ public:
 
     /// Submit asynchronous inference. The NPU scheduler runs the job and
     /// invokes @p callback (from a HailoRT thread) once outputs are ready; the
-    /// caller MUST keep @p inputs/@p outputs alive until the callback fires.
+    /// callback may run before run_async() returns. The caller MUST keep
+    /// @p inputs/@p outputs alive until both the callback and this call have
+    /// returned. On a failing return or exception, the backend must not start a
+    /// callback after unwinding, though a callback may already have completed.
     /// Returns HAL_OK (0) on submission success, <0 if the HAL has no async
     /// path or submission failed.
     int run_async(HalInferenceSession* session,
@@ -224,12 +227,19 @@ private:
     void release_post_locked(HalPostprocessSession* s);
 };
 
-/// RAII guard: releases model ref_count on destruction.
+/// RAII guard prepared before model acquisition and armed only after the
+/// acquisition succeeds. Copying the id therefore cannot leak an acquired ref.
 struct ModelGuard {
     ModelManager* mgr = nullptr;
     std::string   id;
+    bool          armed = false;
+
     ModelGuard(ModelManager* m, const std::string& i) : mgr(m), id(i) {}
-    ~ModelGuard() { if (mgr) mgr->release_model(id); }
+    ~ModelGuard() { if (mgr && armed) mgr->release_model(id); }
+
+    void arm() noexcept { armed = true; }
+    void disarm() noexcept { armed = false; }
+
     ModelGuard(const ModelGuard&) = delete;
     ModelGuard& operator=(const ModelGuard&) = delete;
 };
