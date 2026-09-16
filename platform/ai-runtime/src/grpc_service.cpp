@@ -88,12 +88,33 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
     const pb::ModelRegisterRequest* req,
     pb::ModelRegisterResponse* resp) {
 
-    LOG_INFO("RegisterModel: model_id=%s path=%s type=%s",
-             req->model_id().c_str(), req->model_path().c_str(), req->model_type().c_str());
+    LOG_INFO("RegisterModel: model_id=%s path=%s type=%s transient=%d",
+             req->model_id().c_str(), req->model_path().c_str(),
+             req->model_type().c_str(), req->transient());
 
     if (req->model_id().empty() || req->model_path().empty()) {
         resp->mutable_status()->set_success(false);
         resp->mutable_status()->set_message("model_id and model_path required");
+        return grpc::Status::OK;
+    }
+
+    // App-bundled (transient) models have no platform.db metadata to supply a
+    // postprocess type later — this registration is the only chance to get it.
+    // An empty model_type means raw-tensor-only output: the model would load
+    // fine and then silently return nothing useful to apps expecting
+    // structured results (the DPM failure mode). Fail loudly instead — unless
+    // the registration explicitly opts into raw output (raw_output_only), which
+    // is how bundled packages declare output_mode=raw: the app decodes the
+    // tensors itself, so no postprocess session is wanted.
+    if (req->transient() && req->model_type().empty() && !req->raw_output_only()) {
+        LOG_ERROR("RegisterModel: transient model '%s' registered without "
+                  "model_type — post-processing would be unavailable "
+                  "(raw tensors only). Rejecting.",
+                  req->model_id().c_str());
+        resp->mutable_status()->set_success(false);
+        resp->mutable_status()->set_message(
+            "model_type is required for app-bundled (transient) model '" +
+            req->model_id() + "'");
         return grpc::Status::OK;
     }
 
@@ -103,17 +124,40 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
         owner_id = "<system>";
     }
 
-    int rc = model_mgr_->register_model(req->model_id(), req->model_path(), owner_id);
+    std::string why;
+    int rc = model_mgr_->register_model(req->model_id(), req->model_path(),
+                                        owner_id, req->transient(),
+                                        req->model_variant(),
+                                        req->model_type(), &why);
     if (rc < 0) {
         resp->mutable_status()->set_success(false);
-        resp->mutable_status()->set_message("Failed to register model");
+        resp->mutable_status()->set_message(
+            "Failed to register model '" + req->model_id() + "': " +
+            (why.empty() ? std::string("internal error") : why));
         return grpc::Status::OK;
     }
 
-    // Initialize post-processing if model_type is provided
-    if (!req->model_type().empty() && model_mgr_->has_post_ops()) {
+    // Initialize post-processing only for a fresh entry. rc==1 is an
+    // identical same-id/path/config co-owner: its shared postprocess session
+    // is already initialized, and replacing it during an active inference is
+    // unnecessary even though the requested configuration is equivalent.
+    if (rc == 0 && !req->model_type().empty() && model_mgr_->has_post_ops()) {
         int post_rc = model_mgr_->init_post_process(
             req->model_id(), req->model_type(), req->model_variant());
+        if (post_rc != 0 && req->transient()) {
+            // A transient model that declared a postprocess type but failed to
+            // initialize it would answer inference with raw tensors — silent
+            // degradation. Roll the registration back and fail loudly.
+            LOG_ERROR("RegisterModel: post-process init failed for transient "
+                      "model %s (type=%s, rc=%d), rolling back registration",
+                      req->model_id().c_str(), req->model_type().c_str(), post_rc);
+            model_mgr_->unregister_model(req->model_id(), owner_id);
+            resp->mutable_status()->set_success(false);
+            resp->mutable_status()->set_message(
+                "post-process init failed for app-bundled model '" +
+                req->model_id() + "' (type=" + req->model_type() + ")");
+            return grpc::Status::OK;
+        }
         if (post_rc != 0) {
             LOG_WARN("Post-process init failed for %s: %d (inference will return raw tensors)",
                      req->model_id().c_str(), post_rc);
@@ -149,12 +193,48 @@ grpc::Status AIRuntimeServiceImpl::UnregisterModel(
         // touched by any late callback.
         session_mgr_->destroy_sessions_by_model(req->model_id());
     }
-    resp->set_success(rc == 0);
-    resp->set_message(rc == 0 ? "Unregistered" : "Failed to unregister");
+    resp->set_success(rc >= 0);
+    resp->set_message(rc == 0 ? "Unregistered" :
+                      rc > 0 ? "Owner released; model remains registered" :
+                               "Failed to unregister");
     return grpc::Status::OK;
 }
 
 // ─── ListModels ───────────────────────────────────────────────────────────────
+
+// Copies HAL tensor specs onto a protobuf ModelInfo. Shared by ListModels and
+// GetModelInfo so the list path carries the same per-tensor facts as the
+// detail path (platform-api backfills its DB rows from the list response).
+void AIRuntimeServiceImpl::fill_tensor_specs(const HalModelInfo& mi,
+                                             pb::ModelInfo* info) {
+    for (uint32_t i = 0; i < mi.num_inputs; i++) {
+        auto* spec = info->add_inputs();
+        spec->set_name(mi.inputs[i].name);
+        spec->set_dtype(hal_dtype_to_proto(mi.inputs[i].dtype));
+        // NV12/NV21/I420 inputs map to the ambiguous NHW layout in HAL; the
+        // pixel format itself lives only in is_nv12. Surface it as "NV12" so
+        // clients can tell image-plane tensors from planar RGB without
+        // inferring from byte_size (W*H*3/2).
+        spec->set_layout(mi.inputs[i].is_nv12 != 0
+                             ? "NV12"
+                             : hal_layout_to_string(mi.inputs[i].layout));
+        spec->set_byte_size(mi.inputs[i].byte_size);
+        for (int d = 0; d < mi.inputs[i].ndim; d++) {
+            spec->add_shape(mi.inputs[i].shape[d]);
+        }
+    }
+
+    for (uint32_t i = 0; i < mi.num_outputs; i++) {
+        auto* spec = info->add_outputs();
+        spec->set_name(mi.outputs[i].name);
+        spec->set_dtype(hal_dtype_to_proto(mi.outputs[i].dtype));
+        spec->set_layout(hal_layout_to_string(mi.outputs[i].layout));
+        spec->set_byte_size(mi.outputs[i].byte_size);
+        for (int d = 0; d < mi.outputs[i].ndim; d++) {
+            spec->add_shape(mi.outputs[i].shape[d]);
+        }
+    }
+}
 
 grpc::Status AIRuntimeServiceImpl::ListModels(
     grpc::ServerContext* /*ctx*/,
@@ -169,11 +249,13 @@ grpc::Status AIRuntimeServiceImpl::ListModels(
         info->set_model_path(m.path);
         info->set_version(m.model_info.version);
         info->set_load_timestamp(static_cast<uint64_t>(m.load_time));
+        info->set_transient(m.transient);
         // Include first owner_id if available
         auto owners = model_mgr_->get_owners(m.id);
         if (!owners.empty()) {
             info->set_owner_id(owners[0]);
         }
+        fill_tensor_specs(m.model_info, info);
     }
     return grpc::Status::OK;
 }
@@ -195,26 +277,8 @@ grpc::Status AIRuntimeServiceImpl::GetModelInfo(
     resp->set_model_path(m.path);
     resp->set_version(m.model_info.version);
     resp->set_load_timestamp(static_cast<uint64_t>(m.load_time));
-
-    for (uint32_t i = 0; i < m.model_info.num_inputs; i++) {
-        auto* spec = resp->add_inputs();
-        spec->set_name(m.model_info.inputs[i].name);
-        spec->set_dtype(hal_dtype_to_proto(m.model_info.inputs[i].dtype));
-        spec->set_layout(hal_layout_to_string(m.model_info.inputs[i].layout));
-        for (int d = 0; d < m.model_info.inputs[i].ndim; d++) {
-            spec->add_shape(m.model_info.inputs[i].shape[d]);
-        }
-    }
-
-    for (uint32_t i = 0; i < m.model_info.num_outputs; i++) {
-        auto* spec = resp->add_outputs();
-        spec->set_name(m.model_info.outputs[i].name);
-        spec->set_dtype(hal_dtype_to_proto(m.model_info.outputs[i].dtype));
-        spec->set_layout(hal_layout_to_string(m.model_info.outputs[i].layout));
-        for (int d = 0; d < m.model_info.outputs[i].ndim; d++) {
-            spec->add_shape(m.model_info.outputs[i].shape[d]);
-        }
-    }
+    resp->set_transient(m.transient);
+    fill_tensor_specs(m.model_info, resp);
 
     return grpc::Status::OK;
 }

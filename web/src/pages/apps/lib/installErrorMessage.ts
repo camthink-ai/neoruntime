@@ -27,6 +27,20 @@ const ERROR_MATCHERS: ErrorMatcher[] = [
       }),
   },
   {
+    pattern: /^Invalid image tar:\s*(.+)$/is,
+    translate: (m, t) => t('sys.apps.import.errors.invalid_image_tar', {
+        detail: m[1].trim(),
+        defaultValue:
+          'The image file is not a valid docker-save archive. Export it with docker save and try again. {{detail}}',
+      }),
+  },
+  {
+    pattern: /^Image exceeds the maximum allowed size/i,
+    translate: (_m, t) => t('sys.apps.import.upload_errors.image_too_large', {
+        defaultValue: 'The image file exceeds the 2GB upload limit.',
+      }),
+  },
+  {
     pattern:
       /^Failed to (?:create upload directory|create file|save file|read file):\s*(.+)$/is,
     translate: (m, t) => t('sys.apps.import.upload_errors.save_failed', {
@@ -202,12 +216,8 @@ export function translateInstallError(
     });
   }
 
-  for (const matcher of ERROR_MATCHERS) {
-    const match = raw.match(matcher.pattern);
-    if (match) {
-      return matcher.translate(match, t);
-    }
-  }
+  const matched = matchInstallError(raw, t);
+  if (matched) return matched;
 
   return t('sys.apps.import.errors.unknown', {
     detail: raw,
@@ -215,6 +225,37 @@ export function translateInstallError(
   });
 }
 
+/** First matching translation for a raw backend message, or undefined when
+ * nothing matches (no payload / unknown text). */
+function matchInstallError(
+  raw: string | undefined,
+  t: TFunction
+): string | undefined {
+  if (!raw?.trim()) return undefined;
+  for (const matcher of ERROR_MATCHERS) {
+    const match = raw.match(matcher.pattern);
+    if (match) {
+      return matcher.translate(match, t);
+    }
+  }
+  return undefined;
+}
+
 export function resolveInstallApiError(error: unknown, t: TFunction): string {
   return translateInstallError(readApiErrorPayload(error), t);
+}
+
+/**
+ * Matched-only variant for non-install error contexts (e.g. applying YAML
+ * editor changes): a specifically recognized backend error keeps its own
+ * translated copy, while anything unmatched falls back to the caller's
+ * context message instead of the install-flavored generic — "installation
+ * failed" wording is wrong when no installation was attempted.
+ */
+export function resolveKnownApiError(
+  error: unknown,
+  t: TFunction,
+  fallback: string
+): string {
+  return matchInstallError(readApiErrorPayload(error), t) ?? fallback;
 }

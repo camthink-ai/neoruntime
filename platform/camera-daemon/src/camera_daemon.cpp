@@ -15,6 +15,7 @@
 #include "../include/encoded_publisher.h"
 #include "../include/ai_overlay_subscriber.h"
 #include "../include/dpm_worker.h"
+#include "../include/dsp_service.h"
 #include <dlfcn.h>
 
 #ifdef HAS_GRPC
@@ -461,6 +462,33 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     fd_cfg.max_clients = config_.fd_pub_max_clients;
     fd_cfg.max_outstanding_per_client = config_.fd_pub_max_outstanding;
     fd_pub_ = std::make_unique<FdPublisher>(frame_router_.get(), fd_cfg);
+
+    // DSP offload service (PLAT-1..5): one HAL DSP context + dma-buf buffer
+    // registry shared by all app jobs. Started BEFORE the FD publisher so a
+    // UDS DSP_ALLOC can never race service startup; the publisher dispatches
+    // DSP_ALLOC/DSP_BUF_RELEASE to it (set_dsp_service wires the pointer).
+    if (hal_loader_ && hal_loader_->has_dsp() && hal_loader_->has_frame_buffer()) {
+        // P2: knobs come from the `dsp:` YAML section (defaults in
+        // dsp_service.h) — quota applies per owning client connection.
+        const DspServiceConfig dsp_cfg = config_.dsp;
+        dsp_service_ = std::make_unique<DspService>(hal_loader_->dsp(),
+                                                    hal_loader_->frame_buffer(),
+                                                    dsp_cfg);
+        if (dsp_service_->start()) {
+            fd_pub_->set_dsp_service(dsp_service_.get());
+            HAL_LOG_INFO("CameraDaemon: DSP offload service started "
+                         "(max_batch=%u, timeout=%ums, quota=%.0f jobs/s %.0f MPix/s)",
+                         dsp_cfg.max_batch, dsp_cfg.job_timeout_ms,
+                         dsp_cfg.quota_jobs_per_sec, dsp_cfg.quota_mpix_per_sec);
+        } else {
+            HAL_LOG_WARNING("CameraDaemon: DSP service failed to start, "
+                            "app DSP offload disabled");
+            dsp_service_.reset();
+        }
+    } else {
+        HAL_LOG_INFO("CameraDaemon: HAL DSP/frame_buffer ops unavailable, "
+                     "app DSP offload disabled");
+    }
 
     // Register all subscribers with FrameRouter
     register_subscribers();
@@ -6559,6 +6587,15 @@ void CameraDaemon::shutdown() {
     // 3d. Stop FD publisher (releases DMA-BUF references)
     if (fd_pub_) {
         fd_pub_->stop();
+    }
+
+    // 3e. Stop DSP offload service (drains leftover jobs, frees remaining
+    //     registry buffers, deinits the HAL DSP context). Must run AFTER
+    //     fd_pub_->stop(): client disconnects above already detached their
+    //     buffers; must run BEFORE HAL unload below.
+    if (dsp_service_) {
+        dsp_service_->stop();
+        dsp_service_.reset();
     }
 
     // 3e. Stop FrameRouter dispatch thread (drains pending frames)

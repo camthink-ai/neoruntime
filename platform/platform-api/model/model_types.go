@@ -13,9 +13,13 @@ const (
 )
 
 // FieldOption defines a selectable option for FieldTypeSelect fields.
+// Custom marks deployment-specific entries (e.g. a customer-trained model
+// verified against this plugin build): the standard UI hides them unless
+// they are already the active value, so generic users never see them.
 type FieldOption struct {
-	Value string `json:"value"`
-	Label string `json:"label"`
+	Value  string `json:"value"`
+	Label  string `json:"label"`
+	Custom bool   `json:"custom,omitempty"`
 }
 
 // ModelFieldDef describes a single configuration field for a model type.
@@ -74,6 +78,81 @@ func selectField(key string, def string, opts []FieldOption) ModelFieldDef {
 	}
 }
 
+func textField(key string, def string) ModelFieldDef {
+	return ModelFieldDef{
+		Key: key, Type: FieldTypeText, Required: false, Default: def,
+	}
+}
+
+// DetectionPostprocessProfile couples a HEF basename the vendor postprocess
+// plugin (libyolo_hailortpp_post.so) recognizes with the backend function it
+// maps to. HAL rewrites the NMS tensor name to <HEF basename>/yolov8_nms_postprocess
+// and the plugin selects its function by that basename, so models stored under
+// any other name (e.g. the sha256 CAS blob name) fail postprocess on every
+// frame and must be re-materialized under one of these names at load time.
+type DetectionPostprocessProfile struct {
+	Basename        string // HEF filename without extension
+	BackendFunction string // plugin backend function for this basename
+	Label           string // human-readable label for the wizard dropdown
+	Custom          bool   // deployment-specific entry; UI hides it unless active
+}
+
+// DefaultDetectionProfile is the zero-config profile: the plugin's default
+// postprocess function is bound to this basename.
+const DefaultDetectionProfile = "hailo_yolov8n_384_640"
+
+// DetectionPostprocessProfiles lists the basenames verified against the
+// vendor plugin. Other compiled-in names map to generic single-argument
+// functions with a hardcoded 0.4 threshold and are deliberately excluded.
+var DetectionPostprocessProfiles = []DetectionPostprocessProfile{
+	{Basename: "hailo_yolov8n_384_640", BackendFunction: "hailo_yolov8n", Label: "YOLOv8n 384x640 (default)"},
+	{Basename: "hailo_yolov8s_384_640", BackendFunction: "hailo_yolov8s", Label: "YOLOv8s 384x640"},
+	{Basename: "hailo_yolov8m_384_640", BackendFunction: "hailo_yolov8m", Label: "YOLOv8m 384x640"},
+	// Customer-trained parking-lot model: RGB888 1920x1080 in, one class.
+	// Unlike the yolov8 profiles its NMS tensor is named
+	// yolov5m_vehicles/yolov5_nms_postprocess, so only the composed
+	// variant's backend_function routes it — the plugin's default selection
+	// never matches (fire-smoke signature). Device-verified 2026-09-02:
+	// output decodes exactly like the hand-decoded NMS blob, but the label
+	// table is baked ("car") and ignores the JSON labels.
+	// Custom: the wizard suggests it from the parsed vstream info and the
+	// dropdown only surfaces it then (or when updating such a row) — it is
+	// invisible to users without this deployment's HEF.
+	{Basename: "yolov5m_vehicles", BackendFunction: "yolov5m_vehicles", Label: "YOLOv5m Vehicles 1920x1080", Custom: true},
+}
+
+// LookupDetectionProfile returns the profile for a basename; ok is false for
+// names the plugin does not handle usefully.
+func LookupDetectionProfile(basename string) (DetectionPostprocessProfile, bool) {
+	for _, p := range DetectionPostprocessProfiles {
+		if p.Basename == basename {
+			return p, true
+		}
+	}
+	return DetectionPostprocessProfile{}, false
+}
+
+// LookupDetectionBackendFunction returns the profile a postprocess
+// backend_function name belongs to; ok is false for names outside the
+// verified set (including the generic single-argument functions, which
+// hardcode a 0.4 threshold and COCO labels and are not usable).
+func LookupDetectionBackendFunction(fn string) (DetectionPostprocessProfile, bool) {
+	for _, p := range DetectionPostprocessProfiles {
+		if p.BackendFunction == fn {
+			return p, true
+		}
+	}
+	return DetectionPostprocessProfile{}, false
+}
+
+func detectionProfileOptions() []FieldOption {
+	opts := make([]FieldOption, 0, len(DetectionPostprocessProfiles))
+	for _, p := range DetectionPostprocessProfiles {
+		opts = append(opts, FieldOption{Value: p.Basename, Label: p.Label, Custom: p.Custom})
+	}
+	return opts
+}
+
 // SupportedModelTypes is the canonical list of model types.
 // Single source of truth for Go layer, derived from HAL HalPostprocessType enum.
 var SupportedModelTypes = []ModelTypeDef{
@@ -84,6 +163,13 @@ var SupportedModelTypes = []ModelTypeDef{
 			reqNumField("threshold", 0.25, 0, 1, 0.01),
 			reqNumField("max_detections", 64, 1, 999, 1),
 			numField("nms_threshold", 0.45, 0, 1, 0.01),
+			// Drives the runtime materialization basename and the composed
+			// variant's backend_function (see handlers/ai_postprocess.go).
+			selectField("postprocess_profile", DefaultDetectionProfile, detectionProfileOptions()),
+			// Metadata only: the plugin's label table is compiled in and cannot
+			// be changed via JSON. Consumers map output class_id N (1-based)
+			// to labels[N-1]; list classes in training order, no background.
+			textField("labels", ""),
 		},
 	},
 	{
@@ -153,6 +239,59 @@ var SupportedModelTypes = []ModelTypeDef{
 // SupportedFormats lists accepted model file formats for the current platform.
 var SupportedFormats = []FileFormat{
 	{Extension: ".hef", MIMEType: "application/octet-stream", Label: "Hailo HEF"},
+}
+
+// PackageExtension is the import-only single-file container (AMPK layout, see
+// storage/modelpackage.go): platform metadata JSON + the HEF, unpacked and
+// staged as a plain .hef blob at parse time. Deliberately not part of
+// SupportedFormats — it is a transport container, not a model binary.
+const PackageExtension = ".bin"
+
+// Output delivery modes — orthogonal to the semantic model type. The type
+// answers "what do the outputs mean" (UI/metadata); the mode answers "how are
+// they delivered": plugin-decoded structured results, or bare NPU tensors the
+// consumer decodes itself.
+const (
+	OutputModePlatform = "platform" // platform postprocess decodes NMS blobs into structured results
+	OutputModeRaw      = "raw"      // no postprocess session; Infer returns raw output tensors
+)
+
+// ResolveOutputMode normalizes a requested/stored output mode. Empty resolves
+// to platform (rows written before the column existed, requests that omit it).
+// ok is false for values outside the known set — API boundaries should reject
+// those rather than silently coerce.
+func ResolveOutputMode(raw string) (mode string, ok bool) {
+	trimmed := strings.TrimSpace(raw)
+	switch trimmed {
+	case "":
+		return OutputModePlatform, true
+	case OutputModePlatform, OutputModeRaw:
+		return trimmed, true
+	default:
+		return "", false
+	}
+}
+
+// HEF output format classifications, derived from parse-hef vstream info.
+// This — not the semantic model type — decides whether the platform
+// postprocess path is even possible.
+const (
+	OutputFormatNMS        = "nms"         // NMS layer compiled in: fixed-format detections blob
+	OutputFormatFeatureMap = "feature_map" // raw feature maps; only consumable in raw output mode
+)
+
+// ClassifyOutputFormat inspects parse-hef vstream info for an NMS-layer
+// output (tensor names like <basename>/yolov8_nms_postprocess). Empty input
+// returns "" (unknown) so legacy rows without vstream info skip
+// cross-validation instead of failing open or closed.
+func ClassifyOutputFormat(vstreamInfo string) string {
+	if strings.TrimSpace(vstreamInfo) == "" {
+		return ""
+	}
+	if strings.Contains(vstreamInfo, "_nms_postprocess") {
+		return OutputFormatNMS
+	}
+	return OutputFormatFeatureMap
 }
 
 // ResolveModelType normalizes aliases to canonical ID.

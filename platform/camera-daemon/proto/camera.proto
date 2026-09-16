@@ -673,6 +673,27 @@ service CameraControl {
   // Scalar profile-field runtime knobs (platform-owned config layer; allow-listed).
   rpc SetConfigField(SetConfigFieldRequest) returns (Status);
   rpc GetConfigField(GetConfigFieldRequest) returns (GetConfigFieldResponse);
+
+  // DSP offload (P0). Buffers are allocated/freed over the FD publisher UDS
+  // (FD_PUB_MSG_DSP_ALLOC / FD_PUB_MSG_DSP_BUF_RELEASE, fds via SCM_RIGHTS)
+  // and referenced here by buffer id. Synchronous single-job form first.
+  rpc SubmitDspJob(DspJobRequest) returns (DspJobResponse);
+
+  // DSP offload P2: the async submit/wait pair. SubmitDspJobAsync enqueues
+  // the same DspJobRequest and returns immediately with a job_id;
+  // WaitDspJob blocks (caller-chosen timeout, 0 = non-blocking poll) and
+  // returns the DspJobResponse of the finished job. A job is reaped when
+  // waited to completion or its owner disconnects — re-waiting a reaped id
+  // is an error, re-waiting a timed-out one is fine.
+  rpc SubmitDspJobAsync(DspJobRequest) returns (DspJobResponse);
+  rpc WaitDspJob(DspWaitRequest) returns (DspJobResponse);
+
+  // One-shot JPEG encode of a registered DSP buffer (S-3(a), SDK
+  // hardware-routing proposal). Input: any buffer id from the DSP registry
+  // (alloc or import); output: a complete JPEG frame in the response. The
+  // daemon keeps one encoder context per distinct (width, height, format,
+  // quality) and recreates it when that key changes.
+  rpc EncodeImage(EncodeImageRequest) returns (EncodeImageResponse);
 }
 
 // Device capabilities auto-detected from loaded HAL modules
@@ -758,4 +779,101 @@ message AudioPcmChunk {
   uint32 sample_rate = 2;
   uint32 channels = 3;
   string format = 4;     // S16LE / S32LE / F32LE
+}
+
+// ======== DSP offload (P0; see docs proposal dsp-offload.md) ========
+
+// DspOp order deliberately differs from HalDspOpType (HAL puts
+// CONVERT_FORMAT at 0); the daemon maps via explicit switch in
+// CameraControlServiceImpl::SubmitDspJob. DspInterpolation and
+// DspScalingMode below ARE order-identical to their hal_dsp.h
+// counterparts and are static_cast after range validation.
+enum DspOp {
+  DSP_OP_RESIZE = 0;
+  DSP_OP_CROP_AND_RESIZE = 1;
+  DSP_OP_MULTI_CROP_AND_RESIZE = 2;
+  DSP_OP_CONVERT_FORMAT = 3;
+  // P1: composite ARGB32 overlays onto an NV12 base in place (the src
+  // buffer IS the output). dst_buffer_ids are the overlays, rects[i]
+  // places overlay i on the base — see DspRect/DspJobRequest notes.
+  DSP_OP_BLEND = 4;
+}
+
+enum DspInterpolation {
+  DSP_INTERP_NEAREST = 0;
+  DSP_INTERP_BILINEAR = 1;
+  DSP_INTERP_AREA = 2;
+  DSP_INTERP_BICUBIC = 3;
+}
+
+enum DspScalingMode {
+  DSP_SCALING_STRETCH = 0;
+  DSP_SCALING_LETTERBOX_MIDDLE = 1;
+  DSP_SCALING_LETTERBOX_UP_LEFT = 2;
+  DSP_SCALING_SCALE_AND_CROP = 3;
+}
+
+// Scheduling hint (P0: accepted and logged, single FIFO queue; platform
+// jobs preempt at the vendor singleton level only — see proposal PLAT-4).
+enum DspPriority {
+  DSP_PRIORITY_BACKGROUND = 0;
+  DSP_PRIORITY_NORMAL = 1;
+}
+
+// One crop window + per-output target size (MULTI_CROP: one per dst buffer;
+// CROP_AND_RESIZE: exactly one; BLEND: one per overlay buffer, placing it
+// on the base — x/y = position on the base, width/height = overlay
+// footprint (must equal that overlay buffer's dims; blend pastes 1:1, it
+// does not scale), dst_width/dst_height repeat the overlay dims;
+// RESIZE/CONVERT: none).
+message DspRect {
+  uint32 x = 1;           // crop origin, pixels
+  uint32 y = 2;
+  uint32 width = 3;       // crop size, pixels (>0)
+  uint32 height = 4;
+  uint32 dst_width = 5;   // output size, pixels (>0, even for YUV)
+  uint32 dst_height = 6;
+}
+
+message DspJobRequest {
+  DspOp op = 1;
+  uint64 src_buffer_id = 2;          // id from FD_PUB_MSG_DSP_ALLOC_RESP
+  repeated uint64 dst_buffer_ids = 3; // 1 (RESIZE/CROP/CONVERT) .. 64 (MULTI);
+                                      // BLEND: 1..64 overlay buffers (ARGB32)
+  repeated DspRect rects = 4;          // per dst for MULTI/CROP/BLEND; empty else
+  DspInterpolation interpolation = 5;
+  DspScalingMode scaling_mode = 6;     // per-request (P0: applies to all rects)
+  DspPriority priority = 7;
+}
+
+message DspJobResponse {
+  bool success = 1;
+  string message = 2;
+  int32 error_code = 3;     // negative HAL error, -EINVAL style codes for validation
+  uint32 elapsed_ms = 4;
+  uint64 job_id = 5;        // SubmitDspJobAsync ack; echoed by WaitDspJob
+  bool done = 6;            // WaitDspJob: job finished (false = timed-out poll)
+}
+
+// P2 async wait: timeout_ms 0 = non-blocking poll (HAL wait() convention).
+// The id comes from a SubmitDspJobAsync response and stays valid until the
+// job is waited to completion or its owner disconnects.
+message DspWaitRequest {
+  uint64 job_id = 1;
+  uint32 timeout_ms = 2;
+}
+
+// One-shot JPEG encode (S-3(a)). src_buffer_id must reference a buffer in
+// the DSP registry (id from FD_PUB_MSG_DSP_ALLOC_RESP or a DSP import).
+message EncodeImageRequest {
+  uint64 src_buffer_id = 1;
+  uint32 quality = 2;         // JPEG quality [1..100]; 0 = daemon default (85)
+}
+
+message EncodeImageResponse {
+  bool success = 1;
+  string message = 2;
+  int32 error_code = 3;       // negative HAL error or DspServiceError
+  uint32 elapsed_ms = 4;
+  bytes jpeg = 5;             // complete JPEG frame (empty on failure)
 }
