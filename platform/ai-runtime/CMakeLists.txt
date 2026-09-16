@@ -245,13 +245,19 @@ target_link_libraries(ai-runtime PRIVATE
     rt
 )
 
-# ── Unit test (no gRPC dependency, only HAL stub) ────────────────────────────
+# ── Unit test (HAL stub; links gRPC only because AutoInfer owns an
+# EventBusClient handle end-to-end) ───────────────────────────────────────────
 add_executable(ai-runtime-test
     test/test_with_stub.cpp
+    src/common.cpp
     src/hal_ml_loader.cpp
     src/model_manager.cpp
     src/session_manager.cpp
     src/inference_scheduler.cpp
+    src/postprocess_pool.cpp
+    src/fd_receiver.cpp
+    src/auto_infer.cpp
+    src/event_bus_client.cpp
     src/config.cpp
     ${HAL_COMMON_SOURCES}
 )
@@ -265,12 +271,58 @@ target_include_directories(ai-runtime-test PRIVATE
 )
 
 target_link_libraries(ai-runtime-test PRIVATE
+    ai_runtime_proto
     Threads::Threads
     dl
 )
+target_compile_options(ai-runtime-test PRIVATE -UNDEBUG)
+target_compile_definitions(ai-runtime-test PRIVATE AIPC_AI_RUNTIME_TESTING)
+
+add_executable(fd-receiver-deadlock-test
+    test/fd_receiver_deadlock_test.cpp
+    src/fd_receiver.cpp
+)
+
+target_include_directories(fd-receiver-deadlock-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${HAL_INCLUDE_DIR}
+    ${HAL_INCLUDE_DIR}/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/camera-daemon/include
+)
+
+target_link_libraries(fd-receiver-deadlock-test PRIVATE Threads::Threads)
+target_compile_options(fd-receiver-deadlock-test PRIVATE -UNDEBUG)
+
+add_executable(stream-infer-utils-test
+    test/stream_infer_utils_test.cpp
+    src/stream_infer_utils.cpp
+    src/fd_receiver.cpp
+)
+
+target_include_directories(stream-infer-utils-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${HAL_INCLUDE_DIR}
+    ${HAL_INCLUDE_DIR}/common
+    ${HAL_INCLUDE_DIR}/model
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/camera-daemon/include
+)
+
+target_link_libraries(stream-infer-utils-test PRIVATE
+    ai_runtime_proto
+    Threads::Threads
+)
+target_compile_options(stream-infer-utils-test PRIVATE -UNDEBUG)
 
 enable_testing()
 add_test(NAME ai_runtime_unit_test COMMAND ai-runtime-test)
+add_test(NAME fd_receiver_deadlock_test COMMAND fd-receiver-deadlock-test)
+add_test(NAME stream_infer_utils_test COMMAND stream-infer-utils-test)
+set_tests_properties(ai_runtime_unit_test PROPERTIES TIMEOUT 30)
+# Every wait inside the suite is bounded at 2s, so a real deadlock still trips
+# this quickly; the larger budget only absorbs ASan slowdown of the 18-test
+# orchestration (each test parks threads for 50-150ms on purpose).
+set_tests_properties(fd_receiver_deadlock_test PROPERTIES TIMEOUT 30)
+set_tests_properties(stream_infer_utils_test PROPERTIES TIMEOUT 5)
 
 # ── Install ──────────────────────────────────────────────────────────────────
 install(TARGETS ai-runtime DESTINATION /opt/aipc/bin)
