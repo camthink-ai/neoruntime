@@ -21,7 +21,7 @@
  *     quota (jobs/s + MPix/s) is charged to the SRC buffer's owner process
  *   - a RESIZE dst must be a pool-allocated buffer (imports are src-only)
  *
- * StreamPreprocessPool layers the per-stream model-geometry pool on top:
+ * StreamPreprocessPool layers a shared model-geometry pool on top:
  * DSP_IMPORT the incoming frame, RESIZE it into a free private slot, then
  * fd-bind the slot (bind_dma_frame) as the NPU input — zero CPU pixel
  * copies. Slots cycle free → bound (riding an InferRequest) → free.
@@ -33,6 +33,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -57,6 +58,7 @@ public:
         uint32_t width = 0, height = 0, num_planes = 0;
         uint32_t strides[3] = {0, 0, 0};
         uint32_t sizes[3]   = {0, 0, 0};
+        uint64_t uds_generation = 0;  // connection that owns every id
         std::vector<uint64_t> ids;
         std::vector<int>      fds;
     };
@@ -76,11 +78,22 @@ public:
     void release_pool(PoolInfo* pool);
 
     /// DSP_IMPORT a received frame's plane fds (daemon dups them, so our
-    /// copies stay ours to close). 0 on success with *id set.
-    int import_frame(const ReceivedFrame& frame, uint64_t* id);
+    /// copies stay ours to close). 0 on success with *id and the owning UDS
+    /// connection generation set.
+    int import_frame(const ReceivedFrame& frame, uint64_t* id,
+                     uint64_t* uds_generation);
 
-    /// DSP_BUF_RELEASE one id (import or pool buffer of this connection).
-    void release_buffer(uint64_t id);
+    enum ReleaseResult {
+        RELEASE_OK = 0,
+        RELEASE_TRANSPORT_ERROR = -1,
+        RELEASE_STALE_GENERATION = -2,
+    };
+
+    /// DSP_BUF_RELEASE one id on the connection generation that owns it.
+    /// Returns RELEASE_OK only when the release message was sent; a missing or
+    /// broken connection is reported instead of silently reconnecting, because
+    /// disconnect cleanup has already revoked every id from that generation.
+    int release_buffer(uint64_t id, uint64_t uds_generation);
 
     /// Synchronous SubmitDspJob RESIZE src→dst (single dst, bilinear,
     /// stretch). Returns 0 on success, <0 otherwise with *err_code (daemon
@@ -90,6 +103,7 @@ public:
 
 private:
     int ensure_uds_locked();
+    void close_uds_locked();
     std::shared_ptr<grpc::Channel> ensure_channel_locked();
 
     std::string uds_path_;
@@ -97,24 +111,26 @@ private:
 
     std::mutex uds_mu_;
     int        uds_fd_ = -1;
+    uint64_t   uds_generation_ = 0;
 
     std::mutex                  grpc_mu_;
     std::shared_ptr<grpc::Channel> channel_;
 };
 
 /**
- * Per-StreamInfer-call private preprocess pool at the model's input
- * geometry. Frames whose geometry does NOT match the model are resized
+ * Shared preprocess pool for one model input geometry. Frames whose geometry
+ * does NOT match the model are resized
  * into pool slots on the DSP and fd-bound — the path that today fails at
  * the HAL input size check (-2811).
  *
- * Lifetime: created after the model snapshot, destroyed at stream exit
- * AFTER the bounded drain, so normally every lease is back by then. A
- * lease that outlives the pool (late callback after a drain timeout)
- * still self-cleans: slot state is shared and the last owner releases
- * the daemon id and closes the plane fds.
+ * Lifetime: acquired lazily by mismatched streams and shared while the same
+ * geometry remains active. A lease that outlives the pool (late callback after
+ * a stream drain timeout)
+ * still self-cleans: the pool releases daemon ids before DspClient shutdown,
+ * while shared slot state lets the last lease close its plane fds safely.
  */
-class StreamPreprocessPool {
+class StreamPreprocessPool
+    : public std::enable_shared_from_this<StreamPreprocessPool> {
 public:
     StreamPreprocessPool(DspClient& dsp, ModelManager* mgr,
                          uint32_t job_timeout_ms);
@@ -127,21 +143,23 @@ public:
     /// layout is direct-bindable (compact strides).
     int init(uint32_t model_w, uint32_t model_h, uint32_t slots);
 
-    bool     usable() const { return usable_; }
+    bool     usable() const { return usable_.load(); }
     uint32_t width()  const { return width_; }
     uint32_t height() const { return height_; }
 
     /// A pool slot pinned for one frame. Destruction frees the bound HAL
     /// tensor (after the NPU read completed) and returns the slot; this is
-    /// what rides InferRequest.resource_holder. `keepalive` is available
-    /// for callers that must pin the source frame beyond prepare(); the
-    /// stream path leaves it null — the daemon's import dups the frame fds,
-    /// so the source can be returned to the camera pool right after the
-    /// resize completes.
+    /// what rides InferRequest.resource_holder. The lease also pins its owning
+    /// pool so daemon buffer ids and local plane fds cannot be retired while
+    /// the NPU is still reading the slot.
     struct SlotLease {
         struct Impl;                      // slot + shared pool state
         std::shared_ptr<Impl> impl;
-        std::shared_ptr<void>  keepalive; // optional extra pin (unused here)
+        std::shared_ptr<StreamPreprocessPool> pool_owner;
+
+        SlotLease() = default;
+        SlotLease(const SlotLease&) = delete;
+        SlotLease& operator=(const SlotLease&) = delete;
         ~SlotLease();
     };
 
@@ -165,7 +183,7 @@ private:
     ModelManager*  mgr_;
     uint32_t       job_timeout_ms_;
     uint32_t       width_ = 0, height_ = 0;
-    bool           usable_ = false;
+    std::atomic<bool> usable_{false};
     DspClient::PoolInfo pool_;
     std::shared_ptr<Shared> shared_;
 };

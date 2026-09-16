@@ -64,18 +64,35 @@ int recv_dsp_msg(int fd, void* data, size_t data_len,
     msg.msg_controllen = sizeof(cmsg_buf);
 
     *num_fds = 0;
-    ssize_t n = ::recvmsg(fd, &msg, 0);
+    ssize_t n = ::recvmsg(fd, &msg, MSG_CMSG_CLOEXEC);
     if (n <= 0) return -1;
-    if ((msg.msg_flags & MSG_CTRUNC) != 0) return -1;
 
+    bool ancillary_error = (msg.msg_flags & MSG_CTRUNC) != 0;
     for (struct cmsghdr* c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
-        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
-            int nfds = static_cast<int>((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-            if (nfds > max_fds) nfds = max_fds;
-            if (nfds > FD_PUB_DSP_MAX_FDS) nfds = FD_PUB_DSP_MAX_FDS;
-            memcpy(fds, CMSG_DATA(c), sizeof(int) * static_cast<size_t>(nfds));
-            *num_fds = nfds;
+        if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+        if (c->cmsg_len < CMSG_LEN(0)) {
+            ancillary_error = true;
+            continue;
         }
+
+        const int nfds = static_cast<int>(
+            (c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+        const int* received = reinterpret_cast<const int*>(CMSG_DATA(c));
+        for (int i = 0; i < nfds; ++i) {
+            if (!ancillary_error && *num_fds < max_fds &&
+                *num_fds < FD_PUB_DSP_MAX_FDS) {
+                fds[(*num_fds)++] = received[i];
+            } else {
+                ::close(received[i]);
+                ancillary_error = true;
+            }
+        }
+    }
+
+    if (ancillary_error) {
+        for (int i = 0; i < *num_fds; ++i) ::close(fds[i]);
+        *num_fds = 0;
+        return -1;
     }
     return static_cast<int>(n);
 }
@@ -112,9 +129,14 @@ DspClient::DspClient(const std::string& uds_path, const std::string& grpc_endpoi
 
 DspClient::~DspClient() {
     // Closing the UDS releases every buffer this process allocated/imported
-    // and reaps its async jobs (daemon disconnect cleanup) — the safety net
-    // for any id a late pool lease failed to release.
+    // and reaps its async jobs (daemon disconnect cleanup).
+    std::lock_guard lock(uds_mu_);
+    close_uds_locked();
+}
+
+void DspClient::close_uds_locked() {
     if (uds_fd_ >= 0) ::close(uds_fd_);
+    uds_fd_ = -1;
 }
 
 int DspClient::ensure_uds_locked() {
@@ -141,7 +163,10 @@ int DspClient::ensure_uds_locked() {
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &kIoTimeout, sizeof(kIoTimeout));
 
     uds_fd_ = fd;
-    LOG_INFO("DspClient: connected to %s (dsp buffer plane)", uds_path_.c_str());
+    ++uds_generation_;
+    if (uds_generation_ == 0) ++uds_generation_;  // reserve 0 for "no owner"
+    LOG_INFO("DspClient: connected to %s (dsp buffer plane, generation=%lu)",
+             uds_path_.c_str(), (unsigned long)uds_generation_);
     return uds_fd_;
 }
 
@@ -165,8 +190,8 @@ std::shared_ptr<grpc::Channel> DspClient::ensure_channel_locked() {
         return nullptr;
     }
     // CreateInsecureChannelFromFd takes fd ownership (musl resolver bypass,
-    // same as EventBusClient). Channel is shared for the process lifetime;
-    // a daemon restart is surfaced per-call as an RPC failure.
+    // same as EventBusClient). The channel is cached until an RPC transport
+    // failure, then the next call reconnects after a daemon restart.
     channel_ = grpc::CreateInsecureChannelFromFd("camera-control", fd);
     if (!channel_) {
         LOG_ERROR("DspClient: CreateInsecureChannelFromFd(%s) failed", path.c_str());
@@ -196,8 +221,7 @@ int DspClient::alloc_pool(PoolInfo* out, uint32_t w, uint32_t h, uint32_t count)
     if (fd_pub_sendmsg(fd, &msg, sizeof(msg), nullptr, 0) != 0) {
         LOG_ERROR("DspClient: ALLOC send failed (%ux%u x%u): %s",
                   (unsigned)w, (unsigned)h, (unsigned)count, strerror(errno));
-        ::close(fd);
-        uds_fd_ = -1;
+        close_uds_locked();
         return -1;
     }
 
@@ -212,8 +236,7 @@ int DspClient::alloc_pool(PoolInfo* out, uint32_t w, uint32_t h, uint32_t count)
         LOG_ERROR("DspClient: ALLOC resp broken (n=%d type=%u): %s",
                   n, resp.hdr.type, n <= 0 ? strerror(errno) : "desync");
         for (int i = 0; i < num_fds; ++i) ::close(fds[i]);
-        ::close(fd);
-        uds_fd_ = -1;
+        close_uds_locked();
         return -1;
     }
 
@@ -231,14 +254,14 @@ int DspClient::alloc_pool(PoolInfo* out, uint32_t w, uint32_t h, uint32_t count)
         LOG_ERROR("DspClient: ALLOC plane/fd mismatch (count=%u planes=%u fds=%d)",
                   got, resp.num_planes, num_fds);
         for (int i = 0; i < num_fds; ++i) ::close(fds[i]);
-        ::close(fd);
-        uds_fd_ = -1;
+        close_uds_locked();
         return -1;
     }
 
-    out->width      = w;
-    out->height     = h;
-    out->num_planes = resp.num_planes;
+    out->width          = w;
+    out->height         = h;
+    out->num_planes     = resp.num_planes;
+    out->uds_generation = uds_generation_;
     for (uint32_t i = 0; i < 3; ++i) {
         out->strides[i] = resp.strides[i];
         out->sizes[i]   = resp.sizes[i];
@@ -254,15 +277,19 @@ int DspClient::alloc_pool(PoolInfo* out, uint32_t w, uint32_t h, uint32_t count)
 
 void DspClient::release_pool(PoolInfo* pool) {
     if (!pool) return;
-    for (uint64_t id : pool->ids) release_buffer(id);
+    for (uint64_t id : pool->ids)
+        release_buffer(id, pool->uds_generation);
     for (int fd : pool->fds) ::close(fd);
     pool->ids.clear();
     pool->fds.clear();
+    pool->uds_generation = 0;
 }
 
-int DspClient::import_frame(const ReceivedFrame& frame, uint64_t* id) {
+int DspClient::import_frame(const ReceivedFrame& frame, uint64_t* id,
+                            uint64_t* uds_generation) {
     std::lock_guard lock(uds_mu_);
     if (id) *id = 0;
+    if (uds_generation) *uds_generation = 0;
     if (!frame.fd_group || frame.fd_group->fds.empty()) return -1;
 
     int fd = ensure_uds_locked();
@@ -288,8 +315,7 @@ int DspClient::import_frame(const ReceivedFrame& frame, uint64_t* id) {
         LOG_ERROR("DspClient: IMPORT send failed (frame %ux%u): %s",
                   (unsigned)frame.width, (unsigned)frame.height,
                   strerror(errno));
-        ::close(fd);
-        uds_fd_ = -1;
+        close_uds_locked();
         return -1;
     }
 
@@ -298,8 +324,7 @@ int DspClient::import_frame(const ReceivedFrame& frame, uint64_t* id) {
     if (n != static_cast<int>(sizeof(resp)) ||
         resp.hdr.type != FD_PUB_MSG_DSP_IMPORT_RESP) {
         LOG_ERROR("DspClient: IMPORT resp broken (n=%d type=%u)", n, resp.hdr.type);
-        ::close(fd);
-        uds_fd_ = -1;
+        close_uds_locked();
         return -1;
     }
     if (resp.code != 0) {
@@ -309,18 +334,26 @@ int DspClient::import_frame(const ReceivedFrame& frame, uint64_t* id) {
         return -1;
     }
     if (id) *id = resp.import_id;
+    if (uds_generation) *uds_generation = uds_generation_;
     return 0;
 }
 
-void DspClient::release_buffer(uint64_t id) {
+int DspClient::release_buffer(uint64_t id, uint64_t uds_generation) {
     std::lock_guard lock(uds_mu_);
+    if (id == 0) return RELEASE_OK;
 
-    int fd = ensure_uds_locked();
-    if (fd < 0) {
-        LOG_WARN("DspClient: RELEASE id=%lu skipped (no connection; buffer is "
-                 "reaped on daemon-side disconnect cleanup)",
-                 (unsigned long)id);
-        return;
+    if (uds_fd_ < 0) {
+        LOG_WARN("DspClient: RELEASE id=%lu generation=%lu failed: connection "
+                 "is closed (daemon disconnect cleanup revoked its buffers)",
+                 (unsigned long)id, (unsigned long)uds_generation);
+        return RELEASE_TRANSPORT_ERROR;
+    }
+    if (uds_generation == 0 || uds_generation != uds_generation_) {
+        LOG_WARN("DspClient: RELEASE id=%lu generation=%lu skipped: active "
+                 "generation is %lu (old buffers were revoked on disconnect)",
+                 (unsigned long)id, (unsigned long)uds_generation,
+                 (unsigned long)uds_generation_);
+        return RELEASE_STALE_GENERATION;
     }
 
     FdPubDspBufReleaseMsg msg{};
@@ -328,13 +361,15 @@ void DspClient::release_buffer(uint64_t id) {
     msg.hdr.size  = sizeof(msg);
     msg.buffer_id = id;
 
-    if (fd_pub_sendmsg(fd, &msg, sizeof(msg), nullptr, 0) != 0) {
-        LOG_WARN("DspClient: RELEASE id=%lu send failed: %s (buffer is reaped "
-                 "on daemon-side disconnect cleanup)",
-                 (unsigned long)id, strerror(errno));
-        ::close(fd);
-        uds_fd_ = -1;
+    if (fd_pub_sendmsg(uds_fd_, &msg, sizeof(msg), nullptr, 0) != 0) {
+        LOG_WARN("DspClient: RELEASE id=%lu generation=%lu send failed: %s "
+                 "(daemon disconnect cleanup revokes all buffers in the pool)",
+                 (unsigned long)id, (unsigned long)uds_generation,
+                 strerror(errno));
+        close_uds_locked();
+        return RELEASE_TRANSPORT_ERROR;
     }
+    return RELEASE_OK;
 }
 
 int DspClient::resize(uint64_t src_id, uint64_t dst_id, Interp interp,
@@ -347,7 +382,8 @@ int DspClient::resize(uint64_t src_id, uint64_t dst_id, Interp interp,
     {
         std::lock_guard lock(grpc_mu_);
         ch = ensure_channel_locked();
-    }    if (!ch) {
+    }
+    if (!ch) {
         if (err_code) *err_code = -1;
         if (message)  *message = "cannot reach camera-daemon control plane";
         return -1;
@@ -378,6 +414,13 @@ int DspClient::resize(uint64_t src_id, uint64_t dst_id, Interp interp,
     aipc::camera::DspJobResponse resp;
     grpc::Status st = stub->SubmitDspJob(&ctx, job, &resp);
     if (!st.ok()) {
+        // A channel created from an already-connected Unix fd cannot recover
+        // after daemon restart. Drop only the generation this call used so a
+        // later resize reconnects without disturbing a newer channel.
+        {
+            std::lock_guard lock(grpc_mu_);
+            if (channel_ == ch) channel_.reset();
+        }
         if (err_code) *err_code = -1;
         if (message)  *message = "SubmitDspJob: " + st.error_message();
         return -1;
@@ -398,20 +441,19 @@ struct StreamPreprocessPool::Shared {
         std::vector<int> fds;      // plane fd dups for THIS slot
         bool in_use    = false;    // pinned by a live lease
         bool poisoned  = false;    // retired: possible late DSP write
-        bool reclaimed = false;    // daemon id released + fds closed (once)
+        bool reclaimed = false;    // plane fds closed (once)
     };
     std::mutex mu;
     std::vector<Slot> slots;
+    uint64_t uds_generation = 0;   // generation that owns every slot id
+    size_t healthy_slots = 0;      // slots not retired by timeout/disconnect
     bool destroyed = false;        // pool dtor ran
-    DspClient* dsp = nullptr;      // for late lease cleanup
-    bool engaged_logged = false;   // one "engaged" line per pool (per stream;
-                                   // binds are single-threaded per stream)
+    bool engaged_logged = false;   // one "engaged" line per shared pool
 };
 
 struct StreamPreprocessPool::SlotLease::Impl {
     std::shared_ptr<Shared> shared;
     uint32_t slot = 0;
-    ModelManager* mgr = nullptr;
     // Bind descriptor inputs (copied at prepare; pool may die before us).
     std::vector<int> fds;
     uint32_t num_planes = 0;
@@ -420,6 +462,7 @@ struct StreamPreprocessPool::SlotLease::Impl {
     // Bound tensor (valid after a successful bind()); freed by OUR dtor,
     // i.e. after the NPU read completed.
     HalTensor bound{};
+    void (*free_tensor)(HalTensor*) = nullptr;
     bool bound_valid = false;
 };
 
@@ -428,16 +471,26 @@ StreamPreprocessPool::StreamPreprocessPool(DspClient& dsp, ModelManager* mgr,
     : dsp_(dsp), mgr_(mgr), job_timeout_ms_(job_timeout_ms) {}
 
 StreamPreprocessPool::~StreamPreprocessPool() {
-    if (!shared_) return;
-    std::lock_guard lock(shared_->mu);
-    shared_->destroyed = true;
-    for (auto& s : shared_->slots) {
-        if (s.in_use || s.reclaimed) continue;  // live lease will reclaim
-        s.reclaimed = true;
-        if (s.id != 0) dsp_.release_buffer(s.id);
-        for (int fd : s.fds) ::close(fd);
-        s.fds.clear();
+    if (shared_) {
+        std::lock_guard lock(shared_->mu);
+        shared_->destroyed = true;
+        for (auto& s : shared_->slots) {
+            // Release daemon ownership while DspClient is still guaranteed alive.
+            // A live lease only needs our local fd dups for the pending NPU read.
+            if (s.id != 0) {
+                dsp_.release_buffer(s.id, shared_->uds_generation);
+                s.id = 0;
+            }
+            if (s.in_use || s.reclaimed) continue;  // live lease closes its fds
+            s.reclaimed = true;
+            for (int fd : s.fds) ::close(fd);
+            s.fds.clear();
+        }
     }
+
+    // Before init() commits slot ownership to shared_, PoolInfo remains the
+    // sole owner. This also covers exceptions during Shared allocation/fill.
+    dsp_.release_pool(&pool_);
 }
 
 int StreamPreprocessPool::init(uint32_t model_w, uint32_t model_h,
@@ -471,19 +524,22 @@ int StreamPreprocessPool::init(uint32_t model_w, uint32_t model_h,
         return 0;  // allocated but not usable; caller checks usable()
     }
 
-    shared_ = std::make_shared<Shared>();
-    shared_->dsp = &dsp_;
-    shared_->slots.resize(pool_.ids.size());
+    auto new_shared = std::make_shared<Shared>();
+    new_shared->uds_generation = pool_.uds_generation;
+    new_shared->healthy_slots = pool_.ids.size();
+    new_shared->slots.resize(pool_.ids.size());
     for (size_t i = 0; i < pool_.ids.size(); ++i) {
-        auto& s = shared_->slots[i];
+        auto& s = new_shared->slots[i];
         s.id = pool_.ids[i];
         s.fds.assign(
             pool_.fds.begin() + static_cast<long>(i * pool_.num_planes),
             pool_.fds.begin() + static_cast<long>((i + 1) * pool_.num_planes));
     }
-    // Slot fds' ownership moved into Shared; PoolInfo keeps only geometry.
+    // Commit ownership only after every allocation/copy succeeds. Before this
+    // point PoolInfo remains the sole owner, so destructor cleanup is exact.
     pool_.ids.clear();
     pool_.fds.clear();
+    shared_ = std::move(new_shared);
     LOG_INFO("StreamPreprocess: pool %ux%u NV12, %zu slot(s) ready",
              (unsigned)width_, (unsigned)height_, shared_->slots.size());
     return 0;
@@ -493,6 +549,19 @@ std::shared_ptr<StreamPreprocessPool::SlotLease>
 StreamPreprocessPool::prepare(const ReceivedFrame& frame, uint64_t* dsp_us) {
     if (dsp_us) *dsp_us = 0;
     if (!usable_ || !shared_) return nullptr;
+    auto pool_owner = weak_from_this().lock();
+    if (!pool_owner) return nullptr;
+
+    // Allocate all lease state before reserving a slot. In particular, copying
+    // the FD vector can throw; the slot must not become permanently busy if it
+    // does.
+    auto impl = std::make_shared<SlotLease::Impl>();
+    auto lease = std::make_shared<SlotLease>();
+    impl->shared     = shared_;
+    impl->num_planes = pool_.num_planes;
+    for (uint32_t p = 0; p < 3; ++p) impl->strides[p] = pool_.strides[p];
+    impl->src_w      = frame.width;
+    impl->src_h      = frame.height;
 
     uint32_t idx = 0;
     {
@@ -500,32 +569,54 @@ StreamPreprocessPool::prepare(const ReceivedFrame& frame, uint64_t* dsp_us) {
         if (shared_->destroyed) return nullptr;
         bool found = false;
         for (size_t i = 0; i < shared_->slots.size(); ++i) {
-            if (!shared_->slots[i].in_use && !shared_->slots[i].poisoned) {
-                shared_->slots[i].in_use = true;
+            auto& slot = shared_->slots[i];
+            if (!slot.in_use && !slot.poisoned) {
+                impl->fds = slot.fds;  // borrowed (never closed by the lease)
+                slot.in_use = true;
                 idx = static_cast<uint32_t>(i);
                 found = true;
                 break;
             }
         }
-        if (!found) return nullptr;  // all busy → repack this frame
+        if (!found) return nullptr;  // all busy → keep direct DMA input
     }
 
-    auto impl = std::make_shared<SlotLease::Impl>();
-    impl->shared     = shared_;
-    impl->mgr        = mgr_;
-    impl->slot       = idx;
-    impl->fds        = shared_->slots[idx].fds;  // borrowed (never closed here)
-    impl->num_planes = pool_.num_planes;
-    for (uint32_t p = 0; p < 3; ++p) impl->strides[p] = pool_.strides[p];
-    impl->src_w      = frame.width;
-    impl->src_h      = frame.height;
+    impl->slot = idx;
+    lease->impl = std::move(impl);
+    lease->pool_owner = std::move(pool_owner);
 
-    auto lease = std::make_shared<SlotLease>(
-        SlotLease{std::move(impl), nullptr});
+    auto poison_slot = [&](uint32_t slot) {
+        std::lock_guard lock(shared_->mu);
+        auto& s = shared_->slots[slot];
+        if (!s.poisoned) {
+            s.poisoned = true;
+            if (shared_->healthy_slots > 0) --shared_->healthy_slots;
+        }
+        if (shared_->healthy_slots == 0) usable_ = false;
+    };
+    auto poison_all = [&]() {
+        std::lock_guard lock(shared_->mu);
+        for (auto& s : shared_->slots) s.poisoned = true;
+        shared_->healthy_slots = 0;
+        usable_ = false;
+    };
 
     uint64_t import_id = 0;
-    if (dsp_.import_frame(frame, &import_id) != 0) {
+    uint64_t import_generation = 0;
+    if (dsp_.import_frame(frame, &import_id, &import_generation) != 0) {
         lease.reset();  // ~SlotLease frees the slot
+        return nullptr;
+    }
+    // A reconnect reaps every destination id from the allocation generation.
+    // Do not submit a job against, or later return, such a revoked slot.
+    if (import_generation != shared_->uds_generation) {
+        LOG_WARN("StreamPreprocess: UDS generation changed (pool=%lu import=%lu); "
+                 "retiring all destination slots",
+                 (unsigned long)shared_->uds_generation,
+                 (unsigned long)import_generation);
+        dsp_.release_buffer(import_id, import_generation);
+        poison_all();
+        lease.reset();
         return nullptr;
     }
     // The daemon dup'd the frame fds inside the import; from here on the
@@ -534,12 +625,26 @@ StreamPreprocessPool::prepare(const ReceivedFrame& frame, uint64_t* dsp_us) {
     const uint64_t t0 = steady_now_us();
     int err = 0;
     std::string msg;
-    const uint64_t dst_id = shared_->slots[idx].id;  // stream-thread only
+    const uint64_t dst_id = shared_->slots[idx].id;  // this lease owns the slot
     const int rc = dsp_.resize(import_id, dst_id, DspClient::INTERP_BILINEAR,
                                DspClient::PRIO_BACKGROUND, job_timeout_ms_,
                                &err, &msg);
     const uint64_t us = steady_now_us() - t0;
-    dsp_.release_buffer(import_id);
+    const int release_rc =
+        dsp_.release_buffer(import_id, import_generation);
+
+    // A failed release closes (or observes replacement of) the owning UDS.
+    // Daemon disconnect cleanup revokes the whole destination pool generation,
+    // including a slot whose resize RPC just succeeded.
+    if (release_rc != DspClient::RELEASE_OK) {
+        LOG_WARN("StreamPreprocess: import release failed (id=%lu generation=%lu "
+                 "rc=%d); retiring all destination slots",
+                 (unsigned long)import_id, (unsigned long)import_generation,
+                 release_rc);
+        poison_all();
+        lease.reset();
+        return nullptr;
+    }
 
     if (rc != 0) {
         LOG_WARN("StreamPreprocess: resize failed (frame %ux%u -> %ux%u): "
@@ -547,16 +652,17 @@ StreamPreprocessPool::prepare(const ReceivedFrame& frame, uint64_t* dsp_us) {
                  (unsigned)frame.width, (unsigned)frame.height,
                  (unsigned)width_, (unsigned)height_, rc, err, msg.c_str());
         // err==-2 unknown id: pool ids are stale (daemon restarted) — every
-        //      future job would fail too, degrade the pool to repack.
+        //      future job would fail too, degrade to the direct DMA path.
         // err==-4 job timeout: dst undefined, a straggler write is still
         //      possible — retire the slot.
         // rc==-1 transport: the job may reach the daemon after our deadline
         //      — retire the slot and degrade (channel suspect).
-        if (err == -2 || rc == -1) usable_ = false;
-        {
-            std::lock_guard lock(shared_->mu);
-            if (err == -4 || rc == -1) shared_->slots[idx].poisoned = true;
+        if (err == -2) {
+            poison_all();
+        } else if (err == -4 || rc == -1) {
+            poison_slot(idx);
         }
+        if (rc == -1) usable_ = false;
         lease.reset();  // ~SlotLease frees the slot (poisoned slots stay out)
         return nullptr;
     }
@@ -570,7 +676,7 @@ bool StreamPreprocessPool::bind(HalInferenceSession* sess, SlotLease* lease,
     if (!sess || !lease || !lease->impl || !lease->impl->shared || !out)
         return false;
     const HalInferenceOps* ops = mgr_->infer_ops();
-    if (!ops || !ops->bind_dma_frame) return false;
+    if (!ops || !ops->bind_dma_frame || !ops->free_tensor) return false;
     if (lease->impl->fds.size() < lease->impl->num_planes) return false;
 
     HalDmaFrameDesc desc{};
@@ -594,11 +700,19 @@ bool StreamPreprocessPool::bind(HalInferenceSession* sess, SlotLease* lease,
     if (ops->bind_dma_frame(sess, &desc, &lease->impl->bound) != HAL_OK)
         return false;  // off-contract: direct DMA fallback; slot remains valid
 
+    lease->impl->free_tensor = ops->free_tensor;
     lease->impl->bound_valid = true;
     *out = lease->impl->bound;
 
-    if (!lease->impl->shared->engaged_logged) {
-        lease->impl->shared->engaged_logged = true;
+    bool log_engaged = false;
+    {
+        std::lock_guard lock(lease->impl->shared->mu);
+        if (!lease->impl->shared->engaged_logged) {
+            lease->impl->shared->engaged_logged = true;
+            log_engaged = true;
+        }
+    }
+    if (log_engaged) {
         LOG_INFO("stream dsp preprocess engaged (%ux%u -> %ux%u via %zu-slot "
                  "pool, zero repack)",
                  (unsigned)lease->impl->src_w, (unsigned)lease->impl->src_h,
@@ -610,15 +724,16 @@ bool StreamPreprocessPool::bind(HalInferenceSession* sess, SlotLease* lease,
 
 StreamPreprocessPool::SlotLease::~SlotLease() {
     if (!impl || !impl->shared) return;
-    if (impl->bound_valid && impl->mgr) impl->mgr->free_tensor(&impl->bound);
+    if (impl->bound_valid && impl->free_tensor)
+        impl->free_tensor(&impl->bound);
     auto sh = impl->shared;
     std::lock_guard lock(sh->mu);
     auto& s = sh->slots[impl->slot];
     s.in_use = false;
     if (sh->destroyed && !s.reclaimed) {
-        // Pool is gone; we are the last owner of this slot's resources.
+        // Pool destruction already released the daemon id while DspClient was
+        // alive. The late lease owns only these local plane fd dups.
         s.reclaimed = true;
-        if (s.id != 0 && sh->dsp) sh->dsp->release_buffer(s.id);
         for (int fd : s.fds) ::close(fd);
         s.fds.clear();
     }
