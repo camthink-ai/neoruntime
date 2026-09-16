@@ -21,6 +21,7 @@
 #include <sys/un.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -226,6 +227,12 @@ static inline int fd_pub_recvmsg(int sock_fd, void* data, size_t data_len,
                                   int* fds, int* out_num_fds, int max_fds) {
     struct msghdr msg;
     struct iovec iov;
+    int stored_fds = 0;
+    if (out_num_fds) *out_num_fds = 0;
+    if (!data || data_len == 0 || max_fds < 0 || max_fds > FD_PUB_MAX_FDS) {
+        errno = EINVAL;
+        return -1;
+    }
     memset(&msg, 0, sizeof(msg));
 
     iov.iov_base = data;
@@ -238,20 +245,42 @@ static inline int fd_pub_recvmsg(int sock_fd, void* data, size_t data_len,
     msg.msg_control = cmsg_buf;
     msg.msg_controllen = sizeof(cmsg_buf);
 
-    if (out_num_fds) *out_num_fds = 0;
-
-    ssize_t received = recvmsg(sock_fd, &msg, 0);
+    int recv_flags = MSG_WAITALL;
+#ifdef MSG_CMSG_CLOEXEC
+    recv_flags |= MSG_CMSG_CLOEXEC;
+#endif
+    ssize_t received = recvmsg(sock_fd, &msg, recv_flags);
     if (received <= 0) return -1;
 
-    /* Extract FDs from ancillary data */
-    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-        int nfds = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-        if (nfds > max_fds) nfds = max_fds;
-        if (fds) memcpy(fds, CMSG_DATA(cmsg), sizeof(int) * nfds);
-        if (out_num_fds) *out_num_fds = nfds;
+    for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg;
+         cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
+            continue;
+        if (cmsg->cmsg_len < CMSG_LEN(0)) {
+            msg.msg_flags |= MSG_CTRUNC;
+            break;
+        }
+
+        const size_t payload = cmsg->cmsg_len - CMSG_LEN(0);
+        const int nfds = (int)(payload / sizeof(int));
+        const int* received_fds = (const int*)CMSG_DATA(cmsg);
+        for (int i = 0; i < nfds; ++i) {
+            if (fds && stored_fds < max_fds)
+                fds[stored_fds++] = received_fds[i];
+            else
+                close(received_fds[i]);
+        }
     }
 
+    if ((msg.msg_flags & MSG_CTRUNC) || received != (ssize_t)data_len) {
+        if (fds) {
+            for (int i = 0; i < stored_fds; ++i) close(fds[i]);
+        }
+        errno = (msg.msg_flags & MSG_CTRUNC) ? EMSGSIZE : EPROTO;
+        return -1;
+    }
+
+    if (out_num_fds) *out_num_fds = stored_fds;
     return (int)received;
 }
 

@@ -418,7 +418,7 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.watchdog_warn_ms = parse_u32_config(val, "watchdog.warn_threshold_ms");
         } else if (section == "dsp") {
             // P2: DspServiceConfig knobs (defaults live in dsp_service.h).
-            // quota is per owning client (one budget per app connection).
+            // Quota and retained-resource caps are per process incarnation.
             if (trimmed.find("quota_jobs_per_sec:") != std::string::npos)
                 cfg.dsp.quota_jobs_per_sec = parse_float_config(val, "dsp.quota_jobs_per_sec");
             else if (trimmed.find("quota_mpix_per_sec:") != std::string::npos)
@@ -431,8 +431,18 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.dsp.max_buffers_per_client = parse_u32_config(val, "dsp.max_buffers_per_client");
             else if (trimmed.find("max_client_pixels:") != std::string::npos)
                 cfg.dsp.max_client_pixels = parse_u32_config(val, "dsp.max_client_pixels");
+            else if (trimmed.find("max_total_buffers:") != std::string::npos)
+                cfg.dsp.max_total_buffers = parse_u32_config(val, "dsp.max_total_buffers");
+            else if (trimmed.find("max_total_buffer_pixels:") != std::string::npos)
+                cfg.dsp.max_total_buffer_pixels = parse_u32_config(val, "dsp.max_total_buffer_pixels");
             else if (trimmed.find("max_imports_per_client:") != std::string::npos)
                 cfg.dsp.max_imports_per_client = parse_u32_config(val, "dsp.max_imports_per_client");
+            else if (trimmed.find("max_import_bytes_per_client:") != std::string::npos)
+                cfg.dsp.max_import_bytes_per_client = parse_u32_config(val, "dsp.max_import_bytes_per_client");
+            else if (trimmed.find("max_total_imports:") != std::string::npos)
+                cfg.dsp.max_total_imports = parse_u32_config(val, "dsp.max_total_imports");
+            else if (trimmed.find("max_total_import_bytes:") != std::string::npos)
+                cfg.dsp.max_total_import_bytes = parse_u32_config(val, "dsp.max_total_import_bytes");
             else if (trimmed.find("max_async_jobs_per_client:") != std::string::npos)
                 cfg.dsp.max_async_jobs_per_client = parse_u32_config(val, "dsp.max_async_jobs_per_client");
         } else if (section == "ai_overlay") {

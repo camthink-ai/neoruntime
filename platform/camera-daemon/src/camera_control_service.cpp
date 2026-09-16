@@ -1685,8 +1685,34 @@ grpc::Status CameraControlServiceImpl::WaitDspJob(
     }
 
     bool done = false;
-    DspJobResult result = svc->wait_job(request->job_id(), request->timeout_ms(),
-                                        done);
+    DspJobResult result;
+    const uint32_t wait_ms = std::min(request->timeout_ms(),
+                                      svc->max_wait_job_timeout_ms());
+    if (wait_ms == 0) {
+        result = svc->wait_job(request->job_id(), 0, done);
+    } else {
+        constexpr uint32_t kCancellationPollMs = 100;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(wait_ms);
+        for (;;) {
+            if (context->IsCancelled()) {
+                return grpc::Status(grpc::StatusCode::CANCELLED,
+                                    "DSP job wait canceled");
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                result = svc->wait_job(request->job_id(), 0, done);
+                break;
+            }
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline - now).count();
+            const uint32_t slice_ms = std::min<uint32_t>(
+                kCancellationPollMs,
+                static_cast<uint32_t>(std::max<int64_t>(remaining, 1)));
+            result = svc->wait_job(request->job_id(), slice_ms, done);
+            if (result.rc != DSP_SVC_ERR_TIMEOUT) break;
+        }
+    }
     bool ok = (result.rc == DSP_SVC_OK);
     response->set_success(ok);
     response->set_message(ok && result.message.empty() ? "OK" : result.message);
