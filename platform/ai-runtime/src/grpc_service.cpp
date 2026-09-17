@@ -1916,10 +1916,22 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
         req->session_id(), req->stream_id(), req->model_id(),
         req->fps_limit(), 0, 5);
 
+    // The guard fires on every StreamInfer exit — clean finish, error
+    // return, or client disconnect (ctx cancellation breaks the loop): the
+    // session is destroyed and a tagged session additionally broadcasts
+    // session/end so the daemon-side overlay sidecars are swept (P2-13).
+    // The sweep tag is req->session_id() — the client-facing string the
+    // SDK stamps on its annotate events — NOT the internal session id
+    // (app-stream-model-ts) the daemon would never have seen.
     struct SessionGuard {
         SessionManager* mgr; std::string id;
-        ~SessionGuard() { mgr->destroy_session(id); }
-    } guard{session_mgr_, session_id};
+        AIRuntimeServiceImpl* svc = nullptr;
+        std::string client_tag;
+        ~SessionGuard() {
+            mgr->destroy_session(id);
+            if (svc) svc->publish_session_end(client_tag);
+        }
+    } guard{session_mgr_, session_id, this, req->session_id()};
 
     auto session = session_mgr_->get_session(session_id);
     if (!session) {
@@ -2572,7 +2584,17 @@ grpc::Status AIRuntimeServiceImpl::DestroySession(
     const pb::SessionConfig* req,
     pb::Status* resp) {
 
+    // P2-13: capture the client-facing tag before the session object is
+    // destroyed — app_id at creation time (for StreamInfer sessions that
+    // is the SDK's session_id) is what overlay sidecars were tagged with.
+    // The broadcast goes out after the destroy so a downstream observer
+    // reacting to session/end sees a fully torn-down runtime session.
+    std::string client_tag;
+    if (auto s = session_mgr_->get_session(req->session_id()))
+        client_tag = s->app_id;
+
     bool ok = session_mgr_->destroy_session(req->session_id());
+    publish_session_end(client_tag);
     resp->set_success(ok);
     resp->set_message(ok ? "Destroyed" : "Session not found");
     return grpc::Status::OK;
@@ -2698,6 +2720,26 @@ void AIRuntimeServiceImpl::publish_result(const std::string& stream_id,
 
     event_bus_->publish(topic, "ai-runtime", timestamp_ns, event_id, payload,
                         {{"stream_id", stream_id}, {"model_id", model_id}});
+}
+
+void AIRuntimeServiceImpl::publish_session_end(
+    const std::string& client_session_id) {
+    // Daemon contract (ai_overlay_subscriber.h:104): the sweep trigger is
+    // the exact topic "<prefix>session/end" with the session riding in
+    // metadata["session_id"]. The prefix is the configured result prefix —
+    // the daemon's ai_overlay.topic_prefix must agree with it (both
+    // default "inference/"), the same coupling result publishing already
+    // has. Payload is unused by the daemon; "{}" keeps bus snoopers happy.
+    // Reserved-name rule: no result may publish under a model+stream that
+    // literally spells "session/end" — this is the sole sanctioned user.
+    if (client_session_id.empty()) return;  // untagged: nothing to sweep
+    if (!event_bus_ || !event_bus_->connected()) return;
+
+    const std::string topic =
+        cfg_.event_bus_result_topic_prefix + "session/end";
+    event_bus_->publish(topic, "ai-runtime", now_ns(),
+                        "session-end-" + client_session_id,
+                        "{}", {{"session_id", client_session_id}});
 }
 
 // ─── CLIP text encoding ──────────────────────────────────────────────────────

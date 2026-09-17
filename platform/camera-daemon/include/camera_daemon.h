@@ -21,9 +21,11 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <condition_variable>
 #include <shared_mutex>
 #include <thread>
@@ -183,11 +185,31 @@ struct DaemonConfig {
     bool        ai_overlay_draw_confidence = true;
     bool        ai_overlay_draw_landmarks = true;
     bool        ai_overlay_enable_face_blur = false;
+    uint32_t    ai_overlay_face_blur_block_size = 8;   // mosaic cell size (px); 0 = blur
     uint32_t    ai_overlay_box_thickness = 2;
     // Stream mapping: inference_stream_id → display_encoder_stream
     // e.g. "third" → "main" means results from stream_id="third" drawn on "main" encoder.
     // If empty, auto-generated from configured streams (all → first encoder stream).
     std::unordered_map<std::string, std::string> ai_overlay_stream_map;
+    // Behavior decoupling (output-isolation scope cut): platform result
+    // events ("ai-runtime"/"auto-infer" publishers) draw only when their
+    // infer stream is explicitly bound here (infer → display, same
+    // direction as stream_map) or the legacy switch is on. App events
+    // (SDK publish) are always admitted. Static yaml only — never an
+    // UpdateAiOverlay RPC knob.
+    bool        ai_overlay_legacy_auto_bind = false;
+    std::map<std::string, std::string> ai_overlay_bindings;
+    // Result validity window (ms). 0 = derive per stream: per-result ttl
+    // (event metadata) > stream override (ai_overlay_stream_result_ttls) >
+    // this global > round(2000/fps) from the stream config > 500ms fallback.
+    uint32_t    ai_overlay_result_ttl_ms = 0;
+    std::unordered_map<std::string, uint32_t> ai_overlay_stream_result_ttls;
+    // Strict frame-lock (P1-6): identity-fed display streams (stream_map
+    // D→D) wait — bounded — for the frame's own inference result at the
+    // bake site. Wait cap 0 = derive (2 frame periods, clamp [1,500] ms);
+    // expiry degrades to preview semantics with a rate-limited warning.
+    bool        ai_overlay_strict_frame_lock = false;
+    uint32_t    ai_overlay_strict_wait_cap_ms = 0;
 
     // Logging
     std::string log_level;
@@ -377,7 +399,10 @@ public:
      * @brief Update AI overlay configuration - hot reload
      */
     bool update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence,
-                                   uint32_t box_thickness);
+                                   uint32_t box_thickness,
+                                   std::optional<bool> enable_face_blur = {},
+                                   std::optional<bool> strict_frame_lock = {},
+                                   std::optional<uint32_t> strict_wait_cap_ms = {});
 
 #ifdef HAS_GRPC
     /**

@@ -11,6 +11,7 @@
 #include "../include/osd_manager.h"
 #include "../include/encoder_manager.h"
 #include "../include/fd_publisher.h"
+#include "../include/fd_protocol.h"
 #include "../include/rtsp_server.h"
 #include "../include/encoded_publisher.h"
 #include "../include/ai_overlay_subscriber.h"
@@ -983,6 +984,19 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
 #endif
         restart_data_consumers();
 
+        // Whole-pipeline rebuild: every stream's frame generation restarted.
+        // Bump the overlay epoch per encoder stream so app commands tagged
+        // to the old generation are rejected (and its layers purged)
+        // instead of decorating the new one.
+        {
+            std::shared_lock<std::shared_mutex> lk(op_mu_);
+            if (ai_overlay_) {
+                for (const auto& ec : config_.encoders) {
+                    ai_overlay_->note_stream_restart(ec.stream_name);
+                }
+            }
+        }
+
         // Verify the rebuilt pipeline actually produces frames. Rotation
         // rebuilds all ISP pipelines; if the post-rebuild encoder path is dead
         // we surface the truth so the player/UI can prompt a restart rather than
@@ -1602,8 +1616,97 @@ void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_na
         }
     }
 
-    if (frame_router_) {
-        frame_router_->on_frame_arrived(dispatch_name, frame);
+    // AI overlay: same bake point as DPM. The frontend bridge invokes this
+    // callback BEFORE auto-feeding the encoder (hailo15_ml_frontend_bridge
+    // runs cb() ahead of add_buffer() on the same buffer), so pixels drawn
+    // here reach the encoded stream in BOTH auto_feed and manual mode.
+    // ai_overlay_ is swapped under op_mu_ (update_ai_overlay_config resets
+    // it under the write lock), so take the read lock around the call.
+    // Semantics mirror DPM: the overlay is baked into the shared pipeline
+    // buffer, so zero-copy subscribers of an overlaid stream see it too —
+    // apps that need clean inference input should subscribe a stream that
+    // is not an overlay target (ai_overlay.stream_map models that split).
+    // apply_overlay no-ops in O(1) when no fresh result matches the stream.
+    //
+    // Strict frame-lock (P1-6) reorders the two steps for identity-fed
+    // streams: the frame is dispatched to the router FIRST — the router
+    // feed is what carries it to ai-runtime, so gating ahead of the
+    // dispatch would wait for a result that can never arrive — and only
+    // then blocks in apply_overlay's bounded wait for the frame's own
+    // result. The bridge still runs this whole callback ahead of the
+    // encoder's add_buffer, so the locked draw still precedes encoding.
+    bool strict_bake = false;
+    {
+        std::shared_lock<std::shared_mutex> lk(op_mu_);
+        if (ai_overlay_) {
+            strict_bake = ai_overlay_->strict_gate_active(dispatch_name);
+        }
+    }
+    if (strict_bake && !encoder_auto_feed_enabled_.load()) {
+        // Manual feed has no bridge-ordering guarantee that a draw after
+        // the router dispatch lands before the encoder consumes this
+        // frame — the wait could miss the encode entirely. Strict stays
+        // auto-feed only; this configuration falls back to preview.
+        static bool warned_manual_strict = false;
+        if (!warned_manual_strict) {
+            warned_manual_strict = true;
+            HAL_LOG_WARNING(
+                "CameraDaemon: strict_frame_lock ignored in manual encoder "
+                "feed mode, falling back to preview (stream=%s)",
+                dispatch_name.c_str());
+        }
+        strict_bake = false;
+    }
+
+    // Frame metadata flags (P1-7): coarse "bake active" truth, computed once
+    // per frame before either dispatch order so strict and preview modes
+    // carry identical bits. This is NOT per-frame draw truth — an empty
+    // scene or a SKIP verdict still sets the bit when the pass is active,
+    // because "did anything draw this frame" flaps and can never promise a
+    // clean frame. The flag answers "is this stream in the baked set",
+    // i.e. the runtime counterpart of the stream_map config split: the
+    // OVERLAY bit is scoped to bake targets (stream_map values — identity
+    // D→D and cross-fed I→D displays). A stream that is only an inference
+    // source (key mapped to a foreign display, e.g. the clean inference
+    // feed) carries flag 0 and apply_overlay skips it, so the bit always
+    // matches stream_map and never lies about pixel truth. DPM stays
+    // global: it draws on every stream via its own mask logic.
+    uint32_t frame_flags = 0;
+    {
+        std::shared_lock<std::shared_mutex> lk(op_mu_);
+        if (ai_overlay_ && ai_overlay_->is_running() &&
+            ai_overlay_->is_bake_target(dispatch_name)) {
+            frame_flags |= FD_PUB_FRAME_FLAG_OVERLAY_BAKED;
+        }
+    }
+    if (dpm && dpm->is_running() && hal_loader_ && hal_loader_->has_draw()) {
+        frame_flags |= FD_PUB_FRAME_FLAG_DPM_BAKED;
+    }
+
+    if (strict_bake && frame_router_) {
+        frame_router_->on_frame_arrived(dispatch_name, frame, frame_flags);
+    }
+
+    {
+        std::shared_lock<std::shared_mutex> lk(op_mu_);
+        if (ai_overlay_) {
+            // The HAL frame's own sequence (the shared media-context counter
+            // the FD publisher and ai-runtime both re-export verbatim) is the
+            // frame-generation authority at the bake site: it anchors the
+            // app-command late-frame judgement and bounds frame-bound layer
+            // drawing in the SAME counter space the SDK's frame_sequence
+            // metadata lives in. The frame_router's per-dispatch counter must
+            // NOT be used here: it counts only this stream's callbacks while
+            // the HAL counter ticks once per frontend callback across ALL
+            // streams — mixing the two spaces drops every bound annotation
+            // on a multi-stream deployment as a "late command".
+            ai_overlay_->apply_overlay(dispatch_name, frame,
+                                       frame ? frame->sequence : 0);
+        }
+    }
+
+    if (!strict_bake && frame_router_) {
+        frame_router_->on_frame_arrived(dispatch_name, frame, frame_flags);
     }
 }
 
@@ -1858,6 +1961,18 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
                 response.set_interrupt_ms(interrupt_ms);
                 return false;
             }
+            // Pipeline restart = every stream's frame generation restarted.
+            // Bump the overlay epoch per encoder stream so app commands
+            // tagged to the old generation are rejected (and its layers
+            // purged) instead of decorating the new one.
+            {
+                std::shared_lock<std::shared_mutex> lk(op_mu_);
+                if (ai_overlay_) {
+                    for (const auto& ec : config_.encoders) {
+                        ai_overlay_->note_stream_restart(ec.stream_name);
+                    }
+                }
+            }
             // Some HAL/MediaLibrary paths reset feed mode after stop/start.
             // Restore auto-feed so encoded sockets continue producing packets.
             if (encoder_auto_feed_enabled_.load() && media_ops->set_encoder_auto_feed) {
@@ -2046,8 +2161,21 @@ bool CameraDaemon::set_rtsp_enabled(bool enabled) {
     return true;
 }
 
-bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence, uint32_t box_thickness) {
+bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence,
+                                            uint32_t box_thickness,
+                                            std::optional<bool> enable_face_blur,
+                                            std::optional<bool> strict_frame_lock,
+                                            std::optional<uint32_t> strict_wait_cap_ms) {
     std::unique_lock<std::shared_mutex> lock(op_mu_);
+    // Absent flag keeps the current face-blur state (yaml value until first set).
+    const bool face_blur = enable_face_blur.value_or(config_.ai_overlay_enable_face_blur);
+    // Strict frame-lock hot path: persist first so init_ai_overlay (used when
+    // the overlay is being enabled right now) picks the new values up too.
+    if (strict_frame_lock.has_value())
+        config_.ai_overlay_strict_frame_lock = strict_frame_lock.value();
+    if (strict_wait_cap_ms.has_value())
+        config_.ai_overlay_strict_wait_cap_ms = strict_wait_cap_ms.value();
+
     if (enabled && !ai_overlay_) {
         if (!hal_loader_ || !hal_loader_->has_draw()) {
             HAL_LOG_ERROR("CameraDaemon: Cannot enable AI overlay without HAL draw ops");
@@ -2058,6 +2186,7 @@ bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool
         config_.ai_overlay_draw_labels = draw_labels;
         config_.ai_overlay_draw_confidence = draw_confidence;
         config_.ai_overlay_box_thickness = box_thickness;
+        config_.ai_overlay_enable_face_blur = face_blur;
 
         return init_ai_overlay();
     }
@@ -2072,10 +2201,14 @@ bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool
 
     // Update existing AI overlay config
     if (ai_overlay_) {
-        ai_overlay_->update_config(draw_labels, draw_confidence, box_thickness);
+        ai_overlay_->update_config(draw_labels, draw_confidence, box_thickness, face_blur);
         config_.ai_overlay_draw_labels = draw_labels;
         config_.ai_overlay_draw_confidence = draw_confidence;
         config_.ai_overlay_box_thickness = box_thickness;
+        config_.ai_overlay_enable_face_blur = face_blur;
+        if (strict_frame_lock.has_value() || strict_wait_cap_ms.has_value())
+            ai_overlay_->update_strict(config_.ai_overlay_strict_frame_lock,
+                                       config_.ai_overlay_strict_wait_cap_ms);
     }
 
     return true;
@@ -3660,6 +3793,8 @@ void* CameraDaemon::refresh_autofocus_video_context() {
 
     // init_from_context clears callbacks and running flags. Rebind the frame
     // router before subscribing to the refreshed contexts.
+    // Route through handle_video_frame_for_routing (not straight into the
+    // router) so the DPM bake and AI overlay keep applying after the refresh.
     for (auto& slot : video_source_->streams()) {
         std::string dispatch_name = slot.name;
         auto it = video_name_map_.find(slot.name);
@@ -3667,7 +3802,7 @@ void* CameraDaemon::refresh_autofocus_video_context() {
 
         video_source_->set_frame_callback(slot.name,
             [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
-                frame_router_->on_frame_arrived(dispatch_name, frame);
+                handle_video_frame_for_routing(dispatch_name, frame);
             });
     }
     for (auto& slot : video_source_->streams()) {
@@ -4117,14 +4252,27 @@ bool CameraDaemon::init_ai_overlay() {
     cfg.draw_confidence     = config_.ai_overlay_draw_confidence;
     cfg.draw_landmarks      = config_.ai_overlay_draw_landmarks;
     cfg.enable_face_blur    = config_.ai_overlay_enable_face_blur;
+    cfg.face_blur_block_size = config_.ai_overlay_face_blur_block_size;
     cfg.box_thickness       = config_.ai_overlay_box_thickness;
+    cfg.result_ttl_ms       = config_.ai_overlay_result_ttl_ms;
+    cfg.strict_frame_lock   = config_.ai_overlay_strict_frame_lock;
+    cfg.strict_wait_cap_ms  = config_.ai_overlay_strict_wait_cap_ms;
+    cfg.legacy_auto_bind    = config_.ai_overlay_legacy_auto_bind;
+    if (!config_.ai_overlay_bindings.empty())
+        cfg.bindings = config_.ai_overlay_bindings;
+    if (!config_.ai_overlay_stream_result_ttls.empty())
+        cfg.stream_result_ttls = config_.ai_overlay_stream_result_ttls;
     cfg.draw_ops            = hal_loader_->draw();
 
     // Stream mapping: inference stream_id → display encoder stream.
     if (!config_.ai_overlay_stream_map.empty()) {
         cfg.stream_map = config_.ai_overlay_stream_map;
-    } else {
-        // Auto-generate: map every configured stream → first encoder stream
+    } else if (cfg.legacy_auto_bind) {
+        // Legacy auto-generate (every stream → first encoder) only under
+        // the legacy switch: the new default must not silently bind every
+        // stream and re-couple a bare subscribe() to the video. Operators
+        // who want the old behavior declare legacy_auto_bind: 1 (or list
+        // explicit bindings).
         std::string primary_encoder;
         if (!config_.encoders.empty()) {
             primary_encoder = config_.encoders[0].stream_name;
@@ -4138,9 +4286,39 @@ bool CameraDaemon::init_ai_overlay() {
             cfg.stream_map["ai"]        = primary_encoder;
         }
     }
+    for (auto& [k, v] : cfg.bindings) {
+        HAL_LOG_INFO("CameraDaemon: AI overlay binding: %s → %s", k.c_str(), v.c_str());
+    }
+
+    // fps per display stream (from [streams]) feeds the derived default TTL:
+    // resolve_result_ttl_ms turns 30fps into ~67ms (≈2 frame periods).
+    for (auto& s : config_.streams) {
+        if (!s.name.empty() && s.fps > 0)
+            cfg.stream_fps[s.name] = s.fps;
+    }
 
     for (auto& [k, v] : cfg.stream_map) {
         HAL_LOG_INFO("CameraDaemon: AI overlay stream_map: %s → %s", k.c_str(), v.c_str());
+    }
+
+    // Strict frame-lock diagnosis (log-once at init): which display streams
+    // the strict gate will actually gate. The gate applies only to identity
+    // feeds (map D→D); cross-fed display streams (map I→D, I≠D) always keep
+    // preview semantics because a cross-fed result never carries the display
+    // stream's own frame_sequence.
+    if (cfg.strict_frame_lock) {
+        for (auto& [infer_stream, display_stream] : cfg.stream_map) {
+            if (infer_stream == display_stream) {
+                HAL_LOG_INFO("CameraDaemon: strict frame lock ACTIVE on stream=%s "
+                             "(cap=%u ms%s)",
+                             display_stream.c_str(), cfg.strict_wait_cap_ms,
+                             cfg.strict_wait_cap_ms == 0 ? ", derived from fps" : "");
+            } else if (cfg.stream_map.count(display_stream) == 0) {
+                HAL_LOG_INFO("CameraDaemon: strict frame lock not applicable to "
+                             "cross-fed stream=%s (inference source=%s)",
+                             display_stream.c_str(), infer_stream.c_str());
+            }
+        }
     }
 
     ai_overlay_ = std::make_unique<AiOverlaySubscriber>(cfg);
@@ -4184,8 +4362,11 @@ void CameraDaemon::register_subscribers() {
                 });
         }
 
-        // --- Priority 2: Encoder subscriber (AI overlay → OSD → encode → FPS update) ---
-        // Skip in media pipeline auto_feed mode — encoder gets frames from pipeline directly
+        // --- Priority 2: Encoder subscriber (OSD → encode → FPS update) ---
+        // Skip in media pipeline auto_feed mode — encoder gets frames from pipeline directly.
+        // AI overlay is NOT drawn here anymore: it bakes at the frontend callback
+        // (handle_video_frame_for_routing) so it reaches the encoded stream in
+        // auto_feed mode too; drawing here as well would double-render in manual mode.
         if (!auto_feed && has_encoder && encoder_mgr_) {
             std::string sname = s.name;
             std::string enc_name = s.name;
@@ -4198,9 +4379,6 @@ void CameraDaemon::register_subscribers() {
             fps_trackers_[sname] = FpsTracker{};
             frame_router_->subscribe(s.name, "encoder_" + s.name,
                 [this, sname, enc_name](ManagedFrame* mf) {
-                    if (ai_overlay_) {
-                        ai_overlay_->apply_overlay(sname, &mf->frame);
-                    }
                     encoder_mgr_->encode_frame(enc_name, &mf->frame);
                     frame_router_->release(mf);
 
@@ -6065,6 +6243,9 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
 
                 // init_from_context clears the old stream slots and callbacks.
                 // Rebind them before restarting frame delivery.
+                // Same as the AF-refresh rebind: go through
+                // handle_video_frame_for_routing so DPM bake and AI overlay
+                // survive the profile switch.
                 for (auto& slot : video_source_->streams()) {
                     std::string dispatch_name = slot.name;
                     auto vnit = video_name_map_.find(slot.name);
@@ -6072,7 +6253,7 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
 
                     video_source_->set_frame_callback(slot.name,
                         [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
-                            frame_router_->on_frame_arrived(dispatch_name, frame);
+                            handle_video_frame_for_routing(dispatch_name, frame);
                         });
                 }
                 for (auto& slot : video_source_->streams()) {
