@@ -28,6 +28,62 @@ std::string variant_backend_function(const std::string& variant) {
     return variant.substr(q1 + 1, q2 - q1 - 1);
 }
 
+// Single-frame host-buffer size implied by a tensor's reported geometry —
+// what a batch=1 session reports in byte_size, and what a client computes to
+// build one input frame. Returns 0 when the shape/layout does not yield a
+// confidently computable size (caller treats that as "cannot verify").
+uint64_t single_frame_bytes(const HalModelTensorInfo &t)
+{
+    const uint32_t elem = hal_dtype_size(t.dtype);
+    if (t.is_nv12)
+    {
+        // NV12-family input: 4-dim RGB-like shape [1,H,W,C]; payload = H*W*3/2
+        if (t.ndim < 3) return 0;
+        const int64_t h = t.shape[t.ndim - 3];
+        const int64_t w = t.shape[t.ndim - 2];
+        if (h <= 0 || w <= 0) return 0;
+        return (uint64_t)h * (uint64_t)w * 3U / 2U;
+    }
+    switch (t.layout)
+    {
+        case HAL_TENSOR_LAYOUT_NHWC:   // [N,H,W,C]
+        case HAL_TENSOR_LAYOUT_NCHW:   // [N,C,H,W]
+        case HAL_TENSOR_LAYOUT_NHW:    // [N,H,W] byte planes
+        {
+            // Spatial/channel dims are the trailing 3; shape[0] is the batch
+            // slot (reported as 1 by backends regardless of session batch).
+            if (t.ndim < 3 || elem == 0) return 0;
+            uint64_t v = 1;
+            for (int i = t.ndim - 3; i < t.ndim; i++)
+            {
+                if (t.shape[i] <= 0) return 0;
+                v *= (uint64_t)t.shape[i];
+            }
+            return v * elem;
+        }
+        case HAL_TENSOR_LAYOUT_NC:     // [N,C]
+        {
+            if (t.ndim < 2 || t.shape[t.ndim - 1] <= 0 || elem == 0) return 0;
+            return (uint64_t)t.shape[t.ndim - 1] * elem;
+        }
+        case HAL_TENSOR_LAYOUT_CHW:    // [C,H,W]
+        case HAL_TENSOR_LAYOUT_HWC:    // [H,W,C]
+        {
+            if (elem == 0) return 0;
+            uint64_t v = 1;
+            for (int i = 0; i < t.ndim; i++)
+            {
+                if (t.shape[i] <= 0) return 0;
+                v *= (uint64_t)t.shape[i];
+            }
+            return v * elem;
+        }
+        case HAL_TENSOR_LAYOUT_UNKNOWN:
+        default:
+            return 0;
+    }
+}
+
 } // namespace
 
 // ============================================================
@@ -100,7 +156,8 @@ int ModelManager::register_model(const std::string& model_id,
                                  bool transient,
                                  const std::string& variant,
                                  const std::string& model_type,
-                                 std::string* why) {
+                                 std::string* why,
+                                 uint32_t batch_size) {
     std::unique_lock lock(mu_);
 
     if (models_.count(model_id)) {
@@ -145,6 +202,24 @@ int ModelManager::register_model(const std::string& model_id,
             }
             return -1;
         }
+        const uint32_t want_batch = batch_size > 0 ? batch_size : 1;
+        const uint32_t have_batch = models_[model_id].batch_size;
+        if (want_batch != have_batch) {
+            // Re-registering an id at a different batch would have to either
+            // silently ignore the request or rebuild the HAL session; both
+            // surprise callers. Fail loudly with the stored batch so the
+            // caller can pick a fresh id (or match the stored batch).
+            LOG_ERROR("Model %s already registered with batch=%u; "
+                      "re-registration requested batch=%u (rejected)",
+                      model_id.c_str(), have_batch, want_batch);
+            if (why) {
+                *why = "model id '" + model_id +
+                       "' is already registered with batch=" +
+                       std::to_string(have_batch) + "; re-registration " +
+                       "requested batch=" + std::to_string(want_batch);
+            }
+            return -1;
+        }
         // Model already loaded — add co-ownership if owner_id is provided.
         // The stored transient flag wins: a model already registered under a
         // visibility contract (e.g. system-visible) keeps it even when a
@@ -168,6 +243,24 @@ int ModelManager::register_model(const std::string& model_id,
     // Check if the same file is already loaded under a different model_id
     for (const auto& [existing_id, entry] : models_) {
         if (entry.path == model_path) {
+            const uint32_t want_batch = batch_size > 0 ? batch_size : 1;
+            if (want_batch != entry.batch_size) {
+                // The alias shares the existing HAL session, so a differing
+                // batch request would silently serve the stored batch — the
+                // same fake-success as an unchecked set_batch_size.
+                LOG_ERROR("Model file %s already loaded as '%s' with batch=%u; "
+                          "alias '%s' requested batch=%u (rejected)",
+                          model_path.c_str(), existing_id.c_str(),
+                          entry.batch_size, model_id.c_str(), want_batch);
+                if (why) {
+                    *why = "model file '" + model_path +
+                           "' is already loaded as '" + existing_id +
+                           "' with batch=" + std::to_string(entry.batch_size) +
+                           "; alias '" + model_id + "' requested batch=" +
+                           std::to_string(want_batch);
+                }
+                return -1;
+            }
             LOG_INFO("Model file %s already loaded as '%s', aliasing as '%s'",
                      model_path.c_str(), existing_id.c_str(), model_id.c_str());
             // Create an alias entry under the new model_id. The alias shares the
@@ -181,6 +274,11 @@ int ModelManager::register_model(const std::string& model_id,
             alias.transient = transient;  // visibility is per-id, follows this registration
             alias.model_type = model_type; // decoding identity is per-id too: init_post_process
             alias.variant    = variant;    // gives the alias its own postprocess session
+            // The alias is a fresh registry entry: snapshot refcount starts at
+            // 0 (the copy inherited the original's in-flight count). Shared
+            // HAL session lifetimes are tracked separately by infer_refs_/
+            // post_refs_, which the bumps below cover.
+            alias.ref_count = 0;
             models_.emplace(model_id, alias);
             add_infer_locked(shared_infer);
             add_post_locked(shared_post);
@@ -194,7 +292,13 @@ int ModelManager::register_model(const std::string& model_id,
     // HAL v2: session-based inference
     HalInferenceConfig infer_cfg{};
     std::strncpy(infer_cfg.model_path, model_path.c_str(), HAL_MAX_MODEL_PATH - 1);
-    infer_cfg.batch_size = 1;
+    // NPU batch: 0 normalizes to 1 (single-frame). >1 asks the backend for a
+    // batched session (HailoRT set_batch_size). HailoRT accepts the value
+    // silently (void return; with the scheduler active it is only a
+    // burst-size hint), so misconfiguration is NOT caught at create() — the
+    // geometry check after get_model_info below rejects a batch the HEF does
+    // not serve.
+    infer_cfg.batch_size = batch_size > 0 ? batch_size : 1;
     infer_cfg.timeout_ms = 5000;
     infer_cfg.use_dma = true;
 
@@ -253,6 +357,7 @@ int ModelManager::register_model(const std::string& model_id,
     entry.transient  = transient;
     entry.model_type = model_type;
     entry.variant    = variant;
+    entry.batch_size = infer_cfg.batch_size;
     entry.ref_count  = 0;
     entry.load_time  = std::time(nullptr);
 
@@ -260,9 +365,41 @@ int ModelManager::register_model(const std::string& model_id,
     if (infer_ops_->get_model_info) {
         infer_ops_->get_model_info(session, &entry.model_info);
     }
-    LOG_INFO("Model registered: %s (session=%p, owner=%s, transient=%d)",
+
+    // NPU batch geometry check. On a batch=1-compiled HEF, set_batch_size(4)
+    // is accepted silently while the session keeps serving single frames
+    // (byte_size stays 1 frame). A batch>1 registration whose input byte_size
+    // did not scale to batch x single-frame would let InferBatch pack B
+    // partial frames into ONE real frame and slice one output B ways —
+    // confident garbage. Reject at registration instead.
+    if (infer_cfg.batch_size > 1) {
+        for (uint32_t k = 0; k < entry.model_info.num_inputs; k++) {
+            const HalModelTensorInfo &t = entry.model_info.inputs[k];
+            const uint64_t one = single_frame_bytes(t);
+            if (one == 0 || t.byte_size != one * infer_cfg.batch_size) {
+                LOG_ERROR("Model %s: batch=%u rejected — input '%s' byte_size=%u "
+                          "!= %u x single-frame=%llu (HEF likely compiled "
+                          "batch=1; recompile the HEF with batch=%u)",
+                          model_id.c_str(), infer_cfg.batch_size,
+                          t.name[0] ? t.name : "(unnamed)",
+                          t.byte_size, infer_cfg.batch_size,
+                          (unsigned long long)one, infer_cfg.batch_size);
+                if (why) {
+                    *why = "model '" + model_id + "' batch=" +
+                           std::to_string(infer_cfg.batch_size) +
+                           " rejected: input byte_size does not equal batch x "
+                           "single-frame (HEF likely compiled batch=1)";
+                }
+                infer_ops_->destroy(session);
+                return -1;
+            }
+        }
+    }
+
+    LOG_INFO("Model registered: %s (session=%p, owner=%s, transient=%d, batch=%u)",
              model_id.c_str(), (void*)session,
-             owner_id.empty() ? "<system>" : owner_id.c_str(), transient);
+             owner_id.empty() ? "<system>" : owner_id.c_str(), transient,
+             entry.batch_size);
 
     models_.emplace(model_id, std::move(entry));
     add_infer_locked(session);  // first reference to the freshly created session
@@ -622,6 +759,7 @@ std::optional<ModelSnapshot> ModelManager::acquire_model_snapshot(const std::str
     snap.model_info    = it->second.model_info;
     snap.num_outputs   = static_cast<int>(it->second.model_info.num_outputs);
     if (snap.num_outputs <= 0) snap.num_outputs = 1;
+    snap.batch_size    = it->second.batch_size > 0 ? it->second.batch_size : 1;
     return snap;
 }
 

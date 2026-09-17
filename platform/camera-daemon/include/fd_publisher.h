@@ -173,6 +173,10 @@ private:
      * closes every received fd (import_buffer dups what it keeps). */
     void handle_dsp_import(ClientState* client, const void* msg_data,
                            const int* fds, int num_fds);
+    /* Cross-process buffer lookup (DSP_LOOKUP): pin + geometry + dup'd fds.
+     * Called on the client's recv thread; the lookup reply carries fds. */
+    void handle_dsp_lookup(ClientState* client, const void* msg_data);
+    void handle_dsp_lookup_release(ClientState* client, const void* msg_data);
     void disconnect_client(int client_fd);
     void release_all_outstanding(ClientState* client);
     /** Remove one outstanding entry (used to undo a tracked-but-unsent frame). */

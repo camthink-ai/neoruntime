@@ -44,6 +44,9 @@ struct ModelEntry {
     PostprocessSession   post_session;              // HAL v2 postprocess session
 
     HalModelInfo model_info{};
+    // NPU batch the HAL session was configured with (HalInferenceConfig).
+    // 1 = single-frame; >1 requires InferBatch (grouped into one NPU job).
+    uint32_t     batch_size = 1;
     int          ref_count  = 0;
     int64_t      load_time  = 0;        // Unix timestamp
 };
@@ -56,6 +59,7 @@ struct ModelSnapshot {
     HalPostprocessType     post_type     = HAL_POST_TYPE_NONE;
     HalModelInfo           model_info{};
     int                    num_outputs   = 0;
+    uint32_t               batch_size    = 1;
 };
 
 /// Thread-safe model lifecycle manager backed by HAL ops.
@@ -80,6 +84,12 @@ public:
     /// variant is the model's postprocess variant blob; for detections its
     /// backend_function is forwarded to the HAL inference session so NMS output
     /// tensors are named after the selected vendor function, not the file path.
+    /// batch_size configures the HAL inference session's NPU batch (>1 is only
+    /// valid for batch-compiled HEFs — registration verifies the reported
+    /// input byte_size equals batch x single-frame and refuses otherwise;
+    /// InferBatch then groups B frames into one NPU job). The batch is part of
+    /// the registration identity: a re-registration at a different batch is
+    /// refused like any other identity mismatch.
     /// Returns 0 for a fresh registration, 1 when the identical entry was
     /// already loaded and only ownership changed, <0 on error; why (optional)
     /// carries the human-readable refusal reason.
@@ -88,7 +98,8 @@ public:
                        bool transient = false,
                        const std::string& variant = "",
                        const std::string& model_type = "",
-                       std::string* why = nullptr);
+                       std::string* why = nullptr,
+                       uint32_t batch_size = 1);
 
     /// Unregister (unload) a model. With owner_id, an absent owner is an
     /// idempotent no-op; other owners keep the model resident; the last owner

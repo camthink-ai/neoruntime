@@ -218,6 +218,10 @@ void test_stop_fences_async_submission(HalDspOps* dsp, HalFrameBufferOps* fb,
 
 void test_buffer_resource_caps(HalDspOps* dsp, HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    // fork-only P1-9 retention parks released pool buffers for 3s by
+    // default; this suite asserts immediate HAL release timing, so every
+    // config here disables it via the documented rollback knob.
+    cfg.pool_retention_ms = 0;
     cfg.max_buffers_per_client = 2;
     cfg.max_client_pixels = 49152;
     cfg.max_total_buffers = 2;
@@ -251,6 +255,7 @@ void test_buffer_resource_caps(HalDspOps* dsp, HalFrameBufferOps* fb) {
     for (int fd : conn_b) ::close(fd);
 
     DspServiceConfig total_cfg;
+    total_cfg.pool_retention_ms = 0;
     total_cfg.max_buffers_per_client = 4;
     total_cfg.max_client_pixels = 98304;
     total_cfg.max_total_buffers = 2;
@@ -275,6 +280,7 @@ void test_buffer_resource_caps(HalDspOps* dsp, HalFrameBufferOps* fb) {
 void test_allocation_reservation_rollback(HalDspOps* dsp,
                                           HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.max_buffers_per_client = 1;
     cfg.max_client_pixels = 49152;
     cfg.max_total_buffers = 1;
@@ -296,6 +302,7 @@ void test_allocation_reservation_rollback(HalDspOps* dsp,
 
 void test_import_resource_caps(HalDspOps* dsp, HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.max_imports_per_client = 2;
     cfg.max_import_bytes_per_client = 1536;
     cfg.max_total_imports = 4;
@@ -336,6 +343,7 @@ void test_import_resource_caps(HalDspOps* dsp, HalFrameBufferOps* fb) {
     for (int socket_fd : conn_b) ::close(socket_fd);
 
     DspServiceConfig total_cfg;
+    total_cfg.pool_retention_ms = 0;
     total_cfg.max_imports_per_client = 4;
     total_cfg.max_import_bytes_per_client = 6144;
     total_cfg.max_total_imports = 1;
@@ -362,6 +370,7 @@ void test_import_resource_caps(HalDspOps* dsp, HalFrameBufferOps* fb) {
 void test_import_reservation_rollback(HalDspOps* dsp,
                                       HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.max_imports_per_client = 1;
     cfg.max_import_bytes_per_client = 1536;
     cfg.max_total_imports = 1;
@@ -386,6 +395,7 @@ void test_import_reservation_rollback(HalDspOps* dsp,
 void test_detached_pins_remain_charged(HalDspOps* dsp,
                                        HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.max_buffers_per_client = 2;
     cfg.max_client_pixels = 245760;
     cfg.max_total_buffers = 2;
@@ -651,6 +661,7 @@ void test_import_registration_fenced_by_disconnect(HalDspOps* dsp,
 void test_pin_bookkeeping_allocation_failures(HalDspOps* dsp,
                                               HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.quota_jobs_per_sec = 1000;
     cfg.quota_mpix_per_sec = 1000;
     DspService service(dsp, fb, cfg);
@@ -681,6 +692,7 @@ void test_pin_bookkeeping_allocation_failures(HalDspOps* dsp,
 void test_random_id_failure_is_transactional(HalDspOps* dsp,
                                              HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.quota_jobs_per_sec = 1000;
     cfg.quota_mpix_per_sec = 1000;
     DspService service(dsp, fb, cfg);
@@ -727,6 +739,7 @@ void test_random_id_failure_is_transactional(HalDspOps* dsp,
 void test_async_waiters_are_bounded(HalDspOps* dsp,
                                     HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.quota_jobs_per_sec = 1000;
     cfg.quota_mpix_per_sec = 1000;
     cfg.max_waiters_per_job = 1;
@@ -818,6 +831,7 @@ void test_async_waiters_are_bounded(HalDspOps* dsp,
 void test_stop_wakes_waiters_for_queued_jobs(HalDspOps* dsp,
                                               HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.quota_jobs_per_sec = 1000;
     cfg.quota_mpix_per_sec = 1000;
     cfg.max_wait_job_timeout_ms = 1000;
@@ -901,6 +915,7 @@ void test_actual_pool_bytes_are_accounted(HalDspOps* dsp,
     g_plane_extra_bytes.store(extra_bytes);
 
     DspServiceConfig limited_cfg;
+    limited_cfg.pool_retention_ms = 0;
     limited_cfg.max_client_pixels = retained_pool_bytes - 1;
     limited_cfg.max_total_buffer_pixels = retained_pool_bytes - 1;
     DspService limited(dsp, fb, limited_cfg);
@@ -910,6 +925,7 @@ void test_actual_pool_bytes_are_accounted(HalDspOps* dsp,
     limited.stop();
 
     DspServiceConfig exact_cfg;
+    exact_cfg.pool_retention_ms = 0;
     exact_cfg.max_client_pixels = retained_pool_bytes;
     exact_cfg.max_total_buffer_pixels = retained_pool_bytes;
     DspService exact(dsp, fb, exact_cfg);
@@ -934,6 +950,7 @@ void test_actual_pool_bytes_are_accounted(HalDspOps* dsp,
 void test_pool_admission_precedes_hal_allocation(HalDspOps* dsp,
                                                  HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.max_client_pixels = 256U * 1024U * 1024U;
     cfg.max_total_buffer_pixels = 256U * 1024U * 1024U;
     DspService service(dsp, fb, cfg);
@@ -977,6 +994,7 @@ void test_default_caps_allow_common_nv12_pools(HalDspOps* dsp,
 void test_async_cap_survives_reconnect(HalDspOps* dsp,
                                        HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.max_async_jobs_per_client = 1;
     cfg.quota_jobs_per_sec = 1000;
     cfg.quota_mpix_per_sec = 1000;
@@ -1046,6 +1064,7 @@ void test_async_cap_survives_reconnect(HalDspOps* dsp,
 void test_disconnected_queued_waiter_reports_failure(HalDspOps* dsp,
                                                      HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.quota_jobs_per_sec = 1000;
     cfg.quota_mpix_per_sec = 1000;
     cfg.quota_total_jobs_per_sec = 1000;
@@ -1101,6 +1120,7 @@ void test_disconnected_queued_waiter_reports_failure(HalDspOps* dsp,
 void test_disconnected_running_waiter_reports_failure(HalDspOps* dsp,
                                                       HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.quota_jobs_per_sec = 1000;
     cfg.quota_mpix_per_sec = 1000;
     cfg.quota_total_jobs_per_sec = 1000;
@@ -1144,6 +1164,7 @@ void test_disconnected_running_waiter_reports_failure(HalDspOps* dsp,
 void test_service_async_cap_limits_all_owners(HalDspOps* dsp,
                                                HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.max_async_jobs_per_client = 2;
     cfg.max_total_async_jobs = 1;
     cfg.quota_jobs_per_sec = 1000;
@@ -1215,6 +1236,7 @@ void test_service_async_cap_limits_all_owners(HalDspOps* dsp,
 void test_service_quota_limits_all_owners(HalDspOps* dsp,
                                            HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.max_async_jobs_per_client = 2;
     cfg.max_total_async_jobs = 4;
     cfg.quota_jobs_per_sec = 1000;
@@ -1247,6 +1269,7 @@ void test_service_quota_limits_all_owners(HalDspOps* dsp,
 void test_service_mpix_quota_limits_all_owners(HalDspOps* dsp,
                                                 HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.max_async_jobs_per_client = 2;
     cfg.max_total_async_jobs = 4;
     cfg.quota_jobs_per_sec = 1000;
@@ -1279,6 +1302,7 @@ void test_service_mpix_quota_limits_all_owners(HalDspOps* dsp,
 void test_job_rejects_cross_registration_buffers(HalDspOps* dsp,
                                                  HalFrameBufferOps* fb) {
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.quota_jobs_per_sec = 1000;
     cfg.quota_mpix_per_sec = 1000;
     DspService service(dsp, fb, cfg);
@@ -1315,6 +1339,7 @@ int main() {
     fb.release_frame_buffer = release_buffer;
 
     DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
     cfg.max_async_jobs_per_client = 2;
     cfg.quota_jobs_per_sec = 1000;
     cfg.quota_mpix_per_sec = 1000;
@@ -1413,6 +1438,7 @@ int main() {
     test_job_rejects_cross_registration_buffers(&dsp, &fb);
 
     DspServiceConfig quota_cfg;
+    quota_cfg.pool_retention_ms = 0;
     quota_cfg.max_async_jobs_per_client = 2;
     quota_cfg.quota_jobs_per_sec = 1;
     quota_cfg.quota_mpix_per_sec = 1000;

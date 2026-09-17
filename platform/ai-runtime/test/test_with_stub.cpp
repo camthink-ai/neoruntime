@@ -77,6 +77,9 @@ static int tests_failed = 0;
 #define ASSERT_EQ(a, b, msg) \
     do { if ((a) != (b)) { FAIL(msg); return; } } while(0)
 
+#define ASSERT_NE(a, b, msg) \
+    do { if ((a) == (b)) { FAIL(msg); return; } } while (0)
+
 #define ASSERT_FALSE(expr, msg) ASSERT_TRUE(!(expr), msg)
 
 static std::string get_stub_path() {
@@ -314,6 +317,13 @@ void test_model_manager() {
     ASSERT_TRUE(why.find("different configuration") != std::string::npos,
                 "variant collision should carry a useful reason");
 
+    // Same id/path/decoder at a different NPU batch is refused too: the
+    // entry keeps its HAL session, so a silent accept would serve the
+    // stored batch instead of the requested one.
+    rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-c",
+                            true, variant, "detection", nullptr, 2);
+    ASSERT_TRUE(rc != 0, "different batch should be refused");
+
     // Get model via snapshot (rehash-safe)
     auto snap = mgr.acquire_model_snapshot("yolo_test");
     ASSERT_TRUE(snap.has_value(), "acquire_model_snapshot returned nullopt");
@@ -515,6 +525,108 @@ void test_model_alias_refcount() {
     }
     ASSERT_EQ(g_mock_destroys, 1, "destructor must free the shared session exactly once");
     ASSERT_EQ(g_mock_creates, g_mock_destroys, "destructor: create/destroy must balance");
+
+    PASS();
+}
+
+// ─── Test: NPU batch models ──────────────────────────────────────────────────
+
+void test_batch_model() {
+    TEST(batch_model);
+
+    std::string path = get_stub_path();
+    ASSERT_TRUE(!path.empty(), "stub library not found");
+
+    HalMlLoader loader;
+    ASSERT_TRUE(loader.load(path), "load failed");
+
+    ModelManager mgr(loader.infer_ops(), loader.post_ops(), loader.draw_ops(), &loader);
+
+    const uint32_t B = 4;
+    const uint32_t per_frame_in  = 640 * 640 * 3;
+    const uint32_t per_frame_out = 1024 * sizeof(float);
+
+    int rc = mgr.register_model("batch4", "/fake/batch4.hef",
+                                "", false, "", "", nullptr, B);
+    ASSERT_EQ(rc, 0, "register_model(batch=4) failed");
+
+    auto snap = mgr.acquire_model_snapshot("batch4");
+    ASSERT_TRUE(snap.has_value(), "model not found");
+    ASSERT_EQ(snap->batch_size, B, "snapshot should carry the configured batch");
+
+    // Stub geometry scales by batch — the platform contract that model_manager
+    // verifies at registration (input byte_size == B x single-frame).
+    ASSERT_EQ(snap->model_info.inputs[0].byte_size, per_frame_in * B,
+              "input byte_size should be B x per-frame");
+    ASSERT_EQ(snap->model_info.inputs[0].shape[0], (int32_t)B,
+              "input shape[0] should be the batch");
+    ASSERT_EQ(snap->model_info.outputs[0].byte_size, per_frame_out * B,
+              "output byte_size should be B x per-frame");
+
+    // A full-batch payload (B concatenated frames) passes run().
+    std::vector<uint8_t> batch_buf(per_frame_in * B, 0);
+    HalTensor in{};
+    in.data      = batch_buf.data();
+    in.ndim      = 4;
+    in.shape[0]  = (int32_t)B;
+    in.shape[1]  = 3;
+    in.shape[2]  = 640;
+    in.shape[3]  = 640;
+    in.dtype     = HAL_DTYPE_UINT8;
+    in.byte_size = per_frame_in * B;
+
+    std::vector<uint8_t> out_buf(per_frame_out * B, 0);
+    HalTensor out{};
+    out.data      = out_buf.data();
+    out.byte_size = per_frame_out * B;
+
+    rc = mgr.infer(snap->infer_session, &in, 1, &out, 1);
+    ASSERT_EQ(rc, 0, "full-batch run should succeed");
+
+    // A single-frame payload is rejected — exactly the trap the hailo15 bind
+    // check (in.byte_size != frame_size) would catch on real hardware.
+    in.byte_size = per_frame_in;
+    rc = mgr.infer(snap->infer_session, &in, 1, &out, 1);
+    ASSERT_NE(rc, 0, "single-frame payload on a batch model must fail");
+
+    // run_async validates identically then fires the callback inline (stub),
+    // which is what makes the InferBatch grouping path exercisable off-device.
+    int fired = 0;
+    in.byte_size = per_frame_in * B;
+    rc = mgr.run_async(snap->infer_session, &in, 1, &out, 1,
+                       [](HalTensor*, int, int err, void* ud) {
+                           if (err == 0) ++*(int*)ud;
+                       }, &fired);
+    ASSERT_EQ(rc, 0, "run_async full-batch submit should succeed");
+    ASSERT_EQ(fired, 1, "stub run_async should fire the callback inline");
+
+    // Default registration keeps batch=1 semantics.
+    rc = mgr.register_model("batch1", "/fake/batch1.hef");
+    ASSERT_EQ(rc, 0, "register_model(default) failed");
+    auto snap1 = mgr.acquire_model_snapshot("batch1");
+    ASSERT_TRUE(snap1.has_value(), "batch1 model not found");
+    ASSERT_EQ(snap1->batch_size, 1u, "default registration should be batch=1");
+    mgr.release_model("batch1");
+    mgr.unregister_model("batch1");
+
+    // Re-registering an id (or aliasing a file) at a DIFFERENT batch must be
+    // rejected: both paths share the existing HAL session, so a silent accept
+    // would serve the stored batch (fake success — the trap that motivated
+    // the checks in model_manager).
+    rc = mgr.register_model("batch4", "/fake/batch4.hef",
+                            "", false, "", "", nullptr, 2);
+    ASSERT_NE(rc, 0, "same-id re-registration with batch=2 must fail");
+    rc = mgr.register_model("batch4b", "/fake/batch4.hef",
+                            "", false, "", "", nullptr, 1);
+    ASSERT_NE(rc, 0, "alias of a batch=4 file at batch=1 must fail");
+    rc = mgr.register_model("batch4b", "/fake/batch4.hef",
+                            "", false, "", "", nullptr, 4);
+    ASSERT_EQ(rc, 0, "alias at the SAME batch should still succeed");
+    mgr.unregister_model("batch4b");
+
+    mgr.release_model("batch4");
+    rc = mgr.unregister_model("batch4");
+    ASSERT_EQ(rc, 0, "unregister failed");
 
     PASS();
 }
@@ -917,10 +1029,13 @@ void test_inference_scheduler() {
     int result_rc = -999;
     uint64_t infer_us = 0;
 
+    // The stub validates input[0].byte_size == 640*640*3*batch (the batch
+    // contract check in stub_infer_run), so the dummy payload must carry the
+    // stub's single-frame geometry even though the scheduler never reads it.
     HalTensor input{};
-    uint8_t dummy[1024] = {};
-    input.data = dummy;
-    input.byte_size = sizeof(dummy);
+    std::vector<uint8_t> dummy(640 * 640 * 3, 0);
+    input.data = dummy.data();
+    input.byte_size = static_cast<uint32_t>(dummy.size());
     input.ndim = 4;
     input.shape[0] = 1; input.shape[1] = 3; input.shape[2] = 640; input.shape[3] = 640;
     input.dtype = HAL_DTYPE_UINT8;
@@ -1476,16 +1591,19 @@ void test_dma_fd_infer() {
     auto snap = mgr.acquire_model_snapshot("dma_test");
     ASSERT_TRUE(snap.has_value(), "model not found");
 
-    // Simulate DMA-BUF path: data=NULL, dma_fd=fake (stub ignores actual fd)
+    // Simulate DMA-BUF path: data=NULL, dma_fd=fake (stub ignores actual fd).
+    // byte_size must match the stub's single-frame geometry (the batch
+    // contract check in stub_infer_run).
     HalTensor input{};
     input.data      = nullptr;
     input.dma_fd    = 42;   // fake fd; stub doesn't actually read it
-    input.ndim      = 3;
-    input.shape[0]  = 1080;
-    input.shape[1]  = 1920;
-    input.shape[2]  = 1;
+    input.ndim      = 4;
+    input.shape[0]  = 1;
+    input.shape[1]  = 3;
+    input.shape[2]  = 640;
+    input.shape[3]  = 640;
     input.dtype     = HAL_DTYPE_UINT8;
-    input.byte_size = 1920 * 1080;
+    input.byte_size = 640 * 640 * 3;
 
     HalTensor output{};
     uint8_t dummy_out[256] = {};
@@ -1868,6 +1986,7 @@ int main() {
     test_owner_scoped_unregister();
     test_force_unregister_all_is_atomic_when_busy();
     test_model_alias_refcount();
+    test_batch_model();
     test_stream_infer_config();
     test_session_manager();
     test_session_ids_are_unique_under_concurrency();

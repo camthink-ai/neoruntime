@@ -80,7 +80,25 @@ typedef struct {
     char stream_name[FD_PUB_MAX_STREAM_NAME];
 } FdPubSubscribeMsg;
 
-/* ========== Server → Client: Frame delivery (sent with SCM_RIGHTS) ========== */
+/* ========== Frame delivery flags (FdPubFrameMsg.flags) ==========
+ * Per-frame metadata telling the SDK client what was already baked into
+ * the pixels it receives, so it can skip its own pass (or warn about
+ * double-draw). Baked-ness is a property of the STREAM, not the frame:
+ * overlay admission is decided at bind time (a stream only enters the
+ * baked set when something exposes a draw op). Per-frame "did anything
+ * actually draw" would flap with empty scenes and can never promise a
+ * clean frame — every router stream is a potential overlay display, so
+ * the flag answers "is this stream in the baked set" (cross-check
+ * against stream_map config). */
+#define FD_PUB_FRAME_FLAG_OVERLAY_BAKED 0x1u
+#define FD_PUB_FRAME_FLAG_DPM_BAKED     0x2u
+
+/* ========== Server → Client: Frame delivery (sent with SCM_RIGHTS) ==========
+ * Wire compat: on 64-bit builds this struct ends with 4 bytes of tail
+ * padding (76 data bytes, sizeof 80). `flags` consumes that padding, so
+ * sizeof stays 80 — an older SDK's format string ending in "4x" ignores
+ * it, and an older daemon's memset leaves it 0. No protocol version
+ * bump needed in either direction. */
 typedef struct {
     FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_FRAME */
     uint64_t frame_id;      /* Unique frame ID (must be sent back in RELEASE) */
@@ -93,6 +111,7 @@ typedef struct {
     uint32_t strides[3];    /* Stride per plane */
     uint32_t sizes[3];      /* Size per plane in bytes */
     uint32_t num_fds;       /* Number of DMA-BUF fds attached */
+    uint32_t flags;         /* FD_PUB_FRAME_FLAG_* (metadata) */
 } FdPubFrameMsg;
 
 /* ========== Client → Server: Release frame ========== */
