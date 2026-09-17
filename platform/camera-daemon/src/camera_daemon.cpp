@@ -42,6 +42,9 @@
 #include <iomanip>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 #include <unistd.h>
 
 extern "C" {
@@ -461,6 +464,7 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     fd_cfg.sock_path = config_.fd_pub_sock_path;
     fd_cfg.max_clients = config_.fd_pub_max_clients;
     fd_cfg.max_outstanding_per_client = config_.fd_pub_max_outstanding;
+    fd_cfg.lease_ms = config_.fd_pub_lease_ms;
     fd_pub_ = std::make_unique<FdPublisher>(frame_router_.get(), fd_cfg);
 
     // DSP offload service (PLAT-1..5): one HAL DSP context + dma-buf buffer
@@ -488,6 +492,47 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     } else {
         HAL_LOG_INFO("CameraDaemon: HAL DSP/frame_buffer ops unavailable, "
                      "app DSP offload disabled");
+    }
+
+    // App frame injection (PushFrame P0-P2): rides the DSP registry above
+    // (buffers pinned by id, never a raw fd). Constructed only when the
+    // registry exists; the master gate (config_.injection.enabled, ships
+    // false) decides whether PushFrame accepts frames. The bake-site
+    // handoff (take_frame + compose in handle_video_frame_for_routing)
+    // consumes frames targeted at this stream (stream_id) or legacy
+    // matching-dims REPLACE pushes; see inject_nv12_copy /
+    // inject_argb_blend there. P2-12 resolvers: the identity resolver
+    // anchors the manifest permission gate to the FdPublisher's
+    // SO_PEERCRED identities; the stream-dims resolver answers push-time
+    // geometry checks from the live bake-site dims cache.
+    if (dsp_service_) {
+        injection_service_ = std::make_unique<InjectionService>(
+            dsp_service_.get(), config_.injection);
+        if (fd_pub_) {
+            injection_service_->set_identity_resolver(
+                [this](int owner_fd) {
+                    return fd_pub_->client_identity(owner_fd);
+                });
+            // P2-13: a disconnect closes the owner's injection session
+            // (queue flush + pin release) instead of wedging it.
+            fd_pub_->set_injection_service(injection_service_.get());
+        }
+        injection_service_->set_stream_dims_resolver(
+            [this](const std::string& name, uint32_t& w, uint32_t& h) {
+                std::shared_lock<std::shared_mutex> lk(stream_dims_mu_);
+                const auto it = stream_dims_.find(name);
+                if (it == stream_dims_.end()) {
+                    return false;
+                }
+                w = it->second.first;
+                h = it->second.second;
+                return true;
+            });
+        injection_service_->start();
+        HAL_LOG_INFO("CameraDaemon: frame injection service started "
+                     "(enabled=%s, queue=%u)",
+                     config_.injection.enabled ? "true" : "false",
+                     config_.injection.queue_capacity);
     }
 
     // Register all subscribers with FrameRouter
@@ -1470,10 +1515,245 @@ void CameraDaemon::bind_video_source_callbacks() {
     }
 }
 
+// Copy an injected NV12 dma-buf frame (PushFrame REPLACE full-frame or
+// OVERLAY opaque inset) onto the pipeline frame's planes at (dst_x,
+// dst_y). The source is a DSP-registry pin: real dma-buf imports carry
+// no CPU mapping (fb->planes[] stay NULL — DSP hardware consumes the
+// fds), so each plane is mapped PROT_READ for exactly the copy,
+// bracketed by DMA_BUF_IOCTL_SYNC (START|READ before, END|READ after);
+// the per-frame map/unmap keeps zero cache-lifetime coupling with the
+// registry. NV12 is strided rows of `width` payload bytes — Y: height
+// rows at (dst_x, dst_y), UV: height/2 rows at (dst_x, dst_y/2) — each
+// plane at its own src/dst stride (dst_x/dst_y even keeps the chroma
+// grid aligned). Any failure logs and leaves the ISP pixels intact:
+// the stream degrades to the camera, never to garbage.
+static void inject_nv12_copy(const InjectionService::QueuedFrame& qf,
+                             HalFrameBuffer* frame,
+                             uint32_t dst_x, uint32_t dst_y) {
+    const HalFrameBuffer* src = qf.pin.fb();
+    if (!src || src->num_planes < 2u || frame->num_planes < 2u ||
+        !frame->planes[0] || !frame->planes[1]) {
+        HAL_LOG_WARNING("CameraDaemon: injected frame unusable, keeping ISP pixels");
+        return;
+    }
+
+    const uint32_t rows[2] = {qf.height, qf.height / 2u};
+    const uint32_t src_stride[2] = {
+        qf.stride, src->strides[1] != 0u ? src->strides[1] : qf.stride};
+    for (uint32_t p = 0; p < 2u; ++p) {
+        if (src->dma_fds[p] < 0 ||
+            src->sizes[p] < (rows[p] - 1u) * src_stride[p] + qf.width) {
+            HAL_LOG_WARNING("CameraDaemon: injected plane %u too small, keeping ISP pixels", p);
+            return;
+        }
+    }
+
+    uint8_t* maps[2] = {nullptr, nullptr};
+    for (uint32_t p = 0; p < 2u; ++p) {
+        const int fd = src->dma_fds[p];
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+        if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+            HAL_LOG_WARNING("CameraDaemon: injected plane %u sync failed, keeping ISP pixels", p);
+            break;
+        }
+        void* m = mmap(nullptr, src->sizes[p], PROT_READ, MAP_SHARED, fd, 0);
+        if (m == MAP_FAILED) {
+            sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+            (void)ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+            HAL_LOG_WARNING("CameraDaemon: injected plane %u mmap failed, keeping ISP pixels", p);
+            break;
+        }
+        maps[p] = static_cast<uint8_t*>(m);
+    }
+
+    if (maps[0] && maps[1]) {
+        /* Y rows land at dst_y+r; UV rows at dst_y/2+r (both planes take
+         * dst_x as the byte column offset — NV12 packs one UV byte pair
+         * per pixel column). */
+        const uint32_t dst_row_off[2] = {dst_y, dst_y / 2u};
+        for (uint32_t p = 0; p < 2u; ++p) {
+            const uint8_t* sp = maps[p];
+            uint8_t* dp = static_cast<uint8_t*>(frame->planes[p]) +
+                          static_cast<size_t>(dst_row_off[p]) * frame->strides[p] +
+                          dst_x;
+            for (uint32_t r = 0; r < rows[p]; ++r) {
+                memcpy(dp + static_cast<size_t>(r) * frame->strides[p],
+                       sp + static_cast<size_t>(r) * src_stride[p],
+                       qf.width);
+            }
+        }
+    }
+
+    /* Unmap/sync-end exactly what was mapped (planes map in order, so
+     * break-on-null is exact). */
+    for (uint32_t p = 0; p < 2u && maps[p]; ++p) {
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+        (void)ioctl(src->dma_fds[p], DMA_BUF_IOCTL_SYNC, &sync);
+        (void)munmap(maps[p], src->sizes[p]);
+    }
+}
+
+/* ARGB32 → NV12 color conversion (BT.601 limited range). ARGB32 memory
+ * byte order is [A,R,G,B] (the SDK's dsp.py packs the same layout). */
+static inline uint8_t argb_y_of(uint8_t r, uint8_t g, uint8_t b) {
+    const int32_t v = ((16829 * r + 33039 * g + 6416 * b + 32768) >> 16) + 16;
+    return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+static inline uint8_t argb_u_of(uint8_t r, uint8_t g, uint8_t b) {
+    const int32_t v = ((-9714 * r - 19076 * g + 28784 * b + 32768) >> 16) + 128;
+    return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+static inline uint8_t argb_v_of(uint8_t r, uint8_t g, uint8_t b) {
+    const int32_t v = ((28784 * r - 24113 * g - 4655 * b + 32768) >> 16) + 128;
+    return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+// Alpha-blend an injected ARGB32 frame (PushFrame P2 OVERLAY) over the
+// pipeline NV12 frame at (dest_x, dest_y), on the CPU. Rationale: the
+// DSP build_blend op needs a registry-resident base frame and the
+// pipeline buffer is not one, and the DSP queue is a single congested
+// worker (P1-9 unfixed) — the bake site blends on CPU instead. Layout:
+// NV12 chroma is a 2x2 macroblock grid, so the blend walks 2x2 source
+// pixel blocks; per-pixel luma blends with that pixel's alpha, chroma
+// blends once per block with the block's total coverage (sw = sum of
+// the 4 alphas, 0..1020; u/v source are the alpha-weighted average of
+// the block's converted chroma). Fully transparent blocks (sw == 0)
+// leave the frame untouched. The source mapping follows the registry
+// layout: dma-buf imports map PROT_READ per use (sync-bracketed, same
+// as inject_nv12_copy), memfd/malloc imports already carry planes[0].
+// Validation guarantees even width/height/even dest, so macroblocks
+// tile the source exactly. Any failure logs and leaves the ISP pixels
+// intact.
+static void inject_argb_blend(const InjectionService::QueuedFrame& qf,
+                              HalFrameBuffer* frame) {
+    const HalFrameBuffer* src = qf.pin.fb();
+    if (!src || src->num_planes < 1u || frame->num_planes < 2u ||
+        !frame->planes[0] || !frame->planes[1]) {
+        HAL_LOG_WARNING("CameraDaemon: injected frame unusable, keeping ISP pixels");
+        return;
+    }
+    if (src->sizes[0] < (qf.height - 1u) * qf.stride + qf.width * 4u) {
+        HAL_LOG_WARNING("CameraDaemon: injected ARGB32 plane too small, keeping ISP pixels");
+        return;
+    }
+
+    uint8_t* map = nullptr;
+    const uint8_t* argb = static_cast<const uint8_t*>(src->planes[0]);
+    if (!argb) {
+        if (src->dma_fds[0] < 0) {
+            HAL_LOG_WARNING("CameraDaemon: injected ARGB32 has no mapping or fd");
+            return;
+        }
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+        if (ioctl(src->dma_fds[0], DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+            HAL_LOG_WARNING("CameraDaemon: injected ARGB32 sync failed, keeping ISP pixels");
+            return;
+        }
+        map = static_cast<uint8_t*>(
+            mmap(nullptr, src->sizes[0], PROT_READ, MAP_SHARED,
+                 src->dma_fds[0], 0));
+        if (map == MAP_FAILED) {
+            sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+            (void)ioctl(src->dma_fds[0], DMA_BUF_IOCTL_SYNC, &sync);
+            HAL_LOG_WARNING("CameraDaemon: injected ARGB32 mmap failed, keeping ISP pixels");
+            return;
+        }
+        argb = map;
+    }
+
+    uint8_t* y_plane = static_cast<uint8_t*>(frame->planes[0]);
+    uint8_t* uv_plane = static_cast<uint8_t*>(frame->planes[1]);
+    const uint32_t y_stride = frame->strides[0];
+    const uint32_t uv_stride = frame->strides[1];
+    const uint32_t dx = qf.dest_x;
+    const uint32_t dy = qf.dest_y;
+
+    for (uint32_t by = 0; by < qf.height; by += 2u) {
+        const uint8_t* srow0 = argb + static_cast<size_t>(by) * qf.stride;
+        const uint8_t* srow1 = (by + 1u < qf.height)
+            ? srow0 + qf.stride : nullptr;
+        uint8_t* yrow0 = y_plane + static_cast<size_t>(dy + by) * y_stride + dx;
+        uint8_t* yrow1 = (by + 1u < qf.height) ? yrow0 + y_stride : nullptr;
+        uint8_t* uvrow = uv_plane +
+                         static_cast<size_t>((dy + by) / 2u) * uv_stride + dx;
+
+        for (uint32_t bx = 0; bx < qf.width; bx += 2u) {
+            const bool two_cols = (bx + 1u < qf.width);
+            uint32_t sw = 0;          /* total coverage: sum of 4 alphas */
+            int32_t su = 0, sv = 0;   /* alpha-weighted source chroma sums */
+
+            /* Per-pixel luma blend + chroma accumulation, 2x2 block. */
+            for (uint32_t py = 0; py < 2u; ++py) {
+                const uint8_t* srow = py == 0u ? srow0 : srow1;
+                uint8_t* yrow = py == 0u ? yrow0 : yrow1;
+                if (!srow || !yrow) continue; /* odd trailing row can't happen (even h) */
+                for (uint32_t px = 0; px < 2u; ++px) {
+                    if (px == 1u && !two_cols) continue; /* even w, also can't happen */
+                    const uint8_t* p = srow + static_cast<size_t>(bx + px) * 4u;
+                    const uint8_t a = p[0];
+                    const uint8_t r = p[1];
+                    const uint8_t g = p[2];
+                    const uint8_t b = p[3];
+                    if (a == 0u) continue;
+                    const uint8_t yd = yrow[bx + px];
+                    yrow[bx + px] = static_cast<uint8_t>(
+                        (a * argb_y_of(r, g, b) + (255u - a) * yd + 128u) >> 8);
+                    sw += a;
+                    su += a * argb_u_of(r, g, b);
+                    sv += a * argb_v_of(r, g, b);
+                }
+            }
+
+            if (sw == 0u) {
+                continue; /* fully transparent block */
+            }
+            /* Block chroma: source = alpha-weighted average color;
+             * dest = coverage-weighted mix with the existing chroma. */
+            const uint8_t u_src = static_cast<uint8_t>((su + sw / 2u) / sw);
+            const uint8_t v_src = static_cast<uint8_t>((sv + sw / 2u) / sw);
+            /* UV addressing is in BYTES, like inject_nv12_copy: one u,v pair
+             * (2 bytes) per 2 luma columns, so block bx (luma cols dx+bx,
+             * dx+bx+1) sits at byte offset dx+bx of the uv row — uvrow
+             * already carries the dx base, the per-block step is just bx.
+             * A bx*2 step writes every other chroma sample and spills past
+             * the row end into the next chroma row's left edge. */
+            uint8_t* uvp = uvrow + static_cast<size_t>(bx);
+            uvp[0] = static_cast<uint8_t>((sw * u_src + (1020u - sw) * uvp[0] + 510u) / 1020u);
+            uvp[1] = static_cast<uint8_t>((sw * v_src + (1020u - sw) * uvp[1] + 510u) / 1020u);
+        }
+    }
+
+    if (map) {
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+        (void)ioctl(src->dma_fds[0], DMA_BUF_IOCTL_SYNC, &sync);
+        (void)munmap(map, src->sizes[0]);
+    }
+}
+
 void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_name,
                                                   HalFrameBuffer* frame) {
     if (!frame) {
         return;
+    }
+
+    // Live stream dims cache (P2-12): cheap shared-lock compare every
+    // frame, unique-lock write only on change. Feeds the InjectionService
+    // stream_dims resolver so push-time geometry checks work even before
+    // the first frame of a freshly (re)started stream.
+    {
+        std::shared_lock<std::shared_mutex> lk(stream_dims_mu_);
+        const auto it = stream_dims_.find(dispatch_name);
+        if (it == stream_dims_.end() ||
+            it->second.first != frame->width ||
+            it->second.second != frame->height) {
+            lk.unlock();
+            std::unique_lock<std::shared_mutex> ulk(stream_dims_mu_);
+            stream_dims_[dispatch_name] = {frame->width, frame->height};
+        }
     }
 
     // Dynamic Privacy Mask: bake the worker-produced bytemask onto
@@ -1511,6 +1791,73 @@ void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_na
         }
         if (dpm_capture && dpm_capture->is_running()) {
             dpm_capture->offer_frame(frame);
+        }
+    }
+
+    // App frame injection (PushFrame P0-P2): with the DPM offer above
+    // already made on the real ISP pixels (its DSP resize is
+    // synchronous, so the worker's copies are already made), compose the
+    // newest due queued app frame FOR THIS STREAM over THIS pipeline
+    // buffer. Everything below — DPM mask/mosaic, AI overlay,
+    // frame_router subscribers and the frontend bridge's encoder
+    // add_buffer — then consumes the composed pixels, while platform
+    // masking draws on top by construction (frame-injection.md risk 4:
+    // the worker never sees injected content and the mask always wins
+    // over REPLACE). Dispatch: stream-targeted items follow their
+    // stream_id; legacy (empty stream_id) REPLACE items follow the P0
+    // dims-match rule. pts pacing (pts_ns vs frame timestamp, device
+    // CLOCK_MONOTONIC domain) picks the newest due item and drops
+    // superseded older ones inside take_frame. Composition by mode:
+    //   REPLACE  NV12 content copy over the whole frame (dims must equal
+    //            the encode dims — push-time checks are best-effort, a
+    //            mid-session reconfigure ends here as a WARN skip);
+    //   OVERLAY  NV12 opaque inset paste at (dest_x, dest_y), or ARGB32
+    //            CPU alpha blend (bounds hard-checked against this
+    //            frame).
+    // With no session, nothing due, or a mismatch it is an O(1) miss
+    // and the ISP pixels flow on untouched. The queued pin releases at
+    // this scope's exit, after the compose.
+    if (injection_service_) {
+        InjectionService::QueuedFrame qf;
+        if (injection_service_->take_frame(dispatch_name, frame->width,
+                                           frame->height,
+                                           frame->timestamp_ns, qf)) {
+            const HalFrameBuffer* src = qf.pin.fb();
+            if (qf.mode == InjectionMode::Replace) {
+                if (qf.width == frame->width && qf.height == frame->height &&
+                    src && src->format == HAL_PIX_FMT_NV12) {
+                    inject_nv12_copy(qf, frame, 0, 0);
+                } else {
+                    HAL_LOG_WARNING("CameraDaemon: injected REPLACE %ux%u does "
+                                    "not match stream '%s' %ux%u, dropping it",
+                                    qf.width, qf.height, dispatch_name.c_str(),
+                                    frame->width, frame->height);
+                }
+            } else if (src && qf.dest_x + qf.width <= frame->width &&
+                       qf.dest_y + qf.height <= frame->height) {
+                if (src->format == HAL_PIX_FMT_NV12) {
+                    inject_nv12_copy(qf, frame, qf.dest_x, qf.dest_y);
+                } else if (src->format == HAL_PIX_FMT_ARGB32) {
+                    inject_argb_blend(qf, frame);
+                } else {
+                    HAL_LOG_WARNING("CameraDaemon: injected OVERLAY has "
+                                    "unsupported format %d, dropping it",
+                                    static_cast<int>(src->format));
+                }
+            } else {
+                HAL_LOG_WARNING("CameraDaemon: injected OVERLAY %u+%u, %u+%u "
+                                "exceeds stream '%s' %ux%u, dropping it",
+                                qf.dest_x, qf.width, qf.dest_y, qf.height,
+                                dispatch_name.c_str(), frame->width,
+                                frame->height);
+            }
+            // Write-lease release (Fix-1): every path above has finished
+            // reading the injected pixels (compose or skip), so the SDK
+            // may rewrite this pool slot from the next PushFrame response
+            // on. Before this ack the id stays in the daemon's in-flight
+            // set even across an EOS/owner-disconnect session close that
+            // lands mid-bake.
+            injection_service_->note_bake_done(qf.buffer_id);
         }
     }
 
@@ -5143,6 +5490,24 @@ void CameraDaemon::get_stream_status(aipc::camera::GetStreamStatusResponse& resp
         uint64_t ms = encoder_mgr_->ms_since_last_packet(enc_name);
         info->set_ms_since_last_frame(ms);  // UINT64_MAX sentinel → JSON null on the Go side
 
+        // Unified drop/throughput observability (P1-10): publisher-side
+        // counters (seq assignments, overflow evictions, per-client
+        // skips/failures) and overlay bake-side counters on one surface.
+        // Fields stay zero when a layer is absent (publisher disabled /
+        // stream never through the bake site) so the response shape is
+        // stable. Publisher streams are keyed by config name — the encoder
+        // output callback translates media names back to it.
+        EncodedPublisher::StreamDropStats ds{};
+        if (encoded_pub_ && encoded_pub_->get_stream_stats(ec.stream_name, &ds)) {
+            info->set_packets_published(ds.packets_published);
+            info->set_queue_overflow_drops(ds.queue_overflow_drops);
+            info->set_client_send_drops(ds.client_send_drops);
+            info->set_client_send_failures(ds.client_send_failures);
+            info->set_client_disconnects(ds.client_disconnects);
+            info->set_last_packet_seq(ds.last_packet_seq);
+            info->set_publisher_clients(ds.clients);
+        }
+
         bool stalled = encoder_mgr_->is_stream_stalled(enc_name, kStallThresholdMs, kStartupGraceMs);
         bool seen    = encoder_mgr_->seen_first_packet(enc_name);
 
@@ -6599,6 +6964,13 @@ void CameraDaemon::shutdown() {
     // 3d. Stop FD publisher (releases DMA-BUF references)
     if (fd_pub_) {
         fd_pub_->stop();
+    }
+
+    // 3d-1. Stop frame injection FIRST: its queue holds BufferPins against
+    //       the DSP registry that 3e below is about to drain and destroy.
+    if (injection_service_) {
+        injection_service_->stop();
+        injection_service_.reset();
     }
 
     // 3e. Stop DSP offload service (drains leftover jobs, frees remaining

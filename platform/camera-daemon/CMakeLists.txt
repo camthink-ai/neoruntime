@@ -196,6 +196,7 @@ set(SOURCES
     src/audio_service.cpp
     src/dpm_worker.cpp
     src/dsp_service.cpp
+    src/injection_service.cpp
     src/autofocus_controller.cpp
     src/illumination_controller.cpp
     src/daynight_policy.cpp
@@ -287,6 +288,20 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(daynight-policy-test PRIVATE pthread)
     add_test(NAME daynight-policy-test COMMAND daynight-policy-test)
 
+    add_executable(injection-owner-test
+        tests/injection_owner_test.cpp
+        src/injection_service.cpp
+        src/dsp_service.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(injection-owner-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(injection-owner-test PRIVATE pthread rt)
+    add_test(NAME injection-owner-test COMMAND injection-owner-test)
     add_executable(fg2009-position-test
         tests/fg2009_position_test.cpp
         ${HAL_COMMON_DIR}/devices/hal_lens_fg2009.c

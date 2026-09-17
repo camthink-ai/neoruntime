@@ -349,6 +349,7 @@ static DaemonConfig load_config(const std::string& path) {
     cfg.fd_pub_sock_path = "/run/aipc/camera.sock";
     cfg.fd_pub_max_clients = 16;
     cfg.fd_pub_max_outstanding = 3;
+    cfg.fd_pub_lease_ms = 200;
     cfg.rtsp_enabled = true;
     cfg.rtsp_port = 8554;
     cfg.encoded_pub_enabled = true;
@@ -418,6 +419,7 @@ static DaemonConfig load_config(const std::string& path) {
         if (trimmed.find("service:") == 0) { section = "service"; continue; }
         if (trimmed.find("lens:") == 0) { section = "lens"; lens_subsection.clear(); continue; }
         if (trimmed.find("dsp:") == 0) { section = "dsp"; continue; }
+        if (trimmed.find("injection:") == 0) { section = "injection"; continue; }
         if (trimmed.find("streams:") == 0) { section = "streams"; cfg.streams.clear(); continue; }
         if (trimmed.find("encoders:") == 0) { section = "encoders"; cfg.encoders.clear(); continue; }
 
@@ -485,6 +487,34 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.dsp.max_total_import_bytes = parse_u32_config(val, "dsp.max_total_import_bytes");
             else if (trimmed.find("max_async_jobs_per_client:") != std::string::npos)
                 cfg.dsp.max_async_jobs_per_client = parse_u32_config(val, "dsp.max_async_jobs_per_client");
+        } else if (section == "injection") {
+            // P0-P2: app frame injection knobs (defaults live in
+            // injection_service.h). `enabled` is the master gate and ships
+            // false: opt-in, enable per deployment.
+            if (trimmed.find("enabled:") != std::string::npos)
+                cfg.injection.enabled = (val == "true" || val == "1");
+            else if (trimmed.find("queue_capacity:") != std::string::npos)
+                cfg.injection.queue_capacity = parse_u32_config(val, "injection.queue_capacity");
+            else if (trimmed.find("allowed_apps:") != std::string::npos) {
+                // P2-12 manifest permission gate: comma-separated app
+                // identities (SO_PEERCRED cmdline basenames). Empty/missing
+                // = allow all (development default).
+                cfg.injection.allowed_apps.clear();
+                size_t pos = 0;
+                while (pos <= val.size()) {
+                    size_t comma = val.find(',', pos);
+                    std::string app = val.substr(pos, (comma == std::string::npos
+                                                        ? val.size() : comma) - pos);
+                    /* trim spaces around each entry */
+                    const size_t b = app.find_first_not_of(" \t");
+                    const size_t e = app.find_last_not_of(" \t");
+                    if (b != std::string::npos)
+                        cfg.injection.allowed_apps.push_back(app.substr(b, e - b + 1));
+                    if (comma == std::string::npos)
+                        break;
+                    pos = comma + 1;
+                }
+            }
         } else if (section == "ai_overlay") {
             if (trimmed.find("enabled:") != std::string::npos)
                 cfg.ai_overlay_enabled = (val == "true" || val == "1");

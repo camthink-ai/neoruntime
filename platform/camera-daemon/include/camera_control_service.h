@@ -365,6 +365,34 @@ public:
         const aipc::camera::EncodeImageRequest* request,
         aipc::camera::EncodeImageResponse* response) override;
 
+    // App frame injection (PushFrame P0-P2; see docs proposals
+    // frame-injection.md). Metadata-only RPC: the pixel buffer rides
+    // camera.sock SCM_RIGHTS into the DSP registry; this references it by
+    // registry id. REPLACE takes NV12, OVERLAY adds ARGB32 + a required
+    // stream_id target; the bake site composes ahead of the encoder.
+    grpc::Status PushFrame(
+        grpc::ServerContext* context,
+        const aipc::camera::PushFrameRequest* request,
+        aipc::camera::PushFrameResponse* response) override;
+
+    // Client-streaming form (P2): each request is one push_frame; first
+    // rejection ends the stream with that error; an end_of_stream request
+    // closes the session; a clean half-close keeps it open.
+    grpc::Status PushFrameStream(
+        grpc::ServerContext* context,
+        grpc::ServerReader<aipc::camera::PushFrameRequest>* reader,
+        aipc::camera::PushFrameResponse* response) override;
+
+    grpc::Status GetInjectionStatus(
+        grpc::ServerContext* context,
+        const aipc::camera::Empty* request,
+        aipc::camera::InjectionStatusResponse* response) override;
+
+    grpc::Status StopInjection(
+        grpc::ServerContext* context,
+        const aipc::camera::Empty* request,
+        aipc::camera::InjectionStatusResponse* response) override;
+
 private:
     CameraDaemon* daemon_;
     /* Shared by the sync/async DSP submit handlers: maps the proto request

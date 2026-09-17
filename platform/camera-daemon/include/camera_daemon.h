@@ -66,6 +66,8 @@ class AudioService;
 class DpmWorker;
 class DspService;
 #include "dsp_service.h"
+class InjectionService;
+#include "injection_service.h"
 struct AudioCfg;
 
 #ifdef HAS_GRPC
@@ -157,6 +159,7 @@ struct DaemonConfig {
     std::string fd_pub_sock_path;
     uint32_t    fd_pub_max_clients;
     uint32_t    fd_pub_max_outstanding;
+    uint32_t    fd_pub_lease_ms;
 
     // Watchdog
     uint32_t    watchdog_scan_ms;
@@ -165,6 +168,11 @@ struct DaemonConfig {
 
     // DSP offload service (P2: `dsp:` YAML section; defaults in dsp_service.h)
     DspServiceConfig dsp;
+
+    // App frame injection (P0: `injection:` YAML section; defaults in
+    // injection_service.h). Master gate ships OFF — see the wiring TODOs
+    // in injection_service.cpp.
+    InjectionServiceConfig injection;
 
     // RTSP
     bool        rtsp_enabled;
@@ -558,6 +566,8 @@ public:
     AudioService* audio_service() const { return audio_service_.get(); }
     /** App-facing DSP offload service (null when HAL lacks DSP/buffer ops). */
     DspService* dsp_service() const { return dsp_service_.get(); }
+    /** App frame injection service (null when DSP registry is off). */
+    InjectionService* injection_service() const { return injection_service_.get(); }
 
 #ifdef HAS_GRPC
     /**
@@ -651,6 +661,17 @@ private:
     std::unique_ptr<EncoderManager> encoder_mgr_;
     std::unique_ptr<FdPublisher>    fd_pub_;
     std::unique_ptr<DspService>     dsp_service_;
+    // Frame injection (PushFrame P0) — holds BufferPins against the DSP
+    // registry, so it must be destroyed BEFORE dsp_service_ (declared
+    // after it; members destruct in reverse order).
+    std::unique_ptr<InjectionService> injection_service_;
+    // Live per-stream encode dims, observed at the bake site and fed to
+    // InjectionService's best-effort stream_dims resolver (P2-12). The
+    // frame IS the authority — this cache just answers push-time
+    // geometry questions before the first frame of a restarted stream.
+    // shared_mutex: the frame path reads it every frame, pushes are rare.
+    mutable std::shared_mutex stream_dims_mu_;
+    std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> stream_dims_;
     std::shared_ptr<RtspServer>     rtsp_server_;
     std::unique_ptr<EncodedPublisher> encoded_pub_;
     std::unique_ptr<AiOverlaySubscriber> ai_overlay_;
