@@ -596,6 +596,7 @@ static void fill_proto_post_result(pb::PostResult* out, const HalPostprocessResu
 
 namespace {
 
+// ─── Input admission limits ───────────────────────────────────────────────
 constexpr int kMaxInferBatchRequests = 64;
 constexpr uint64_t kMaxInferBatchInputBytes = 32ULL * 1024ULL * 1024ULL;
 
@@ -2543,7 +2544,7 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             std::shared_ptr<StreamDmaInputLease> direct_lease;
             bool early_released = false;
             uint64_t dsp_us = 0;
-            const uint64_t repack_us = 0;
+            uint64_t repack_us = 0;
 
             const bool nv12_model = model_in_w > 0 && model_in_h > 0;
             const bool nv12_frame = frame.format == HAL_PIX_FMT_NV12;
@@ -2623,9 +2624,55 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                 num_inputs = 1;
                 input_owner = direct_lease;
             } else if (num_inputs == 0) {
-                // Preserve the pre-existing non-NV12/unknown-model fallback.
-                num_inputs = build_nv12_tensors(frame, inputs);
-                input_owner = frame.fd_group;
+                // Packed-RGB-input model: convert through the session-aware
+                // preprocess. build_nv12_tensors can never match an RGB model's
+                // byte_size and run() would reject every frame. The conversion
+                // cost is reported in repack_us (it is the CPU stage of this
+                // path).
+                const bool rgb_model = snap->model_info.num_inputs > 0 &&
+                    !snap->model_info.inputs[0].is_nv12;
+                bool converted = false;
+                if (rgb_model && nv12_frame) {
+                    const uint64_t conv_t0 = now_us();
+                    std::string conv_why;
+                    converted = convert_nv12_frame_to_input(
+                        snap->infer_session, model_mgr_, frame.width,
+                        frame.height, frame.num_planes, frame.strides,
+                        frame.sizes,
+                        frame.fd_group ? frame.fd_group->fds
+                                       : std::vector<int>(),
+                        inputs[0], conv_why);
+                    repack_us = now_us() - conv_t0;
+                    if (converted) {
+                        num_inputs = 1;
+                        // The tensor owns its pixels; free_tensor runs when the
+                        // last input_owner ref drops (after the NPU read) — the
+                        // source fd dups ride along via keep_fds.
+                        input_owner.reset(
+                            new HalTensor(inputs[0]),
+                            [this, keep_fds = frame.fd_group](void* p) {
+                                auto* t = static_cast<HalTensor*>(p);
+                                model_mgr_->free_tensor(t);
+                                delete t;
+                            });
+                    } else {
+                        frame.delivery.acknowledge();
+                        resp.set_frame_sequence(frame.sequence);
+                        resp.set_timestamp_ns(frame.timestamp_ns);
+                        resp.mutable_status()->set_success(false);
+                        resp.mutable_status()->set_message(
+                            "Frame conversion failed: " + conv_why);
+                        resp.mutable_perf()->set_repack_us(repack_us);
+                        resp.mutable_perf()->set_dsp_us(dsp_us);
+                        if (!writer->Write(resp)) break;
+                        continue;
+                    }
+                }
+                if (!converted) {
+                    // Preserve the pre-existing non-NV12/unknown-model fallback.
+                    num_inputs = build_nv12_tensors(frame, inputs);
+                    input_owner = frame.fd_group;
+                }
             }
 
             resp.set_frame_sequence(frame.sequence);
@@ -2872,8 +2919,19 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             // later and does its own free/release — no leak, and its
             // admission permit is released by on_complete (not here).
             uint32_t stream_timeout_ms = 5000;
-            if (future.wait_for(std::chrono::milliseconds(stream_timeout_ms))
-                != std::future_status::ready) {
+            constexpr uint32_t WAIT_SLICE_MS = 50;
+            uint32_t waited_ms = 0;
+            std::future_status fstat = std::future_status::timeout;
+            while (!ctx->IsCancelled()
+                   && fstat != std::future_status::ready
+                   && waited_ms < stream_timeout_ms) {
+                fstat = future.wait_for(
+                    std::chrono::milliseconds(WAIT_SLICE_MS));
+                waited_ms += WAIT_SLICE_MS;
+            }
+            if (fstat != std::future_status::ready) {
+                if (ctx->IsCancelled()) break;  // drop the response;
+                                                // on_complete self-cleans
                 LOG_WARN("StreamInfer: inference timeout, skipping frame");
                 // Do not release admission here; on_complete still owns it.
                 // Do NOT touch stream_resp — on_complete owns it.
@@ -2915,7 +2973,10 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
     // block forever if a HAL job is stuck. Late callbacks self-clean
     // (free + release + in_flight--) so it's safe to return.
     {
-        auto deadline = SteadyClock::now() + Milliseconds(5000);
+        // Cancelled streams get a shorter drain — the client is gone and
+        // late callbacks self-clean, so the full window buys nothing.
+        auto deadline = SteadyClock::now()
+            + Milliseconds(ctx->IsCancelled() ? 1000 : 5000);
         while (in_flight->load() > 0) {
             if (SteadyClock::now() >= deadline) {
                 LOG_WARN("StreamInfer: drain timeout, %u orphan job(s) — "
