@@ -1622,6 +1622,18 @@ grpc::Status CameraControlServiceImpl::SubmitDspJob(
     response->set_message(ok && result.message.empty() ? "OK" : result.message);
     response->set_error_code(result.rc);
     response->set_elapsed_ms(result.elapsed_ms);
+    // Server-side trace for failed DSP jobs: without it a firmware-level
+    // failure surfaced only on the client and the daemon journal kept zero
+    // evidence for post-mortems. Successes stay at INFO above; failures
+    // log at ERROR with rc + service message.
+    if (!ok) {
+        HAL_LOG_ERROR("[CameraControl] SubmitDspJob FAILED: op=%d src=%lu "
+                      "dsts=%zu rects=%zu rc=%d elapsed_ms=%u msg='%s'",
+                      static_cast<int>(request->op()),
+                      (unsigned long)desc.src_id, desc.dst_ids.size(),
+                      desc.rects.size(), result.rc, result.elapsed_ms,
+                      result.message.c_str());
+    }
     return grpc::Status::OK;
 }
 
@@ -1661,6 +1673,15 @@ grpc::Status CameraControlServiceImpl::SubmitDspJobAsync(
     response->set_error_code(result.rc);
     response->set_job_id(job_id);
     response->set_done(false); /* enqueued, not executed */
+    // Same server-side failure trace as the sync path.
+    if (!ok) {
+        HAL_LOG_ERROR("[CameraControl] SubmitDspJobAsync FAILED: op=%d src=%lu "
+                      "dsts=%zu rects=%zu rc=%d msg='%s'",
+                      static_cast<int>(request->op()),
+                      (unsigned long)desc.src_id, desc.dst_ids.size(),
+                      desc.rects.size(), result.rc,
+                      result.message.c_str());
+    }
     return grpc::Status::OK;
 }
 
@@ -1719,12 +1740,18 @@ grpc::Status CameraControlServiceImpl::WaitDspJob(
     response->set_error_code(result.rc);
     response->set_elapsed_ms(result.elapsed_ms);
     response->set_job_id(request->job_id());
-    /* done tracks the job's lifecycle, not its outcome: a completed job
-     * with a nonzero HAL rc is done too, and reporting it as pending would
-     * send the client back to a poll that can only answer "unknown or
-     * reaped job id" (the entry is dropped at reap). false = still pending
-     * (timeout / poll) or unknown id — error_code separates those two. */
-    response->set_done(done);
+    /* false = still pending (timeout / poll) or unknown id — the error_code
+     * separates those two cases. */
+    response->set_done(ok);
+    // Failure trace — but skip ERR_TIMEOUT: clients poll wait_job in a loop
+    // and a timeout return is the normal "still pending" poll result, not a
+    // job failure. Logging it would flood the journal once per poll.
+    if (!ok && result.rc != DSP_SVC_ERR_TIMEOUT) {
+        HAL_LOG_ERROR("[CameraControl] WaitDspJob FAILED: job_id=%lu rc=%d "
+                      "elapsed_ms=%u msg='%s'",
+                      (unsigned long)request->job_id(), result.rc,
+                      result.elapsed_ms, result.message.c_str());
+    }
     return grpc::Status::OK;
 }
 
