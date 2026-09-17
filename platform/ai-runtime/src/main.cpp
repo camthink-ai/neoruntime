@@ -150,9 +150,13 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Resolves Tensor.buffer_id inference inputs against camera-daemon's DSP
+    // buffer registry (same UDS). Lazily connects on first use.
+    BufferLookupClient buffer_lookup(cfg.fd_socket_path);
+
     // ── gRPC server ──────────────────────────────────────────────────────────
     AIRuntimeServiceImpl service(cfg, &model_mgr, &session_mgr,
-                                 &scheduler, &fd_receiver, &event_bus,
+                                 &scheduler, &fd_receiver, &buffer_lookup, &event_bus,
                                  &postprocess_pool, &dsp_client,
                                  hal_loader.clip_text_enc_ops(),
                                  hal_loader.genai_ops());

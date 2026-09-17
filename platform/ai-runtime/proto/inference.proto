@@ -43,9 +43,17 @@ message Tensor {
   repeated int32 shape = 1;
   DataType dtype = 2;
   bytes data = 3;
-  
+
   // Optional: DMA-BUF (zero-copy)
   int32 dma_fd = 4;
+
+  // Cross-process frame reference: id in camera-daemon's DSP buffer registry
+  // (from DSP_ALLOC or DSP_IMPORT over the camera.sock UDS). ai-runtime
+  // resolves it back to fds+geometry via DSP_LOOKUP and repacks into its own
+  // input buffer — the frame never crosses gRPC as pixels. Mutually exclusive
+  // with data/dma_fd; dma_fd (a raw fd number from another process) is
+  // rejected by ai-runtime.
+  uint64 buffer_id = 5;
 }
 
 // ============ Model management ============

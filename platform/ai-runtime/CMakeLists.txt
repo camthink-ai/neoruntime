@@ -217,6 +217,7 @@ set(SOURCES
     src/inference_scheduler.cpp
     src/postprocess_pool.cpp
     src/fd_receiver.cpp
+    src/buffer_lookup.cpp
     src/dsp_client.cpp
     src/event_bus_client.cpp
     src/config.cpp

@@ -1698,9 +1698,14 @@ static int hailo15_infer_tensor_from_frame_ex(HalInferenceSession *session,
                           p->cfg.preprocess.color == HAL_PREPROCESS_COLOR_RGB_TO_BGR);
     /* Packed 3-channel interleaved model inputs only: NV12-order inputs are
      * served by the exact-match fast path above and cannot be resized on the
-     * CPU staging path; planar (NHCW) or non-3-channel inputs are rejected. */
+     * CPU staging path; planar (NHCW) or non-3-channel inputs are rejected.
+     * F8CR is the quantized packed 8-bit order vendor detection HEFs report
+     * (e.g. yolov5m_vehicles 1080p RGB): byte-compatible with the staged
+     * RGB888 buffer — the raw array path feeds those models the identical
+     * flat uint8 tensor. */
     const bool packed_rgb_ok =
-        (dfm.order == HAILO_FORMAT_ORDER_RGB888 || dfm.order == HAILO_FORMAT_ORDER_NHWC) &&
+        (dfm.order == HAILO_FORMAT_ORDER_RGB888 || dfm.order == HAILO_FORMAT_ORDER_NHWC ||
+         dfm.order == HAILO_FORMAT_ORDER_F8CR) &&
         dsh.features == 3;
     if (!packed_rgb_ok)
     {
@@ -2464,5 +2469,10 @@ HalInferenceOps HAL_INFERENCE_OPS = {
     .bind_dma_frame = hailo15_infer_bind_dma_frame,
     .probe_capability = hailo15_infer_probe_capability,
 };
+
+/* ABI guard companion (see hal_inference.h): sizeof the table this build
+ * exports, so consumers refuse tail members an older table lacks instead of
+ * reading past its end (mixed-deploy SIGILL, two core dumps 2026-09-16). */
+const uint32_t HAL_INFERENCE_OPS_ABI_SIZE = (uint32_t)sizeof(HalInferenceOps);
 
 } // extern "C"

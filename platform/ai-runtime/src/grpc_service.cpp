@@ -21,6 +21,7 @@
 #include <future>
 #include <limits>
 #include <unistd.h>
+#include <sys/mman.h>
 
 namespace aipc::ai_runtime {
 
@@ -33,6 +34,7 @@ AIRuntimeServiceImpl::AIRuntimeServiceImpl(
     SessionManager* session_mgr,
     InferenceScheduler* scheduler,
     FdReceiver* fd_receiver,
+    BufferLookupClient* buffer_lookup,
     EventBusClient* event_bus,
     PostprocessPool* postprocess_pool,
     DspClient* dsp_client,
@@ -49,6 +51,7 @@ AIRuntimeServiceImpl::AIRuntimeServiceImpl(
     , session_mgr_(session_mgr)
     , scheduler_(scheduler)
     , fd_receiver_(fd_receiver)
+    , buffer_lookup_(buffer_lookup)
     , event_bus_(event_bus)
     , postprocess_pool_(postprocess_pool)
     , dsp_client_(dsp_client)
@@ -626,6 +629,248 @@ bool validate_infer_inputs(const pb::InferRequest& request,
     return true;
 }
 
+// Repack an NV12 frame received as per-plane dma-buf fds into a tight
+// [h*3/2, w] UINT8 CPU buffer — byte-for-byte the layout the bytes path
+// sends, so downstream geometry validation is identical. One dma-buf per
+// plane, plane data at offset 0 (platform convention: DSP pool allocs,
+// imports, and subscribed frames). Returns false with a reason on any
+// layout it cannot map.
+bool repack_nv12_planes(uint32_t width, uint32_t height, uint32_t format,
+                        uint32_t num_planes, const uint32_t* strides,
+                        const uint32_t* sizes, const std::vector<int>& fds,
+                        std::string& out, std::string& why) {
+    constexpr uint32_t kHalPixFmtNv12 = 0;  // HalPixelFormat NV12
+    if (format != kHalPixFmtNv12) {
+        why = "frame format is not NV12 (repack supports NV12 only)";
+        return false;
+    }
+    if (num_planes != 2) {
+        why = "NV12 frame must have 2 planes, got " + std::to_string(num_planes);
+        return false;
+    }
+    const uint32_t w = width, h = height;
+    if (w == 0 || h == 0 || (h & 1) != 0) {
+        why = "invalid NV12 geometry";
+        return false;
+    }
+    if (fds.size() < 2) {
+        why = "NV12 frame must carry 2 plane fds, got "
+              + std::to_string(fds.size());
+        return false;
+    }
+    const uint32_t uv_rows = h / 2;
+    if (strides[0] < w || sizes[0] < (uint64_t)strides[0] * h) {
+        why = "Y plane smaller than stride*height";
+        return false;
+    }
+    if (strides[1] < w || sizes[1] < (uint64_t)strides[1] * uv_rows) {
+        why = "UV plane smaller than stride*(height/2)";
+        return false;
+    }
+
+    out.assign((size_t)w * h * 3 / 2, '\0');
+
+    void* maps[2] = {nullptr, nullptr};
+    const uint32_t rows[2] = {h, uv_rows};
+    bool ok = true;
+    for (int p = 0; p < 2 && ok; ++p) {
+        maps[p] = mmap(nullptr, sizes[p], PROT_READ, MAP_SHARED, fds[p], 0);
+        if (maps[p] == MAP_FAILED) {
+            maps[p] = nullptr;
+            why = "mmap of plane " + std::to_string(p) + " failed";
+            ok = false;
+        }
+    }
+    if (ok) {
+        char* dst = out.data();
+        for (int p = 0; p < 2; ++p) {
+            const char* src  = static_cast<const char*>(maps[p]);
+            uint32_t   stride = strides[p];
+            for (uint32_t row = 0; row < rows[p]; ++row) {
+                memcpy(dst, src + (size_t)row * stride, w);
+                dst += w;
+            }
+        }
+    }
+    for (int p = 0; p < 2; ++p) {
+        if (maps[p]) munmap(maps[p], sizes[p]);
+    }
+    return ok;
+}
+
+// Frame fetched via Tensor.buffer_id (per-plane dma-buf fds + geometry from
+// BufferLookupClient).
+bool repack_nv12_planes(const BufferLookupClient::LookupResult& r,
+                        std::string& out, std::string& why) {
+    return repack_nv12_planes(r.width, r.height, r.format, r.num_planes,
+                              r.strides, r.sizes, r.fds, out, why);
+}
+
+// ─── P1-2: buffer_id direct-bind ─────────────────────────────────────────────
+
+// Borrowed resources behind a direct-bound input frame. The registry lease
+// and the dup'd plane fds must outlive the NPU read, so ownership rides with
+// the request (Infer: on_complete lambda capture; InferBatch: the item ctx)
+// and this destructor returns everything exactly once.
+struct DmaInputLease {
+    ModelManager*                  mgr = nullptr;  // free_tensor for bound inputs
+    std::vector<HalTensor>         bound;          // canonical priv owners
+    std::vector<int>               fds;            // dup'd plane fds from lookup()
+    BufferLookupClient*            lookup = nullptr;
+    std::vector<uint64_t>          buffer_ids;     // pinned registry ids
+    ~DmaInputLease() {
+        if (mgr)
+            for (auto& t : bound) mgr->free_tensor(&t);
+        for (int fd : fds) close(fd);
+        if (lookup)
+            for (uint64_t id : buffer_ids) lookup->release(id);
+    }
+};
+
+// Try fd direct-bind for a Tensor.buffer_id input. When the looked-up frame
+// is a compact NV12 dmabuf whose geometry matches the model's first input,
+// bind_dma_frame() returns a zero-CPU-copy tensor and the mmap+memcpy repack
+// is skipped entirely. Any contract mismatch (padding, geometry, format)
+// returns false and the caller falls back to the repack unchanged. On
+// success `lease` accumulates the borrowed fds + registry pin; the caller
+// must keep it alive until the inference has completed.
+bool try_bind_dma_input(HalInferenceSession* sess, ModelManager* mgr,
+                        const HalModelInfo& mi,
+                        const BufferLookupClient::LookupResult& r,
+                        uint64_t buffer_id, BufferLookupClient* lookup,
+                        HalTensor& ht, std::shared_ptr<DmaInputLease>& lease) {
+    constexpr uint32_t kHalPixFmtNv12 = 0;  // HalPixelFormat NV12
+    if (!sess || !mgr || r.format != kHalPixFmtNv12 ||
+        r.width == 0 || r.height == 0 || r.fds.empty())
+        return false;
+    // Format/geometry precheck (2026-09-16 remediation #10): the bind
+    // contract is exact-geometry NV12. A model whose first input is not an
+    // NV12 blob, or an NV12 model of different dimensions, can never bind —
+    // skip the HAL call (and its per-frame ERROR log) instead of retrying
+    // every frame.
+    if (mi.num_inputs == 0 || !mi.inputs[0].is_nv12 ||
+        mi.inputs[0].byte_size != (uint64_t)r.width * r.height * 3 / 2)
+        return false;
+    const HalInferenceOps* ops = mgr->infer_ops();
+    // ABI guard: an older HAL's table ends before bind_dma_frame — the slot
+    // then reads adjacent rodata, not NULL, so the pointer check alone
+    // cannot catch it (R1 SIGILL at the StreamPreprocessPool::bind site).
+    if (!ops || !mgr->has_infer_op(offsetof(HalInferenceOps, bind_dma_frame)) ||
+        !ops->bind_dma_frame)
+        return false;
+
+    HalDmaFrameDesc desc{};
+    desc.format   = HAL_PIX_FMT_NV12;
+    desc.width    = r.width;
+    desc.height   = r.height;
+    desc.borrowed = 1;  // fds stay owned by the lease
+    const uint32_t rows[HAL_MAX_PLANES] = {r.height, r.height / 2, 0};
+    for (uint32_t p = 0; p < r.num_planes && p < HAL_MAX_PLANES; p++) {
+        desc.fd[p]         = r.fds[p];
+        desc.offset[p]     = 0;  // registry plane fds are whole dmabufs
+        desc.stride[p]     = r.strides[p];
+        desc.bytes_used[p] = (uint64_t)r.strides[p] * rows[p];
+    }
+    for (uint32_t p = r.num_planes < HAL_MAX_PLANES ? r.num_planes : HAL_MAX_PLANES;
+         p < HAL_MAX_PLANES; p++)
+        desc.fd[p] = -1;
+    if (r.num_planes == 1)
+        desc.bytes_used[0] = (uint64_t)r.width * r.height * 3 / 2;
+
+    HalTensor bound{};
+    if (ops->bind_dma_frame(sess, &desc, &bound) != HAL_OK)
+        return false;  // off-contract → repack fallback, fds still ours to close
+
+    static std::atomic<bool> s_bind_logged{false};
+    if (!s_bind_logged.exchange(true))
+        LOG_INFO("buffer_id direct-bind engaged (%ux%u NV12, zero repack)",
+                 (unsigned)r.width, (unsigned)r.height);
+
+    ht = bound;
+    if (!lease) {
+        lease         = std::make_shared<DmaInputLease>();
+        lease->mgr    = mgr;
+        lease->lookup = lookup;
+    }
+    lease->bound.push_back(bound);
+    // fd ownership moves into the lease: the descriptor copied the fd NUMBERS,
+    // the lease closes them after the NPU read completes.
+    lease->fds.insert(lease->fds.end(), r.fds.begin(), r.fds.end());
+    lease->buffer_ids.push_back(buffer_id);
+    return true;
+}
+
+// NV12 → model-input conversion fallback (2026-09-16 remediation #10, and
+// the R4 attribution correction): a model whose first input is packed RGB
+// (yolov5m_vehicles, tiny_yolov4_license_plates, …) can neither direct-bind
+// (NV12-only contract) nor consume the tight NV12 repack — its byte_size can
+// never match, so run() used to reject every frame with a per-frame HAL
+// ERROR while the client saw the inference fail. tensor_from_frame_ex is
+// the session-aware path built for exactly this case: BT.601 NV12→RGB plus
+// bilinear resize into a model-shaped tensor. The returned tensor owns its
+// buffer through priv — release it via ModelManager::free_tensor (the
+// DmaInputLease bound-vector already does exactly that).
+bool convert_nv12_frame_to_input(HalInferenceSession* sess, ModelManager* mgr,
+                                 uint32_t width, uint32_t height,
+                                 uint32_t num_planes, const uint32_t* strides,
+                                 const uint32_t* sizes, const std::vector<int>& fds,
+                                 HalTensor& ht, std::string& why) {
+    const HalInferenceOps* ops = mgr->infer_ops();
+    if (!ops ||
+        !mgr->has_infer_op(offsetof(HalInferenceOps, tensor_from_frame_ex)) ||
+        !ops->tensor_from_frame_ex) {
+        why = "model input is not NV12 and this HAL has no tensor_from_frame_ex "
+              "(deploy ai-runtime and HAL from the same build)";
+        return false;
+    }
+    if (num_planes < 2 || fds.size() < 2) {
+        why = "conversion needs a 2-plane NV12 frame, got " +
+              std::to_string(num_planes) + " plane(s)";
+        return false;
+    }
+
+    void* maps[2] = {nullptr, nullptr};
+    bool mapped = true;
+    for (int p = 0; p < 2 && mapped; ++p) {
+        maps[p] = mmap(nullptr, sizes[p], PROT_READ, MAP_SHARED, fds[p], 0);
+        if (maps[p] == MAP_FAILED) {
+            maps[p] = nullptr;
+            mapped = false;
+        }
+    }
+    bool converted = false;
+    if (!mapped) {
+        why = "mmap of frame planes failed";
+    } else {
+        HalFrameBuffer fb{};
+        fb.width      = width;
+        fb.height     = height;
+        fb.format     = HAL_PIX_FMT_NV12;
+        fb.num_planes = 2;
+        for (int p = 0; p < 2; ++p) {
+            fb.dma_fds[p] = fds[p];
+            fb.planes[p]  = maps[p];
+            fb.strides[p] = strides[p];
+            fb.sizes[p]   = sizes[p];
+        }
+        HalTensor out{};
+        if (ops->tensor_from_frame_ex(sess, &fb, &out) == HAL_OK) {
+            ht = out;
+            converted = true;
+            static std::atomic<bool> s_conv_logged{false};
+            if (!s_conv_logged.exchange(true))
+                LOG_INFO("NV12->RGB conversion fallback engaged "
+                         "(tensor_from_frame_ex, %ux%u source)",
+                         (unsigned)width, (unsigned)height);
+        } else {
+            why = "tensor_from_frame_ex rejected the frame";
+        }
+    }
+    for (int p = 0; p < 2; ++p)
+        if (maps[p]) munmap(maps[p], sizes[p]);
+    return converted;
+}
+
 }  // namespace
 
 // ─── Infer (synchronous single-shot) ─────────────────────────────────────────
@@ -697,23 +942,117 @@ grpc::Status AIRuntimeServiceImpl::Infer(
     // and invalidate previously stored data() pointers.
     auto input_data_holder = std::make_shared<std::vector<std::string>>();
     input_data_holder->resize(num_inputs);
+    // P1-2: owns borrowed fds + registry pins for direct-bound buffer_id
+    // inputs; captured by on_complete so they outlive the NPU read.
+    std::shared_ptr<DmaInputLease> dma_lease;
     auto input_tensors = std::make_shared<std::vector<HalTensor>>(num_inputs);
     for (int i = 0; i < num_inputs; i++) {
         auto& pb_t = req->inputs(i);
         auto& ht   = (*input_tensors)[i];
         std::memset(&ht, 0, sizeof(HalTensor));
 
-        // Assign to pre-allocated storage so the payload outlives the RPC.
-        // Numeric FDs are rejected at the gRPC boundary above.
-        (*input_data_holder)[i] = pb_t.data();
-        ht.data      = const_cast<char*>((*input_data_holder)[i].data());
-        ht.byte_size = static_cast<uint32_t>((*input_data_holder)[i].size());
-        ht.dma_fd    = -1;
+        if (pb_t.dma_fd() > 0) {
+            // A raw fd number from the caller's process is meaningless here —
+            // exactly the cross-process handoff the buffer_id path replaces.
+            // Reject loudly instead of binding a random descriptor.
+            resp->mutable_status()->set_success(false);
+            resp->mutable_status()->set_message(
+                "Tensor.dma_fd rejected: a raw fd number cannot cross "
+                "processes; pass the frame as bytes or a buffer_id");
+            return grpc::Status::OK;
+        }
 
-        ht.dtype = proto_dtype_to_hal(pb_t.dtype());
-        ht.ndim  = static_cast<int32_t>(pb_t.shape_size());
-        for (int d = 0; d < ht.ndim && d < HAL_MAX_TENSOR_DIMS; d++) {
-            ht.shape[d] = pb_t.shape(d);
+        bool frame_geometry = false;  // dtype/shape taken from the looked-up frame
+        if (pb_t.buffer_id() != 0) {
+            if (!buffer_lookup_) {
+                resp->mutable_status()->set_success(false);
+                resp->mutable_status()->set_message(
+                    "Tensor.buffer_id rejected: buffer registry not configured");
+                return grpc::Status::OK;
+            }
+            auto lr = buffer_lookup_->lookup(pb_t.buffer_id());
+            if (lr.rc != 0) {
+                resp->mutable_status()->set_success(false);
+                resp->mutable_status()->set_message(
+                    "Tensor.buffer_id lookup failed: " + lr.message);
+                return grpc::Status::OK;
+            }
+            std::string why;
+            // P1-2: fd direct-bind first — a compact layout matching the
+            // model's first input skips the mmap+memcpy repack entirely
+            // (try_bind_dma_input prechecks format/geometry; padding /
+            // geometry mismatch / non-NV12 falls through to the repack or
+            // the conversion below unchanged). First input only:
+            // bind_dma_frame validates against input 0.
+            const bool rgb_model = snap->model_info.num_inputs > 0 &&
+                !snap->model_info.inputs[0].is_nv12;
+            const bool bound = i == 0 &&
+                try_bind_dma_input(snap->infer_session, model_mgr_,
+                                   snap->model_info, lr,
+                                   pb_t.buffer_id(), buffer_lookup_, ht,
+                                   dma_lease);
+            if (!bound) {
+                bool prepared = false;
+                const char* prep = "repack";
+                if (i == 0 && rgb_model) {
+                    // Packed-RGB model: convert through the session-aware
+                    // preprocess — the NV12 repack's byte_size can never
+                    // match and run() would reject every frame.
+                    prep = "conversion";
+                    prepared = convert_nv12_frame_to_input(
+                        snap->infer_session, model_mgr_, lr.width, lr.height,
+                        lr.num_planes, lr.strides, lr.sizes, lr.fds, ht, why);
+                    if (prepared) {
+                        // Tensor owns its buffer; the lease free_tensor's it
+                        // once the NPU read completes.
+                        if (!dma_lease) {
+                            dma_lease      = std::make_shared<DmaInputLease>();
+                            dma_lease->mgr = model_mgr_;
+                        }
+                        dma_lease->bound.push_back(ht);
+                    }
+                } else {
+                    prepared = repack_nv12_planes(lr, (*input_data_holder)[i], why);
+                    if (prepared) {
+                        const uint32_t w = lr.width, h = lr.height;
+                        ht.data      = const_cast<char*>((*input_data_holder)[i].data());
+                        ht.byte_size = static_cast<uint32_t>(w) * h * 3 / 2;
+                        ht.dma_fd    = -1;
+                        // Geometry comes from the daemon's registry, not the wire, so a
+                        // mismatched client-declared shape never reaches the NPU.
+                        ht.dtype     = HAL_DTYPE_UINT8;
+                        ht.ndim      = 2;
+                        ht.shape[0]  = static_cast<int32_t>(h * 3 / 2);
+                        ht.shape[1]  = static_cast<int32_t>(w);
+                    }
+                }
+                for (int fd : lr.fds) close(fd);
+                // Lease dropped once our own copy exists (or cannot be made).
+                buffer_lookup_->release(pb_t.buffer_id());
+                if (!prepared) {
+                    resp->mutable_status()->set_success(false);
+                    resp->mutable_status()->set_message(
+                        std::string("Tensor.buffer_id ") + prep + " failed: " + why);
+                    return grpc::Status::OK;
+                }
+            }
+            // dtype/shape/byte_size of a bound tensor come from
+            // bind_dma_frame (desc-derived); both arms carry frame geometry.
+            frame_geometry = true;
+        } else {
+            // Assign to pre-allocated slot — no reallocation
+            (*input_data_holder)[i] = pb_t.data();
+            ht.data      = const_cast<char*>((*input_data_holder)[i].data());
+            ht.byte_size = static_cast<uint32_t>((*input_data_holder)[i].size());
+            ht.dma_fd    = -1;
+        }
+
+        if (!frame_geometry) {
+            ht.dtype = proto_dtype_to_hal(pb_t.dtype());
+            ht.ndim  = static_cast<int32_t>(pb_t.shape_size());
+            for (int d = 0; d < ht.ndim && d < HAL_MAX_TENSOR_DIMS; d++) {
+                ht.shape[d] = pb_t.shape(d);
+            }
         }
     }
 
@@ -728,7 +1067,8 @@ grpc::Status AIRuntimeServiceImpl::Infer(
     inf_req->resource_holder = input_data_holder;  // keep inputs alive
 
     inf_req->on_complete = [this, promise, response_ptr, post_session,
-                            enable_post, model_id, infer_session](
+                            enable_post, model_id, infer_session,
+                            input_tensors, session_id, dma_lease](
         int rc, HalTensor* outputs, int num_outputs,
         uint64_t infer_us, uint64_t queue_us,
         bool model_acquired) {
@@ -900,6 +1240,9 @@ struct InferBatchItemCtx {
     pb::InferResponse              response;
     std::vector<std::string>       input_data;   // owns CPU input payloads
     std::vector<HalTensor>         inputs;        // inputs[k].data -> input_data[k] or dma_fd
+    // P1-2: borrowed fds + registry pins for direct-bound buffer_id inputs;
+    // freed when the last ctx reference drops (late callbacks included).
+    std::shared_ptr<struct DmaInputLease> dma_lease;
     std::vector<HalTensor>         outputs;       // HAL-align output buffers (priv-owned)
     int                            max_outputs = 0;
     std::optional<ModelSnapshot>   snap;
@@ -1269,18 +1612,116 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
         const int num_inputs = infer_req.inputs_size();
         c->input_data.resize(num_inputs);
         c->inputs.resize(num_inputs);
+        bool item_failed = false;
+        std::string fail_msg;
         for (int j = 0; j < num_inputs; j++) {
             const auto& pb_t = infer_req.inputs(j);
             HalTensor&  ht   = c->inputs[j];
             std::memset(&ht, 0, sizeof(HalTensor));
-            c->input_data[j].assign(pb_t.data().data(), pb_t.data().size());
-            ht.data      = const_cast<char*>(c->input_data[j].data());
-            ht.byte_size = static_cast<uint32_t>(c->input_data[j].size());
-            ht.dma_fd    = -1;
-            ht.dtype = proto_dtype_to_hal(pb_t.dtype());
-            ht.ndim  = static_cast<int32_t>(pb_t.shape_size());
-            for (int d = 0; d < ht.ndim && d < HAL_MAX_TENSOR_DIMS; d++)
-                ht.shape[d] = pb_t.shape(d);
+            if (pb_t.dma_fd() > 0) {
+                // Cross-process raw fd — same red line as single Infer.
+                item_failed = true;
+                fail_msg = "Tensor.dma_fd rejected: a raw fd number cannot "
+                           "cross processes; pass the frame as bytes or a "
+                           "buffer_id";
+                break;
+            }
+            bool frame_geometry = false;  // dtype/shape from the looked-up frame
+            if (pb_t.buffer_id() != 0) {
+                if (!buffer_lookup_) {
+                    item_failed = true;
+                    fail_msg = "Tensor.buffer_id rejected: buffer registry not configured";
+                    break;
+                }
+                auto lr = buffer_lookup_->lookup(pb_t.buffer_id());
+                if (lr.rc != 0) {
+                    item_failed = true;
+                    fail_msg = "Tensor.buffer_id lookup failed: " + lr.message;
+                    break;
+                }
+                std::string why;
+                // P1-2: fd direct-bind first (first input only —
+                // bind_dma_frame validates against input 0).
+                // try_bind_dma_input prechecks format/geometry; off-contract
+                // frames repack or convert as before.
+                const bool rgb_model = c->snap->model_info.num_inputs > 0 &&
+                    !c->snap->model_info.inputs[0].is_nv12;
+                const bool bound = j == 0 &&
+                    try_bind_dma_input(c->snap->infer_session, model_mgr_,
+                                       c->snap->model_info, lr,
+                                       pb_t.buffer_id(), buffer_lookup_, ht,
+                                       c->dma_lease);
+                if (!bound) {
+                    bool prepared = false;
+                    const char* prep = "repack";
+                    if (j == 0 && rgb_model) {
+                        // Packed-RGB model: convert through the session-aware
+                        // preprocess — the NV12 repack's byte_size can never
+                        // match and run() would reject every frame.
+                        prep = "conversion";
+                        prepared = convert_nv12_frame_to_input(
+                            c->snap->infer_session, model_mgr_, lr.width,
+                            lr.height, lr.num_planes, lr.strides, lr.sizes,
+                            lr.fds, ht, why);
+                        if (prepared) {
+                            // Tensor owns its buffer; the lease free_tensor's
+                            // it once the NPU read completes.
+                            if (!c->dma_lease) {
+                                c->dma_lease      = std::make_shared<DmaInputLease>();
+                                c->dma_lease->mgr = model_mgr_;
+                            }
+                            c->dma_lease->bound.push_back(ht);
+                        }
+                    } else {
+                        prepared = repack_nv12_planes(lr, c->input_data[j], why);
+                        if (prepared) {
+                            const uint32_t w = lr.width, h = lr.height;
+                            ht.data      = const_cast<char*>(c->input_data[j].data());
+                            ht.byte_size = static_cast<uint32_t>(w) * h * 3 / 2;
+                            ht.dma_fd    = -1;
+                            // Geometry comes from the daemon's registry, not the wire.
+                            ht.dtype     = HAL_DTYPE_UINT8;
+                            ht.ndim      = 2;
+                            ht.shape[0]  = static_cast<int32_t>(h * 3 / 2);
+                            ht.shape[1]  = static_cast<int32_t>(w);
+                        }
+                    }
+                    for (int fd : lr.fds) close(fd);
+                    // Lease dropped once our own copy exists (or cannot be made).
+                    buffer_lookup_->release(pb_t.buffer_id());
+                    if (!prepared) {
+                        item_failed = true;
+                        fail_msg = std::string("Tensor.buffer_id ") + prep +
+                                   " failed: " + why;
+                        break;
+                    }
+                }
+                // dtype/shape/byte_size of a bound tensor come from
+                // bind_dma_frame; both arms carry frame geometry.
+                frame_geometry = true;
+            } else {
+                c->input_data[j].assign(pb_t.data().data(), pb_t.data().size());
+                ht.data      = const_cast<char*>(c->input_data[j].data());
+                ht.byte_size = static_cast<uint32_t>(c->input_data[j].size());
+                ht.dma_fd    = -1;
+            }
+            if (!frame_geometry) {
+                ht.dtype = proto_dtype_to_hal(pb_t.dtype());
+                ht.ndim  = static_cast<int32_t>(pb_t.shape_size());
+                for (int d = 0; d < ht.ndim && d < HAL_MAX_TENSOR_DIMS; d++)
+                    ht.shape[d] = pb_t.shape(d);
+            }
+        }
+        if (item_failed) {
+            // Release the model ref taken above — no async callback will fire.
+            if (!c->released.exchange(true)) {
+                model_mgr_->release_model(c->model_id);
+            }
+            c->response.mutable_status()->set_success(false);
+            c->response.mutable_status()->set_message(fail_msg);
+            c->done.store(true);
+            complete_now();
+            continue;
         }
 
         c->max_outputs = c->snap->num_outputs;

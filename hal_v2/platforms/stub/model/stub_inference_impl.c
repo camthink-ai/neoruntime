@@ -161,3 +161,6 @@ HalInferenceOps HAL_INFERENCE_OPS = {
     /* M3 addition (appended at the table tail, after get_version) */
     .tensor_from_frame_ex = stub_infer_tensor_from_frame_ex,
 };
+
+/* ABI guard companion (see hal_inference.h). */
+const uint32_t HAL_INFERENCE_OPS_ABI_SIZE = (uint32_t)sizeof(HalInferenceOps);

@@ -511,6 +511,31 @@ typedef struct HalInferenceOps {
 /* ========== Global Operations Table ========== */
 extern HalInferenceOps HAL_INFERENCE_OPS;
 
+/*
+ * ABI guard (2026-09-16, remediation for the mixed-deploy SIGILL):
+ * HalInferenceOps carries no in-struct size/version, so a consumer built
+ * against a newer header reads tail members (tensor_from_frame_ex,
+ * bind_dma_frame, probe_capability) past the end of an older provider's
+ * table and calls a garbage pointer. Providers export this SEPARATE symbol
+ * holding sizeof(HalInferenceOps); consumers dlsym it and require
+ * offsetof(HalInferenceOps, member) + sizeof(void*) before reading any
+ * member appended after get_version. A missing symbol means the provider
+ * predates the guard: treat every tail member as unavailable. Deliberately
+ * NOT a struct field — the member layout of already-shipped builds must
+ * stay byte-identical in both directions.
+ */
+extern const uint32_t HAL_INFERENCE_OPS_ABI_SIZE;
+
+/* 1 when the provider's table provably contains the member at member_offset
+ * (pass offsetof(HalInferenceOps, <member>)). abi_size may be NULL for
+ * pre-guard providers — that answers 0 for every offset. */
+static inline int hal_inference_ops_has(const uint32_t *abi_size,
+                                        size_t member_offset)
+{
+    return abi_size != 0 &&
+           *abi_size >= (uint32_t)(member_offset + sizeof(void *));
+}
+
 /* ========== On-chip NMS output decoding ========== */
 
 /**

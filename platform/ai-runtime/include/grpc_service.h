@@ -5,6 +5,7 @@
 #include "session_manager.h"
 #include "inference_scheduler.h"
 #include "fd_receiver.h"
+#include "buffer_lookup.h"
 #include "event_bus_client.h"
 #include "postprocess_pool.h"
 #include "stream_infer_utils.h"
@@ -32,6 +33,7 @@ public:
                          SessionManager* session_mgr,
                          InferenceScheduler* scheduler,
                          FdReceiver* fd_receiver,
+                         BufferLookupClient* buffer_lookup,
                          EventBusClient* event_bus,
                          PostprocessPool* postprocess_pool,
                          DspClient* dsp_client,
@@ -152,6 +154,7 @@ private:
     SessionManager*     session_mgr_;
     InferenceScheduler*  scheduler_;
     FdReceiver*          fd_receiver_;
+    BufferLookupClient*  buffer_lookup_;
     EventBusClient*      event_bus_;
     PostprocessPool*     postprocess_pool_;
     DspClient*           dsp_client_;      // stream DSP preprocess

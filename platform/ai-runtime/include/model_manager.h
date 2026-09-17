@@ -178,10 +178,17 @@ public:
 
     bool has_post_ops() const;
 
-    /// HAL inference ops table for service-layer tensor manipulation such as
-    /// binding a DSP resize slot through bind_dma_frame. May be null only
-    /// before load.
+    /// HAL inference ops table — for service-layer tensor manipulation that
+    /// needs ops beyond the wrapped helpers (e.g. bind_dma_frame on
+    /// buffer_id inputs). May be null only before load.
     const HalInferenceOps* infer_ops() const { return infer_ops_; }
+
+    /// Tail-member availability under the ops-table ABI guard: pass
+    /// offsetof(HalInferenceOps, <member>). With no loader (ops tables
+    /// injected directly in tests) the table is assumed complete.
+    bool has_infer_op(size_t member_offset) const {
+        return loader_ ? loader_->has_infer_op(member_offset) : true;
+    }
 
     /// Check if HAL supports async inference (run_async != nullptr).
     bool has_async() const;
