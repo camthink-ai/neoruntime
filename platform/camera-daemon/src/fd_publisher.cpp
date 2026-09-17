@@ -400,6 +400,30 @@ void FdPublisher::client_recv_loop(ClientState* client) {
             break;
         }
 
+        case FD_PUB_MSG_DSP_LOOKUP: {
+            if (payload_size != sizeof(FdPubDspLookupMsg) - sizeof(hdr)) break;
+
+            char buf[sizeof(FdPubDspLookupMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) break;
+
+            handle_dsp_lookup(client, buf);
+            break;
+        }
+
+        case FD_PUB_MSG_DSP_LOOKUP_RELEASE: {
+            if (payload_size != sizeof(FdPubDspLookupReleaseMsg) - sizeof(hdr)) break;
+
+            char buf[sizeof(FdPubDspLookupReleaseMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) break;
+
+            handle_dsp_lookup_release(client, buf);
+            break;
+        }
+
         case FD_PUB_MSG_UNSUBSCRIBE: {
             // subscribed/stream_name are read on the dispatch thread under
             // clients_mu_ — flip the flag under the same lock.
@@ -612,6 +636,73 @@ void FdPublisher::handle_dsp_import(ClientState* client, const void* msg_data,
     send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
 }
 
+void FdPublisher::handle_dsp_lookup(ClientState* client, const void* msg_data) {
+    auto* msg = static_cast<const FdPubDspLookupMsg*>(msg_data);
+
+    FdPubDspLookupRespMsg resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.hdr.type = FD_PUB_MSG_DSP_LOOKUP_RESP;
+    resp.hdr.size = sizeof(resp);
+
+    if (!dsp_service_) {
+        resp.code = DSP_SVC_ERR_UNAVAILABLE;
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    DspService::LookupResult r = dsp_service_->lookup_buffer(client->fd,
+                                                             msg->buffer_id);
+    resp.code = r.rc;
+    if (r.rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP LOOKUP id=%lu from fd=%d failed: "
+                        "rc=%d (%s)", (unsigned long)msg->buffer_id,
+                        client->fd, r.rc, r.message.c_str());
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    resp.width = r.width;
+    resp.height = r.height;
+    resp.format = (uint32_t)r.format;
+    resp.num_planes = r.num_planes;
+    for (uint32_t i = 0; i < HAL_MAX_PLANES && i < r.num_planes; ++i) {
+        resp.strides[i] = r.strides[i];
+        resp.sizes[i] = r.sizes[i];
+    }
+
+    /* Plane fds ride with this reply via SCM_RIGHTS. The fds in r are fresh
+     * dup()s made for this caller; whether or not the send succeeds they are
+     * ours to close here — the receiver got its own references on delivery
+     * (SCM_RIGHTS installs new fds at the receiver), and a failed/partial
+     * send never leaves usable fds anywhere else. */
+    if (fd_pub_sendmsg_capped(client->fd, &resp, sizeof(resp),
+                              r.fds.data(), (int)r.fds.size(),
+                              FD_PUB_MAX_FDS) != 0) {
+        std::lock_guard<std::mutex> sl(stats_mu_);
+        stats_.send_errors++;
+        HAL_LOG_ERROR("FdPublisher: DSP LOOKUP resp send failed for fd=%d "
+                      "(lease id=%lu still held — awaiting RELEASE)",
+                      client->fd, (unsigned long)msg->buffer_id);
+    }
+    for (int fd : r.fds) close(fd);
+}
+
+void FdPublisher::handle_dsp_lookup_release(ClientState* client,
+                                            const void* msg_data) {
+    auto* msg = static_cast<const FdPubDspLookupReleaseMsg*>(msg_data);
+
+    if (!dsp_service_) return;
+
+    /* Fire-and-forget like DSP_BUF_RELEASE: the lease is dropped, and a
+     * bogus id merely logs (it cannot outlive the connection anyway). */
+    int rc = dsp_service_->lookup_release(client->fd, msg->buffer_id);
+    if (rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP LOOKUP release id=%lu from fd=%d "
+                        "rc=%d", (unsigned long)msg->buffer_id, client->fd,
+                        rc);
+    }
+}
+
 void FdPublisher::disconnect_client(int client_fd) {
     ClientState* client = nullptr;
 
@@ -632,6 +723,9 @@ void FdPublisher::disconnect_client(int client_fd) {
     // is the registry key and could be reused by a new client after close().
     if (dsp_service_) {
         dsp_service_->release_client_buffers(client_fd);
+        // Drop any cross-process lookup leases this borrower still holds.
+        // Same fd-number recycling argument as release_client_buffers.
+        dsp_service_->lookup_release_all(client_fd);
     }
 
     // Close socket (will unblock recv in client_recv_loop)

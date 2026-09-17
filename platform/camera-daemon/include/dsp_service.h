@@ -2,13 +2,17 @@
  * @file dsp_service.h
  * @brief App-facing DSP job service (PLAT-1/4/5 of the DSP-offload roadmap).
  *
- * Owns the single HAL DSP context used for app-submitted jobs and the
- * dma-buf buffer registry those jobs reference. Context model is D1 from
- * docs/proposals/dsp-offload.md: one context, daemon-multiplexed — extra
- * in-process contexts buy zero parallelism (measured speedup 1.00x), so
- * this service never inits per-client contexts. dpm_worker keeps its own
- * context for now; the vendor PriorityQueueSingleton serializes all DSP
- * work process-wide regardless (P0 deliberately does not touch dpm).
+ * Owns the HAL DSP contexts used for app-submitted jobs and the
+ * dma-buf buffer registry those jobs reference. P1-9 lane split: one
+ * context per priority lane (NORMAL at cfg.device_priority, BACKGROUND
+ * at 0) — the vendor executes higher-priority QUEUED work first
+ * (dsp_set_priority), so normal-lane app jobs stop queueing behind
+ * 30fps stream-side DSP tasks. Still context model D1 from
+ * docs/proposals/dsp-offload.md: the extra context buys ordering, not
+ * parallelism (measured speedup 1.00x — the vendor PriorityQueueSingleton
+ * serializes all DSP work process-wide), so this service never inits
+ * per-client contexts. dpm_worker keeps its own context (priority 0);
+ * P0 deliberately does not touch dpm.
  *
  * Transport split:
  *  - Buffer plane (FdPublisher UDS, fds via SCM_RIGHTS):
@@ -24,11 +28,16 @@
  * Buffer ids are process-unique, monotonically increasing and never
  * reused. Buffers are refcount-pinned by queued/running jobs: a release
  * detaches the id from the registry immediately (new jobs fail to resolve
- * it) and the underlying HAL buffer is freed when the last pin drops.
+ * it); the underlying HAL buffer is then parked in the retention cache
+ * (cfg.pool_retention_*) — the next same-geometry alloc reuses it — or,
+ * with retention disabled/full, freed when the last pin drops. A parked
+ * buffer keeps its dma fds alive: a client writing through fds it kept
+ * past release() can corrupt the buffer's next owner.
  */
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -36,6 +45,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -87,6 +97,10 @@ struct DspServiceConfig {
     uint64_t max_import_bytes_per_client = 67108864; /* 64 MiB */
     uint32_t max_total_imports = 256;
     uint64_t max_total_import_bytes = 268435456; /* 256 MiB */
+    /* Cross-process read leases (DSP_LOOKUP) per connection. A lease pins
+     * the buffer and holds dup'd fds until released; a stuck borrower must
+     * not be able to pin the registry unboundedly. */
+    uint32_t max_lookups_per_client = 16;
     /* P2: outstanding SubmitDspJobAsync jobs per owner and service. Bounds
      * the registry/queues (each entry holds a JobItem + pins until retired). */
     uint32_t max_async_jobs_per_client = 32;
@@ -95,6 +109,22 @@ struct DspServiceConfig {
     uint32_t max_waiters_per_job = 4;
     uint32_t max_total_waiters = 64;
     uint32_t max_wait_job_timeout_ms = 30000;
+    /* P1-9: vendor device priority of the NORMAL lane's HAL context
+     * (dsp_set_priority — the vendor runs higher-priority queued work
+     * first). 1 puts app jobs ahead of same-priority stream-side DSP work
+     * (dpm resizes, encoder); 0 restores the pre-split flat ordering.
+     * The BACKGROUND lane always inits at 0 — a bulk lane must never
+     * preempt the encoder. */
+    int device_priority = 1;
+    /* P1-9 tail fix: released pool buffers are parked by geometry for this
+     * grace period instead of freed to HAL, and alloc_buffers reuses them
+     * first — each skip avoids a whole HAL pool-chunk destroy/create round
+     * (the 43ms resize tail). Parking ONE buffer keeps the vendor pool
+     * chunk alive, so footprint is accounted per chunk (32 buffers), not
+     * per parked buffer. Either field 0 disables retention entirely
+     * (rollback knob: free-on-last-pin, the pre-fix behavior). */
+    uint32_t pool_retention_ms = 3000;
+    uint64_t pool_retention_max_bytes = 192ULL << 20;
 };
 
 /** Job priority. P0 has two levels; platform (daemon-internal) jobs are
@@ -135,6 +165,11 @@ struct DspServiceStats {
     uint64_t buffers_allocated = 0;
     uint64_t buffers_released = 0;
     uint64_t buffers_in_registry = 0;
+    /* P1-9 pool retention (cfg.pool_retention_*). */
+    uint64_t retention_reuses = 0; /* alloc served from a parked buffer   */
+    uint64_t retention_releases = 0; /* parks dropped to HAL: expired,
+                                      * cap-evicted, or stop-flushed      */
+    uint64_t retention_parked = 0; /* gauge: buffers parked right now     */
 };
 
 class DspService {
@@ -192,6 +227,39 @@ public:
 
     /** UDS disconnect hook: detach every buffer owned by the client. */
     void release_client_buffers(int client_fd);
+
+    /* ---------------- Cross-process lookup plane (DSP_LOOKUP) --------- */
+
+    /** Result of lookup_buffer: geometry + dup'd dma-buf plane fds. */
+    struct LookupResult {
+        int rc = DSP_SVC_OK;
+        std::string message;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        HalPixelFormat format = HAL_PIX_FMT_NV12;
+        uint32_t num_planes = 0;
+        uint32_t strides[HAL_MAX_PLANES] = {0, 0, 0};
+        uint32_t sizes[HAL_MAX_PLANES] = {0, 0, 0};
+        std::vector<int> fds;       /* num_planes dup'd fds; caller closes  */
+    };
+
+    /**
+     * Resolve a registry buffer_id for a NON-owning connection and pin it
+     * (lease) for that connection: the underlying frame stays alive even if
+     * the owning client disconnects mid-lease. Serves HAL_MEM_DMABUF buffers
+     * only — pool buffers and imported dma-buf frames; a memfd/USERPTR
+     * import is refused with DSP_SVC_ERR_INVALID. The returned fds are
+     * fresh dup()s of the frame's dma-buf planes; closing them does not end
+     * the lease (lookup_release does). Caps at cfg.max_lookups_per_client
+     * outstanding leases per connection.
+     */
+    LookupResult lookup_buffer(int client_fd, uint64_t buffer_id);
+
+    /** Drop one lease taken by this connection (unknown id: no-op error). */
+    int lookup_release(int client_fd, uint64_t buffer_id);
+
+    /** UDS disconnect hook: drop every lease this connection took. */
+    void lookup_release_all(int client_fd);
 
     /* ---------------- One-shot ops plane (daemon-internal) ----------- */
 
@@ -541,7 +609,14 @@ private:
     HalFrameBufferOps* fb_ops_ = nullptr;
     DspServiceConfig cfg_;
 
-    void* dsp_ctx_ = nullptr;
+    /* P1-9 per-lane HAL contexts — vendor-level queue PRIORITY, not
+     * parallelism: the vendor PriorityQueueSingleton still serializes all
+     * DSP execution process-wide; ordering of queued work is the lever.
+     * dsp_ctx_normal_ inits at cfg_.device_priority, dsp_ctx_background_
+     * at 0. dsp_ctx_background_ may stay null (init failure → BACKGROUND
+     * jobs degrade onto the normal lane; service still starts). */
+    void* dsp_ctx_normal_ = nullptr;
+    void* dsp_ctx_background_ = nullptr;
     std::thread worker_;
     std::atomic<bool> running_{false};
     std::mutex lifecycle_mu_;
@@ -592,6 +667,50 @@ private:
     uint64_t pending_buffer_bytes_ = 0;
     uint32_t total_imports_ = 0;
     uint64_t total_import_bytes_ = 0;
+
+    // P1-9 pool retention: released NON-imported pool buffers parked by
+    // geometry {width, height, format} for cfg.pool_retention_ms, reused
+    // by same-geometry allocs. All state below lives under buffers_mu_;
+    // HAL release calls happen on collected lists AFTER unlocking, per
+    // the file-head locking model in dsp_service.cpp.
+    using ParkedGeometry = std::array<uint32_t, 3>; /* {w, h, fmt} */
+    struct ParkedBuffer {
+        HalFrameBuffer* fb;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::map<ParkedGeometry, std::deque<ParkedBuffer>> parked_;
+    std::deque<ParkedGeometry> parked_order_; /* first-park order — whole-
+                                               * geometry LRU eviction */
+    uint64_t parked_footprint_ = 0; /* chunk-accurate bytes parked        */
+    /* Queued by park_or_free_locked under buffers_mu_ (refused inputs +
+     * eviction victims + the retention-disabled case); released to HAL by
+     * drain_pending_releases() after the lock drops. Reserved in start()
+     * because detach_entry_locked pushes here on a noexcept path. */
+    std::vector<HalFrameBuffer*> pending_release_;
+    /* caller holds buffers_mu_; parks fb or queues it into
+     * pending_release_, then evicts whole oldest geometries while
+     * parked_footprint_ exceeds the cap (evictions queued the same
+     * way). Refuses when not running or retention is disabled — fb is
+     * queued for release instead. */
+    void park_or_free_locked(const ParkedGeometry& g, HalFrameBuffer* fb);
+    /* swaps pending_release_ under buffers_mu_ and HAL-releases outside
+     * it; call only with buffers_mu_ NOT held */
+    void drain_pending_releases() noexcept;
+    /* takes buffers_mu_ itself (alloc path runs lock-free): drops expired
+     * front entries of g (HAL-released after unlock), pops one reusable
+     * buffer or returns nullptr. Counts retention_reuses on a hit. */
+    HalFrameBuffer* take_parked(const ParkedGeometry& g);
+    /* caller holds buffers_mu_; moves every expired park to to_free. */
+    void sweep_parked_locked(std::vector<HalFrameBuffer*>& to_free);
+
+    // Cross-process lookup leases (DSP_LOOKUP): per-connection map of
+    // buffer_id → pins taken by that connection. OWN mutex: pin_buffer and
+    // ~BufferPin take buffers_mu_, so holding lookup_mu_ across a pin/unpin
+    // would invert the lock order against disconnect paths. All methods
+    // move pins in/out under lookup_mu_ only, never both at once.
+    std::mutex lookup_mu_;
+    std::unordered_map<int, std::unordered_map<uint64_t, std::vector<BufferPin>>>
+        lookup_leases_;
 
     // Per-owner token buckets.
     std::mutex quota_mu_;
