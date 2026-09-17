@@ -209,6 +209,20 @@ bool SessionManager::check_qps_limit(Session* s) {
     return avg_qps < static_cast<double>(s->max_qps);
 }
 
+void SessionManager::record_skew(Session* s, uint64_t skew_us) {
+    if (!s || skew_us == 0) return;
+    s->total_skew_us.fetch_add(skew_us, std::memory_order_relaxed);
+    s->skew_count.fetch_add(1, std::memory_order_relaxed);
+    // Monotonic max via CAS — concurrent recorders race benignly, the
+    // largest value always wins eventually.
+    uint64_t cur = s->max_skew_us.load(std::memory_order_relaxed);
+    while (skew_us > cur &&
+           !s->max_skew_us.compare_exchange_weak(
+               cur, skew_us, std::memory_order_relaxed)) {
+        // cur reloaded by compare_exchange_weak on failure
+    }
+}
+
 void SessionManager::record_inference(Session* s, uint64_t latency_us) {
     if (!s) return;
     s->last_infer.store(SteadyClock::now(), std::memory_order_relaxed);

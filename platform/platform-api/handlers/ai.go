@@ -569,7 +569,7 @@ func (h *APIHandlers) GetAIStats(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	stats, err := client.GetStats(ctx, &inferencepb.Empty{})
+	stats, err := client.GetStats(ctx, &inferencepb.GetStatsRequest{})
 	if err != nil {
 		Resp(c).FailMsg(CodeServiceError, err.Error())
 		return

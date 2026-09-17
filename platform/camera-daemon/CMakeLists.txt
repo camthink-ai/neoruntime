@@ -364,6 +364,56 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(ai-overlay-binding-test PRIVATE pthread)
     add_test(NAME ai-overlay-binding-test COMMAND ai-overlay-binding-test)
 
+    # P1-9: per-lane vendor priority split (NORMAL ctx at cfg priority,
+    # BACKGROUND ctx at 0). Host-only; fake HalDspOps/ fb_ops.
+    add_executable(dsp-lane-split-test
+        tests/dsp_lane_split_test.cpp
+        src/dsp_service.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(dsp-lane-split-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(dsp-lane-split-test PRIVATE pthread rt)
+    add_test(NAME dsp-lane-split-test COMMAND dsp-lane-split-test)
+
+    # P1-9: pool-retention cache — released pool buffers park by geometry
+    # so per-call-pool clients (the accel router) stop recreating the
+    # vendor 32-buffer dma chunk every call. Host-only; fake HAL ops.
+    add_executable(dsp-pool-retention-test
+        tests/dsp_pool_retention_test.cpp
+        src/dsp_service.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(dsp-pool-retention-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(dsp-pool-retention-test PRIVATE pthread rt)
+    add_test(NAME dsp-pool-retention-test COMMAND dsp-pool-retention-test)
+
+    # keep_fd read-only contract guard: imported buffers are source-only
+    # (the one exception: BLEND ARGB32 overlay dst). Guards existing
+    # validate_and_pin policy; no production change. Host-only.
+    add_executable(dsp-import-write-target-test
+        tests/dsp_import_write_target_test.cpp
+        src/dsp_service.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(dsp-import-write-target-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(dsp-import-write-target-test PRIVATE pthread rt)
+    add_test(NAME dsp-import-write-target-test COMMAND dsp-import-write-target-test)
+
     add_executable(fg2009-position-test
         tests/fg2009_position_test.cpp
         ${HAL_COMMON_DIR}/devices/hal_lens_fg2009.c
