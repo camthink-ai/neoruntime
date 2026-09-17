@@ -94,6 +94,15 @@ message AiOverlayConfig {
   bool show_confidence = 6;
   // Show label
   bool show_label = 7;
+  // Mosaic detections labeled "face" (subscriber-level face blur)
+  optional bool enable_face_blur = 8;
+  // Strict frame-lock (P1-6): identity-fed display streams wait — bounded —
+  // for each frame's own inference result at the bake site. Absent = keep
+  // current (yaml) setting.
+  optional bool strict_frame_lock = 9;
+  // Strict wait cap in ms. 0 = derive from stream fps (2 frame periods,
+  // clamp [1,500]). Only meaningful when strict_frame_lock is set.
+  optional uint32 strict_wait_cap_ms = 10;
 }
 
 // OSD Text Overlay Configuration
@@ -270,6 +279,26 @@ message StreamStatusInfo {
   uint64 ms_since_last_frame = 10;  // ms since last encoded frame (UINT64_MAX = never/unknown)
   uint32 measured_fps = 11;         // observed output fps (0 = unknown)
   string status_detail = 12;        // human-readable context, e.g. stall reason
+  // Overlay bake observability (ai_overlay_subscriber, per stream). bake_skips
+  // counts frames the bake site passed through un-annotated because no fresh
+  // result existed (no-result or TTL-expired); a clean source-only feed is
+  // not a skip. strict_* mirror the strict-gate verdict counters.
+  uint64 bake_skips = 19;        // frames baked without a fresh overlay result
+  uint64 strict_locked = 20;     // strict mode: frames locked to their own result
+  uint64 strict_degraded = 21;   // strict mode: fell back to newest-fresh result
+  uint64 strict_skips = 22;      // strict mode: frames skipped (no usable result)
+  // Overlay behavior-decoupling + frame-sync observability (per display
+  // stream). stream_epoch is the stream generation counter — ReconfigureEncoder
+  // / full-transform-reinit bumps it and purges held layers, so an app still
+  // holding the old generation can detect the restart instead of writing
+  // silently-rejected overlays forever. The overlay_* counters aggregate every
+  // infer stream routed onto this display (identity + stream_map/bindings
+  // cross-feeds), mirroring the bake site's own layer collection.
+  uint64 stream_epoch = 24;              // stream generation (restart bumps, never 0)
+  uint64 overlay_layer_count = 25;       // overlay layers currently held for the stream
+  uint64 overlay_late_commands = 26;     // app overlay events rejected: frame already passed
+  uint64 overlay_epoch_rejects = 27;     // app overlay events rejected: stale stream_epoch
+  uint64 overlay_no_binding_drops = 28;  // platform result events dropped: no binding
 }
 
 message GetStreamStatusResponse {

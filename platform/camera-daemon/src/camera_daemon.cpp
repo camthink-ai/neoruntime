@@ -5321,6 +5321,25 @@ void CameraDaemon::get_stream_status(aipc::camera::GetStreamStatusResponse& resp
         uint64_t ms = encoder_mgr_->ms_since_last_packet(enc_name);
         info->set_ms_since_last_frame(ms);  // UINT64_MAX sentinel → JSON null on the Go side
 
+        AiOverlaySubscriber::OverlayStreamStats os{};
+        if (ai_overlay_) {
+            ai_overlay_->snapshot_stream_stats(ec.stream_name, &os);
+            info->set_bake_skips(os.bake_skips);
+            info->set_strict_locked(os.strict_locked);
+            info->set_strict_degraded(os.strict_degraded);
+            info->set_strict_skips(os.strict_skips);
+            // Behavior-decoupling + frame-sync observability (fields 24-28):
+            // epoch / live layer count for the app-side restart handshake,
+            // the two app-event ingest rejections, and the unbound platform
+            // drop counter. Aggregated across every infer stream routed onto
+            // this display by snapshot_stream_stats itself.
+            info->set_stream_epoch(os.stream_epoch);
+            info->set_overlay_layer_count(os.overlay_layer_count);
+            info->set_overlay_late_commands(os.overlay_late_commands);
+            info->set_overlay_epoch_rejects(os.overlay_epoch_rejects);
+            info->set_overlay_no_binding_drops(os.overlay_no_binding_drops);
+        }
+
         bool stalled = encoder_mgr_->is_stream_stalled(enc_name, kStallThresholdMs, kStartupGraceMs);
         bool seen    = encoder_mgr_->seen_first_packet(enc_name);
 

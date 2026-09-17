@@ -274,17 +274,32 @@ grpc::Status CameraControlServiceImpl::UpdateAiOverlay(
         return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
     }
 
-    HAL_LOG_INFO("[CameraControl] Update AI Overlay: enabled=%s labels=%s confidence=%s thickness=%u",
+    HAL_LOG_INFO("[CameraControl] Update AI Overlay: enabled=%s labels=%s confidence=%s thickness=%u face_blur=%s strict=%s cap=%s",
                  request->enabled() ? "true" : "false",
                  request->show_label() ? "true" : "false",
                  request->show_confidence() ? "true" : "false",
-                 request->line_thickness());
+                 request->line_thickness(),
+                 request->has_enable_face_blur()
+                     ? (request->enable_face_blur() ? "true" : "false") : "keep",
+                 request->has_strict_frame_lock()
+                     ? (request->strict_frame_lock() ? "true" : "false") : "keep",
+                 request->has_strict_wait_cap_ms()
+                     ? std::to_string(request->strict_wait_cap_ms()).c_str() : "keep");
 
     bool success = daemon_->update_ai_overlay_config(
         request->enabled(),
         request->show_label(),
         request->show_confidence(),
-        request->line_thickness()
+        request->line_thickness(),
+        request->has_enable_face_blur()
+            ? std::optional<bool>(request->enable_face_blur())
+            : std::optional<bool>{},
+        request->has_strict_frame_lock()
+            ? std::optional<bool>(request->strict_frame_lock())
+            : std::optional<bool>{},
+        request->has_strict_wait_cap_ms()
+            ? std::optional<uint32_t>(request->strict_wait_cap_ms())
+            : std::optional<uint32_t>{}
     );
 
     response->set_success(success);
