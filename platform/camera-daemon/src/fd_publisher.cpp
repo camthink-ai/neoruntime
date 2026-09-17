@@ -7,6 +7,7 @@
 #include "../include/fd_protocol.h"
 #include "../include/frame_router.h"
 #include "../include/dsp_service.h"
+#include "../include/injection_service.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -21,6 +22,39 @@
 extern "C" {
     #include "hal_log.h"
 }
+
+namespace {
+
+/* App identity of a connected UDS peer: SO_PEERCRED pid → /proc/<pid>/
+ * cmdline basename (e.g. "my-app" from "/usr/bin/my-app --flag").
+ * Captured at accept time; "" when the kernel or procfs can't answer. */
+std::string peer_identity_from_fd(int fd) {
+    struct ucred cred;
+    socklen_t cred_len = sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0 ||
+        cred.pid <= 0) {
+        return "";
+    }
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", cred.pid);
+    int proc_fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (proc_fd < 0) {
+        return "";
+    }
+    char buf[256];
+    const ssize_t n = read(proc_fd, buf, sizeof(buf) - 1);
+    close(proc_fd);
+    if (n <= 0) {
+        return "";
+    }
+    buf[n] = '\0';
+    /* cmdline args are NUL-separated; argv[0] is the leading string. */
+    std::string argv0(buf);
+    const size_t slash = argv0.find_last_of('/');
+    return slash == std::string::npos ? argv0 : argv0.substr(slash + 1);
+}
+
+} // namespace
 
 FdPublisher::FdPublisher(FrameRouter* router, const FdPublisherConfig& config)
     : router_(router), config_(config) {}
@@ -131,21 +165,84 @@ void FdPublisher::on_frame(const std::string& stream_name, ManagedFrame* mf) {
             // in that gap was discarded as "unknown" and pinned one of the
             // max_outstanding slots until disconnect (permanent delivery
             // stall for that client, no negative ack to detect it).
+            //
+            // Contract enforcement (P1-7), decided here at dispatch time:
+            //   lease  — any held frame older than lease_ms → refuse new
+            //             frames until the client releases (or disconnects).
+            //             Never a mid-read revocation: the client may still
+            //             be reading the dma-buf. The ~4s router watchdog
+            //             stays as the memory backstop, not the contract.
+            //   quota  — max_outstanding_per_client unreturned frames →
+            //             refuse until something comes back.
+            // Both refusals are counted and WARNed (rate-limited 1/s per
+            // client) so the journal shows live numbers; frames_dropped is
+            // reserved for send-path EAGAIN.
             bool tracked = false;
             {
                 std::lock_guard<std::mutex> ol(client->outstanding_mu);
-                if (client->outstanding.size() < config_.max_outstanding_per_client) {
+                const auto now = std::chrono::steady_clock::now();
+                bool lease_violated = false;
+                long long oldest_age_ms = 0;
+
+                if (config_.lease_ms > 0 && !client->outstanding.empty()) {
+                    auto oldest = client->outstanding.begin();
+                    for (auto it = client->outstanding.begin();
+                         it != client->outstanding.end(); ++it) {
+                        if (it->second.lend < oldest->second.lend) {
+                            oldest = it;
+                        }
+                    }
+                    oldest_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        now - oldest->second.lend)
+                                        .count();
+                    lease_violated = oldest_age_ms > static_cast<long long>(config_.lease_ms);
+                }
+
+                if (lease_violated) {
+                    uint64_t quota_rej = 0, lease_rej = 0;
+                    {
+                        std::lock_guard<std::mutex> sl(stats_mu_);
+                        lease_rej = ++stats_.frames_lease_rejected;
+                        quota_rej = stats_.frames_quota_rejected;
+                    }
+                    if (now - client->last_reject_warn >= std::chrono::seconds(1)) {
+                        client->last_reject_warn = now;
+                        HAL_LOG_WARNING(
+                            "FdPublisher: lease reject fd=%d stream=%s: oldest of %zu "
+                            "held frames is %lldms > lease %ums — no new frames until "
+                            "released (quota_rejected=%llu lease_rejected=%llu)",
+                            client->fd, client->stream_name.c_str(),
+                            client->outstanding.size(), oldest_age_ms, config_.lease_ms,
+                            static_cast<unsigned long long>(quota_rej),
+                            static_cast<unsigned long long>(lease_rej));
+                    }
+                } else if (client->outstanding.size() >= config_.max_outstanding_per_client) {
+                    uint64_t quota_rej = 0, lease_rej = 0;
+                    {
+                        std::lock_guard<std::mutex> sl(stats_mu_);
+                        quota_rej = ++stats_.frames_quota_rejected;
+                        lease_rej = stats_.frames_lease_rejected;
+                    }
+                    if (now - client->last_reject_warn >= std::chrono::seconds(1)) {
+                        client->last_reject_warn = now;
+                        HAL_LOG_WARNING(
+                            "FdPublisher: quota reject fd=%d stream=%s: %zu held >= max "
+                            "%u — release a frame to receive more "
+                            "(quota_rejected=%llu lease_rejected=%llu)",
+                            client->fd, client->stream_name.c_str(),
+                            client->outstanding.size(), config_.max_outstanding_per_client,
+                            static_cast<unsigned long long>(quota_rej),
+                            static_cast<unsigned long long>(lease_rej));
+                    }
+                } else {
                     router_->retain(mf);   // ref first: never publish an un-retained entry
-                    client->outstanding[mf->frame_id] = mf;
+                    client->outstanding[mf->frame_id] = {mf, now};
                     tracked = true;
                 }
             }
 
             if (!tracked) {
-                // Client too slow — drop frame for this client
-                std::lock_guard<std::mutex> sl(stats_mu_);
-                stats_.frames_dropped++;
-                continue;
+                continue;  // refusal already counted + logged above
             }
 
             switch (send_frame_to_client(client, mf)) {
@@ -221,6 +318,12 @@ uint32_t FdPublisher::stream_client_count(const std::string& stream_name) const 
     return count;
 }
 
+std::string FdPublisher::client_identity(int fd) const {
+    std::lock_guard<std::mutex> lock(clients_mu_);
+    const auto it = clients_.find(fd);
+    return it == clients_.end() ? std::string() : it->second->identity;
+}
+
 FdPublisher::Stats FdPublisher::get_stats() const {
     std::lock_guard<std::mutex> lock(stats_mu_);
     return stats_;
@@ -228,6 +331,10 @@ FdPublisher::Stats FdPublisher::get_stats() const {
 
 void FdPublisher::set_dsp_service(DspService* dsp_service) {
     dsp_service_ = dsp_service;
+}
+
+void FdPublisher::set_injection_service(InjectionService* injection_service) {
+    injection_service_ = injection_service;
 }
 
 /* ========== Private methods ========== */
@@ -259,6 +366,7 @@ void FdPublisher::accept_loop() {
 
         auto* client = new ClientState();
         client->fd = client_fd;
+        client->identity = peer_identity_from_fd(client_fd);
 
         {
             std::lock_guard<std::mutex> lock(clients_mu_);
@@ -274,8 +382,9 @@ void FdPublisher::accept_loop() {
             stats_.clients_connected++;
         }
 
-        HAL_LOG_INFO("FdPublisher: Client connected (fd=%d, total=%u)",
-                     client_fd, client_count());
+        HAL_LOG_INFO("FdPublisher: Client connected (fd=%d, identity='%s', "
+                     "total=%u)",
+                     client_fd, client->identity.c_str(), client_count());
     }
 }
 
@@ -400,6 +509,30 @@ void FdPublisher::client_recv_loop(ClientState* client) {
             break;
         }
 
+        case FD_PUB_MSG_DSP_LOOKUP: {
+            if (payload_size != sizeof(FdPubDspLookupMsg) - sizeof(hdr)) break;
+
+            char buf[sizeof(FdPubDspLookupMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) break;
+
+            handle_dsp_lookup(client, buf);
+            break;
+        }
+
+        case FD_PUB_MSG_DSP_LOOKUP_RELEASE: {
+            if (payload_size != sizeof(FdPubDspLookupReleaseMsg) - sizeof(hdr)) break;
+
+            char buf[sizeof(FdPubDspLookupReleaseMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) break;
+
+            handle_dsp_lookup_release(client, buf);
+            break;
+        }
+
         case FD_PUB_MSG_UNSUBSCRIBE: {
             // subscribed/stream_name are read on the dispatch thread under
             // clients_mu_ — flip the flag under the same lock.
@@ -487,7 +620,7 @@ void FdPublisher::handle_release(ClientState* client, const void* msg_data) {
                            frame_id, client->fd);
             return;
         }
-        mf = it->second;
+        mf = it->second.mf;
         client->outstanding.erase(it);
     }
 
@@ -612,6 +745,73 @@ void FdPublisher::handle_dsp_import(ClientState* client, const void* msg_data,
     send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
 }
 
+void FdPublisher::handle_dsp_lookup(ClientState* client, const void* msg_data) {
+    auto* msg = static_cast<const FdPubDspLookupMsg*>(msg_data);
+
+    FdPubDspLookupRespMsg resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.hdr.type = FD_PUB_MSG_DSP_LOOKUP_RESP;
+    resp.hdr.size = sizeof(resp);
+
+    if (!dsp_service_) {
+        resp.code = DSP_SVC_ERR_UNAVAILABLE;
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    DspService::LookupResult r = dsp_service_->lookup_buffer(client->fd,
+                                                             msg->buffer_id);
+    resp.code = r.rc;
+    if (r.rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP LOOKUP id=%lu from fd=%d failed: "
+                        "rc=%d (%s)", (unsigned long)msg->buffer_id,
+                        client->fd, r.rc, r.message.c_str());
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    resp.width = r.width;
+    resp.height = r.height;
+    resp.format = (uint32_t)r.format;
+    resp.num_planes = r.num_planes;
+    for (uint32_t i = 0; i < HAL_MAX_PLANES && i < r.num_planes; ++i) {
+        resp.strides[i] = r.strides[i];
+        resp.sizes[i] = r.sizes[i];
+    }
+
+    /* Plane fds ride with this reply via SCM_RIGHTS. The fds in r are fresh
+     * dup()s made for this caller; whether or not the send succeeds they are
+     * ours to close here — the receiver got its own references on delivery
+     * (SCM_RIGHTS installs new fds at the receiver), and a failed/partial
+     * send never leaves usable fds anywhere else. */
+    if (fd_pub_sendmsg_capped(client->fd, &resp, sizeof(resp),
+                              r.fds.data(), (int)r.fds.size(),
+                              FD_PUB_MAX_FDS) != 0) {
+        std::lock_guard<std::mutex> sl(stats_mu_);
+        stats_.send_errors++;
+        HAL_LOG_ERROR("FdPublisher: DSP LOOKUP resp send failed for fd=%d "
+                      "(lease id=%lu still held — awaiting RELEASE)",
+                      client->fd, (unsigned long)msg->buffer_id);
+    }
+    for (int fd : r.fds) close(fd);
+}
+
+void FdPublisher::handle_dsp_lookup_release(ClientState* client,
+                                            const void* msg_data) {
+    auto* msg = static_cast<const FdPubDspLookupReleaseMsg*>(msg_data);
+
+    if (!dsp_service_) return;
+
+    /* Fire-and-forget like DSP_BUF_RELEASE: the lease is dropped, and a
+     * bogus id merely logs (it cannot outlive the connection anyway). */
+    int rc = dsp_service_->lookup_release(client->fd, msg->buffer_id);
+    if (rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP LOOKUP release id=%lu from fd=%d "
+                        "rc=%d", (unsigned long)msg->buffer_id, client->fd,
+                        rc);
+    }
+}
+
 void FdPublisher::disconnect_client(int client_fd) {
     ClientState* client = nullptr;
 
@@ -628,10 +828,21 @@ void FdPublisher::disconnect_client(int client_fd) {
     // Release all outstanding frames
     release_all_outstanding(client);
 
+    // Close the injection session when (and only when) the disconnecting
+    // client is its owner. Before release_client_buffers: queued pins must
+    // unpin before the registry detaches the entries; before close(): the
+    // fd number is the ownership key and could be reused by a new client.
+    if (injection_service_) {
+        injection_service_->release_owner(client_fd);
+    }
+
     // Detach every DSP buffer this client owns. Before close(): the fd number
     // is the registry key and could be reused by a new client after close().
     if (dsp_service_) {
         dsp_service_->release_client_buffers(client_fd);
+        // Drop any cross-process lookup leases this borrower still holds.
+        // Same fd-number recycling argument as release_client_buffers.
+        dsp_service_->lookup_release_all(client_fd);
     }
 
     // Close socket (will unblock recv in client_recv_loop)
@@ -662,9 +873,9 @@ void FdPublisher::release_all_outstanding(ClientState* client) {
                        client->outstanding.size(), client->fd);
     }
 
-    for (auto& [frame_id, mf] : client->outstanding) {
-        if (mf && router_) {
-            router_->release(mf);
+    for (auto& [frame_id, entry] : client->outstanding) {
+        if (entry.mf && router_) {
+            router_->release(entry.mf);
         }
     }
     client->outstanding.clear();
@@ -710,6 +921,7 @@ FdPublisher::send_frame_to_client(ClientState* client, ManagedFrame* mf) {
     }
 
     msg.num_fds = num_fds;
+    msg.flags = mf->flags;   // FD_PUB_FRAME_FLAG_* baked-metadata
 
     if (num_fds == 0) {
         // No DMA-BUF fds — this frame type doesn't support FD passing

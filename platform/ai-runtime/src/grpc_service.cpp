@@ -186,9 +186,9 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
     const pb::ModelRegisterRequest* req,
     pb::ModelRegisterResponse* resp) {
 
-    LOG_INFO("RegisterModel: model_id=%s path=%s type=%s transient=%d",
+    LOG_INFO("RegisterModel: model_id=%s path=%s type=%s transient=%d batch=%u",
              req->model_id().c_str(), req->model_path().c_str(),
-             req->model_type().c_str(), req->transient());
+             req->model_type().c_str(), req->transient(), req->batch_size());
 
     if (req->model_id().empty() || req->model_path().empty()) {
         resp->mutable_status()->set_success(false);
@@ -226,7 +226,8 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
     int rc = model_mgr_->register_model(req->model_id(), req->model_path(),
                                         owner_id, req->transient(),
                                         req->model_variant(),
-                                        req->model_type(), &why);
+                                        req->model_type(), &why,
+                                        req->batch_size());
     if (rc < 0) {
         resp->mutable_status()->set_success(false);
         resp->mutable_status()->set_message(
@@ -348,6 +349,7 @@ grpc::Status AIRuntimeServiceImpl::ListModels(
         info->set_version(m.model_info.version);
         info->set_load_timestamp(static_cast<uint64_t>(m.load_time));
         info->set_transient(m.transient);
+        info->set_batch_size(m.batch_size);
         // Include first owner_id if available
         auto owners = model_mgr_->get_owners(m.id);
         if (!owners.empty()) {
@@ -376,6 +378,7 @@ grpc::Status AIRuntimeServiceImpl::GetModelInfo(
     resp->set_version(m.model_info.version);
     resp->set_load_timestamp(static_cast<uint64_t>(m.load_time));
     resp->set_transient(m.transient);
+    resp->set_batch_size(m.batch_size);
     fill_tensor_specs(m.model_info, resp);
 
     return grpc::Status::OK;
@@ -912,6 +915,20 @@ grpc::Status AIRuntimeServiceImpl::Infer(
         0 /*fps_limit*/, 0 /*max_qps*/, 5 /*priority*/);
     auto infer_session = session_mgr_->get_session(implicit_session_id);
 
+    // Batch models speak InferBatch only: their session expects B x per-frame
+    // input bytes, so a single-frame submission could only fail the HAL
+    // size check deep in the backend. Reject with an actionable message.
+    if (snap->batch_size > 1) {
+        resp->mutable_status()->set_success(false);
+        resp->mutable_status()->set_message(
+            "Model '" + req->model_id() + "' is registered with batch=" +
+            std::to_string(snap->batch_size) +
+            "; single-frame Infer is not available for it. Use InferBatch "
+            "with " + std::to_string(snap->batch_size) +
+            "-frame groups, or register a batch=1 variant of the model.");
+        return grpc::Status::OK;
+    }
+
     int num_inputs = req->inputs_size();
     if (num_inputs != snap->model_info.num_inputs) {
         resp->mutable_status()->set_success(false);
@@ -1257,6 +1274,15 @@ struct InferBatchItemCtx {
     std::atomic<bool>              finishing{false};
     std::atomic<bool>              released{false};  // model ref released?
     bool                           success = false;
+
+    // ── Grouped (NPU batch) execution only ─────────────────────────────────
+    // Frame slot this item occupies inside its batch job (0..B-1); -1 for
+    // plain single-frame jobs.
+    int                            batch_frame = -1;
+    // Grouped jobs hand each item a per-frame VIEW into the group's batch
+    // output tensors; views must not go through free_outputs (the group
+    // frees the real tensors once every post task has drained).
+    bool                           outputs_are_view = false;
 };
 
 // Shared completion signaling across all items in a batch: the last callback to
@@ -1350,6 +1376,184 @@ struct BatchModelRefGuard {
         }
     }
 };
+
+// ── NPU batch aggregation ─────────────────────────────────────────────────────
+// One HAL job covering B consecutive same-model items (B = the model's
+// registered batch_size). The group owns the concatenated input buffers and
+// the HAL-allocated batch outputs; items hold per-frame views. The group is
+// deleted by the LAST completing per-item post task (or synchronously on the
+// failure paths), never by the submitting RPC thread — late callbacks after an
+// RPC timeout must stay safe.
+struct InferBatchGroupCtx {
+    ModelManager*                        mgr = nullptr;
+    SessionManager*                      smgr = nullptr;
+    PostprocessPool*                     pool = nullptr;
+    std::shared_ptr<InferBatchSyncState> sync;
+    std::vector<std::shared_ptr<InferBatchItemCtx>> items;  // real (non-pad) items
+    std::vector<std::string>             input_data;        // per input idx: B frames concatenated
+    std::vector<HalTensor>               inputs;            // point into input_data
+    std::vector<HalTensor>               outputs;           // HAL batch outputs (priv-owned)
+    int                                  max_outputs = 0;
+    uint32_t                             frames = 0;        // B incl. padding frames
+    std::vector<uint32_t>                per_frame_out_bytes;
+    std::atomic<int>                     pending_posts{0};
+};
+
+// Per-item completion work shared by the single-item and grouped InferBatch
+// paths: snapshot raw outputs to proto, run post-processing, free tensors
+// (unless the item only holds a view), record stats, release the model ref,
+// and signal the RPC waiter. Runs on the PostprocessPool so the HailoRT
+// completion thread can immediately service the next callback.
+static void infer_batch_item_post(InferBatchItemCtx* ctx,
+                                  const std::shared_ptr<InferBatchSyncState>& sync,
+                                  ModelManager* mgr, SessionManager* smgr,
+                                  Microseconds elapsed,
+                                  InferBatchGroupCtx* group = nullptr) {
+    const int max_out = ctx->max_outputs;
+
+    // Snapshot raw outputs to proto.
+    for (int k = 0; k < max_out; k++) {
+        auto* pt = ctx->response.add_outputs();
+        pt->set_dtype(AIRuntimeServiceImpl::hal_dtype_to_proto(ctx->outputs[k].dtype));
+        for (int d = 0; d < ctx->outputs[k].ndim; d++)
+            pt->add_shape(ctx->outputs[k].shape[d]);
+        if (ctx->outputs[k].data && ctx->outputs[k].byte_size > 0)
+            pt->set_data(ctx->outputs[k].data, ctx->outputs[k].byte_size);
+    }
+
+    // Post-processing. The Hailo SDK postprocess library may throw
+    // std::invalid_argument when the HEF's nms output tensor name does not
+    // match the postprocess config (e.g. a misconfigured/renamed
+    // model registered under the wrong type). Catch here so a bad model
+    // degrades to a failed inference instead of:
+    //   • propagating out of the synchronous fallback path (→ terminate
+    //     → SIGABRT, core.grpcpp_sync_ser), and
+    //   • leaving ctx->done=false on the pool path (→ batch timeout +
+    //     model ref leak).
+    bool pp_failed = false;
+    if (mgr->has_post_ops() && ctx->snap->post_session) {
+        HalPostprocessResult post_result{};
+        try {
+            if (mgr->post_process(ctx->snap->post_session,
+                                  ctx->outputs.data(), max_out,
+                                  &post_result) == 0) {
+                fill_proto_post_result(ctx->response.mutable_post_result(),
+                                       post_result);
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Postprocess failed for model '%s': %s",
+                      ctx->model_id.c_str(), e.what());
+            pp_failed = true;
+            ctx->response.mutable_status()->set_success(false);
+            ctx->response.mutable_status()->set_message(
+                std::string("Postprocess failed: ") + e.what());
+        }
+        mgr->free_post_result(&post_result);
+    }
+
+    // Views (grouped items) borrow the group's buffers: the group frees the
+    // real tensors after every post task has drained (below).
+    if (!ctx->outputs_are_view)
+        mgr->free_outputs(ctx->outputs.data(), max_out);
+    if (!pp_failed) {
+        ctx->response.mutable_status()->set_success(true);
+        ctx->success = true;
+    }
+    ctx->response.set_infer_time_us(static_cast<uint64_t>(elapsed.count()));
+
+    if (ctx->infer_session)
+        smgr->record_inference(ctx->infer_session.get(),
+                               static_cast<uint64_t>(elapsed.count()));
+
+    // Release model ref here (self-sufficient: works even if RPC timed out).
+    // Atomic exchange prevents double-release if the RPC thread also tries.
+    if (!ctx->released.exchange(true)) {
+        mgr->release_model(ctx->model_id);
+    }
+
+    ctx->done.store(true);
+    {
+        std::lock_guard<std::mutex> lk(sync->mtx);
+        if (--sync->remaining <= 0)
+            sync->cv.notify_all();
+    }
+
+    // Group teardown: the last post task frees the batch tensors and the
+    // group itself. Every other post task has already copied what it needed
+    // out of ctx->outputs (views into group->outputs), so the last one out
+    // can safely release the real buffers.
+    if (group && group->pending_posts.fetch_sub(1) == 1) {
+        mgr->free_outputs(group->outputs.data(), group->max_outputs);
+        delete group;
+    }
+}
+
+// HAL completion callback for a grouped batch job: slices the batch outputs
+// into per-frame views and runs the shared per-item post work on the pool.
+static void infer_batch_group_callback(HalTensor* /*outputs*/, int /*num_outputs*/,
+                                       int status, void* userdata) {
+    auto* g = static_cast<InferBatchGroupCtx*>(userdata);
+    if (!g) return;
+
+    if (status != 0) {
+        // Failure path: no post-processing needed, handle synchronously.
+        for (auto& c : g->items) {
+            if (!c->released.exchange(true)) {
+                g->mgr->release_model(c->model_id);
+            }
+            c->response.mutable_status()->set_success(false);
+            c->response.mutable_status()->set_message(
+                "Inference failed: " + std::to_string(status));
+            c->done.store(true);
+            c->success = false;
+            {
+                std::lock_guard<std::mutex> lk(g->sync->mtx);
+                if (--g->sync->remaining <= 0)
+                    g->sync->cv.notify_all();
+            }
+        }
+        g->mgr->free_outputs(g->outputs.data(), g->max_outputs);
+        delete g;
+        return;
+    }
+
+    // Success: give every real item its per-frame view of the batch outputs.
+    for (auto& c : g->items) {
+        c->max_outputs = g->max_outputs;
+        c->outputs.assign(g->max_outputs, HalTensor{});
+        for (int k = 0; k < g->max_outputs; k++) {
+            HalTensor& v = c->outputs[k];
+            v = g->outputs[k];  // copy name/dtype/shape/priv metadata
+            if (g->outputs[k].data && g->per_frame_out_bytes[k] > 0) {
+                v.data = static_cast<uint8_t*>(g->outputs[k].data) +
+                         static_cast<uint64_t>(c->batch_frame) *
+                             g->per_frame_out_bytes[k];
+                v.byte_size = g->per_frame_out_bytes[k];
+            }
+            v.priv = nullptr;  // view — freed only via the group
+        }
+        c->outputs_are_view = true;
+    }
+
+    // Offload per-item work to the PostprocessPool so this HailoRT completion
+    // thread can immediately service the next async inference callback.
+    for (auto& c : g->items) {
+        auto elapsed = std::chrono::duration_cast<Microseconds>(
+            SteadyClock::now() - c->start);
+        auto* ctx  = c.get();
+        auto  sync = g->sync;
+        auto* mgr  = g->mgr;
+        auto* smgr = g->smgr;
+        auto* grp  = g;
+        PostprocessPool::Task post_task = [ctx, sync, mgr, smgr, elapsed, grp]() {
+            infer_batch_item_post(ctx, sync, mgr, smgr, elapsed, grp);
+        };
+        if (!g->pool || !g->pool->submit(post_task)) {
+            post_task();  // synchronous fallback (same policy as single items)
+        }
+    }
+    // g is NOT deleted here: the last post task owns the teardown.
+}
 
 }  // namespace
 
@@ -1640,13 +1844,13 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
                     break;
                 }
                 std::string why;
-                // P1-2: fd direct-bind first (first input only —
-                // bind_dma_frame validates against input 0).
-                // try_bind_dma_input prechecks format/geometry; off-contract
-                // frames repack or convert as before.
+                // P1-2: fd direct-bind first (first input, single-frame
+                // models only — NPU-batch grouping needs contiguous CPU
+                // frames). try_bind_dma_input prechecks format/geometry;
+                // off-contract frames repack or convert as before.
                 const bool rgb_model = c->snap->model_info.num_inputs > 0 &&
                     !c->snap->model_info.inputs[0].is_nv12;
-                const bool bound = j == 0 &&
+                const bool bound = j == 0 && c->snap->batch_size == 1 &&
                     try_bind_dma_input(c->snap->infer_session, model_mgr_,
                                        c->snap->model_info, lr,
                                        pb_t.buffer_id(), buffer_lookup_, ht,
@@ -1654,7 +1858,7 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
                 if (!bound) {
                     bool prepared = false;
                     const char* prep = "repack";
-                    if (j == 0 && rgb_model) {
+                    if (j == 0 && c->snap->batch_size == 1 && rgb_model) {
                         // Packed-RGB model: convert through the session-aware
                         // preprocess — the NV12 repack's byte_size can never
                         // match and run() would reject every frame.
@@ -1721,6 +1925,16 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
             c->response.mutable_status()->set_message(fail_msg);
             c->done.store(true);
             complete_now();
+            continue;
+        }
+
+        // NPU-batch models (batch>1) do not submit inline: consecutive
+        // same-model frames are grouped into one NPU job by the grouped
+        // submit phase after the per-frame validation pass. Disarm the
+        // guard — the model ref rides with the item until the group's
+        // post tasks release it.
+        if (c->snap->batch_size > 1) {
+            model_ref_guard.disarm();
             continue;
         }
 
@@ -1797,6 +2011,169 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
         finish_batch_item(model_mgr_, scheduler_, c, sync, c->max_outputs);
         cb_state->release_owner();  // unused callback owner
         cb_state->release_owner();  // submitter owner
+    }
+
+    // ── Per-frame size validation for batch models (NPU-batch) ────────────
+    // A batch>1 session expects each item to carry exactly the per-frame
+    // byte count (model_info sizes are B x per-frame). Fail mismatched items
+    // up front so grouping never builds a torn batch buffer. Inline-submitted
+    // items (batch<=1) skip this pass; deferred batch items were prepped in
+    // the materialization loop above.
+    for (int i = 0; i < num_requests; i++) {
+        auto& c = ctxs[i];
+        if (!c->acquired || !c->snap || c->snap->batch_size <= 1) continue;
+        const uint32_t  B  = c->snap->batch_size;
+        const auto&     mi = c->snap->model_info;
+        const int      nin = static_cast<int>(c->inputs.size());
+        bool bad = false;
+        std::string why;
+        if (nin != static_cast<int>(mi.num_inputs)) {
+            bad = true;
+            why = "expects " + std::to_string(mi.num_inputs) +
+                  " inputs, got " + std::to_string(nin);
+        } else {
+            for (int k = 0; k < nin && !bad; k++) {
+                const uint32_t per_frame = mi.inputs[k].byte_size / B;
+                if (per_frame == 0 || c->inputs[k].byte_size != per_frame) {
+                    bad = true;
+                    why = "input[" + std::to_string(k) + "] byte_size " +
+                          std::to_string(c->inputs[k].byte_size) +
+                          " != per-frame " + std::to_string(per_frame) +
+                          " (model batch=" + std::to_string(B) + ")";
+                }
+            }
+        }
+        if (bad) {
+            if (!c->released.exchange(true)) {
+                model_mgr_->release_model(c->model_id);
+            }
+            c->acquired = false;
+            c->response.mutable_status()->set_success(false);
+            c->response.mutable_status()->set_message("Batch model input mismatch: " + why);
+            c->done.store(true);
+            complete_now();
+        }
+    }
+
+    // ── Grouped NPU-batch submit phase (batch>1 models) ────────────────────
+    // Single-frame items were submitted inline in the materialization loop
+    // above. Here, consecutive same-model items of a batch>1 model collapse
+    // into ONE NPU job per B frames: the array runs all B frames in parallel
+    // inside a single job instead of B serialized jobs. Grouped jobs predate
+    // the external-async accounting and stay outside it — their teardown is
+    // self-sufficient (sync->remaining + pending_posts).
+    int i = 0;
+    while (i < num_requests) {
+        auto& c = ctxs[i];
+        if (!c->acquired) { i++; continue; }  // failed during materialization
+        if (c->snap->batch_size <= 1) { i++; continue; }  // submitted inline
+        const uint32_t B = c->snap->batch_size;
+
+        // ── Grouped batch job ──
+        // Collect the maximal run [i, j) of consecutive acquired items that
+        // share this model and batch size, then submit ceil(run/B) jobs.
+        int j = i + 1;
+        while (j < num_requests && ctxs[j]->acquired &&
+               ctxs[j]->model_id == c->model_id &&
+               ctxs[j]->snap && ctxs[j]->snap->batch_size == B) {
+            j++;
+        }
+
+        const auto& mi   = c->snap->model_info;
+        const int   nin  = static_cast<int>(c->inputs.size());
+        const int   nout = c->snap->num_outputs;
+
+        std::vector<uint32_t> pf_in(nin), pf_out(nout);
+        bool geo_ok = true;
+        for (int k = 0; k < nin && geo_ok; k++)
+            if ((pf_in[k] = mi.inputs[k].byte_size / B) == 0) geo_ok = false;
+        for (int k = 0; k < nout && geo_ok; k++)
+            if ((pf_out[k] = mi.outputs[k].byte_size / B) == 0) geo_ok = false;
+        if (!geo_ok) {
+            // Degenerate model_info (zero per-frame size): fail the whole run.
+            for (int q = i; q < j; q++) {
+                auto& qc = ctxs[q];
+                if (!qc->released.exchange(true)) {
+                    model_mgr_->release_model(qc->model_id);
+                }
+                qc->response.mutable_status()->set_success(false);
+                qc->response.mutable_status()->set_message(
+                    "Batch model geometry unavailable (zero per-frame size)");
+                qc->done.store(true);
+                complete_now();
+            }
+            i = j;
+            continue;
+        }
+
+        for (int off = i; off < j; off += (int)B) {
+            const int n = std::min<int>((int)B, j - off);  // real items in this chunk
+
+            auto* g = new InferBatchGroupCtx;
+            g->mgr  = model_mgr_;
+            g->smgr = session_mgr_;
+            g->pool = postprocess_pool_;
+            g->sync = sync;
+            g->frames        = B;
+            g->max_outputs   = nout;
+            g->per_frame_out_bytes = pf_out;
+            g->pending_posts.store(n);
+            g->items.reserve(n);
+
+            // Concatenate B frames per input; padding frames duplicate the
+            // last real item's pixels (their results are discarded — only the
+            // NPU needs a full batch).
+            g->input_data.resize(nin);
+            for (int r = 0; r < (int)B; r++) {
+                const bool pad = (r >= n);
+                auto& src = pad ? ctxs[off + n - 1] : ctxs[off + r];
+                if (!pad) {
+                    src->batch_frame = r;
+                    g->items.push_back(src);
+                }
+                for (int k = 0; k < nin; k++) {
+                    g->input_data[k].append(
+                        static_cast<const char*>(src->inputs[k].data), pf_in[k]);
+                }
+            }
+
+            g->inputs.resize(nin);
+            for (int k = 0; k < nin; k++) {
+                HalTensor& ht = g->inputs[k];
+                std::memset(&ht, 0, sizeof(HalTensor));
+                ht.data      = const_cast<char*>(g->input_data[k].data());
+                ht.byte_size = static_cast<uint32_t>(g->input_data[k].size());
+                ht.dma_fd    = -1;
+                ht.dtype     = mi.inputs[k].dtype;
+                ht.ndim      = mi.inputs[k].ndim;
+                for (int d = 0; d < ht.ndim && d < HAL_MAX_TENSOR_DIMS; d++)
+                    ht.shape[d] = mi.inputs[k].shape[d];
+                if (ht.ndim >= 1)
+                    ht.shape[0] = static_cast<int32_t>(B);
+            }
+            g->outputs.assign(nout, HalTensor{});
+
+            int rc = model_mgr_->run_async(c->snap->infer_session,
+                                           g->inputs.data(), nin,
+                                           g->outputs.data(), nout,
+                                           infer_batch_group_callback, g);
+            if (rc != 0) {
+                // Submission failed: no callback will fire. Clean up + signal.
+                for (auto& ic : g->items) {
+                    if (!ic->released.exchange(true)) {
+                        model_mgr_->release_model(ic->model_id);
+                    }
+                    ic->response.mutable_status()->set_success(false);
+                    ic->response.mutable_status()->set_message(
+                        "Inference submission failed: " + std::to_string(rc));
+                    ic->done.store(true);
+                    complete_now();
+                }
+                model_mgr_->free_outputs(g->outputs.data(), g->max_outputs);
+                delete g;
+            }
+        }
+        i = j;
     }
 
     // Wait for callbacks with a single timeout. Items not done by
@@ -1916,10 +2293,22 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
         req->session_id(), req->stream_id(), req->model_id(),
         req->fps_limit(), 0, 5);
 
+    // The guard fires on every StreamInfer exit — clean finish, error
+    // return, or client disconnect (ctx cancellation breaks the loop): the
+    // session is destroyed and a tagged session additionally broadcasts
+    // session/end so the daemon-side overlay sidecars are swept (P2-13).
+    // The sweep tag is req->session_id() — the client-facing string the
+    // SDK stamps on its annotate events — NOT the internal session id
+    // (app-stream-model-ts) the daemon would never have seen.
     struct SessionGuard {
         SessionManager* mgr; std::string id;
-        ~SessionGuard() { mgr->destroy_session(id); }
-    } guard{session_mgr_, session_id};
+        AIRuntimeServiceImpl* svc = nullptr;
+        std::string client_tag;
+        ~SessionGuard() {
+            mgr->destroy_session(id);
+            if (svc) svc->publish_session_end(client_tag);
+        }
+    } guard{session_mgr_, session_id, this, req->session_id()};
 
     auto session = session_mgr_->get_session(session_id);
     if (!session) {
@@ -2428,6 +2817,22 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                                    stream_resp->post_result());
                 }
 
+                // Skew (success only): result-ready (here — response fully
+                // built, post-process done) minus frame capture. Both stamps
+                // are CLOCK_MONOTONIC: the daemon's frame stamp comes from
+                // the media pipeline and now_us() is steady_clock. Failures
+                // keep skew_us = 0 ("not measured").
+                if (!pp_failed) {
+                    uint64_t ready_us = now_us();
+                    uint64_t capture_us = ts_ns / 1000;
+                    if (ready_us > capture_us) {
+                        uint64_t skew_us = ready_us - capture_us;
+                        stream_resp->set_skew_us(
+                            static_cast<int64_t>(skew_us));
+                        session_mgr_->record_skew(session.get(), skew_us);
+                    }
+                }
+
                 cleanup.promise_value = true;
                 } catch (const std::exception& e) {
                     LOG_ERROR("StreamInfer completion failed for model '%s': %s",
@@ -2572,7 +2977,17 @@ grpc::Status AIRuntimeServiceImpl::DestroySession(
     const pb::SessionConfig* req,
     pb::Status* resp) {
 
+    // P2-13: capture the client-facing tag before the session object is
+    // destroyed — app_id at creation time (for StreamInfer sessions that
+    // is the SDK's session_id) is what overlay sidecars were tagged with.
+    // The broadcast goes out after the destroy so a downstream observer
+    // reacting to session/end sees a fully torn-down runtime session.
+    std::string client_tag;
+    if (auto s = session_mgr_->get_session(req->session_id()))
+        client_tag = s->app_id;
+
     bool ok = session_mgr_->destroy_session(req->session_id());
+    publish_session_end(client_tag);
     resp->set_success(ok);
     resp->set_message(ok ? "Destroyed" : "Session not found");
     return grpc::Status::OK;
@@ -2582,8 +2997,19 @@ grpc::Status AIRuntimeServiceImpl::DestroySession(
 
 grpc::Status AIRuntimeServiceImpl::GetStats(
     grpc::ServerContext* /*ctx*/,
-    const pb::Empty* /*req*/,
+    const pb::GetStatsRequest* req,
     pb::SystemStats* resp) {
+
+    // Sampling window for the blocking HAL queries below (device/CPU/DSP
+    // utilization is measured, not read). 0 = server default 500ms — the
+    // pre-parameterization behavior, also what an Empty-sending legacy
+    // client gets. Clamped to [1,5000].
+    uint32_t window_ms = req ? req->sampling_window_ms() : 0;
+    if (window_ms == 0) {
+        window_ms = 500;
+    } else if (window_ms > 5000) {
+        window_ms = 5000;
+    }
 
     auto models   = model_mgr_->list_models();
     auto sessions = session_mgr_->list_sessions();
@@ -2596,11 +3022,20 @@ grpc::Status AIRuntimeServiceImpl::GetStats(
         // Aggregate from sessions
         uint64_t total_latency = 0;
         uint64_t total_inferences = 0;
+        uint64_t total_skew = 0;
+        uint64_t skew_samples = 0;
+        uint64_t max_skew = 0;
         for (auto& s : sessions) {
             if (s->model_id == m.id) {
                 uint64_t count = s->infer_count.load(std::memory_order_relaxed);
                 total_inferences += count;
                 total_latency += s->total_latency_us.load(std::memory_order_relaxed);
+
+                // Stream-infer skew aggregation (see Session::total_skew_us)
+                skew_samples += s->skew_count.load(std::memory_order_relaxed);
+                total_skew += s->total_skew_us.load(std::memory_order_relaxed);
+                uint64_t sk_max = s->max_skew_us.load(std::memory_order_relaxed);
+                if (sk_max > max_skew) max_skew = sk_max;
 
                 // QPS from sliding window
                 auto now_ms = static_cast<uint64_t>(
@@ -2622,9 +3057,17 @@ grpc::Status AIRuntimeServiceImpl::GetStats(
         }
         stat->set_total_inferences(total_inferences);
 
+        // Skew aggregates — only set when samples exist so old-server
+        // semantics ("all 0") are preserved for stream-less models.
+        if (skew_samples > 0) {
+            stat->set_avg_skew_us(total_skew / skew_samples);
+            stat->set_max_skew_us(max_skew);
+            stat->set_skew_samples(skew_samples);
+        }
+
         // Query HAL for per-session hardware FPS
         HalInferenceSessionPerfStats hw_perf{};
-        if (model_mgr_->query_session_stats(m.id, 500, &hw_perf) == 0) {
+        if (model_mgr_->query_session_stats(m.id, window_ms, &hw_perf) == 0) {
             if (hw_perf.fps > 0)
                 stat->set_hw_fps(hw_perf.fps);
         }
@@ -2638,7 +3081,7 @@ grpc::Status AIRuntimeServiceImpl::GetStats(
 
     // Query HAL for performance stats
     HalInferencePerfStats perf{};
-    if (model_mgr_->query_performance_stats(500, &perf) == 0) {
+    if (model_mgr_->query_performance_stats(window_ms, &perf) == 0) {
         if (perf.npu_utilization >= 0) {
             resp->set_device_utilization(perf.npu_utilization / 100.0f);
         }
@@ -2698,6 +3141,26 @@ void AIRuntimeServiceImpl::publish_result(const std::string& stream_id,
 
     event_bus_->publish(topic, "ai-runtime", timestamp_ns, event_id, payload,
                         {{"stream_id", stream_id}, {"model_id", model_id}});
+}
+
+void AIRuntimeServiceImpl::publish_session_end(
+    const std::string& client_session_id) {
+    // Daemon contract (ai_overlay_subscriber.h:104): the sweep trigger is
+    // the exact topic "<prefix>session/end" with the session riding in
+    // metadata["session_id"]. The prefix is the configured result prefix —
+    // the daemon's ai_overlay.topic_prefix must agree with it (both
+    // default "inference/"), the same coupling result publishing already
+    // has. Payload is unused by the daemon; "{}" keeps bus snoopers happy.
+    // Reserved-name rule: no result may publish under a model+stream that
+    // literally spells "session/end" — this is the sole sanctioned user.
+    if (client_session_id.empty()) return;  // untagged: nothing to sweep
+    if (!event_bus_ || !event_bus_->connected()) return;
+
+    const std::string topic =
+        cfg_.event_bus_result_topic_prefix + "session/end";
+    event_bus_->publish(topic, "ai-runtime", now_ns(),
+                        "session-end-" + client_session_id,
+                        "{}", {{"session_id", client_session_id}});
 }
 
 // ─── CLIP text encoding ──────────────────────────────────────────────────────

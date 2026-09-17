@@ -2,6 +2,7 @@
 #include "camera_daemon.h"
 #include "hal_loader.h"
 #include "dsp_service.h"
+#include "injection_service.h"
 
 #include <algorithm>
 #include <chrono>
@@ -274,17 +275,32 @@ grpc::Status CameraControlServiceImpl::UpdateAiOverlay(
         return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
     }
 
-    HAL_LOG_INFO("[CameraControl] Update AI Overlay: enabled=%s labels=%s confidence=%s thickness=%u",
+    HAL_LOG_INFO("[CameraControl] Update AI Overlay: enabled=%s labels=%s confidence=%s thickness=%u face_blur=%s strict=%s cap=%s",
                  request->enabled() ? "true" : "false",
                  request->show_label() ? "true" : "false",
                  request->show_confidence() ? "true" : "false",
-                 request->line_thickness());
+                 request->line_thickness(),
+                 request->has_enable_face_blur()
+                     ? (request->enable_face_blur() ? "true" : "false") : "keep",
+                 request->has_strict_frame_lock()
+                     ? (request->strict_frame_lock() ? "true" : "false") : "keep",
+                 request->has_strict_wait_cap_ms()
+                     ? std::to_string(request->strict_wait_cap_ms()).c_str() : "keep");
 
     bool success = daemon_->update_ai_overlay_config(
         request->enabled(),
         request->show_label(),
         request->show_confidence(),
-        request->line_thickness()
+        request->line_thickness(),
+        request->has_enable_face_blur()
+            ? std::optional<bool>(request->enable_face_blur())
+            : std::optional<bool>{},
+        request->has_strict_frame_lock()
+            ? std::optional<bool>(request->strict_frame_lock())
+            : std::optional<bool>{},
+        request->has_strict_wait_cap_ms()
+            ? std::optional<uint32_t>(request->strict_wait_cap_ms())
+            : std::optional<uint32_t>{}
     );
 
     response->set_success(success);
@@ -2092,4 +2108,269 @@ CameraControlServiceImpl::~CameraControlServiceImpl() {
      * jpeg_ (unique_ptr<JpegShotState>) needs the complete type. */
     std::lock_guard<std::mutex> lk(jpeg_mu_);
     jpeg_.reset();
+}
+
+// ---- App frame injection (PushFrame P0-P2) ------------------------------
+//
+// All handlers are metadata-only: the pixel buffer arrives over the
+// camera.sock UDS (SCM_RIGHTS, DSP_IMPORT handshake) and is referenced by
+// its DSP-registry id — no fd number crosses gRPC here. REPLACE takes an
+// NV12 dma-buf (full-frame content copy); OVERLAY additionally takes an
+// ARGB32 buffer (CPU alpha blend at dest_x/dest_y) and requires an
+// explicit stream_id target; empty stream_id keeps the P0 legacy
+// dims-matching REPLACE semantics. Accepted frames queue (cap 3,
+// drop-oldest; take_frame applies pts pacing — newest due wins) and the
+// bake site drains them via InjectionService::take_frame() ahead of each
+// encoder push (camera_daemon.cpp handle_video_frame_for_routing); the
+// pure ISP path restores at the next IDR after StopInjection/session
+// close. PushFrameStream (P2) is the client-streaming variant: same
+// per-request semantics, first rejection ends the stream, an
+// end_of_stream request closes the session, a clean half-close without
+// one keeps it.
+
+namespace {
+/* Write-lease reporting (Fix-1): mirror InjectionServiceStatus's
+ * in-flight snapshot (queued + mid-bake registry ids) into a response.
+ * Works for both PushFrameResponse and InjectionStatusResponse — the
+ * field name/number are identical by design. Old SDKs ignore the
+ * unknown field; the SDK detects the protocol via
+ * InjectionStatusResponse.reports_in_flight_buffers. */
+template <typename ResponseT>
+void fill_in_flight(const InjectionServiceStatus& st, ResponseT* response) {
+    for (uint64_t id : st.in_flight_buffer_ids)
+        response->add_in_flight_buffer_ids(id);
+}
+} // namespace
+
+grpc::Status CameraControlServiceImpl::PushFrame(
+    grpc::ServerContext* context,
+    const aipc::camera::PushFrameRequest* request,
+    aipc::camera::PushFrameResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    InjectionService* inj = daemon_->injection_service();
+    if (!inj || !inj->is_running()) {
+        response->set_success(false);
+        response->set_message("frame injection unavailable (DSP registry off?)");
+        response->set_error_code(INJ_SVC_ERR_UNAVAILABLE);
+        return grpc::Status::OK;
+    }
+
+    InjectionFrameDesc desc;
+    desc.buffer_id = request->buffer_id();
+    desc.width = request->width();
+    desc.height = request->height();
+    desc.stride = request->stride();
+    desc.mode = (request->mode() == aipc::camera::INJECT_OVERLAY)
+                    ? InjectionMode::Overlay
+                    : InjectionMode::Replace;
+    desc.pts_ns = request->pts_ns();
+    desc.dest_x = request->dest_x();
+    desc.dest_y = request->dest_y();
+    desc.stream_id = request->stream_id();
+    desc.end_of_stream = request->end_of_stream();
+    desc.session_id = request->session_id();
+
+    const InjectionPushResult res = inj->push_frame(desc);
+    response->set_success(res.rc == INJ_SVC_OK);
+    response->set_message(res.message);
+    response->set_error_code(res.rc);
+    response->set_injected_frame_id(res.frame_id);
+    response->set_session_id(request->session_id()); /* pure echo: the
+                                                      * caller's tag for
+                                                      * correlating this
+                                                      * reply, "" untagged */
+    /* Post-push lease snapshot: this frame's id is in the set (queued);
+     * ids absent since the last response are free to rewrite. */
+    fill_in_flight(inj->status(), response);
+
+    /* Per-frame RPC: log rejections only — session open/close is already
+     * INFO-logged inside InjectionService, and a per-accept INFO line would
+     * fire at stream fps. */
+    if (res.rc != INJ_SVC_OK) {
+        HAL_LOG_WARNING("[CameraControl] PushFrame rejected: %s (rc=%d)",
+                        res.message.c_str(), res.rc);
+    }
+    return grpc::Status::OK;
+}
+
+// Client-streaming variant (P2): the app pushes frames over one RPC at
+// stream fps instead of one unary call per frame. Reuses PushFrame's
+// per-request semantics exactly (same InjectionFrameDesc mapping); the
+// differences are stream-level:
+//   - first non-OK push ends the stream — every push_frame rejection is
+//     deterministic (geometry/permission/owner conflict), so retrying at
+//     fps would only repeat it; the response carries that rc+message and
+//     the accepted count;
+//   - a request with end_of_stream=true is forwarded (closes the
+//     session) and the stream returns;
+//   - a clean half-close WITHOUT end_of_stream returns normally and
+//     LEAVES the session open — the app may resume with PushFrame or a
+//     new PushFrameStream, or close via StopInjection (the session is
+//     owner-fd anchored, and both transports ride the same gRPC
+//     channel's UDS buffer imports, so the owner does not change).
+grpc::Status CameraControlServiceImpl::PushFrameStream(
+    grpc::ServerContext* context,
+    grpc::ServerReader<aipc::camera::PushFrameRequest>* reader,
+    aipc::camera::PushFrameResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    InjectionService* inj = daemon_->injection_service();
+    if (!inj || !inj->is_running()) {
+        response->set_success(false);
+        response->set_message("frame injection unavailable (DSP registry off?)");
+        response->set_error_code(INJ_SVC_ERR_UNAVAILABLE);
+        return grpc::Status::OK;
+    }
+
+    uint64_t accepted = 0;
+    std::string last_session_id; /* latest non-empty request tag, for the
+                                  * stream-level reply's echo */
+    aipc::camera::PushFrameRequest request;
+    while (reader->Read(&request)) {
+        InjectionFrameDesc desc;
+        desc.buffer_id = request.buffer_id();
+        desc.width = request.width();
+        desc.height = request.height();
+        desc.stride = request.stride();
+        desc.mode = (request.mode() == aipc::camera::INJECT_OVERLAY)
+                        ? InjectionMode::Overlay
+                        : InjectionMode::Replace;
+        desc.pts_ns = request.pts_ns();
+        desc.dest_x = request.dest_x();
+        desc.dest_y = request.dest_y();
+        desc.stream_id = request.stream_id();
+        desc.end_of_stream = request.end_of_stream();
+        desc.session_id = request.session_id();
+        if (!desc.session_id.empty()) last_session_id = desc.session_id;
+
+        const InjectionPushResult res = inj->push_frame(desc);
+        if (res.rc != INJ_SVC_OK) {
+            /* Deterministic rejection: surface it and stop draining. The
+             * session state (if any) is InjectionService's to hold — an
+             * already-open session stays open for StopInjection cleanup. */
+            HAL_LOG_WARNING("[CameraControl] PushFrameStream rejected after "
+                            "%lu frame(s): %s (rc=%d)",
+                            (unsigned long)accepted, res.message.c_str(),
+                            res.rc);
+            response->set_success(false);
+            response->set_message(res.message);
+            response->set_error_code(res.rc);
+            response->set_accepted_frame_count(accepted);
+            response->set_session_id(last_session_id);
+            fill_in_flight(inj->status(), response);
+            return grpc::Status::OK;
+        }
+        if (desc.end_of_stream) {
+            /* Session closed by request: acknowledge and finish. */
+            response->set_success(true);
+            response->set_message(res.message);
+            response->set_accepted_frame_count(accepted);
+            response->set_session_id(last_session_id);
+            fill_in_flight(inj->status(), response);
+            return grpc::Status::OK;
+        }
+        ++accepted;
+    }
+
+    /* Clean half-close without an EOS request: keep the session. */
+    response->set_success(true);
+    response->set_message("client half-close: injection session kept open");
+    response->set_accepted_frame_count(accepted);
+    response->set_session_id(last_session_id);
+    /* Final-response snapshot only: client-streaming has no per-frame
+     * acks, so a lease-aware SDK paces the generator on
+     * GetInjectionStatus polling instead (the snapshot field exists on
+     * both messages for exactly that reason). */
+    fill_in_flight(inj->status(), response);
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::GetInjectionStatus(
+    grpc::ServerContext* context,
+    const aipc::camera::Empty* request,
+    aipc::camera::InjectionStatusResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    InjectionService* inj = daemon_->injection_service();
+    if (!inj || !inj->is_running()) {
+        response->set_success(false);
+        response->set_message("frame injection unavailable (DSP registry off?)");
+        return grpc::Status::OK;
+    }
+
+    const InjectionServiceStatus st = inj->status();
+    response->set_success(true);
+    response->set_message("OK");
+    response->set_active(st.active);
+    response->set_mode(st.mode == InjectionMode::Overlay
+                           ? aipc::camera::INJECT_OVERLAY
+                           : aipc::camera::INJECT_REPLACE);
+    response->set_frames_injected(st.frames_injected);
+    response->set_frames_dropped(st.frames_dropped);
+    response->set_queue_depth(st.queue_depth);
+    response->set_session_id(st.session_id);
+    fill_in_flight(st, response);
+    /* Capability flag: this daemon speaks the write-lease protocol. A
+     * lease-aware SDK that sees false (old daemon) falls back to
+     * depth-only pacing guidance and warns once. */
+    response->set_reports_in_flight_buffers(true);
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::StopInjection(
+    grpc::ServerContext* context,
+    const aipc::camera::Empty* request,
+    aipc::camera::InjectionStatusResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    InjectionService* inj = daemon_->injection_service();
+    if (!inj || !inj->is_running()) {
+        response->set_success(false);
+        response->set_message("frame injection unavailable (DSP registry off?)");
+        return grpc::Status::OK;
+    }
+
+    HAL_LOG_INFO("[CameraControl] StopInjection: flushing inject queue");
+    inj->stop_injection();
+
+    /* Post-flush snapshot: active=false, queue_depth=0, counters retained. */
+    const InjectionServiceStatus st = inj->status();
+    response->set_success(true);
+    response->set_message("injection stopped (queue flushed)");
+    response->set_active(st.active);
+    response->set_mode(st.mode == InjectionMode::Overlay
+                           ? aipc::camera::INJECT_OVERLAY
+                           : aipc::camera::INJECT_REPLACE);
+    response->set_frames_injected(st.frames_injected);
+    response->set_frames_dropped(st.frames_dropped);
+    response->set_queue_depth(st.queue_depth);
+    response->set_session_id(st.session_id); /* "" here: close clears the
+                                              * tag with the session */
+    /* Post-flush lease snapshot: queue ids are gone; any remaining ids
+     * are mid-bake composes the daemon is still reading — the SDK must
+     * not recycle those pool slots yet. */
+    fill_in_flight(st, response);
+    response->set_reports_in_flight_buffers(true);
+    return grpc::Status::OK;
 }

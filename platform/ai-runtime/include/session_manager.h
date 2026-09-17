@@ -26,6 +26,12 @@ struct Session {
     std::atomic<TimePoint> last_infer{TimePoint{}};
     std::atomic<uint64_t> infer_count{0};
     std::atomic<uint64_t> total_latency_us{0};   // cumulative inference latency
+    // Stream-infer skew (result-ready − frame capture, µs). Only StreamInfer
+    // records samples — single-shot Infer has no frame timestamp. Aggregated
+    // per model by GetStats (avg/max/sample count).
+    std::atomic<uint64_t> total_skew_us{0};
+    std::atomic<uint64_t> skew_count{0};
+    std::atomic<uint64_t> max_skew_us{0};
     // QPS window: track inference count in a sliding window
     std::atomic<uint64_t> window_infer_count{0};
     std::atomic<uint64_t> window_start_ms{0};    // epoch ms when window started
@@ -103,6 +109,10 @@ public:
     /// Record an inference event (with latency tracking).
     /// Same liveness contract as check_fps_limit().
     void record_inference(Session* s, uint64_t latency_us = 0);
+
+    /// Record a stream-infer result skew sample (result-ready − frame
+    /// capture, µs). Same liveness contract as check_fps_limit().
+    void record_skew(Session* s, uint64_t skew_us);
 
     /// List all sessions (snapshot). The returned shared_ptrs keep every
     /// session alive across iteration.

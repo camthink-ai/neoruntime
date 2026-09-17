@@ -167,7 +167,7 @@ func (h *APIHandlers) GetSystemStats(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		aiStats, err := client.GetStats(ctx, &inferencepb.Empty{})
+		aiStats, err := client.GetStats(ctx, &inferencepb.GetStatsRequest{})
 		if err == nil {
 			stats["services"].(map[string]interface{})["ai-runtime"] = aiStats
 		}

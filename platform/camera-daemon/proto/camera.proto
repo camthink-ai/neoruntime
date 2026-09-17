@@ -94,6 +94,15 @@ message AiOverlayConfig {
   bool show_confidence = 6;
   // Show label
   bool show_label = 7;
+  // Mosaic detections labeled "face" (subscriber-level face blur)
+  optional bool enable_face_blur = 8;
+  // Strict frame-lock (P1-6): identity-fed display streams wait — bounded —
+  // for each frame's own inference result at the bake site. Absent = keep
+  // current (yaml) setting.
+  optional bool strict_frame_lock = 9;
+  // Strict wait cap in ms. 0 = derive from stream fps (2 frame periods,
+  // clamp [1,500]). Only meaningful when strict_frame_lock is set.
+  optional uint32 strict_wait_cap_ms = 10;
 }
 
 // OSD Text Overlay Configuration
@@ -270,6 +279,37 @@ message StreamStatusInfo {
   uint64 ms_since_last_frame = 10;  // ms since last encoded frame (UINT64_MAX = never/unknown)
   uint32 measured_fps = 11;         // observed output fps (0 = unknown)
   string status_detail = 12;        // human-readable context, e.g. stall reason
+  // Publisher drop observability (encoded_publisher, per stream). The four
+  // drop layers (bake skip / injection queue / publisher send / SDK client)
+  // reconcile against packets_published + last_packet_seq: anything published
+  // but not received shows up as a sequence-number hole client-side.
+  uint64 packets_published = 13;      // packets enqueued into the publisher
+  uint64 queue_overflow_drops = 14;   // newest-kept overflow drops (queue full)
+  uint64 client_send_drops = 15;      // per-client skips (EAGAIN / awaiting keyframe)
+  uint64 client_send_failures = 16;   // per-client hard errors (connection lost)
+  uint64 client_disconnects = 23;     // subscribers reaped after control-poll EOF/ERR
+  uint64 last_packet_seq = 17;        // last assigned packet sequence number (0 = none)
+  uint32 publisher_clients = 18;      // live encoded-stream subscribers
+  // Overlay bake observability (ai_overlay_subscriber, per stream). bake_skips
+  // counts frames the bake site passed through un-annotated because no fresh
+  // result existed (no-result or TTL-expired); a clean source-only feed is
+  // not a skip. strict_* mirror the strict-gate verdict counters.
+  uint64 bake_skips = 19;        // frames baked without a fresh overlay result
+  uint64 strict_locked = 20;     // strict mode: frames locked to their own result
+  uint64 strict_degraded = 21;   // strict mode: fell back to newest-fresh result
+  uint64 strict_skips = 22;      // strict mode: frames skipped (no usable result)
+  // Overlay behavior-decoupling + frame-sync observability (per display
+  // stream). stream_epoch is the stream generation counter — ReconfigureEncoder
+  // / full-transform-reinit bumps it and purges held layers, so an app still
+  // holding the old generation can detect the restart instead of writing
+  // silently-rejected overlays forever. The overlay_* counters aggregate every
+  // infer stream routed onto this display (identity + stream_map/bindings
+  // cross-feeds), mirroring the bake site's own layer collection.
+  uint64 stream_epoch = 24;              // stream generation (restart bumps, never 0)
+  uint64 overlay_layer_count = 25;       // overlay layers currently held for the stream
+  uint64 overlay_late_commands = 26;     // app overlay events rejected: frame already passed
+  uint64 overlay_epoch_rejects = 27;     // app overlay events rejected: stale stream_epoch
+  uint64 overlay_no_binding_drops = 28;  // platform result events dropped: no binding
 }
 
 message GetStreamStatusResponse {
@@ -694,6 +734,22 @@ service CameraControl {
   // daemon keeps one encoder context per distinct (width, height, format,
   // quality) and recreates it when that key changes.
   rpc EncodeImage(EncodeImageRequest) returns (EncodeImageResponse);
+
+  // App frame injection (P0; see docs proposal frame-injection.md).
+  // Control plane only: the NV12 buffer must already be registered with
+  // the FD-publisher DSP registry (alloc or import over camera.sock
+  // SCM_RIGHTS) and is referenced by buffer id — a raw fd number never
+  // crosses gRPC. P0 substitutes the frame at the daemon's encoder feed
+  // (bake/add_buffer frontier); /dev/video10 is a Bayer ISP-front
+  // virtual-sensor node and is NOT part of this contract.
+  rpc PushFrame(PushFrameRequest) returns (PushFrameResponse);
+  // Client-streaming form (P2): each request is one push_frame; a request
+  // with end_of_stream=true closes the injection session and returns. A
+  // clean half-close WITHOUT EOS keeps the session open (matches the unary
+  // semantics — a final burst already in the queue still drains).
+  rpc PushFrameStream(stream PushFrameRequest) returns (PushFrameResponse);
+  rpc GetInjectionStatus(Empty) returns (InjectionStatusResponse);
+  rpc StopInjection(Empty) returns (InjectionStatusResponse);
 }
 
 // Device capabilities auto-detected from loaded HAL modules
@@ -876,4 +932,81 @@ message EncodeImageResponse {
   int32 error_code = 3;       // negative HAL error or DspServiceError
   uint32 elapsed_ms = 4;
   bytes jpeg = 5;             // complete JPEG frame (empty on failure)
+}
+
+// ======== App frame injection (P0; see docs proposal frame-injection.md) ========
+//
+// Output-branch write path: an allow-listed app substitutes or overlays
+// content on the frame that reaches the encoder. P0 landed REPLACE/NV12 at
+// the target stream's encode resolution (even dimensions); P1/P2 add
+// OVERLAY (NV12 inset paste or ARGB32 CPU alpha blend at dest_x/dest_y),
+// stream targeting via stream_id, pts pacing, and this client-streaming
+// form. The injected buffer rides the existing DSP registry (same id
+// namespace as SubmitDspJob/EncodeImage); the daemon composes at the
+// bake/add_buffer frontier, so no media-graph node is involved
+// (2026-09-10 probe: no NV12-accepting OUTPUT node exists; /dev/video10 is
+// Bayer ISP-front, out of scope). Queue is shallow (cap 3) and
+// lossy-tolerant: overflow increments frames_dropped (drop-oldest), never
+// backpressures the encoder.
+
+enum InjectionMode {
+  INJECT_REPLACE = 0;   // replace the encoded frame entirely
+  INJECT_OVERLAY = 1;   // blend over the ISP frame (NV12 inset or ARGB32 alpha)
+}
+
+message PushFrameRequest {
+  uint64 buffer_id = 1;        // DSP-registry id of the injected frame;
+                               // 0 valid only with end_of_stream=true
+  uint32 width = 2;            // injected content width (even)
+  uint32 height = 3;           // injected content height (even)
+  uint32 stride = 4;           // luma stride (NV12) or byte stride (ARGB32)
+  InjectionMode mode = 5;
+  uint64 pts_ns = 6;           // device CLOCK_MONOTONIC presentation time;
+                               // 0 = due immediately; the daemon takes the
+                               // newest due frame and drops older due ones
+  uint32 dest_x = 7;           // OVERLAY position within the target frame
+  uint32 dest_y = 8;           // ignored by REPLACE (full-frame)
+  bool end_of_stream = 9;      // true = flush queue + restore ISP path at next IDR
+  string stream_id = 10;       // target stream; REQUIRED for OVERLAY,
+                               // optional for REPLACE (empty = legacy
+                               // dims-matching against the encoded frame)
+  string session_id = 11;      // app session tag (P2-13): correlation and
+                               // observability only — session ownership
+                               // stays anchored on the UDS client fd; an
+                               // owner disconnect reclaims regardless of
+                               // this field
+}
+
+message PushFrameResponse {
+  bool success = 1;
+  string message = 2;
+  int32 error_code = 3;        // negative HAL error or -EINVAL style validation
+  uint64 injected_frame_id = 4; // running id; correlates with frames_injected
+  uint64 accepted_frame_count = 5; // PushFrameStream: frames accepted before return
+  string session_id = 6;       // echo of the request's session tag ("" when
+                               // untagged); PushFrameStream echoes the last
+                               // non-empty tag seen on the stream
+  repeated uint64 in_flight_buffer_ids = 7; // write-lease snapshot at response
+                               // time: registry ids the daemon may still read
+                               // (queued + mid-bake). A pool slot is safe to
+                               // rewrite only when its id is absent. Absent
+                               // (empty + reports_in_flight_buffers=false in
+                               // GetInjectionStatus) on old daemons
+}
+
+message InjectionStatusResponse {
+  bool success = 1;
+  string message = 2;
+  bool active = 3;             // a session is currently injecting frames
+  InjectionMode mode = 4;
+  uint64 frames_injected = 5;  // frames handed toward the encoder feed
+  uint64 frames_dropped = 6;   // queue-full drops + dimension/format rejects
+  uint32 queue_depth = 7;      // live depth of the inject queue (cap 3)
+  string session_id = 8;       // live session's tag (latest non-empty
+                               // request tag; "" = untagged or no session)
+  repeated uint64 in_flight_buffer_ids = 9; // same write-lease snapshot as
+                               // PushFrameResponse (queued + mid-bake ids)
+  bool reports_in_flight_buffers = 10; // capability flag: false on daemons
+                               // predating the lease protocol (SDK falls
+                               // back to depth-only pacing guidance)
 }

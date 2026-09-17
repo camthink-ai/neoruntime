@@ -11,6 +11,7 @@
 #include "../include/osd_manager.h"
 #include "../include/encoder_manager.h"
 #include "../include/fd_publisher.h"
+#include "../include/fd_protocol.h"
 #include "../include/rtsp_server.h"
 #include "../include/encoded_publisher.h"
 #include "../include/ai_overlay_subscriber.h"
@@ -42,6 +43,9 @@
 #include <iomanip>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 #include <unistd.h>
 
 extern "C" {
@@ -461,6 +465,7 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     fd_cfg.sock_path = config_.fd_pub_sock_path;
     fd_cfg.max_clients = config_.fd_pub_max_clients;
     fd_cfg.max_outstanding_per_client = config_.fd_pub_max_outstanding;
+    fd_cfg.lease_ms = config_.fd_pub_lease_ms;
     fd_pub_ = std::make_unique<FdPublisher>(frame_router_.get(), fd_cfg);
 
     // DSP offload service (PLAT-1..5): one HAL DSP context + dma-buf buffer
@@ -488,6 +493,47 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     } else {
         HAL_LOG_INFO("CameraDaemon: HAL DSP/frame_buffer ops unavailable, "
                      "app DSP offload disabled");
+    }
+
+    // App frame injection (PushFrame P0-P2): rides the DSP registry above
+    // (buffers pinned by id, never a raw fd). Constructed only when the
+    // registry exists; the master gate (config_.injection.enabled, ships
+    // false) decides whether PushFrame accepts frames. The bake-site
+    // handoff (take_frame + compose in handle_video_frame_for_routing)
+    // consumes frames targeted at this stream (stream_id) or legacy
+    // matching-dims REPLACE pushes; see inject_nv12_copy /
+    // inject_argb_blend there. P2-12 resolvers: the identity resolver
+    // anchors the manifest permission gate to the FdPublisher's
+    // SO_PEERCRED identities; the stream-dims resolver answers push-time
+    // geometry checks from the live bake-site dims cache.
+    if (dsp_service_) {
+        injection_service_ = std::make_unique<InjectionService>(
+            dsp_service_.get(), config_.injection);
+        if (fd_pub_) {
+            injection_service_->set_identity_resolver(
+                [this](int owner_fd) {
+                    return fd_pub_->client_identity(owner_fd);
+                });
+            // P2-13: a disconnect closes the owner's injection session
+            // (queue flush + pin release) instead of wedging it.
+            fd_pub_->set_injection_service(injection_service_.get());
+        }
+        injection_service_->set_stream_dims_resolver(
+            [this](const std::string& name, uint32_t& w, uint32_t& h) {
+                std::shared_lock<std::shared_mutex> lk(stream_dims_mu_);
+                const auto it = stream_dims_.find(name);
+                if (it == stream_dims_.end()) {
+                    return false;
+                }
+                w = it->second.first;
+                h = it->second.second;
+                return true;
+            });
+        injection_service_->start();
+        HAL_LOG_INFO("CameraDaemon: frame injection service started "
+                     "(enabled=%s, queue=%u)",
+                     config_.injection.enabled ? "true" : "false",
+                     config_.injection.queue_capacity);
     }
 
     // Register all subscribers with FrameRouter
@@ -983,6 +1029,19 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
 #endif
         restart_data_consumers();
 
+        // Whole-pipeline rebuild: every stream's frame generation restarted.
+        // Bump the overlay epoch per encoder stream so app commands tagged
+        // to the old generation are rejected (and its layers purged)
+        // instead of decorating the new one.
+        {
+            std::shared_lock<std::shared_mutex> lk(op_mu_);
+            if (ai_overlay_) {
+                for (const auto& ec : config_.encoders) {
+                    ai_overlay_->note_stream_restart(ec.stream_name);
+                }
+            }
+        }
+
         // Verify the rebuilt pipeline actually produces frames. Rotation
         // rebuilds all ISP pipelines; if the post-rebuild encoder path is dead
         // we surface the truth so the player/UI can prompt a restart rather than
@@ -1470,10 +1529,245 @@ void CameraDaemon::bind_video_source_callbacks() {
     }
 }
 
+// Copy an injected NV12 dma-buf frame (PushFrame REPLACE full-frame or
+// OVERLAY opaque inset) onto the pipeline frame's planes at (dst_x,
+// dst_y). The source is a DSP-registry pin: real dma-buf imports carry
+// no CPU mapping (fb->planes[] stay NULL — DSP hardware consumes the
+// fds), so each plane is mapped PROT_READ for exactly the copy,
+// bracketed by DMA_BUF_IOCTL_SYNC (START|READ before, END|READ after);
+// the per-frame map/unmap keeps zero cache-lifetime coupling with the
+// registry. NV12 is strided rows of `width` payload bytes — Y: height
+// rows at (dst_x, dst_y), UV: height/2 rows at (dst_x, dst_y/2) — each
+// plane at its own src/dst stride (dst_x/dst_y even keeps the chroma
+// grid aligned). Any failure logs and leaves the ISP pixels intact:
+// the stream degrades to the camera, never to garbage.
+static void inject_nv12_copy(const InjectionService::QueuedFrame& qf,
+                             HalFrameBuffer* frame,
+                             uint32_t dst_x, uint32_t dst_y) {
+    const HalFrameBuffer* src = qf.pin.fb();
+    if (!src || src->num_planes < 2u || frame->num_planes < 2u ||
+        !frame->planes[0] || !frame->planes[1]) {
+        HAL_LOG_WARNING("CameraDaemon: injected frame unusable, keeping ISP pixels");
+        return;
+    }
+
+    const uint32_t rows[2] = {qf.height, qf.height / 2u};
+    const uint32_t src_stride[2] = {
+        qf.stride, src->strides[1] != 0u ? src->strides[1] : qf.stride};
+    for (uint32_t p = 0; p < 2u; ++p) {
+        if (src->dma_fds[p] < 0 ||
+            src->sizes[p] < (rows[p] - 1u) * src_stride[p] + qf.width) {
+            HAL_LOG_WARNING("CameraDaemon: injected plane %u too small, keeping ISP pixels", p);
+            return;
+        }
+    }
+
+    uint8_t* maps[2] = {nullptr, nullptr};
+    for (uint32_t p = 0; p < 2u; ++p) {
+        const int fd = src->dma_fds[p];
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+        if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+            HAL_LOG_WARNING("CameraDaemon: injected plane %u sync failed, keeping ISP pixels", p);
+            break;
+        }
+        void* m = mmap(nullptr, src->sizes[p], PROT_READ, MAP_SHARED, fd, 0);
+        if (m == MAP_FAILED) {
+            sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+            (void)ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+            HAL_LOG_WARNING("CameraDaemon: injected plane %u mmap failed, keeping ISP pixels", p);
+            break;
+        }
+        maps[p] = static_cast<uint8_t*>(m);
+    }
+
+    if (maps[0] && maps[1]) {
+        /* Y rows land at dst_y+r; UV rows at dst_y/2+r (both planes take
+         * dst_x as the byte column offset — NV12 packs one UV byte pair
+         * per pixel column). */
+        const uint32_t dst_row_off[2] = {dst_y, dst_y / 2u};
+        for (uint32_t p = 0; p < 2u; ++p) {
+            const uint8_t* sp = maps[p];
+            uint8_t* dp = static_cast<uint8_t*>(frame->planes[p]) +
+                          static_cast<size_t>(dst_row_off[p]) * frame->strides[p] +
+                          dst_x;
+            for (uint32_t r = 0; r < rows[p]; ++r) {
+                memcpy(dp + static_cast<size_t>(r) * frame->strides[p],
+                       sp + static_cast<size_t>(r) * src_stride[p],
+                       qf.width);
+            }
+        }
+    }
+
+    /* Unmap/sync-end exactly what was mapped (planes map in order, so
+     * break-on-null is exact). */
+    for (uint32_t p = 0; p < 2u && maps[p]; ++p) {
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+        (void)ioctl(src->dma_fds[p], DMA_BUF_IOCTL_SYNC, &sync);
+        (void)munmap(maps[p], src->sizes[p]);
+    }
+}
+
+/* ARGB32 → NV12 color conversion (BT.601 limited range). ARGB32 memory
+ * byte order is [A,R,G,B] (the SDK's dsp.py packs the same layout). */
+static inline uint8_t argb_y_of(uint8_t r, uint8_t g, uint8_t b) {
+    const int32_t v = ((16829 * r + 33039 * g + 6416 * b + 32768) >> 16) + 16;
+    return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+static inline uint8_t argb_u_of(uint8_t r, uint8_t g, uint8_t b) {
+    const int32_t v = ((-9714 * r - 19076 * g + 28784 * b + 32768) >> 16) + 128;
+    return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+static inline uint8_t argb_v_of(uint8_t r, uint8_t g, uint8_t b) {
+    const int32_t v = ((28784 * r - 24113 * g - 4655 * b + 32768) >> 16) + 128;
+    return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+// Alpha-blend an injected ARGB32 frame (PushFrame P2 OVERLAY) over the
+// pipeline NV12 frame at (dest_x, dest_y), on the CPU. Rationale: the
+// DSP build_blend op needs a registry-resident base frame and the
+// pipeline buffer is not one, and the DSP queue is a single congested
+// worker (P1-9 unfixed) — the bake site blends on CPU instead. Layout:
+// NV12 chroma is a 2x2 macroblock grid, so the blend walks 2x2 source
+// pixel blocks; per-pixel luma blends with that pixel's alpha, chroma
+// blends once per block with the block's total coverage (sw = sum of
+// the 4 alphas, 0..1020; u/v source are the alpha-weighted average of
+// the block's converted chroma). Fully transparent blocks (sw == 0)
+// leave the frame untouched. The source mapping follows the registry
+// layout: dma-buf imports map PROT_READ per use (sync-bracketed, same
+// as inject_nv12_copy), memfd/malloc imports already carry planes[0].
+// Validation guarantees even width/height/even dest, so macroblocks
+// tile the source exactly. Any failure logs and leaves the ISP pixels
+// intact.
+static void inject_argb_blend(const InjectionService::QueuedFrame& qf,
+                              HalFrameBuffer* frame) {
+    const HalFrameBuffer* src = qf.pin.fb();
+    if (!src || src->num_planes < 1u || frame->num_planes < 2u ||
+        !frame->planes[0] || !frame->planes[1]) {
+        HAL_LOG_WARNING("CameraDaemon: injected frame unusable, keeping ISP pixels");
+        return;
+    }
+    if (src->sizes[0] < (qf.height - 1u) * qf.stride + qf.width * 4u) {
+        HAL_LOG_WARNING("CameraDaemon: injected ARGB32 plane too small, keeping ISP pixels");
+        return;
+    }
+
+    uint8_t* map = nullptr;
+    const uint8_t* argb = static_cast<const uint8_t*>(src->planes[0]);
+    if (!argb) {
+        if (src->dma_fds[0] < 0) {
+            HAL_LOG_WARNING("CameraDaemon: injected ARGB32 has no mapping or fd");
+            return;
+        }
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+        if (ioctl(src->dma_fds[0], DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+            HAL_LOG_WARNING("CameraDaemon: injected ARGB32 sync failed, keeping ISP pixels");
+            return;
+        }
+        map = static_cast<uint8_t*>(
+            mmap(nullptr, src->sizes[0], PROT_READ, MAP_SHARED,
+                 src->dma_fds[0], 0));
+        if (map == MAP_FAILED) {
+            sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+            (void)ioctl(src->dma_fds[0], DMA_BUF_IOCTL_SYNC, &sync);
+            HAL_LOG_WARNING("CameraDaemon: injected ARGB32 mmap failed, keeping ISP pixels");
+            return;
+        }
+        argb = map;
+    }
+
+    uint8_t* y_plane = static_cast<uint8_t*>(frame->planes[0]);
+    uint8_t* uv_plane = static_cast<uint8_t*>(frame->planes[1]);
+    const uint32_t y_stride = frame->strides[0];
+    const uint32_t uv_stride = frame->strides[1];
+    const uint32_t dx = qf.dest_x;
+    const uint32_t dy = qf.dest_y;
+
+    for (uint32_t by = 0; by < qf.height; by += 2u) {
+        const uint8_t* srow0 = argb + static_cast<size_t>(by) * qf.stride;
+        const uint8_t* srow1 = (by + 1u < qf.height)
+            ? srow0 + qf.stride : nullptr;
+        uint8_t* yrow0 = y_plane + static_cast<size_t>(dy + by) * y_stride + dx;
+        uint8_t* yrow1 = (by + 1u < qf.height) ? yrow0 + y_stride : nullptr;
+        uint8_t* uvrow = uv_plane +
+                         static_cast<size_t>((dy + by) / 2u) * uv_stride + dx;
+
+        for (uint32_t bx = 0; bx < qf.width; bx += 2u) {
+            const bool two_cols = (bx + 1u < qf.width);
+            uint32_t sw = 0;          /* total coverage: sum of 4 alphas */
+            int32_t su = 0, sv = 0;   /* alpha-weighted source chroma sums */
+
+            /* Per-pixel luma blend + chroma accumulation, 2x2 block. */
+            for (uint32_t py = 0; py < 2u; ++py) {
+                const uint8_t* srow = py == 0u ? srow0 : srow1;
+                uint8_t* yrow = py == 0u ? yrow0 : yrow1;
+                if (!srow || !yrow) continue; /* odd trailing row can't happen (even h) */
+                for (uint32_t px = 0; px < 2u; ++px) {
+                    if (px == 1u && !two_cols) continue; /* even w, also can't happen */
+                    const uint8_t* p = srow + static_cast<size_t>(bx + px) * 4u;
+                    const uint8_t a = p[0];
+                    const uint8_t r = p[1];
+                    const uint8_t g = p[2];
+                    const uint8_t b = p[3];
+                    if (a == 0u) continue;
+                    const uint8_t yd = yrow[bx + px];
+                    yrow[bx + px] = static_cast<uint8_t>(
+                        (a * argb_y_of(r, g, b) + (255u - a) * yd + 128u) >> 8);
+                    sw += a;
+                    su += a * argb_u_of(r, g, b);
+                    sv += a * argb_v_of(r, g, b);
+                }
+            }
+
+            if (sw == 0u) {
+                continue; /* fully transparent block */
+            }
+            /* Block chroma: source = alpha-weighted average color;
+             * dest = coverage-weighted mix with the existing chroma. */
+            const uint8_t u_src = static_cast<uint8_t>((su + sw / 2u) / sw);
+            const uint8_t v_src = static_cast<uint8_t>((sv + sw / 2u) / sw);
+            /* UV addressing is in BYTES, like inject_nv12_copy: one u,v pair
+             * (2 bytes) per 2 luma columns, so block bx (luma cols dx+bx,
+             * dx+bx+1) sits at byte offset dx+bx of the uv row — uvrow
+             * already carries the dx base, the per-block step is just bx.
+             * A bx*2 step writes every other chroma sample and spills past
+             * the row end into the next chroma row's left edge. */
+            uint8_t* uvp = uvrow + static_cast<size_t>(bx);
+            uvp[0] = static_cast<uint8_t>((sw * u_src + (1020u - sw) * uvp[0] + 510u) / 1020u);
+            uvp[1] = static_cast<uint8_t>((sw * v_src + (1020u - sw) * uvp[1] + 510u) / 1020u);
+        }
+    }
+
+    if (map) {
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+        (void)ioctl(src->dma_fds[0], DMA_BUF_IOCTL_SYNC, &sync);
+        (void)munmap(map, src->sizes[0]);
+    }
+}
+
 void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_name,
                                                   HalFrameBuffer* frame) {
     if (!frame) {
         return;
+    }
+
+    // Live stream dims cache (P2-12): cheap shared-lock compare every
+    // frame, unique-lock write only on change. Feeds the InjectionService
+    // stream_dims resolver so push-time geometry checks work even before
+    // the first frame of a freshly (re)started stream.
+    {
+        std::shared_lock<std::shared_mutex> lk(stream_dims_mu_);
+        const auto it = stream_dims_.find(dispatch_name);
+        if (it == stream_dims_.end() ||
+            it->second.first != frame->width ||
+            it->second.second != frame->height) {
+            lk.unlock();
+            std::unique_lock<std::shared_mutex> ulk(stream_dims_mu_);
+            stream_dims_[dispatch_name] = {frame->width, frame->height};
+        }
     }
 
     // Dynamic Privacy Mask: bake the worker-produced bytemask onto
@@ -1511,6 +1805,73 @@ void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_na
         }
         if (dpm_capture && dpm_capture->is_running()) {
             dpm_capture->offer_frame(frame);
+        }
+    }
+
+    // App frame injection (PushFrame P0-P2): with the DPM offer above
+    // already made on the real ISP pixels (its DSP resize is
+    // synchronous, so the worker's copies are already made), compose the
+    // newest due queued app frame FOR THIS STREAM over THIS pipeline
+    // buffer. Everything below — DPM mask/mosaic, AI overlay,
+    // frame_router subscribers and the frontend bridge's encoder
+    // add_buffer — then consumes the composed pixels, while platform
+    // masking draws on top by construction (frame-injection.md risk 4:
+    // the worker never sees injected content and the mask always wins
+    // over REPLACE). Dispatch: stream-targeted items follow their
+    // stream_id; legacy (empty stream_id) REPLACE items follow the P0
+    // dims-match rule. pts pacing (pts_ns vs frame timestamp, device
+    // CLOCK_MONOTONIC domain) picks the newest due item and drops
+    // superseded older ones inside take_frame. Composition by mode:
+    //   REPLACE  NV12 content copy over the whole frame (dims must equal
+    //            the encode dims — push-time checks are best-effort, a
+    //            mid-session reconfigure ends here as a WARN skip);
+    //   OVERLAY  NV12 opaque inset paste at (dest_x, dest_y), or ARGB32
+    //            CPU alpha blend (bounds hard-checked against this
+    //            frame).
+    // With no session, nothing due, or a mismatch it is an O(1) miss
+    // and the ISP pixels flow on untouched. The queued pin releases at
+    // this scope's exit, after the compose.
+    if (injection_service_) {
+        InjectionService::QueuedFrame qf;
+        if (injection_service_->take_frame(dispatch_name, frame->width,
+                                           frame->height,
+                                           frame->timestamp_ns, qf)) {
+            const HalFrameBuffer* src = qf.pin.fb();
+            if (qf.mode == InjectionMode::Replace) {
+                if (qf.width == frame->width && qf.height == frame->height &&
+                    src && src->format == HAL_PIX_FMT_NV12) {
+                    inject_nv12_copy(qf, frame, 0, 0);
+                } else {
+                    HAL_LOG_WARNING("CameraDaemon: injected REPLACE %ux%u does "
+                                    "not match stream '%s' %ux%u, dropping it",
+                                    qf.width, qf.height, dispatch_name.c_str(),
+                                    frame->width, frame->height);
+                }
+            } else if (src && qf.dest_x + qf.width <= frame->width &&
+                       qf.dest_y + qf.height <= frame->height) {
+                if (src->format == HAL_PIX_FMT_NV12) {
+                    inject_nv12_copy(qf, frame, qf.dest_x, qf.dest_y);
+                } else if (src->format == HAL_PIX_FMT_ARGB32) {
+                    inject_argb_blend(qf, frame);
+                } else {
+                    HAL_LOG_WARNING("CameraDaemon: injected OVERLAY has "
+                                    "unsupported format %d, dropping it",
+                                    static_cast<int>(src->format));
+                }
+            } else {
+                HAL_LOG_WARNING("CameraDaemon: injected OVERLAY %u+%u, %u+%u "
+                                "exceeds stream '%s' %ux%u, dropping it",
+                                qf.dest_x, qf.width, qf.dest_y, qf.height,
+                                dispatch_name.c_str(), frame->width,
+                                frame->height);
+            }
+            // Write-lease release (Fix-1): every path above has finished
+            // reading the injected pixels (compose or skip), so the SDK
+            // may rewrite this pool slot from the next PushFrame response
+            // on. Before this ack the id stays in the daemon's in-flight
+            // set even across an EOS/owner-disconnect session close that
+            // lands mid-bake.
+            injection_service_->note_bake_done(qf.buffer_id);
         }
     }
 
@@ -1602,8 +1963,97 @@ void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_na
         }
     }
 
-    if (frame_router_) {
-        frame_router_->on_frame_arrived(dispatch_name, frame);
+    // AI overlay: same bake point as DPM. The frontend bridge invokes this
+    // callback BEFORE auto-feeding the encoder (hailo15_ml_frontend_bridge
+    // runs cb() ahead of add_buffer() on the same buffer), so pixels drawn
+    // here reach the encoded stream in BOTH auto_feed and manual mode.
+    // ai_overlay_ is swapped under op_mu_ (update_ai_overlay_config resets
+    // it under the write lock), so take the read lock around the call.
+    // Semantics mirror DPM: the overlay is baked into the shared pipeline
+    // buffer, so zero-copy subscribers of an overlaid stream see it too —
+    // apps that need clean inference input should subscribe a stream that
+    // is not an overlay target (ai_overlay.stream_map models that split).
+    // apply_overlay no-ops in O(1) when no fresh result matches the stream.
+    //
+    // Strict frame-lock (P1-6) reorders the two steps for identity-fed
+    // streams: the frame is dispatched to the router FIRST — the router
+    // feed is what carries it to ai-runtime, so gating ahead of the
+    // dispatch would wait for a result that can never arrive — and only
+    // then blocks in apply_overlay's bounded wait for the frame's own
+    // result. The bridge still runs this whole callback ahead of the
+    // encoder's add_buffer, so the locked draw still precedes encoding.
+    bool strict_bake = false;
+    {
+        std::shared_lock<std::shared_mutex> lk(op_mu_);
+        if (ai_overlay_) {
+            strict_bake = ai_overlay_->strict_gate_active(dispatch_name);
+        }
+    }
+    if (strict_bake && !encoder_auto_feed_enabled_.load()) {
+        // Manual feed has no bridge-ordering guarantee that a draw after
+        // the router dispatch lands before the encoder consumes this
+        // frame — the wait could miss the encode entirely. Strict stays
+        // auto-feed only; this configuration falls back to preview.
+        static bool warned_manual_strict = false;
+        if (!warned_manual_strict) {
+            warned_manual_strict = true;
+            HAL_LOG_WARNING(
+                "CameraDaemon: strict_frame_lock ignored in manual encoder "
+                "feed mode, falling back to preview (stream=%s)",
+                dispatch_name.c_str());
+        }
+        strict_bake = false;
+    }
+
+    // Frame metadata flags (P1-7): coarse "bake active" truth, computed once
+    // per frame before either dispatch order so strict and preview modes
+    // carry identical bits. This is NOT per-frame draw truth — an empty
+    // scene or a SKIP verdict still sets the bit when the pass is active,
+    // because "did anything draw this frame" flaps and can never promise a
+    // clean frame. The flag answers "is this stream in the baked set",
+    // i.e. the runtime counterpart of the stream_map config split: the
+    // OVERLAY bit is scoped to bake targets (stream_map values — identity
+    // D→D and cross-fed I→D displays). A stream that is only an inference
+    // source (key mapped to a foreign display, e.g. the clean inference
+    // feed) carries flag 0 and apply_overlay skips it, so the bit always
+    // matches stream_map and never lies about pixel truth. DPM stays
+    // global: it draws on every stream via its own mask logic.
+    uint32_t frame_flags = 0;
+    {
+        std::shared_lock<std::shared_mutex> lk(op_mu_);
+        if (ai_overlay_ && ai_overlay_->is_running() &&
+            ai_overlay_->is_bake_target(dispatch_name)) {
+            frame_flags |= FD_PUB_FRAME_FLAG_OVERLAY_BAKED;
+        }
+    }
+    if (dpm && dpm->is_running() && hal_loader_ && hal_loader_->has_draw()) {
+        frame_flags |= FD_PUB_FRAME_FLAG_DPM_BAKED;
+    }
+
+    if (strict_bake && frame_router_) {
+        frame_router_->on_frame_arrived(dispatch_name, frame, frame_flags);
+    }
+
+    {
+        std::shared_lock<std::shared_mutex> lk(op_mu_);
+        if (ai_overlay_) {
+            // The HAL frame's own sequence (the shared media-context counter
+            // the FD publisher and ai-runtime both re-export verbatim) is the
+            // frame-generation authority at the bake site: it anchors the
+            // app-command late-frame judgement and bounds frame-bound layer
+            // drawing in the SAME counter space the SDK's frame_sequence
+            // metadata lives in. The frame_router's per-dispatch counter must
+            // NOT be used here: it counts only this stream's callbacks while
+            // the HAL counter ticks once per frontend callback across ALL
+            // streams — mixing the two spaces drops every bound annotation
+            // on a multi-stream deployment as a "late command".
+            ai_overlay_->apply_overlay(dispatch_name, frame,
+                                       frame ? frame->sequence : 0);
+        }
+    }
+
+    if (!strict_bake && frame_router_) {
+        frame_router_->on_frame_arrived(dispatch_name, frame, frame_flags);
     }
 }
 
@@ -1858,6 +2308,18 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
                 response.set_interrupt_ms(interrupt_ms);
                 return false;
             }
+            // Pipeline restart = every stream's frame generation restarted.
+            // Bump the overlay epoch per encoder stream so app commands
+            // tagged to the old generation are rejected (and its layers
+            // purged) instead of decorating the new one.
+            {
+                std::shared_lock<std::shared_mutex> lk(op_mu_);
+                if (ai_overlay_) {
+                    for (const auto& ec : config_.encoders) {
+                        ai_overlay_->note_stream_restart(ec.stream_name);
+                    }
+                }
+            }
             // Some HAL/MediaLibrary paths reset feed mode after stop/start.
             // Restore auto-feed so encoded sockets continue producing packets.
             if (encoder_auto_feed_enabled_.load() && media_ops->set_encoder_auto_feed) {
@@ -2046,8 +2508,21 @@ bool CameraDaemon::set_rtsp_enabled(bool enabled) {
     return true;
 }
 
-bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence, uint32_t box_thickness) {
+bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence,
+                                            uint32_t box_thickness,
+                                            std::optional<bool> enable_face_blur,
+                                            std::optional<bool> strict_frame_lock,
+                                            std::optional<uint32_t> strict_wait_cap_ms) {
     std::unique_lock<std::shared_mutex> lock(op_mu_);
+    // Absent flag keeps the current face-blur state (yaml value until first set).
+    const bool face_blur = enable_face_blur.value_or(config_.ai_overlay_enable_face_blur);
+    // Strict frame-lock hot path: persist first so init_ai_overlay (used when
+    // the overlay is being enabled right now) picks the new values up too.
+    if (strict_frame_lock.has_value())
+        config_.ai_overlay_strict_frame_lock = strict_frame_lock.value();
+    if (strict_wait_cap_ms.has_value())
+        config_.ai_overlay_strict_wait_cap_ms = strict_wait_cap_ms.value();
+
     if (enabled && !ai_overlay_) {
         if (!hal_loader_ || !hal_loader_->has_draw()) {
             HAL_LOG_ERROR("CameraDaemon: Cannot enable AI overlay without HAL draw ops");
@@ -2058,6 +2533,7 @@ bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool
         config_.ai_overlay_draw_labels = draw_labels;
         config_.ai_overlay_draw_confidence = draw_confidence;
         config_.ai_overlay_box_thickness = box_thickness;
+        config_.ai_overlay_enable_face_blur = face_blur;
 
         return init_ai_overlay();
     }
@@ -2072,10 +2548,14 @@ bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool
 
     // Update existing AI overlay config
     if (ai_overlay_) {
-        ai_overlay_->update_config(draw_labels, draw_confidence, box_thickness);
+        ai_overlay_->update_config(draw_labels, draw_confidence, box_thickness, face_blur);
         config_.ai_overlay_draw_labels = draw_labels;
         config_.ai_overlay_draw_confidence = draw_confidence;
         config_.ai_overlay_box_thickness = box_thickness;
+        config_.ai_overlay_enable_face_blur = face_blur;
+        if (strict_frame_lock.has_value() || strict_wait_cap_ms.has_value())
+            ai_overlay_->update_strict(config_.ai_overlay_strict_frame_lock,
+                                       config_.ai_overlay_strict_wait_cap_ms);
     }
 
     return true;
@@ -3660,6 +4140,8 @@ void* CameraDaemon::refresh_autofocus_video_context() {
 
     // init_from_context clears callbacks and running flags. Rebind the frame
     // router before subscribing to the refreshed contexts.
+    // Route through handle_video_frame_for_routing (not straight into the
+    // router) so the DPM bake and AI overlay keep applying after the refresh.
     for (auto& slot : video_source_->streams()) {
         std::string dispatch_name = slot.name;
         auto it = video_name_map_.find(slot.name);
@@ -3667,7 +4149,7 @@ void* CameraDaemon::refresh_autofocus_video_context() {
 
         video_source_->set_frame_callback(slot.name,
             [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
-                frame_router_->on_frame_arrived(dispatch_name, frame);
+                handle_video_frame_for_routing(dispatch_name, frame);
             });
     }
     for (auto& slot : video_source_->streams()) {
@@ -4117,14 +4599,27 @@ bool CameraDaemon::init_ai_overlay() {
     cfg.draw_confidence     = config_.ai_overlay_draw_confidence;
     cfg.draw_landmarks      = config_.ai_overlay_draw_landmarks;
     cfg.enable_face_blur    = config_.ai_overlay_enable_face_blur;
+    cfg.face_blur_block_size = config_.ai_overlay_face_blur_block_size;
     cfg.box_thickness       = config_.ai_overlay_box_thickness;
+    cfg.result_ttl_ms       = config_.ai_overlay_result_ttl_ms;
+    cfg.strict_frame_lock   = config_.ai_overlay_strict_frame_lock;
+    cfg.strict_wait_cap_ms  = config_.ai_overlay_strict_wait_cap_ms;
+    cfg.legacy_auto_bind    = config_.ai_overlay_legacy_auto_bind;
+    if (!config_.ai_overlay_bindings.empty())
+        cfg.bindings = config_.ai_overlay_bindings;
+    if (!config_.ai_overlay_stream_result_ttls.empty())
+        cfg.stream_result_ttls = config_.ai_overlay_stream_result_ttls;
     cfg.draw_ops            = hal_loader_->draw();
 
     // Stream mapping: inference stream_id → display encoder stream.
     if (!config_.ai_overlay_stream_map.empty()) {
         cfg.stream_map = config_.ai_overlay_stream_map;
-    } else {
-        // Auto-generate: map every configured stream → first encoder stream
+    } else if (cfg.legacy_auto_bind) {
+        // Legacy auto-generate (every stream → first encoder) only under
+        // the legacy switch: the new default must not silently bind every
+        // stream and re-couple a bare subscribe() to the video. Operators
+        // who want the old behavior declare legacy_auto_bind: 1 (or list
+        // explicit bindings).
         std::string primary_encoder;
         if (!config_.encoders.empty()) {
             primary_encoder = config_.encoders[0].stream_name;
@@ -4138,9 +4633,39 @@ bool CameraDaemon::init_ai_overlay() {
             cfg.stream_map["ai"]        = primary_encoder;
         }
     }
+    for (auto& [k, v] : cfg.bindings) {
+        HAL_LOG_INFO("CameraDaemon: AI overlay binding: %s → %s", k.c_str(), v.c_str());
+    }
+
+    // fps per display stream (from [streams]) feeds the derived default TTL:
+    // resolve_result_ttl_ms turns 30fps into ~67ms (≈2 frame periods).
+    for (auto& s : config_.streams) {
+        if (!s.name.empty() && s.fps > 0)
+            cfg.stream_fps[s.name] = s.fps;
+    }
 
     for (auto& [k, v] : cfg.stream_map) {
         HAL_LOG_INFO("CameraDaemon: AI overlay stream_map: %s → %s", k.c_str(), v.c_str());
+    }
+
+    // Strict frame-lock diagnosis (log-once at init): which display streams
+    // the strict gate will actually gate. The gate applies only to identity
+    // feeds (map D→D); cross-fed display streams (map I→D, I≠D) always keep
+    // preview semantics because a cross-fed result never carries the display
+    // stream's own frame_sequence.
+    if (cfg.strict_frame_lock) {
+        for (auto& [infer_stream, display_stream] : cfg.stream_map) {
+            if (infer_stream == display_stream) {
+                HAL_LOG_INFO("CameraDaemon: strict frame lock ACTIVE on stream=%s "
+                             "(cap=%u ms%s)",
+                             display_stream.c_str(), cfg.strict_wait_cap_ms,
+                             cfg.strict_wait_cap_ms == 0 ? ", derived from fps" : "");
+            } else if (cfg.stream_map.count(display_stream) == 0) {
+                HAL_LOG_INFO("CameraDaemon: strict frame lock not applicable to "
+                             "cross-fed stream=%s (inference source=%s)",
+                             display_stream.c_str(), infer_stream.c_str());
+            }
+        }
     }
 
     ai_overlay_ = std::make_unique<AiOverlaySubscriber>(cfg);
@@ -4184,8 +4709,11 @@ void CameraDaemon::register_subscribers() {
                 });
         }
 
-        // --- Priority 2: Encoder subscriber (AI overlay → OSD → encode → FPS update) ---
-        // Skip in media pipeline auto_feed mode — encoder gets frames from pipeline directly
+        // --- Priority 2: Encoder subscriber (OSD → encode → FPS update) ---
+        // Skip in media pipeline auto_feed mode — encoder gets frames from pipeline directly.
+        // AI overlay is NOT drawn here anymore: it bakes at the frontend callback
+        // (handle_video_frame_for_routing) so it reaches the encoded stream in
+        // auto_feed mode too; drawing here as well would double-render in manual mode.
         if (!auto_feed && has_encoder && encoder_mgr_) {
             std::string sname = s.name;
             std::string enc_name = s.name;
@@ -4198,9 +4726,6 @@ void CameraDaemon::register_subscribers() {
             fps_trackers_[sname] = FpsTracker{};
             frame_router_->subscribe(s.name, "encoder_" + s.name,
                 [this, sname, enc_name](ManagedFrame* mf) {
-                    if (ai_overlay_) {
-                        ai_overlay_->apply_overlay(sname, &mf->frame);
-                    }
                     encoder_mgr_->encode_frame(enc_name, &mf->frame);
                     frame_router_->release(mf);
 
@@ -5143,6 +5668,43 @@ void CameraDaemon::get_stream_status(aipc::camera::GetStreamStatusResponse& resp
         uint64_t ms = encoder_mgr_->ms_since_last_packet(enc_name);
         info->set_ms_since_last_frame(ms);  // UINT64_MAX sentinel → JSON null on the Go side
 
+        // Unified drop/throughput observability (P1-10): publisher-side
+        // counters (seq assignments, overflow evictions, per-client
+        // skips/failures) and overlay bake-side counters on one surface.
+        // Fields stay zero when a layer is absent (publisher disabled /
+        // stream never through the bake site) so the response shape is
+        // stable. Publisher streams are keyed by config name — the encoder
+        // output callback translates media names back to it.
+        EncodedPublisher::StreamDropStats ds{};
+        if (encoded_pub_ && encoded_pub_->get_stream_stats(ec.stream_name, &ds)) {
+            info->set_packets_published(ds.packets_published);
+            info->set_queue_overflow_drops(ds.queue_overflow_drops);
+            info->set_client_send_drops(ds.client_send_drops);
+            info->set_client_send_failures(ds.client_send_failures);
+            info->set_client_disconnects(ds.client_disconnects);
+            info->set_last_packet_seq(ds.last_packet_seq);
+            info->set_publisher_clients(ds.clients);
+        }
+
+        AiOverlaySubscriber::OverlayStreamStats os{};
+        if (ai_overlay_) {
+            ai_overlay_->snapshot_stream_stats(ec.stream_name, &os);
+            info->set_bake_skips(os.bake_skips);
+            info->set_strict_locked(os.strict_locked);
+            info->set_strict_degraded(os.strict_degraded);
+            info->set_strict_skips(os.strict_skips);
+            // Behavior-decoupling + frame-sync observability (fields 24-28):
+            // epoch / live layer count for the app-side restart handshake,
+            // the two app-event ingest rejections, and the unbound platform
+            // drop counter. Aggregated across every infer stream routed onto
+            // this display by snapshot_stream_stats itself.
+            info->set_stream_epoch(os.stream_epoch);
+            info->set_overlay_layer_count(os.overlay_layer_count);
+            info->set_overlay_late_commands(os.overlay_late_commands);
+            info->set_overlay_epoch_rejects(os.overlay_epoch_rejects);
+            info->set_overlay_no_binding_drops(os.overlay_no_binding_drops);
+        }
+
         bool stalled = encoder_mgr_->is_stream_stalled(enc_name, kStallThresholdMs, kStartupGraceMs);
         bool seen    = encoder_mgr_->seen_first_packet(enc_name);
 
@@ -6065,6 +6627,9 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
 
                 // init_from_context clears the old stream slots and callbacks.
                 // Rebind them before restarting frame delivery.
+                // Same as the AF-refresh rebind: go through
+                // handle_video_frame_for_routing so DPM bake and AI overlay
+                // survive the profile switch.
                 for (auto& slot : video_source_->streams()) {
                     std::string dispatch_name = slot.name;
                     auto vnit = video_name_map_.find(slot.name);
@@ -6072,7 +6637,7 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
 
                     video_source_->set_frame_callback(slot.name,
                         [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
-                            frame_router_->on_frame_arrived(dispatch_name, frame);
+                            handle_video_frame_for_routing(dispatch_name, frame);
                         });
                 }
                 for (auto& slot : video_source_->streams()) {
@@ -6599,6 +7164,13 @@ void CameraDaemon::shutdown() {
     // 3d. Stop FD publisher (releases DMA-BUF references)
     if (fd_pub_) {
         fd_pub_->stop();
+    }
+
+    // 3d-1. Stop frame injection FIRST: its queue holds BufferPins against
+    //       the DSP registry that 3e below is about to drain and destroy.
+    if (injection_service_) {
+        injection_service_->stop();
+        injection_service_.reset();
     }
 
     // 3e. Stop DSP offload service (drains leftover jobs, frees remaining

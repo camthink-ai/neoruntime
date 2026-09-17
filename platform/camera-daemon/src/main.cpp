@@ -349,6 +349,7 @@ static DaemonConfig load_config(const std::string& path) {
     cfg.fd_pub_sock_path = "/run/aipc/camera.sock";
     cfg.fd_pub_max_clients = 16;
     cfg.fd_pub_max_outstanding = 3;
+    cfg.fd_pub_lease_ms = 200;
     cfg.rtsp_enabled = true;
     cfg.rtsp_port = 8554;
     cfg.encoded_pub_enabled = true;
@@ -418,6 +419,7 @@ static DaemonConfig load_config(const std::string& path) {
         if (trimmed.find("service:") == 0) { section = "service"; continue; }
         if (trimmed.find("lens:") == 0) { section = "lens"; lens_subsection.clear(); continue; }
         if (trimmed.find("dsp:") == 0) { section = "dsp"; continue; }
+        if (trimmed.find("injection:") == 0) { section = "injection"; continue; }
         if (trimmed.find("streams:") == 0) { section = "streams"; cfg.streams.clear(); continue; }
         if (trimmed.find("encoders:") == 0) { section = "encoders"; cfg.encoders.clear(); continue; }
 
@@ -485,6 +487,34 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.dsp.max_total_import_bytes = parse_u32_config(val, "dsp.max_total_import_bytes");
             else if (trimmed.find("max_async_jobs_per_client:") != std::string::npos)
                 cfg.dsp.max_async_jobs_per_client = parse_u32_config(val, "dsp.max_async_jobs_per_client");
+        } else if (section == "injection") {
+            // P0-P2: app frame injection knobs (defaults live in
+            // injection_service.h). `enabled` is the master gate and ships
+            // false: opt-in, enable per deployment.
+            if (trimmed.find("enabled:") != std::string::npos)
+                cfg.injection.enabled = (val == "true" || val == "1");
+            else if (trimmed.find("queue_capacity:") != std::string::npos)
+                cfg.injection.queue_capacity = parse_u32_config(val, "injection.queue_capacity");
+            else if (trimmed.find("allowed_apps:") != std::string::npos) {
+                // P2-12 manifest permission gate: comma-separated app
+                // identities (SO_PEERCRED cmdline basenames). Empty/missing
+                // = allow all (development default).
+                cfg.injection.allowed_apps.clear();
+                size_t pos = 0;
+                while (pos <= val.size()) {
+                    size_t comma = val.find(',', pos);
+                    std::string app = val.substr(pos, (comma == std::string::npos
+                                                        ? val.size() : comma) - pos);
+                    /* trim spaces around each entry */
+                    const size_t b = app.find_first_not_of(" \t");
+                    const size_t e = app.find_last_not_of(" \t");
+                    if (b != std::string::npos)
+                        cfg.injection.allowed_apps.push_back(app.substr(b, e - b + 1));
+                    if (comma == std::string::npos)
+                        break;
+                    pos = comma + 1;
+                }
+            }
         } else if (section == "ai_overlay") {
             if (trimmed.find("enabled:") != std::string::npos)
                 cfg.ai_overlay_enabled = (val == "true" || val == "1");
@@ -500,8 +530,18 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.ai_overlay_draw_landmarks = (val == "true" || val == "1");
             else if (trimmed.find("enable_face_blur:") != std::string::npos)
                 cfg.ai_overlay_enable_face_blur = (val == "true" || val == "1");
+            else if (trimmed.find("face_blur_block_size:") != std::string::npos)
+                cfg.ai_overlay_face_blur_block_size = parse_u32_config(val, "ai_overlay.face_blur_block_size");
             else if (trimmed.find("box_thickness:") != std::string::npos)
                 cfg.ai_overlay_box_thickness = parse_u32_config(val, "ai_overlay.box_thickness");
+            else if (trimmed.find("result_ttl_ms:") != std::string::npos)
+                cfg.ai_overlay_result_ttl_ms = parse_u32_config(val, "ai_overlay.result_ttl_ms");
+            else if (trimmed.find("strict_frame_lock:") != std::string::npos)
+                cfg.ai_overlay_strict_frame_lock = (val == "true" || val == "1");
+            else if (trimmed.find("strict_wait_cap_ms:") != std::string::npos)
+                cfg.ai_overlay_strict_wait_cap_ms = parse_u32_config(val, "ai_overlay.strict_wait_cap_ms");
+            else if (trimmed.find("legacy_auto_bind:") != std::string::npos)
+                cfg.ai_overlay_legacy_auto_bind = (val == "true" || val == "1");
             else if (trimmed.find("overlay_library:") != std::string::npos)
                 cfg.ai_overlay_lib = val;
             else if (trimmed.find("stream_map:") != std::string::npos && !val.empty()) {
@@ -515,6 +555,39 @@ static DaemonConfig load_config(const std::string& path) {
                         std::string v = trim(pair.substr(c + 1));
                         if (!k.empty() && !v.empty())
                             cfg.ai_overlay_stream_map[k] = v;
+                    }
+                }
+            } else if (trimmed.find("result_ttl_map:") != std::string::npos && !val.empty()) {
+                // Flat format: "dst1:ms1,dst2:ms2,..." — per-display-stream TTL
+                // overrides (keyed like stream_map values; 0 = derive, see
+                // resolve_result_ttl_ms).
+                std::istringstream ss(val);
+                std::string pair;
+                while (std::getline(ss, pair, ',')) {
+                    auto c = pair.find(':');
+                    if (c != std::string::npos) {
+                        std::string k = trim(pair.substr(0, c));
+                        std::string v = trim(pair.substr(c + 1));
+                        if (!k.empty() && !v.empty())
+                            cfg.ai_overlay_stream_result_ttls[k] =
+                                parse_u32_config(v, "ai_overlay.result_ttl_map");
+                    }
+                }
+            } else if (trimmed.find("bindings:") != std::string::npos && !val.empty()) {
+                // Flat format: "infer1:display1,infer2:display2,..." — same
+                // direction as stream_map. A bound infer stream's platform
+                // results draw on the display stream (the behavior-decoupling
+                // admission path); unbound platform events are dropped and
+                // counted. legacy_auto_bind admits everything (old behavior).
+                std::istringstream ss(val);
+                std::string pair;
+                while (std::getline(ss, pair, ',')) {
+                    auto c = pair.find(':');
+                    if (c != std::string::npos) {
+                        std::string k = trim(pair.substr(0, c));
+                        std::string v = trim(pair.substr(c + 1));
+                        if (!k.empty() && !v.empty())
+                            cfg.ai_overlay_bindings[k] = v;
                     }
                 }
             }
