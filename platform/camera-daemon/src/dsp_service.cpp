@@ -50,19 +50,30 @@ constexpr uint32_t kMinDim = 16;
 constexpr uint32_t kMaxDim = 8192;
 /* SCM_RIGHTS wire cap on the UDS alloc response: count*num_planes fds. */
 constexpr uint32_t kMaxAllocFds = 64;
-/* HAL pool chunk the service asks for (alloc_buffers) AND the unit of
- * retention footprint accounting: parking one buffer of a geometry keeps
- * the vendor's whole chunk alive (the pool cache in hailo15_media_impl is
- * weak — the chunk dies when its last buffer frees), so a geometry parked
- * at all is accounted as a full chunk. */
+/* HAL pool chunk CEILING the service asks for (alloc_buffers): the fd
+ * ceiling — 32 two-plane buffers = FD_PUB_DSP_MAX_FDS(64) fds — and also
+ * the ceiling of retention footprint accounting: parking one buffer of
+ * a geometry keeps the vendor's whole chunk alive (the pool cache in
+ * hailo15_media_impl is weak — the chunk dies when its last buffer
+ * frees), so a geometry parked at all is accounted as a full chunk. */
 constexpr uint32_t kPoolChunkBuffers = 32;
+/* FLOOR for the retention-oriented chunk size (retention_pool_chunk_n).
+ * Four, not hal_v2's app-pool default of eight: at giant geometries the
+ * floor chunk is what a second concurrent geometry has to fit alongside
+ * (a resize parks src AND dst), and 8x4K-RGB + any 4K partner blows the
+ * budget where 4x fits two. A geometry whose chunk still exceeds the
+ * parking budget at this floor simply doesn't park — the pool churns
+ * instead (pre-shrink behavior, functionally intact). */
+constexpr uint32_t kMinPoolChunkBuffers = 4;
 
-/* Full-chunk byte cost of parking any buffer of fb's geometry (strides
- * and sizes are pool-determined, so every buffer of a geometry agrees). */
-uint64_t chunk_bytes_of(const HalFrameBuffer* fb) {
+/* Real per-buffer byte cost of fb's geometry (strides and sizes are
+ * pool-determined, so every buffer of a pool agrees). The full chunk
+ * cost is this times the pool's max_buffers — tracked per park, since
+ * retention-sized and count-raised pools of one geometry can differ. */
+uint64_t buffer_bytes_of(const HalFrameBuffer* fb) {
     uint64_t per = 0;
     for (uint32_t p = 0; p < HAL_MAX_PLANES; ++p) per += fb->sizes[p];
-    return static_cast<uint64_t>(kPoolChunkBuffers) * per;
+    return per;
 }
 
 template <typename T>
@@ -293,6 +304,45 @@ bool dma_buf_capacity(int fd, uint64_t& capacity_out) {
 }
 
 } // namespace
+
+/* Retention-oriented HAL pool chunk size for a geometry: at most HALF
+ * the parking budget's worth of buffers, clamped to
+ * [kMinPoolChunkBuffers, kPoolChunkBuffers]. Sizing the chunk to the
+ * budget is what lets park_or_free_locked accept it: an oversize chunk
+ * is refused there, its released buffers fall straight back to HAL, and
+ * the weak-cached vendor pool dies with its last buffer — so a per-call
+ * alloc/release cycle pays a whole chunk rebuild (dma-heap alloc+map,
+ * ~100ms at 4K) every round. The 4K array-path regression (run4
+ * A15/A16) was exactly that, with the rebuild cost having been cheap
+ * enough to mask it on 9/12.
+ *
+ * The HALF is the two-geometry lesson: one resize call parks src AND
+ * dst. Budget-filling chunks sized src to the whole cap, so parking dst
+ * evicted src oldest-first — every round then re-acquired src from HAL
+ * (~50-70ms, the pool alive but the round paid) — measured as the
+ * 148ms plateau after the first fix. At half budget each of two giant
+ * geometries fits: 4K-NV12(8 bufs, 99.5MiB) + 1080p(32, 33MiB), or
+ * 4K-NV12 + 4K-RGB(4, 99.5MiB), both under the 192MiB default cap.
+ * Sub-4K geometries still clamp to the 32 ceiling — pre-fix sizing.
+ * Retention disabled, or a geometry that won't estimate, keeps the fd
+ * ceiling. The estimate uses minimum strides, so real pool sizes can
+ * run slightly larger — a real chunk that still exceeds the budget is
+ * simply not parked (again the pre-shrink behavior), never a
+ * correctness issue. */
+uint32_t DspService::retention_pool_chunk_n(uint32_t width, uint32_t height,
+                                            HalPixelFormat format)
+    const noexcept {
+    if (cfg_.pool_retention_ms == 0 || cfg_.pool_retention_max_bytes == 0)
+        return kPoolChunkBuffers;
+    uint64_t per_buffer = 0;
+    if (!minimum_pool_bytes(width, height, format, 1, per_buffer) ||
+        per_buffer == 0)
+        return kPoolChunkBuffers;
+    uint64_t n = cfg_.pool_retention_max_bytes / 2 / per_buffer;
+    if (n < kMinPoolChunkBuffers) n = kMinPoolChunkBuffers;
+    if (n > kPoolChunkBuffers) n = kPoolChunkBuffers;
+    return static_cast<uint32_t>(n);
+}
 
 size_t DspService::QuotaKeyHash::operator()(const QuotaKey& key) const noexcept {
     auto combine = [](size_t seed, size_t value) {
@@ -968,11 +1018,18 @@ DspService::AllocResult DspService::alloc_buffers_impl(
     req.height = height;
     req.format = format;
     // hal_v2's default app pool is 8 buffers/geometry (hailo15_media_impl.cpp
-    // kDefaultMaxBuffers) — too small for MULTI_CROP batches. Size the pool to
-    // the fd-plane ceiling: 32 two-plane buffers = FD_PUB_DSP_MAX_FDS(64) fds.
-    // Pool key includes the size, so this never touches the pipeline's own
-    // pool_max_buffers=0 pools.
-    req.pool_max_buffers = kPoolChunkBuffers;
+    // kDefaultMaxBuffers) — too small for MULTI_CROP batches. Ceiling is the
+    // fd plane: 32 two-plane buffers = FD_PUB_DSP_MAX_FDS(64) fds. Within
+    // that ceiling the chunk is sized to the parking budget
+    // (retention_pool_chunk_n) so released buffers can park and per-call
+    // alloc/release cycles stop paying a whole chunk rebuild per round;
+    // count still raises it (a count-capped request must not fail on a
+    // shrunken pool). Pool key includes the size, so this never touches
+    // the pipeline's own pool_max_buffers=0 pools.
+    uint32_t chunk_n = retention_pool_chunk_n(width, height, format);
+    if (count > chunk_n) chunk_n = count;
+    if (chunk_n > kPoolChunkBuffers) chunk_n = kPoolChunkBuffers;
+    req.pool_max_buffers = chunk_n;
     req.mem_type = HAL_MEM_DMABUF;
     req.zero_initialize = false;
     const ParkedGeometry geom{width, height, static_cast<uint32_t>(format)};
@@ -1455,13 +1512,17 @@ DspService::DetachedFrame DspService::detach_entry_locked(
     if (!entry->imported) {
         /* P1-9 retention: an unpinned daemon pool buffer parks by geometry
          * for reuse instead of returning to HAL (each reuse skips a whole
-         * pool-chunk destroy/create round). Evictions — and the
-         * retention-disabled case — land in pending_release_, which the
-         * caller drains after dropping buffers_mu_. */
+         * pool-chunk destroy/create round). Accounted at its OWN pool's
+         * full chunk: pool_key.max_buffers real plane bytes — a
+         * count-raised pool of the same geometry parks heavier than a
+         * retention-sized one. Evictions — and the retention-disabled
+         * case — land in pending_release_, which the caller drains after
+         * dropping buffers_mu_. */
         park_or_free_locked(
             ParkedGeometry{entry->fb->width, entry->fb->height,
                            static_cast<uint32_t>(entry->fb->format)},
-            entry->fb);
+            entry->fb,
+            buffer_bytes_of(entry->fb) * entry->pool_key.max_buffers);
         delete entry;
         return frame;
     }
@@ -1480,11 +1541,13 @@ void DspService::release_detached_frame(HalFrameBufferOps* fb_ops,
 }
 
 /* Park fb for same-geometry reuse, or queue it for HAL release.
- * Caller holds buffers_mu_. Parking is refused while stopping or with
- * retention disabled (either knob = 0); a geometry whose pool chunk
- * alone exceeds the cap is never parked. On first park of a geometry
- * the whole chunk enters the footprint; over-cap pressure then evicts
- * whole geometries front-first (oldest first) — the just-parked
+ * Caller holds buffers_mu_. chunk_bytes is the full pool chunk this
+ * buffer keeps alive. Parking is refused while stopping, with retention
+ * disabled (either knob = 0), or when the chunk alone exceeds the cap;
+ * alloc side sizes retention pools to fit (retention_pool_chunk_n), so
+ * a refusal means a count-raised or floor-clamped pool. On first park
+ * of a geometry the chunk enters the footprint; over-cap pressure then
+ * evicts whole geometries front-first (oldest first) — the just-parked
  * geometry always fits under the cap alone, so eviction stops before
  * reaching it.
  *
@@ -1494,14 +1557,13 @@ void DspService::release_detached_frame(HalFrameBufferOps* fb_ops,
  * capacity covering any eviction burst, and every caller drains via
  * drain_pending_releases() after dropping buffers_mu_. */
 void DspService::park_or_free_locked(const ParkedGeometry& g,
-                                     HalFrameBuffer* fb) {
+                                     HalFrameBuffer* fb, uint64_t chunk_bytes) {
     if (!running_.load() || cfg_.pool_retention_ms == 0 ||
         cfg_.pool_retention_max_bytes == 0) {
         pending_release_.push_back(fb);
         return;
     }
-    const uint64_t chunk = chunk_bytes_of(fb);
-    if (chunk > cfg_.pool_retention_max_bytes) {
+    if (chunk_bytes > cfg_.pool_retention_max_bytes) {
         pending_release_.push_back(fb);
         return;
     }
@@ -1509,11 +1571,12 @@ void DspService::park_or_free_locked(const ParkedGeometry& g,
     if (it == parked_.end()) {
         it = parked_.emplace(g, std::deque<ParkedBuffer>()).first;
         parked_order_.push_back(g);
-        parked_footprint_ += chunk;
+        parked_footprint_ += chunk_bytes;
     }
     it->second.push_back(
         {fb, std::chrono::steady_clock::now() +
-                 std::chrono::milliseconds(cfg_.pool_retention_ms)});
+                 std::chrono::milliseconds(cfg_.pool_retention_ms),
+         chunk_bytes});
     {
         std::lock_guard<std::mutex> lk(stats_mu_);
         stats_.retention_parked++;
@@ -1528,7 +1591,7 @@ void DspService::park_or_free_locked(const ParkedGeometry& g,
             if (vit != parked_.end()) parked_.erase(vit);
             continue; /* stale order entry — nothing to free or subtract */
         }
-        const uint64_t vchunk = chunk_bytes_of(vit->second.front().fb);
+        const uint64_t vchunk = vit->second.front().chunk_bytes;
         const size_t n = vit->second.size();
         for (const ParkedBuffer& pb : vit->second)
             pending_release_.push_back(pb.fb);
@@ -1563,6 +1626,8 @@ void DspService::drain_pending_releases() noexcept {
 HalFrameBuffer* DspService::take_parked(const ParkedGeometry& g) {
     std::vector<HalFrameBuffer*> dead;
     HalFrameBuffer* reuse = nullptr;
+    uint64_t popped_chunk = 0; /* chunk cost of the last pop — the
+                                * geometry's footprint leaves with it */
     {
         std::lock_guard<std::mutex> lk(buffers_mu_);
         auto it = parked_.find(g);
@@ -1570,6 +1635,7 @@ HalFrameBuffer* DspService::take_parked(const ParkedGeometry& g) {
             const auto now = std::chrono::steady_clock::now();
             while (!it->second.empty() && it->second.front().deadline <= now) {
                 dead.push_back(it->second.front().fb);
+                popped_chunk = it->second.front().chunk_bytes;
                 it->second.pop_front();
                 {
                     std::lock_guard<std::mutex> slk(stats_mu_);
@@ -1579,6 +1645,7 @@ HalFrameBuffer* DspService::take_parked(const ParkedGeometry& g) {
             }
             if (!it->second.empty()) {
                 reuse = it->second.front().fb;
+                popped_chunk = it->second.front().chunk_bytes;
                 it->second.pop_front();
                 {
                     std::lock_guard<std::mutex> slk(stats_mu_);
@@ -1587,10 +1654,11 @@ HalFrameBuffer* DspService::take_parked(const ParkedGeometry& g) {
                 }
             }
             if (it->second.empty()) {
-                /* All buffers of a geometry share pool-determined sizes:
-                 * compute the chunk from the last pop while it's in hand. */
-                const HalFrameBuffer* last = reuse ? reuse : dead.back();
-                const uint64_t chunk = chunk_bytes_of(last);
+                /* Footprint leaves with the last pop of the geometry.
+                 * Retention-sized pools of one geometry agree; a
+                 * count-raised pool can park one chunk heavier — at most
+                 * a one-chunk ledger skew against a soft cap. */
+                const uint64_t chunk = popped_chunk;
                 parked_.erase(it);
                 parked_footprint_ =
                     (parked_footprint_ > chunk) ? parked_footprint_ - chunk : 0;
@@ -1615,9 +1683,9 @@ void DspService::sweep_parked_locked(std::vector<HalFrameBuffer*>& to_free) {
     for (auto it = parked_.begin(); it != parked_.end();) {
         auto& dq = it->second;
         const ParkedGeometry g = it->first;
-        const HalFrameBuffer* any = nullptr; /* any fb of this geometry */
+        uint64_t chunk = 0; /* chunk cost of the last expired pop */
         while (!dq.empty() && dq.front().deadline <= now) {
-            any = dq.front().fb;
+            chunk = dq.front().chunk_bytes;
             to_free.push_back(dq.front().fb);
             dq.pop_front();
             {
@@ -1626,8 +1694,7 @@ void DspService::sweep_parked_locked(std::vector<HalFrameBuffer*>& to_free) {
                 if (stats_.retention_parked > 0) stats_.retention_parked--;
             }
         }
-        if (dq.empty() && any) {
-            const uint64_t chunk = chunk_bytes_of(any);
+        if (dq.empty() && chunk != 0) {
             parked_footprint_ =
                 (parked_footprint_ > chunk) ? parked_footprint_ - chunk : 0;
             for (auto oit = parked_order_.begin();
@@ -1988,7 +2055,8 @@ void DspService::unpin_entry(BufferEntry* entry) noexcept {
                 park_or_free_locked(
                     ParkedGeometry{entry->fb->width, entry->fb->height,
                                    static_cast<uint32_t>(entry->fb->format)},
-                    entry->fb);
+                    entry->fb,
+                    buffer_bytes_of(entry->fb) * entry->pool_key.max_buffers);
             }
             delete entry;
         }

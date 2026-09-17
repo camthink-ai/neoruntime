@@ -39,6 +39,7 @@
 static int g_request_count = 0; /* HAL pool rounds                */
 static int g_release_count = 0; /* HAL buffer frees               */
 static int g_next_fd = 100;     /* distinctive dma_fds per buffer */
+static int g_last_pool_max = 0; /* pool_max_buffers of last HAL request */
 
 static int fake_dsp_init(const HalDspConfig*, void** ctx) {
     *ctx = (void*)0x1;
@@ -64,6 +65,7 @@ static int fake_request_fb(const HalFrameBufferRequest* req,
         fb->sizes[1] = req->width * req->height / 2;
     }
     g_request_count++;
+    g_last_pool_max = static_cast<int>(req->pool_max_buffers);
     *out = fb;
     return 0;
 }
@@ -80,6 +82,7 @@ static void reset_globals() {
     g_request_count = 0;
     g_release_count = 0;
     g_next_fd = 100;
+    g_last_pool_max = 0;
 }
 
 /* DspService is non-copyable/non-movable — construct it in place in
@@ -221,32 +224,41 @@ static void case_imports_never_parked() {
 }
 
 static void case_cap_evicts_oldest_geometry() {
-    /* Footprint is chunk-accurate. 32x32 chunk = 49152 B, 40x40 chunk
-     * = 76800 B; cap = 76800 → parking G2 must evict G1 WHOLLY. */
+    /* Footprint is chunk-accurate and the cap still bounds the TOTAL.
+     * Budget-half sizing makes any TWO geometries coexist by design
+     * (that is the src+dst fix) — eviction needs a third: cap 57600
+     * holds G1(32x32 → 18 bufs × 1536B = 27648) + G2(40x40 → 12 × 2400
+     * = 28800) = 56448, but parking G3 (48x48 → 8 × 3456 = 27648) must
+     * evict G1 WHOLLY, oldest-first. */
     reset_globals();
     DspServiceConfig cfg;
-    cfg.pool_retention_max_bytes = 76800;
+    cfg.pool_retention_max_bytes = 57600;
     DspService dsp(&g_dsp_ops, &g_fb_ops, cfg);
     assert(dsp.start());
 
-    auto g1a = alloc_one(dsp, 7, 32, 32); /* chunk 49152 */
+    auto g1a = alloc_one(dsp, 7, 32, 32); /* chunk 27648 */
     assert(dsp.release_buffer(7, g1a.ids[0]) == DSP_SVC_OK);
     assert(dsp.stats().retention_parked == 1);
 
-    auto g2a = alloc_one(dsp, 7, 40, 40); /* chunk 76800 */
+    auto g2a = alloc_one(dsp, 7, 40, 40); /* chunk 28800 */
     assert(dsp.release_buffer(7, g2a.ids[0]) == DSP_SVC_OK);
+    assert(dsp.stats().retention_parked == 2); /* pair coexists — the
+                                                * src+dst guarantee    */
+
+    auto g3a = alloc_one(dsp, 7, 48, 48); /* chunk 27648 */
+    assert(dsp.release_buffer(7, g3a.ids[0]) == DSP_SVC_OK);
     {
         const auto& st = dsp.stats();
-        assert(st.retention_parked == 1); /* only G2 survives        */
-        assert(st.retention_releases == 1); /* G1 evicted            */
+        assert(st.retention_parked == 2); /* G2+G3 survive            */
+        assert(st.retention_releases == 1); /* G1 evicted (oldest)    */
     }
-    assert(g_release_count == 1); /* G1's buffer handed to HAL       */
+    assert(g_release_count == 1); /* G1's buffer handed to HAL        */
 
     /* G1 is gone from the park → fresh HAL round; G2 survives → reuse. */
     auto g1b = alloc_one(dsp, 7, 32, 32);
-    assert(g_request_count == 3); /* 2 originals + G1 re-alloc       */
+    assert(g_request_count == 4); /* 3 originals + G1 re-alloc        */
     auto g2b = alloc_one(dsp, 7, 40, 40);
-    assert(g_request_count == 3); /* served from the park            */
+    assert(g_request_count == 4); /* served from the park             */
     assert(g2b.fds[0] == g2a.fds[0]);
     assert(dsp.stats().retention_reuses == 1);
 
@@ -302,6 +314,146 @@ static void case_stop_flushes_parks() {
     std::printf("  case_stop_flushes_parks ok\n");
 }
 
+/* ---------------- retention-sized chunks (the 4K array-path fix) -----
+ * The A15/A16 regression: a geometry whose full 32-buffer chunk exceeds
+ * pool_retention_max_bytes (4K NV12 ≈ 372MiB vs 192MiB) is never parked,
+ * so per-call alloc/release destroys and rebuilds the vendor chunk every
+ * round. Fix: alloc sizes the pool chunk to HALF the parking budget
+ * (retention_pool_chunk_n) — half, not whole, because one resize parks
+ * src AND dst and whole-budget chunks made the pair evict each other
+ * every round (the 148ms plateau). Fake math: per-buffer NV12 bytes =
+ * w*h*3/2 exactly (no alignment), so 3840x2160 → 12,441,600 B/buffer;
+ * 96MiB/12.44MB → 8 buffers → chunk 94.9MiB ≤ 192MiB → parks. */
+
+static void case_retention_sizes_big_pool() {
+    /* 4K-class geometry: the HAL request asks for a budget-half chunk
+     * (8, not 32) and a release→alloc cycle is served from the park. */
+    reset_globals();
+    DspServiceConfig cfg; /* defaults: ms=3000, cap=192MiB */
+    cfg.pool_retention_max_bytes = 192ULL << 20; /* pin: cases must not
+                                                  * track default drift */
+    DspService dsp(&g_dsp_ops, &g_fb_ops, cfg);
+    assert(dsp.start());
+
+    auto r1 = alloc_one(dsp, 7, 3840, 2160);
+    assert(g_request_count == 1);
+    assert(g_last_pool_max == 8);
+    assert(dsp.release_buffer(7, r1.ids[0]) == DSP_SVC_OK);
+    assert(dsp.stats().retention_parked == 1);
+
+    auto r2 = alloc_one(dsp, 7, 3840, 2160);
+    assert(g_request_count == 1); /* reuse, no HAL pool round           */
+    assert(g_release_count == 0);
+    assert(dsp.stats().retention_reuses == 1);
+    assert(r2.fds[0] == r1.fds[0]);
+
+    dsp.stop();
+    dsp.release_client_buffers(7);
+    std::printf("  case_retention_sizes_big_pool ok\n");
+}
+
+static void case_src_dst_geometries_coexist() {
+    /* The two-geometry lesson, as a regression gate: one resize call
+     * parks src AND dst. Budget-HALF chunks must let a giant src and a
+     * regular dst park together without evicting each other — 4K(8x
+     * 12.44MB = 94.9MiB) + 1080p(32x 3.11MB = 94.9MiB) = 189.9MiB ≤
+     * 192MiB. Whole-budget chunks (16+32 buffers) thrashed here: each
+     * dst park evicted src, and src re-acquired from HAL every round. */
+    reset_globals();
+    DspServiceConfig cfg;
+    cfg.pool_retention_max_bytes = 192ULL << 20;
+    DspService dsp(&g_dsp_ops, &g_fb_ops, cfg);
+    assert(dsp.start());
+
+    auto s1 = alloc_one(dsp, 7, 3840, 2160); /* src geometry  */
+    auto d1 = alloc_one(dsp, 7, 1920, 1080); /* dst geometry  */
+    assert(dsp.release_buffer(7, s1.ids[0]) == DSP_SVC_OK);
+    assert(dsp.stats().retention_parked == 1);
+    assert(dsp.release_buffer(7, d1.ids[0]) == DSP_SVC_OK);
+    assert(dsp.stats().retention_parked == 2); /* BOTH live — no evict */
+    assert(g_release_count == 0);              /* nothing handed back  */
+
+    /* Next round serves both geometries from the park: zero HAL rounds. */
+    auto s2 = alloc_one(dsp, 7, 3840, 2160);
+    auto d2 = alloc_one(dsp, 7, 1920, 1080);
+    assert(g_request_count == 2); /* only the two originals             */
+    assert(g_release_count == 0);
+    assert(dsp.stats().retention_reuses == 2);
+    assert(s2.fds[0] == s1.fds[0]);
+    assert(d2.fds[0] == d1.fds[0]);
+
+    dsp.stop();
+    dsp.release_client_buffers(7);
+    std::printf("  case_src_dst_geometries_coexist ok\n");
+}
+
+static void case_count_raises_chunk_over_cap() {
+    /* count can raise the chunk past the parking budget — the request
+     * must still succeed (a count-capped alloc must not fail on a
+     * shrunken pool), it just doesn't park: the raised chunk exceeds the
+     * cap and is refused, exactly the pre-fix churn behavior for it. */
+    reset_globals();
+    DspServiceConfig cfg;
+    cfg.pool_retention_max_bytes = 192ULL << 20;
+    DspService dsp(&g_dsp_ops, &g_fb_ops, cfg);
+    assert(dsp.start());
+
+    auto r = dsp.alloc_buffers(7, 3840, 2160, HAL_PIX_FMT_NV12, 17);
+    assert(r.rc == DSP_SVC_OK);
+    assert(r.ids.size() == 17);
+    assert(g_last_pool_max == 17); /* max(retention_n=8, count=17)      */
+    for (uint64_t id : r.ids)
+        assert(dsp.release_buffer(7, id) == DSP_SVC_OK);
+    assert(dsp.stats().retention_parked == 0); /* 17-buf chunk > cap    */
+    assert(g_release_count == 17);             /* all freed to HAL      */
+
+    dsp.stop();
+    dsp.release_client_buffers(7);
+    std::printf("  case_count_raises_chunk_over_cap ok\n");
+}
+
+static void case_floor_when_chunk_still_over_cap() {
+    /* A geometry whose chunk exceeds the cap even at the floor (4)
+     * keeps the floor chunk and simply doesn't park — functionally the
+     * pre-fix behavior, with an eighth of the rebuild bytes. Small cap
+     * stands in for a huge geometry (max_pixels_per_op caps w*h). */
+    reset_globals();
+    DspServiceConfig small_cfg;
+    small_cfg.pool_retention_max_bytes = 1ULL << 20; /* 1MiB < 4*768KiB */
+    DspService dsp(&g_dsp_ops, &g_fb_ops, small_cfg);
+    assert(dsp.start());
+
+    auto r1 = alloc_one(dsp, 7, 1024, 512);
+    assert(g_last_pool_max == 4); /* floor, not 512KiB/768KiB=0         */
+    assert(dsp.release_buffer(7, r1.ids[0]) == DSP_SVC_OK);
+    assert(dsp.stats().retention_parked == 0); /* 3MiB chunk > 1MiB     */
+
+    auto r2 = alloc_one(dsp, 7, 1024, 512);
+    assert(g_request_count == 2); /* fresh HAL round — no park to reuse */
+    assert(r2.fds[0] != r1.fds[0]);
+
+    dsp.stop();
+    dsp.release_client_buffers(7);
+    std::printf("  case_floor_when_chunk_still_over_cap ok\n");
+}
+
+static void case_retention_off_keeps_ceiling() {
+    /* Retention disabled: the fd ceiling (32) is asked for regardless —
+     * pre-fix sizing, nothing to park into anyway. */
+    reset_globals();
+    DspServiceConfig cfg;
+    cfg.pool_retention_ms = 0;
+    DspService dsp(&g_dsp_ops, &g_fb_ops, cfg);
+    assert(dsp.start());
+
+    (void)alloc_one(dsp, 7, 1024, 512);
+    assert(g_last_pool_max == 32);
+
+    dsp.stop();
+    dsp.release_client_buffers(7);
+    std::printf("  case_retention_off_keeps_ceiling ok\n");
+}
+
 int main() {
     case_reuse_hit();
     case_lazy_expiry();
@@ -310,6 +462,11 @@ int main() {
     case_cap_evicts_oldest_geometry();
     case_disabled_by_config();
     case_stop_flushes_parks();
+    case_retention_sizes_big_pool();
+    case_src_dst_geometries_coexist();
+    case_count_raises_chunk_over_cap();
+    case_floor_when_chunk_still_over_cap();
+    case_retention_off_keeps_ceiling();
     std::printf("dsp_pool_retention_test: all assertions passed\n");
     return 0;
 }

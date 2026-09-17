@@ -76,9 +76,14 @@ struct DspServiceConfig {
     /* Max pixels per op: source plane and (summed) destination planes. */
     uint64_t max_pixels_per_op = 8294400; /* 3840*2160 */
     /* PLAT-4 quota anchors (dma-buf figures, per owning client):
-     * single-op resize ~1500 ops/s, multi-crop N=7 ~6500 rects/s. */
+     * single-op resize ~1500 ops/s, multi-crop N=7 ~6500 rects/s.
+     * MPix/s: sized for a 4K@30 derived pipeline (8.3 MPix × 30 ≈
+     * 249) — the 120 of the 720p era starved any sustained 4K flow
+     * (per-call pool reuse made 4K resize ~42ms ≈ 246 MPix/s and the
+     * bucket rejected half the calls). Total stays 480: two saturated
+     * 4K clients exactly fill it, a third gets throttled globally. */
     double quota_jobs_per_sec = 100.0;
-    double quota_mpix_per_sec = 120.0;
+    double quota_mpix_per_sec = 240.0;
     double quota_total_jobs_per_sec = 400.0;
     double quota_total_mpix_per_sec = 480.0;
     uint32_t job_timeout_ms = 2000;
@@ -677,6 +682,8 @@ private:
     struct ParkedBuffer {
         HalFrameBuffer* fb;
         std::chrono::steady_clock::time_point deadline;
+        uint64_t chunk_bytes; /* full pool-chunk cost parked with this
+                                * buffer — the vendor chunk it keeps alive */
     };
     std::map<ParkedGeometry, std::deque<ParkedBuffer>> parked_;
     std::deque<ParkedGeometry> parked_order_; /* first-park order — whole-
@@ -687,12 +694,14 @@ private:
      * drain_pending_releases() after the lock drops. Reserved in start()
      * because detach_entry_locked pushes here on a noexcept path. */
     std::vector<HalFrameBuffer*> pending_release_;
-    /* caller holds buffers_mu_; parks fb or queues it into
-     * pending_release_, then evicts whole oldest geometries while
-     * parked_footprint_ exceeds the cap (evictions queued the same
-     * way). Refuses when not running or retention is disabled — fb is
+    /* caller holds buffers_mu_; parks fb (chunk_bytes = the full pool
+     * chunk this buffer keeps alive) or queues it into pending_release_,
+     * then evicts whole oldest geometries while parked_footprint_ exceeds
+     * the cap (evictions queued the same way). Refuses when not running,
+     * retention is disabled, or the chunk alone exceeds the cap — fb is
      * queued for release instead. */
-    void park_or_free_locked(const ParkedGeometry& g, HalFrameBuffer* fb);
+    void park_or_free_locked(const ParkedGeometry& g, HalFrameBuffer* fb,
+                             uint64_t chunk_bytes);
     /* swaps pending_release_ under buffers_mu_ and HAL-releases outside
      * it; call only with buffers_mu_ NOT held */
     void drain_pending_releases() noexcept;
@@ -702,6 +711,13 @@ private:
     HalFrameBuffer* take_parked(const ParkedGeometry& g);
     /* caller holds buffers_mu_; moves every expired park to to_free. */
     void sweep_parked_locked(std::vector<HalFrameBuffer*>& to_free);
+    /* Retention-oriented HAL pool chunk size for a geometry: as many
+     * buffers as the parking budget holds, floored at the hal app-pool
+     * default and ceilinged at the fd ceiling; the fd ceiling itself
+     * when retention is off or the geometry won't estimate. Defined in
+     * dsp_service.cpp next to the constants it clamps between. */
+    uint32_t retention_pool_chunk_n(uint32_t width, uint32_t height,
+                                    HalPixelFormat format) const noexcept;
 
     // Cross-process lookup leases (DSP_LOOKUP): per-connection map of
     // buffer_id → pins taken by that connection. OWN mutex: pin_buffer and
