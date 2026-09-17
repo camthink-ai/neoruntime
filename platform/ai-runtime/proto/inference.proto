@@ -81,6 +81,14 @@ message ModelRegisterRequest {
   // decode them itself. Distinguishes "package forgot the type" (rejected)
   // from "package chose raw output" (allowed).
   bool raw_output_only = 16;
+
+  // NPU batch execution. When >1 the HAL inference session is configured with
+  // this batch (HailoRT set_batch_size) and InferBatch groups consecutive
+  // same-model items into single NPU jobs — one InferJob runs B frames
+  // through the array in parallel instead of B serialized jobs. The HEF must
+  // support the batch (configure() fails otherwise). Single-frame Infer on a
+  // batch>1 model is rejected: use InferBatch, or register a batch-1 variant.
+  uint32 batch_size = 17;
 }
 
 message ModelRegisterResponse {
@@ -102,6 +110,7 @@ message ModelInfo {
   uint64 load_timestamp = 12;
   string owner_id = 13;         // Used during UnregisterModel to specify the caller's identity
   bool transient = 14;          // True for app-bundled models (see ModelRegisterRequest.transient)
+  uint32 batch_size = 15;       // NPU batch the session is configured with (1 = single-frame)
 }
 
 message ModelListResponse {
@@ -231,10 +240,18 @@ message StreamInferRequest {
 
 message StreamInferResponse {
   uint64 frame_sequence = 1;
-  uint64 timestamp_ns = 2;
+  uint64 timestamp_ns = 2;         // Frame capture time (daemon-side stamp)
   repeated Tensor outputs = 3;    // Raw tensors (when post-process disabled)
   Status status = 4;
   PostResult post_result = 5;     // Structured results (when post-process enabled)
+  // Result skew: result-ready time minus frame capture time, in microseconds.
+  // Both stamps are on the device's CLOCK_MONOTONIC — the same domain as
+  // timestamp_ns (the media pipeline's frame stamp is monotonic; wall-clock
+  // reads must not be mixed in). "Result-ready" is when post-processing
+  // finished and the result is usable (filled in the stream's on_complete).
+  // 0 means "not measured" — the field is absent on failed inferences and on
+  // servers that predate it.
+  int64 skew_us = 6;
 
   // Per-stage timing of the serving pipeline (0 = not measured: failed
   // frame, stage not implemented yet, or server predates the field).
@@ -292,6 +309,20 @@ message InferenceStats {
   float current_qps = 5;
   uint32 queue_depth = 6;
   float hw_fps = 7;  // Hardware FPS from HAL latency measurement, 0 if unavailable
+  // Stream-infer skew aggregates (result-ready minus frame capture). Samples
+  // come from StreamInfer responses only — single-shot Infer has no frame
+  // timestamp. All three are 0 when the model has never run on a stream.
+  uint64 avg_skew_us = 8;
+  uint64 max_skew_us = 9;
+  uint64 skew_samples = 10;
+}
+
+// GetStats request. sampling_window_ms bounds the blocking HAL sampling
+// window behind device_utilization / perf stats; 0 = server default (500).
+// Clamped to [1, 5000]. A pre-windowing client sends Empty, which parses
+// here as all-defaults — same behavior as before windowing.
+message GetStatsRequest {
+  uint32 sampling_window_ms = 1;
 }
 
 message SystemStats {
@@ -343,7 +374,7 @@ service InferenceService {
   rpc DestroySession(SessionConfig) returns (Status);
   
   // Statistics
-  rpc GetStats(Empty) returns (SystemStats);
+  rpc GetStats(GetStatsRequest) returns (SystemStats);
 
   // Dynamic postprocess configuration
   rpc UpdatePostprocessConfig(UpdatePostprocessConfigRequest) returns (UpdatePostprocessConfigResponse);
