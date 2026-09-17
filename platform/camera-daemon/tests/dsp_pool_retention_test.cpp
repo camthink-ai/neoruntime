@@ -315,7 +315,7 @@ static void case_stop_flushes_parks() {
 }
 
 /* ---------------- retention-sized chunks (the 4K array-path fix) -----
- * The A15/A16 regression: a geometry whose full 32-buffer chunk exceeds
+ * The regression: a geometry whose full 32-buffer chunk exceeds
  * pool_retention_max_bytes (4K NV12 ≈ 372MiB vs 192MiB) is never parked,
  * so per-call alloc/release destroys and rebuilds the vendor chunk every
  * round. Fix: alloc sizes the pool chunk to HALF the parking budget
@@ -367,6 +367,7 @@ static void case_src_dst_geometries_coexist() {
 
     auto s1 = alloc_one(dsp, 7, 3840, 2160); /* src geometry  */
     auto d1 = alloc_one(dsp, 7, 1920, 1080); /* dst geometry  */
+    assert(g_last_pool_max == 32); /* sub-4K: fd ceiling, retention ON */
     assert(dsp.release_buffer(7, s1.ids[0]) == DSP_SVC_OK);
     assert(dsp.stats().retention_parked == 1);
     assert(dsp.release_buffer(7, d1.ids[0]) == DSP_SVC_OK);
@@ -410,6 +411,166 @@ static void case_count_raises_chunk_over_cap() {
     dsp.stop();
     dsp.release_client_buffers(7);
     std::printf("  case_count_raises_chunk_over_cap ok\n");
+}
+
+static void case_count_fitting_parks_and_evicts() {
+    /* The fitting twin of the refusal case: count=15 at 4K raises the
+     * chunk to 15 (186,624,000 B = 177.9 MiB) which still fits a 180MiB
+     * cap → it PARKS. And the park must be accounted at the real
+     * 15-buffer chunk: a following small-geometry park (1024×512 → 32 ×
+     * 786,432 = 25,165,824) pushes the total to 211,789,824 > 180MiB
+     * and evicts the WHOLE 4K geometry. Retention-sized accounting
+     * (7 × 12,441,600 = 87M, total 112M ≤ cap) would keep it parked —
+     * so this also pins the park-side charge at pool_key.max_buffers. */
+    reset_globals();
+    DspServiceConfig cfg;
+    cfg.pool_retention_max_bytes = 180ULL << 20;
+    DspService dsp(&g_dsp_ops, &g_fb_ops, cfg);
+    assert(dsp.start());
+
+    auto r = dsp.alloc_buffers(7, 3840, 2160, HAL_PIX_FMT_NV12, 15);
+    assert(r.rc == DSP_SVC_OK);
+    assert(r.ids.size() == 15);
+    assert(g_last_pool_max == 15); /* max(retention_n=7, count=15) */
+    for (uint64_t id : r.ids)
+        assert(dsp.release_buffer(7, id) == DSP_SVC_OK);
+    assert(dsp.stats().retention_parked == 15); /* fits, parks */
+    assert(g_release_count == 0);
+
+    auto small = alloc_one(dsp, 7, 1024, 512);
+    assert(g_last_pool_max == 32); /* sub-4K keeps the fd ceiling */
+    assert(dsp.release_buffer(7, small.ids[0]) == DSP_SVC_OK);
+    {
+        const auto& st = dsp.stats();
+        assert(st.retention_parked == 1); /* only the small geometry  */
+        assert(st.retention_releases == 15); /* the 4K chunk evicted  */
+    }
+    assert(g_release_count == 15); /* the 15-buffer chunk to HAL      */
+
+    dsp.stop();
+    dsp.release_client_buffers(7);
+    std::printf("  case_count_fitting_parks_and_evicts ok\n");
+}
+
+static void case_reuse_parks_source_chunk() {
+    /* Provenance: a reused buffer must park at its SOURCE pool's chunk,
+     * not the reusing call's own sizing. Park a count-raised 15-buffer
+     * 4K chunk (186.6M under the 192MiB cap), then a count=20 call
+     * reuses all 15 (its chunk_n is 20 — LARGER here) and allocates 5
+     * fresh. On release the 15 reuses must re-park at 186.6M and only
+     * the 5 fresh (20 × 12,441,600 = 248.8M > cap) may be refused. The
+     * pre-provenance code stamped every entry with THIS call's chunk, so
+     * all 15 reuses were refused too — parked would drop to 0. */
+    reset_globals();
+    DspServiceConfig cfg;
+    cfg.pool_retention_max_bytes = 192ULL << 20;
+    DspService dsp(&g_dsp_ops, &g_fb_ops, cfg);
+    assert(dsp.start());
+
+    auto r1 = dsp.alloc_buffers(7, 3840, 2160, HAL_PIX_FMT_NV12, 15);
+    assert(r1.rc == DSP_SVC_OK);
+    for (uint64_t id : r1.ids)
+        assert(dsp.release_buffer(7, id) == DSP_SVC_OK);
+    assert(dsp.stats().retention_parked == 15);
+
+    auto r2 = dsp.alloc_buffers(7, 3840, 2160, HAL_PIX_FMT_NV12, 20);
+    assert(r2.rc == DSP_SVC_OK);
+    assert(g_last_pool_max == 20); /* max(retention_n=8, count=20) */
+    assert(g_request_count == 20); /* 15 + 5 fresh; 15 were reuses   */
+    for (uint64_t id : r2.ids)
+        assert(dsp.release_buffer(7, id) == DSP_SVC_OK);
+    {
+        const auto& st = dsp.stats();
+        assert(st.retention_parked == 15); /* reuses re-parked       */
+        assert(st.retention_reuses == 15);
+    }
+    assert(g_release_count == 5); /* only the oversize fresh refused */
+
+    /* Full drain and re-park: the 15 parked serve a count=15 alloc with
+     * ZERO fresh HAL rounds, the residency debits exactly its credited
+     * chunk, and stop() flushes 15 + the 5 earlier refusals. */
+    auto r3 = dsp.alloc_buffers(7, 3840, 2160, HAL_PIX_FMT_NV12, 15);
+    assert(r3.rc == DSP_SVC_OK);
+    assert(g_request_count == 20); /* all 15 from the park           */
+    assert(dsp.stats().retention_reuses == 30);
+    for (uint64_t id : r3.ids)
+        assert(dsp.release_buffer(7, id) == DSP_SVC_OK);
+    assert(dsp.stats().retention_parked == 15);
+
+    dsp.stop();
+    dsp.release_client_buffers(7);
+    assert(g_release_count == 20); /* 5 refusals + 15 flushed        */
+    std::printf("  case_reuse_parks_source_chunk ok\n");
+}
+
+static void case_mixed_chunks_ledger_exact() {
+    /* The ledger must stay exact when ONE geometry's deque mixes chunk
+     * sizes (retention-sized 8-chunk re-parked beside a count-raised
+     * 15-chunk) — credit once at first park, debit that same remembered
+     * chunk on every removal path. Old code debited the front/back
+     * buffer's chunk, so a mixed drain subtracted 186.6M for a 99.5M
+     * credit and the clamp silently ate the small geometry's 25.2M —
+     * the final park below then fails to evict what it must. */
+    reset_globals();
+    DspServiceConfig cfg;
+    cfg.pool_retention_max_bytes = 192ULL << 20;
+    DspService dsp(&g_dsp_ops, &g_fb_ops, cfg);
+    assert(dsp.start());
+
+    /* (a) an 8-buffer retention-sized chunk parks: 8 × 12,441,600. */
+    auto a = dsp.alloc_buffers(7, 3840, 2160, HAL_PIX_FMT_NV12, 8);
+    assert(a.rc == DSP_SVC_OK && g_last_pool_max == 8);
+    for (uint64_t id : a.ids)
+        assert(dsp.release_buffer(7, id) == DSP_SVC_OK);
+
+    /* (b) count=15 drains the 8 parked (provenance 99.5M each) and
+     * adds 7 fresh from a 15-pool (chunk 186.6M ≤ cap, parks too). */
+    auto b = dsp.alloc_buffers(7, 3840, 2160, HAL_PIX_FMT_NV12, 15);
+    assert(b.rc == DSP_SVC_OK && g_last_pool_max == 15);
+    for (uint64_t id : b.ids)
+        assert(dsp.release_buffer(7, id) == DSP_SVC_OK);
+    {
+        const auto& st = dsp.stats();
+        assert(st.retention_parked == 15); /* 8@99.5M + 7@186.6M      */
+        assert(st.retention_releases == 0); /* no bogus eviction      */
+    }
+    assert(g_release_count == 0);
+
+    /* (c) a small geometry parks beside it: 99.5M + 25.2M fits. */
+    auto small = alloc_one(dsp, 7, 1024, 512);
+    assert(dsp.release_buffer(7, small.ids[0]) == DSP_SVC_OK);
+    assert(dsp.stats().retention_parked == 16);
+    assert(g_request_count == 16); /* 8 + 7 + 1, rest were reuses     */
+
+    /* (d) drain the mixed deque: the residency must debit its credited
+     * 99.5M, leaving the small geometry's 25.2M in the footprint. */
+    auto d = dsp.alloc_buffers(7, 3840, 2160, HAL_PIX_FMT_NV12, 15);
+    assert(d.rc == DSP_SVC_OK);
+    assert(g_request_count == 16); /* zero fresh — 15 reuses         */
+    for (uint64_t id : d.ids)
+        assert(dsp.release_buffer(7, id) == DSP_SVC_OK);
+    assert(dsp.stats().retention_parked == 16);
+
+    /* (e) a 2560×1440 chunk (18 × 5,529,600 = 99.5M) pushes the true
+     * footprint to 124.7M + 99.5M > cap → the SMALL geometry (oldest)
+     * is evicted. With the skewed ledger the footprint read 99.5M +
+     * 99.5M ≤ cap and nothing was evicted. */
+    auto e = dsp.alloc_buffers(7, 2560, 1440, HAL_PIX_FMT_NV12, 15);
+    assert(e.rc == DSP_SVC_OK);
+    assert(g_last_pool_max == 18); /* max(retention_n=18, count=15) */
+    for (uint64_t id : e.ids)
+        assert(dsp.release_buffer(7, id) == DSP_SVC_OK);
+    {
+        const auto& st = dsp.stats();
+        assert(st.retention_releases == 1); /* the small geometry     */
+        assert(st.retention_parked == 30); /* 15 4K + 15 qhd         */
+    }
+    assert(g_release_count == 1);
+
+    dsp.stop();
+    dsp.release_client_buffers(7);
+    assert(g_release_count == 31); /* + 30 flushed at stop           */
+    std::printf("  case_mixed_chunks_ledger_exact ok\n");
 }
 
 static void case_floor_when_chunk_still_over_cap() {
@@ -465,6 +626,9 @@ int main() {
     case_retention_sizes_big_pool();
     case_src_dst_geometries_coexist();
     case_count_raises_chunk_over_cap();
+    case_count_fitting_parks_and_evicts();
+    case_reuse_parks_source_chunk();
+    case_mixed_chunks_ledger_exact();
     case_floor_when_chunk_still_over_cap();
     case_retention_off_keeps_ceiling();
     std::printf("dsp_pool_retention_test: all assertions passed\n");
