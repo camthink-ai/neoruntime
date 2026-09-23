@@ -90,6 +90,9 @@ type LensState struct {
 	FocusRzDone bool
 	ZoomPos     int32
 	FocusPos    int32
+	// FixedLens reports the image-probe verdict that this lens has no motors;
+	// consumers hide motor controls instead of surfacing MCU errors.
+	FixedLens bool
 }
 
 // LensLimit mirrors HalIOLensLimit from hal_io.h.

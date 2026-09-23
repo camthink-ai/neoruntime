@@ -125,6 +125,15 @@ type DeviceControlServer struct {
 	eventBusClient eventpb.EventBusClient
 	eventBusConn   *grpc.ClientConn
 	eventBusMutex  sync.RWMutex
+
+	// Device event hub. A single poller samples
+	// the light sensor (camera-daemon hardware status) and SoC temperature
+	// (sysfs) and fans DeviceEvents out to subscribers. Sends never block
+	// the poller: a slow subscriber's channel fills and events are
+	// dropped for that subscriber only.
+	eventSubsMu        sync.Mutex
+	eventSubs          map[chan *pb.DeviceEvent]struct{}
+	eventPollerStarted bool
 }
 
 type lensStatusCache struct {
@@ -141,6 +150,7 @@ type lensStatusCache struct {
 	FocusLimitMax int32
 	ZoomRatio     float32
 	HasZoomRatio  bool
+	FixedLens     bool
 }
 
 func NewDeviceControlServer(cfg *Config, lensHal hal.LensHAL, cameraDaemonClient camerapb.CameraControlClient, cameraDaemonConn *grpc.ClientConn) *DeviceControlServer {
@@ -1300,6 +1310,9 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 				AutofocusEnabled: s.autofocusEnabled,
 				ZoomLimit:        &pb.LensLimit{MinPos: cached.ZoomLimitMin, MaxPos: cached.ZoomLimitMax},
 				FocusLimit:       &pb.LensLimit{MinPos: cached.FocusLimitMin, MaxPos: cached.FocusLimitMax},
+				// Keep the fixed-lens verdict across fallbacks so the web keeps
+				// hiding motor controls even when the lens HAL link drops.
+				FixedLens: cached.FixedLens,
 			}
 			fillLensIdentity(resp, cached.ZoomRatio, cached.HasZoomRatio)
 			return resp
@@ -1342,6 +1355,7 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 		AutofocusEnabled: s.autofocusEnabled,
 		ZoomLimit:        &pb.LensLimit{MinPos: zlim.MinPos, MaxPos: zlim.MaxPos},
 		FocusLimit:       &pb.LensLimit{MinPos: flim.MinPos, MaxPos: flim.MaxPos},
+		FixedLens:        state.FixedLens,
 	}
 	fillLensIdentity(resp, zoomRatio, true)
 	s.lensStatusMu.Lock()
@@ -1359,6 +1373,7 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 		FocusLimitMax: resp.FocusLimit.GetMaxPos(),
 		ZoomRatio:     zoomRatio,
 		HasZoomRatio:  true,
+		FixedLens:     resp.FixedLens,
 	}
 	s.hasLensStatus = true
 	s.lensStatusMu.Unlock()
@@ -1944,14 +1959,161 @@ func readSoCTemp() float32 {
 
 // Event Stream
 
+// Event detection thresholds for the poller below. Light changes emit on
+// a 50 mV absolute or 5% relative move (whichever trips first) so both
+// dark-baseline swings and bright small-signal drift are visible;
+// temperature alerts latch at 85°C and clear at 80°C — 5°C of hysteresis
+// so riding the threshold does not machine-gun events.
+const (
+	eventPollInterval      = 2 * time.Second
+	eventQueryTimeout      = time.Second
+	lightDeltaMv           = 50
+	lightDeltaRelPct       = 5
+	socTempAlertC          = 85.0
+	socTempClearC          = 80.0
+	eventSubscriberBacklog = 16
+)
+
+// StartEventPoller launches the single hardware poller behind
+// SubscribeEvents. Idempotent; the poller exits when ctx is cancelled.
+func (s *DeviceControlServer) StartEventPoller(ctx context.Context) {
+	s.eventSubsMu.Lock()
+	if s.eventPollerStarted {
+		s.eventSubsMu.Unlock()
+		return
+	}
+	s.eventPollerStarted = true
+	if s.eventSubs == nil {
+		s.eventSubs = make(map[chan *pb.DeviceEvent]struct{})
+	}
+	s.eventSubsMu.Unlock()
+
+	go s.eventPollerLoop(ctx)
+}
+
+func (s *DeviceControlServer) eventPollerLoop(ctx context.Context) {
+	ticker := time.NewTicker(eventPollInterval)
+	defer ticker.Stop()
+
+	lastLightMv := int64(-1) // -1 = no baseline yet; first sample emits
+	hot := false             // temperature alert latch
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		if mv, ok := s.sampleLightMv(ctx); ok && lightChanged(lastLightMv, mv) {
+			s.publishDeviceEvent(&pb.DeviceEvent{
+				Type:        pb.DeviceEvent_LIGHT_SENSOR_CHANGE,
+				TimestampNs: uint64(time.Now().UnixNano()),
+				Data:        &pb.DeviceEvent_LightSensorValue{LightSensorValue: uint32(mv)},
+			})
+			lastLightMv = mv
+		}
+
+		if t := readSoCTemp(); t > 0 {
+			// Emit on both transitions; recovery carries the same
+			// temperature payload and consumers compare against the
+			// documented thresholds above.
+			if !hot && t >= socTempAlertC {
+				hot = true
+				s.publishDeviceEvent(&pb.DeviceEvent{
+					Type:        pb.DeviceEvent_TEMPERATURE_ALERT,
+					TimestampNs: uint64(time.Now().UnixNano()),
+					Data:        &pb.DeviceEvent_Temperature{Temperature: t},
+				})
+			} else if hot && t <= socTempClearC {
+				hot = false
+				s.publishDeviceEvent(&pb.DeviceEvent{
+					Type:        pb.DeviceEvent_TEMPERATURE_ALERT,
+					TimestampNs: uint64(time.Now().UnixNano()),
+					Data:        &pb.DeviceEvent_Temperature{Temperature: t},
+				})
+			}
+		}
+	}
+}
+
+// sampleLightMv reads the light sensor via camera-daemon's hardware
+// status RPC — the same source GetDeviceStatus reports. False when the
+// daemon is unreachable; the poller just tries again next tick.
+func (s *DeviceControlServer) sampleLightMv(ctx context.Context) (int64, bool) {
+	if s.cameraDaemonClient == nil {
+		return 0, false
+	}
+	qctx, cancel := context.WithTimeout(ctx, eventQueryTimeout)
+	defer cancel()
+	resp, err := s.cameraDaemonClient.GetDeviceHardwareStatus(qctx, &camerapb.Empty{})
+	if err != nil || !resp.GetSuccess() {
+		return 0, false
+	}
+	return int64(resp.GetLightSensorMv()), true
+}
+
+// lightChanged applies the dual hysteresis: absolute 50 mV or relative
+// 5% of the last EMITTED value. The first sample (last < 0) always
+// emits, giving subscribers a baseline.
+func lightChanged(last, now int64) bool {
+	if last < 0 {
+		return true
+	}
+	d := now - last
+	if d < 0 {
+		d = -d
+	}
+	if d >= lightDeltaMv {
+		return true
+	}
+	return last > 0 && d*100 >= int64(lightDeltaRelPct)*last
+}
+
+// publishDeviceEvent fans an event out to every subscriber without
+// blocking: a full channel means that subscriber is not draining — drop
+// for that subscriber only, so one slow client can never stall the
+// poller for the rest. (Distinct from publishEvent, which forwards app
+// lifecycle events to the Event Bus service.)
+func (s *DeviceControlServer) publishDeviceEvent(ev *pb.DeviceEvent) {
+	s.eventSubsMu.Lock()
+	defer s.eventSubsMu.Unlock()
+	for ch := range s.eventSubs {
+		select {
+		case ch <- ev:
+		default:
+			logger.Debug("SubscribeEvents: subscriber backlog full, event dropped (type=%v)", ev.Type)
+		}
+	}
+}
+
 func (s *DeviceControlServer) SubscribeEvents(req *pb.Empty, stream pb.DeviceControl_SubscribeEventsServer) error {
 	logger.Info("Client subscribed to device events")
 
-	// TODO: Implement event subscription
-	// This would monitor MCU for events like GPIO changes, temperature alerts, etc.
+	ch := make(chan *pb.DeviceEvent, eventSubscriberBacklog)
+	s.eventSubsMu.Lock()
+	if s.eventSubs == nil {
+		s.eventSubs = make(map[chan *pb.DeviceEvent]struct{})
+	}
+	s.eventSubs[ch] = struct{}{}
+	s.eventSubsMu.Unlock()
+	defer func() {
+		s.eventSubsMu.Lock()
+		delete(s.eventSubs, ch)
+		s.eventSubsMu.Unlock()
+	}()
 
-	<-stream.Context().Done()
-	return stream.Context().Err()
+	ctx := stream.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ev := <-ch:
+			if err := stream.Send(ev); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func main() {
@@ -2050,6 +2212,10 @@ func main() {
 	deviceServer := NewDeviceControlServer(&cfg, halLens, cameraDaemonClient, cameraDaemonConn)
 	pb.RegisterDeviceControlServer(grpcServer, deviceServer)
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
+
+	// Device event poller (SubscribeEvents) — tied to the reconcile
+	// context so shutdown stops it.
+	deviceServer.StartEventPoller(reconcileCtx)
 
 	// Handle shutdown gracefully
 	sigChan := make(chan os.Signal, 1)
@@ -2166,6 +2332,27 @@ func reconcileLens(ctx context.Context, s *DeviceControlServer, client *lens.Len
 }
 
 func initializeRemoteLens(s *DeviceControlServer, client *lens.LensClient) error {
+	// Leaving READY is not proof of a camera-daemon restart: an overloaded
+	// daemon can also flap the transport transiently. The daemon-side AF0832
+	// bootstrapped flag (in-memory, cleared only by a real restart) and the
+	// MCU home status distinguish the two. When the lens never went away,
+	// skip the mechanical re-home — replaying it on every flap is what moved
+	// the lens to 1.0x/home-focus "by itself" while a page stream loaded.
+	if client.IsAF0832Bootstrapped() {
+		logger.Info("Lens reconnect without daemon restart (AF0832 still bootstrapped); skipping re-home")
+		client.ReplayPersistedConfig()
+		return nil
+	}
+	// Flag absent (post-restart, or a transient IsAF0832Bootstrapped transport
+	// error under load), but the motors may already be homed. Both axes
+	// rz-done means the lens never went away: re-mark and skip the re-home.
+	if zd, fd, err := s.lensHomed(); err == nil && zd && fd {
+		logger.Info("Lens already homed after reconnect (zoom+focus rz-done); re-marking bootstrapped without re-home")
+		_ = client.AF0832MarkBootstrapped()
+		client.ReplayPersistedConfig()
+		return nil
+	}
+
 	if err := client.Init(); err != nil {
 		return fmt.Errorf("remote Init: %w", err)
 	}

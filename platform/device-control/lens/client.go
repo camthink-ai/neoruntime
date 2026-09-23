@@ -384,6 +384,7 @@ func protoToState(s *pb.LensState) hal.LensState {
 		FocusRzDone: s.FocusRzDone,
 		ZoomPos:     s.ZoomPos,
 		FocusPos:    s.FocusPos,
+		FixedLens:   s.FixedLens,
 	}
 }
 

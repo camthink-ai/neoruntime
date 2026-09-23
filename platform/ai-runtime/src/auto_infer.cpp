@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 #include <sys/mman.h>
 #include <condition_variable>
 #include <sstream>
@@ -12,6 +13,46 @@
 namespace aipc::ai_runtime {
 
 using SteadyClock  = std::chrono::steady_clock;
+
+namespace {
+
+// Last-resort termination for shutdown paths that cannot quiesce while
+// preserving callback lifetimes. _Exit avoids both C++ destructors (late HAL
+// callbacks own raw dependencies) and the SIGABRT core dump std::abort would
+// produce; the process is exiting either way.
+[[noreturn]] void terminate_shutdown_failure(const char* why) {
+    LOG_FATAL("AutoInfer: %s; terminating without destructors", why);
+    std::_Exit(EXIT_FAILURE);
+}
+
+// Process-lifetime token distinguishing event ids across ai-runtime restarts,
+// where publisher sequence numbers and monotonic frame timestamps can repeat.
+uint64_t process_instance_token() {
+    static const uint64_t token = [] {
+        const uint64_t pid = static_cast<uint64_t>(::getpid());
+        const uint64_t tick = static_cast<uint64_t>(
+            SteadyClock::now().time_since_epoch().count());
+        return pid * 0x9E3779B97F4A7C15ULL ^ tick;
+    }();
+    return token;
+}
+
+// Event ids must be unique across models on the same stream, publisher
+// reconnects, and process restarts: the frame source only guarantees
+// uniqueness of (sequence, timestamp) within one publisher connection.
+std::string make_event_id(const std::string& model_id,
+                          const std::string& stream_id,
+                          uint64_t generation,
+                          uint64_t frame_seq,
+                          uint64_t ts_ns) {
+    std::ostringstream os;
+    os << "auto-" << std::hex << process_instance_token() << std::dec
+       << "-" << model_id << "-" << stream_id
+       << "-" << generation << "-" << frame_seq << "-" << ts_ns;
+    return os.str();
+}
+
+}  // namespace
 
 // ─── Color Space Helpers ──────────────────────────────────────────────────────
 
@@ -151,13 +192,146 @@ struct MappedNV12Frame {
 // Returns a malloc'd buffer that must be freed by the caller.
 
 struct PreparedInput {
-    void* buffer    = nullptr;   // malloc'd buffer (caller must free)
-    HalTensor tensor{};          // ready-to-submit tensor (data points into buffer)
+    void* buffer    = nullptr;
+    HalTensor tensor{};
+
+    PreparedInput() = default;
+    PreparedInput(const PreparedInput&) = delete;
+    PreparedInput& operator=(const PreparedInput&) = delete;
+    PreparedInput(PreparedInput&& other) noexcept
+        : buffer(other.buffer), tensor(other.tensor) {
+        other.buffer = nullptr;
+        other.tensor.data = nullptr;
+    }
+    PreparedInput& operator=(PreparedInput&& other) noexcept {
+        if (this != &other) {
+            free_buffer();
+            buffer = other.buffer;
+            tensor = other.tensor;
+            other.buffer = nullptr;
+            other.tensor.data = nullptr;
+        }
+        return *this;
+    }
+    ~PreparedInput() { free_buffer(); }
 
     explicit operator bool() const { return buffer != nullptr; }
 
-    void free_buffer() {
-        if (buffer) { std::free(buffer); buffer = nullptr; tensor.data = nullptr; }
+    void* release_buffer() noexcept {
+        void* released = buffer;
+        buffer = nullptr;
+        tensor.data = nullptr;
+        return released;
+    }
+
+    void free_buffer() noexcept {
+        if (buffer) {
+            std::free(buffer);
+            buffer = nullptr;
+            tensor.data = nullptr;
+        }
+    }
+};
+
+struct FreeBuffer {
+    void operator()(void* ptr) const noexcept { std::free(ptr); }
+};
+
+struct AutoInferRequestResources {
+    FrameDelivery delivery;
+    std::shared_ptr<FdGroup> fd_group;
+    std::unique_ptr<void, FreeBuffer> input;
+
+    void release_source() noexcept {
+        delivery.acknowledge();
+        input.reset();
+        fd_group.reset();
+    }
+};
+
+struct AutoInferInFlightTicket {
+    AutoInferInFlightTicket(
+        std::shared_ptr<std::atomic<int>> counter_in,
+        std::shared_ptr<AutoInferOutstandingWorkState> outstanding_in)
+        : counter(std::move(counter_in)),
+          outstanding(std::move(outstanding_in)) {
+        std::lock_guard lock(outstanding->mu);
+        ++outstanding->count;
+        counter->fetch_add(1);
+    }
+
+    ~AutoInferInFlightTicket() {
+        counter->fetch_sub(1);
+        std::lock_guard lock(outstanding->mu);
+        if (--outstanding->count == 0)
+            outstanding->cv.notify_all();
+    }
+
+    std::shared_ptr<std::atomic<int>> counter;
+    std::shared_ptr<AutoInferOutstandingWorkState> outstanding;
+};
+
+struct AutoInferImmediateOutputs {
+    ModelManager* model_mgr = nullptr;
+    HalTensor* outputs = nullptr;
+    int num_outputs = 0;
+    const std::string* model_id = nullptr;
+    bool model_acquired = false;
+    bool armed = true;
+
+    void disarm() noexcept { armed = false; }
+    ~AutoInferImmediateOutputs() noexcept {
+        if (!armed) return;
+        try {
+            if (outputs)
+                model_mgr->free_outputs(outputs, num_outputs);
+        } catch (...) {
+            LOG_ERROR("AutoInfer: immediate output cleanup threw");
+        }
+        try {
+            if (model_acquired)
+                model_mgr->release_model(*model_id);
+        } catch (...) {
+            LOG_ERROR("AutoInfer: immediate model release threw");
+        }
+    }
+};
+
+struct AutoInferOutputResources {
+    AutoInferOutputResources(
+        ModelManager* model_mgr_in,
+        std::unique_ptr<HalTensor[]> outputs_in,
+        int num_outputs_in,
+        std::string model_id_in,
+        bool model_acquired_in,
+        std::shared_ptr<AutoInferInFlightTicket> ticket_in)
+        : model_mgr(model_mgr_in),
+          outputs(std::move(outputs_in)),
+          num_outputs(num_outputs_in),
+          model_id(std::move(model_id_in)),
+          model_acquired(model_acquired_in),
+          ticket(std::move(ticket_in)) {}
+
+    ModelManager* model_mgr = nullptr;
+    std::unique_ptr<HalTensor[]> outputs;
+    int num_outputs = 0;
+    std::string model_id;
+    bool model_acquired = false;
+    std::shared_ptr<AutoInferInFlightTicket> ticket;
+
+    ~AutoInferOutputResources() noexcept {
+        try {
+            if (outputs)
+                model_mgr->free_outputs(outputs.get(), num_outputs);
+        } catch (...) {
+            LOG_ERROR("AutoInfer: output cleanup threw");
+        }
+        try {
+            if (model_acquired)
+                model_mgr->release_model(model_id);
+        } catch (...) {
+            LOG_ERROR("AutoInfer: model release threw");
+        }
     }
 };
 
@@ -233,6 +407,88 @@ static PreparedInput prepare_nv12_input(
 
 // ─── AutoInfer Implementation ─────────────────────────────────────────────────
 
+struct AutoInfer::PipelineFrameState {
+    std::mutex mu;
+    std::condition_variable cv;
+    ReceivedFrame latest_frame{};
+    bool has_frame = false;
+    bool accepting_frames = true;
+};
+
+struct AutoInfer::PipelineRunState {
+    std::mutex mu;
+    std::condition_variable cv;
+    size_t expected = 0;
+    size_t startup_reported = 0;
+    size_t exited = 0;
+    bool startup_failed = false;
+
+    void report_startup(bool success) noexcept {
+        std::lock_guard lock(mu);
+        ++startup_reported;
+        if (!success) startup_failed = true;
+        cv.notify_all();
+    }
+
+    void report_exit() noexcept {
+        std::lock_guard lock(mu);
+        ++exited;
+        cv.notify_all();
+    }
+};
+
+namespace {
+
+std::string auto_infer_subscriber_id(const AutoInferPipeline& pipe) {
+    return pipe.model_id + ":" + pipe.stream_id;
+}
+
+struct SubscriptionGuard {
+    FdReceiver* receiver = nullptr;
+    std::string stream_id;
+    std::string subscriber_id;
+    std::function<void()> quiesce_callback_state;
+
+    void reset() noexcept {
+        auto* current = receiver;
+        receiver = nullptr;
+        if (!current) return;
+        try {
+            if (quiesce_callback_state) quiesce_callback_state();
+            current->unsubscribe(stream_id, subscriber_id);
+        } catch (...) {
+            LOG_ERROR("AutoInfer: subscription cleanup threw");
+        }
+    }
+
+    void arm(FdReceiver* new_receiver) noexcept { receiver = new_receiver; }
+
+    ~SubscriptionGuard() noexcept { reset(); }
+};
+
+struct SessionGuard {
+    SessionManager* manager = nullptr;
+    std::string session_id;
+
+    explicit SessionGuard(SessionManager* manager_in) noexcept
+        : manager(manager_in) {}
+
+    void arm(std::string new_session_id) noexcept {
+        session_id.swap(new_session_id);
+    }
+
+    ~SessionGuard() noexcept {
+        if (!manager || session_id.empty()) return;
+        try {
+            manager->destroy_session(session_id);
+        } catch (...) {
+            LOG_ERROR("AutoInfer: session cleanup threw");
+        }
+    }
+};
+
+}  // namespace
+
 AutoInfer::AutoInfer(ModelManager* model_mgr,
                      FdReceiver* fd_receiver,
                      EventBusClient* event_bus,
@@ -247,6 +503,8 @@ AutoInfer::AutoInfer(ModelManager* model_mgr,
     , session_mgr_(session_mgr)
     , postprocess_pool_(postprocess_pool)
     , cfg_(cfg)
+    , outstanding_work_(
+          std::make_shared<AutoInferOutstandingWorkState>())
 {}
 
 AutoInfer::~AutoInfer() {
@@ -259,41 +517,220 @@ bool AutoInfer::start() {
         return false;
     }
 
-    running_.store(true);
-
-    for (auto& pipe : cfg_.auto_infer_pipelines) {
-        LOG_INFO("AutoInfer: starting pipeline model=%s stream=%s fps=%u",
-                 pipe.model_id.c_str(), pipe.stream_id.c_str(), pipe.fps);
-        threads_.emplace_back(&AutoInfer::pipeline_loop, this, pipe);
+    std::unique_lock lifecycle_lock(lifecycle_mu_);
+    if (lifecycle_state_ == LifecycleState::Running) {
+        if (!pipeline_failed_.load(std::memory_order_acquire)) return true;
+        LOG_WARN("AutoInfer: restarting after a pipeline exited unexpectedly");
+        stop_locked(lifecycle_lock);
     }
 
+    lifecycle_state_ = LifecycleState::Starting;
+    running_.store(true, std::memory_order_release);
+    pipeline_failed_.store(false, std::memory_order_release);
+    std::shared_ptr<PipelineRunState> run_state;
+    try {
+        run_state = std::make_shared<PipelineRunState>();
+        run_state->expected = cfg_.auto_infer_pipelines.size();
+        pipeline_run_state_ = run_state;
+    } catch (...) {
+        running_.store(false, std::memory_order_release);
+        lifecycle_state_ = LifecycleState::Stopped;
+        LOG_ERROR("AutoInfer: failed to allocate pipeline startup state");
+        return false;
+    }
+
+    {
+        std::lock_guard lock(pipeline_states_mu_);
+        pipeline_states_.clear();
+    }
+
+    try {
+        threads_.reserve(cfg_.auto_infer_pipelines.size());
+        for (const auto& pipe : cfg_.auto_infer_pipelines) {
+            LOG_INFO("AutoInfer: starting pipeline model=%s stream=%s fps=%u",
+                     pipe.model_id.c_str(), pipe.stream_id.c_str(), pipe.fps);
+            threads_.emplace_back(
+                &AutoInfer::pipeline_thread_main, this, pipe, run_state);
+        }
+    } catch (const std::exception& e) {
+        {
+            std::lock_guard lock(run_state->mu);
+            run_state->expected = threads_.size();
+        }
+        LOG_ERROR("AutoInfer: pipeline thread creation failed: %s", e.what());
+        stop_locked(lifecycle_lock);
+        return false;
+    } catch (...) {
+        {
+            std::lock_guard lock(run_state->mu);
+            run_state->expected = threads_.size();
+        }
+        LOG_ERROR("AutoInfer: pipeline thread creation failed");
+        stop_locked(lifecycle_lock);
+        return false;
+    }
+
+    constexpr auto kStartupTimeout = std::chrono::seconds(10);
+    bool startup_ready = false;
+    {
+        std::unique_lock state_lock(run_state->mu);
+        startup_ready = run_state->cv.wait_for(
+            state_lock, kStartupTimeout, [&] {
+                return run_state->startup_failed ||
+                       run_state->startup_reported == run_state->expected;
+            });
+        startup_ready = startup_ready && !run_state->startup_failed &&
+                        run_state->startup_reported == run_state->expected;
+    }
+    if (!startup_ready) {
+        LOG_ERROR("AutoInfer: pipeline startup failed or timed out");
+        stop_locked(lifecycle_lock);
+        return false;
+    }
+
+    lifecycle_state_ = LifecycleState::Running;
     return true;
 }
 
 void AutoInfer::stop() {
-    if (!running_.exchange(false)) return;
+    // Signal workers before waiting for the lifecycle mutex so a stop racing a
+    // startup handshake can make that handshake fail promptly instead of waiting
+    // for its full startup timeout.
+    running_.store(false, std::memory_order_release);
+    std::unique_lock lifecycle_lock(lifecycle_mu_);
+    if (lifecycle_state_ == LifecycleState::Stopped) return;
+    stop_locked(lifecycle_lock);
+}
 
-    for (auto& pipe : cfg_.auto_infer_pipelines) {
-        fd_receiver_->unsubscribe(pipe.stream_id);
+void AutoInfer::stop_locked(
+    std::unique_lock<std::mutex>& lifecycle_lock) {
+    if (!lifecycle_lock.owns_lock()) std::abort();
+
+    constexpr auto kShutdownTimeout = std::chrono::seconds(5);
+    const auto shutdown_deadline = SteadyClock::now() + kShutdownTimeout;
+    lifecycle_state_ = LifecycleState::Stopping;
+    running_.store(false, std::memory_order_release);
+
+    std::vector<std::shared_ptr<PipelineFrameState>> pipeline_states;
+    {
+        std::lock_guard lock(pipeline_states_mu_);
+        pipeline_states.reserve(pipeline_states_.size());
+        for (const auto& weak_state : pipeline_states_) {
+            if (auto state = weak_state.lock())
+                pipeline_states.push_back(std::move(state));
+        }
+    }
+    for (const auto& state : pipeline_states) {
+        std::lock_guard lock(state->mu);
+        state->accepting_frames = false;
+        if (state->has_frame)
+            state->latest_frame.delivery.acknowledge();
+        state->latest_frame = {};
+        state->has_frame = false;
+        state->cv.notify_all();
     }
 
-    for (auto& t : threads_) {
-        if (t.joinable()) t.join();
+    for (const auto& pipe : cfg_.auto_infer_pipelines) {
+        try {
+            if (!fd_receiver_->unsubscribe_until(
+                    pipe.stream_id, auto_infer_subscriber_id(pipe),
+                    shutdown_deadline)) {
+                terminate_shutdown_failure(
+                    "unsubscribe did not quiesce before the shutdown deadline");
+            }
+        } catch (...) {
+            terminate_shutdown_failure(
+                "unsubscribe threw; preserving callback lifetime");
+        }
+        if (SteadyClock::now() >= shutdown_deadline) {
+            terminate_shutdown_failure(
+                "unsubscribe exceeded shutdown deadline");
+        }
+    }
+
+    const auto run_state = pipeline_run_state_;
+    if (run_state) {
+        std::unique_lock state_lock(run_state->mu);
+        if (!run_state->cv.wait_until(
+                state_lock, shutdown_deadline, [&] {
+                    return run_state->exited == run_state->expected;
+                })) {
+            terminate_shutdown_failure(
+                "pipeline threads did not stop before the shutdown deadline");
+        }
+    }
+
+    for (auto& thread : threads_) {
+        if (thread.joinable()) thread.join();
     }
     threads_.clear();
 
+    for (const auto& state : pipeline_states) {
+        std::lock_guard lock(state->mu);
+        if (state->has_frame) {
+            state->latest_frame.delivery.acknowledge();
+            state->latest_frame = {};
+            state->has_frame = false;
+        }
+    }
+    {
+        std::lock_guard lock(pipeline_states_mu_);
+        pipeline_states_.clear();
+    }
+
+    {
+        std::unique_lock work_lock(outstanding_work_->mu);
+        if (!outstanding_work_->cv.wait_until(
+                work_lock, shutdown_deadline,
+                [this] { return outstanding_work_->count == 0; })) {
+            terminate_shutdown_failure(
+                "outstanding inference work did not quiesce before the "
+                "shutdown deadline");
+        }
+    }
+
+    pipeline_run_state_.reset();
+    lifecycle_state_ = LifecycleState::Stopped;
     LOG_INFO("AutoInfer: all pipelines stopped");
 }
 
-void AutoInfer::pipeline_loop(const AutoInferPipeline& pipe) {
-    // Acquire model snapshot — safe to use after lock release
+void AutoInfer::pipeline_thread_main(
+    AutoInferPipeline pipe,
+    std::shared_ptr<PipelineRunState> run_state) noexcept {
+    bool startup_succeeded = false;
+    try {
+        pipeline_loop(pipe, run_state, startup_succeeded);
+    } catch (const std::exception& e) {
+        LOG_ERROR("AutoInfer: pipeline '%s/%s' terminated with exception: %s",
+                  pipe.model_id.c_str(), pipe.stream_id.c_str(), e.what());
+    } catch (...) {
+        LOG_ERROR("AutoInfer: pipeline '%s/%s' terminated with exception",
+                  pipe.model_id.c_str(), pipe.stream_id.c_str());
+    }
+
+    if (!startup_succeeded) {
+        run_state->report_startup(false);
+    } else if (running_.load(std::memory_order_acquire)) {
+        pipeline_failed_.store(true, std::memory_order_release);
+        LOG_ERROR("AutoInfer: pipeline '%s/%s' exited unexpectedly",
+                  pipe.model_id.c_str(), pipe.stream_id.c_str());
+    }
+    run_state->report_exit();
+}
+
+void AutoInfer::pipeline_loop(
+    const AutoInferPipeline& pipe,
+    const std::shared_ptr<PipelineRunState>& run_state,
+    bool& startup_succeeded) {
+    // Prepare the guard before acquisition so copying the model id cannot leak
+    // a live ref if allocation throws.
+    ModelGuard model_guard{model_mgr_, pipe.model_id};
     auto snap = model_mgr_->acquire_model_snapshot(pipe.model_id);
     if (!snap) {
         LOG_ERROR("AutoInfer: model '%s' not found, pipeline aborted", pipe.model_id.c_str());
         return;
     }
-
-    ModelGuard model_guard{model_mgr_, pipe.model_id};
+    model_guard.arm();
 
     HalInferenceSession* infer_session = snap->infer_session;
     HalPostprocessSession* pp_session = snap->post_session;
@@ -322,34 +759,43 @@ void AutoInfer::pipeline_loop(const AutoInferPipeline& pipe) {
     }
 
     // Unique subscriber name for this pipeline
-    std::string subscriber_name = pipe.model_id + ":" + pipe.stream_id;
+    const std::string subscriber_name = auto_infer_subscriber_id(pipe);
 
-    // Subscribe to camera-daemon's FD publisher with retry
-    std::mutex frame_mu;
-    std::condition_variable frame_cv;
-    ReceivedFrame latest_frame{};
-    bool has_frame = false;
+    // Keep callback state alive independently from the pipeline stack. The exact
+    // subscription is fenced below before this shared state is released.
+    auto frame_state = std::make_shared<PipelineFrameState>();
+    {
+        std::lock_guard lock(pipeline_states_mu_);
+        pipeline_states_.push_back(frame_state);
+    }
+    SessionGuard session_guard{session_mgr_};
 
     auto do_subscribe = [&]() -> bool {
         return fd_receiver_->subscribe(
             pipe.stream_id,
             subscriber_name,
-            [&](const ReceivedFrame& frame) {
-                std::lock_guard lock(frame_mu);
+            [frame_state](const ReceivedFrame& frame) {
+                std::lock_guard lock(frame_state->mu);
+                if (!frame_state->accepting_frames) {
+                    frame.delivery.acknowledge();
+                    return;
+                }
                 // Release the previously buffered frame if it was never consumed.
                 // This prevents camera-daemon buffer pool exhaustion when frames
                 // arrive faster than inference can process them.
-                if (has_frame && latest_frame.frame_id != 0) {
-                    fd_receiver_->release_frame(pipe.stream_id, latest_frame.frame_id);
+                if (frame_state->has_frame &&
+                    frame_state->latest_frame.frame_id != 0) {
+                    frame_state->latest_frame.delivery.acknowledge();
                 }
-                latest_frame = frame;
-                has_frame = true;
-                frame_cv.notify_one();
+                frame_state->latest_frame = frame;
+                frame_state->has_frame = true;
+                frame_state->cv.notify_one();
             });
     };
 
+    bool subscribed = false;
     int retry = 0;
-    while (running_.load() && !do_subscribe()) {
+    while (running_.load() && !(subscribed = do_subscribe())) {
         if (++retry > 30) {
             LOG_ERROR("AutoInfer: failed to subscribe stream '%s' after %d retries (sub=%s)",
                       pipe.stream_id.c_str(), retry, subscriber_name.c_str());
@@ -357,9 +803,24 @@ void AutoInfer::pipeline_loop(const AutoInferPipeline& pipe) {
         }
         LOG_WARN("AutoInfer: FdReceiver subscribe '%s' failed, retry %d/30... (sub=%s)",
                  pipe.stream_id.c_str(), retry, subscriber_name.c_str());
-        std::this_thread::sleep_for(Milliseconds(2000));
+        std::unique_lock lock(frame_state->mu);
+        frame_state->cv.wait_for(
+            lock, Milliseconds(2000), [&] { return !running_.load(); });
     }
 
+    if (!subscribed) return;
+    auto quiesce_callback_state = [frame_state] {
+        std::lock_guard lock(frame_state->mu);
+        frame_state->accepting_frames = false;
+        if (frame_state->has_frame)
+            frame_state->latest_frame.delivery.acknowledge();
+        frame_state->latest_frame = {};
+        frame_state->has_frame = false;
+        frame_state->cv.notify_all();
+    };
+    SubscriptionGuard subscription_guard{
+        fd_receiver_, pipe.stream_id, subscriber_name,
+        quiesce_callback_state};
     if (!running_.load()) return;
 
     LOG_INFO("AutoInfer: pipeline '%s/%s' running", pipe.model_id.c_str(), pipe.stream_id.c_str());
@@ -368,7 +829,11 @@ void AutoInfer::pipeline_loop(const AutoInferPipeline& pipe) {
     // Hold a shared_ptr: get_session() now returns shared_ptr<Session> (a raw
     // pointer could dangle if the session is destroyed concurrently, and the
     // prior `get_session(id)->running` deref'd it with NO null check).
-    std::string session_id = session_mgr_->create_session("<system>", pipe.stream_id, pipe.model_id, pipe.fps, 0, 5);
+    // app_id is plain "system": SessionManager identifiers are restricted to
+    // [A-Za-z0-9._-], and this app_id only feeds stats output.
+    session_guard.arm(session_mgr_->create_session(
+        "system", pipe.stream_id, pipe.model_id, pipe.fps, 0, 5));
+    const std::string session_id = session_guard.session_id;
     auto session = session_mgr_->get_session(session_id);
     if (!session) {
         LOG_ERROR("AutoInfer: failed to create session for pipeline '%s/%s'",
@@ -376,10 +841,16 @@ void AutoInfer::pipeline_loop(const AutoInferPipeline& pipe) {
         return;
     }
     session->running = true;
+    startup_succeeded = true;
+    run_state->report_startup(true);
 
     auto fps = pipe.fps > 0 ? pipe.fps : 10;
     auto frame_interval = Milliseconds(1000 / fps);
+    // Sequence-zero is a valid first frame; track "seen" separately from the
+    // value so it is never dropped as a phantom duplicate.
     uint64_t last_seq = 0;
+    bool has_last_seq = false;
+    uint64_t publisher_generation = 0;
 
     // Limit outstanding frames to prevent camera-daemon buffer pool exhaustion.
     // With N subscribers sharing the same pool, each pipeline should hold at most
@@ -390,23 +861,63 @@ void AutoInfer::pipeline_loop(const AutoInferPipeline& pipe) {
     while (running_.load()) {
         ReceivedFrame frame{};
         {
-            std::unique_lock lock(frame_mu);
-            if (!frame_cv.wait_for(lock, frame_interval,
-                                   [&] { return has_frame || !running_.load(); })) {
+            std::unique_lock lock(frame_state->mu);
+            if (!frame_state->cv.wait_for(
+                    lock, frame_interval,
+                    [&] { return frame_state->has_frame || !running_.load(); })) {
+                lock.unlock();
+                if (!fd_receiver_->stream_connected(pipe.stream_id)) {
+                    LOG_WARN("AutoInfer: publisher connection lost for stream '%s'; reconnecting",
+                             pipe.stream_id.c_str());
+                    subscription_guard.reset();
+
+                    {
+                        std::lock_guard state_lock(frame_state->mu);
+                        frame_state->accepting_frames = true;
+                    }
+
+                    subscribed = false;
+                    uint64_t reconnect_retry = 0;
+                    while (running_.load(std::memory_order_acquire) &&
+                           !(subscribed = do_subscribe())) {
+                        ++reconnect_retry;
+                        LOG_WARN("AutoInfer: reconnect subscribe '%s' failed, retry %lu (sub=%s)",
+                                 pipe.stream_id.c_str(), reconnect_retry,
+                                 subscriber_name.c_str());
+                        std::unique_lock state_lock(frame_state->mu);
+                        frame_state->cv.wait_for(
+                            state_lock, Milliseconds(2000), [&] {
+                                return !running_.load(std::memory_order_acquire);
+                            });
+                    }
+                    if (!subscribed) break;
+
+                    subscription_guard.arm(fd_receiver_);
+                    ++publisher_generation;
+                    last_seq = 0;
+                    has_last_seq = false;
+                    LOG_INFO("AutoInfer: publisher connection restored for stream '%s'",
+                             pipe.stream_id.c_str());
+                }
                 continue;
             }
             if (!running_.load()) break;
-            frame = latest_frame;
-            has_frame = false;
+            frame = std::move(frame_state->latest_frame);
+            frame_state->latest_frame = {};
+            frame_state->has_frame = false;
         }
 
-        if (frame.sequence == last_seq) continue;
+        if (has_last_seq && frame.sequence == last_seq) {
+            frame.delivery.acknowledge();
+            continue;
+        }
         last_seq = frame.sequence;
+        has_last_seq = true;
 
         // Back-pressure: if too many frames are in the scheduler queue awaiting
         // completion, drop this frame to avoid exhausting camera-daemon's buffer pool.
         if (in_flight->load() >= MAX_IN_FLIGHT) {
-            fd_receiver_->release_frame(pipe.stream_id, frame.frame_id);
+            frame.delivery.acknowledge();
             continue;
         }
 
@@ -417,7 +928,7 @@ void AutoInfer::pipeline_loop(const AutoInferPipeline& pipe) {
         if (!mapped) {
             LOG_ERROR("AutoInfer: DMA-BUF mmap failed for model=%s stream=%s",
                       pipe.model_id.c_str(), pipe.stream_id.c_str());
-            fd_receiver_->release_frame(pipe.stream_id, frame.frame_id);
+            frame.delivery.acknowledge();
             continue;
         }
 
@@ -432,7 +943,7 @@ void AutoInfer::pipeline_loop(const AutoInferPipeline& pipe) {
 
         if (!input) {
             LOG_ERROR("AutoInfer: failed to prepare input for model=%s", pipe.model_id.c_str());
-            fd_receiver_->release_frame(pipe.stream_id, frame.frame_id);
+            frame.delivery.acknowledge();
             continue;
         }
 
@@ -444,138 +955,158 @@ void AutoInfer::pipeline_loop(const AutoInferPipeline& pipe) {
 
         // ── Submit to Scheduler ───────────────────────────────────────────
 
+        auto request_resources = std::make_shared<AutoInferRequestResources>();
+        request_resources->delivery = frame.delivery;
+        request_resources->fd_group = frame.fd_group;
+        request_resources->input.reset(input.release_buffer());
+        auto ticket = std::make_shared<AutoInferInFlightTicket>(
+            in_flight, outstanding_work_);
+
         auto inf_req = std::make_unique<InferRequest>();
         inf_req->model_id   = pipe.model_id;
         inf_req->session_id = session_id;
         inf_req->num_inputs = num_inputs;
         inf_req->inputs[0]  = input.tensor;
+        inf_req->inputs[0].data = request_resources->input.get();
         inf_req->timeout_ms = 1000;
-        inf_req->resource_holder = frame.fd_group;  // Keep FDs alive
-        inf_req->owns_outputs = true;  // Async post-process takes ownership
+        inf_req->resource_holder = request_resources;
+        inf_req->owns_outputs = true;
 
-        // Captured variables for callback
-        auto stream_id  = pipe.stream_id;
-        auto model_id   = pipe.model_id;
-        auto frame_seq  = frame.sequence;
-        auto ts_ns      = frame.timestamp_ns;
-        auto fid        = frame.frame_id;
-        void* buf_to_free = input.buffer;
-        input.buffer = nullptr;  // Transfer ownership to lambda
+        auto stream_id = pipe.stream_id;
+        auto model_id = pipe.model_id;
+        auto frame_seq = frame.sequence;
+        auto ts_ns = frame.timestamp_ns;
+        const auto frame_generation = publisher_generation;
 
-        in_flight->fetch_add(1);
-
-        inf_req->on_complete = [this, stream_id, model_id, frame_seq, ts_ns, fid, enable_post,
-                                pp_session, frame, buf_to_free, in_flight, session_id]
+        inf_req->on_complete =
+            [this, stream_id, model_id, frame_seq, ts_ns, frame_generation,
+             enable_post, pp_session, request_resources, ticket, session_id]
             (int rc, HalTensor* outputs, int num_outputs,
              uint64_t infer_time_us, uint64_t queue_time_us,
-             bool model_acquired) {
+             bool model_acquired) noexcept {
+            (void)queue_time_us;
+            AutoInferImmediateOutputs immediate{
+                model_mgr_, outputs, num_outputs, &model_id, model_acquired};
 
-            // Release frame in camera-daemon
-            fd_receiver_->release_frame(stream_id, fid);
+            try {
+                request_resources->release_source();
 
-            // Free the prepared input buffer
-            std::free(buf_to_free);
+                auto sess = session_mgr_->get_session(session_id);
+                if (sess)
+                    session_mgr_->record_inference(sess.get(), infer_time_us);
 
-            // Record stats on this pipeline's session (single source;
-            // on_hw_complete does not record to avoid double-counting)
-            auto sess = session_mgr_->get_session(session_id);
-            if (sess) {
-                session_mgr_->record_inference(sess.get(), infer_time_us);
-            }
-
-            if (rc != 0) {
-                LOG_WARN("AutoInfer: scheduler infer failed rc=%d (model=%s stream=%s)",
-                         rc, model_id.c_str(), stream_id.c_str());
-                if (outputs) model_mgr_->free_outputs(outputs, num_outputs);
-                if (model_acquired) model_mgr_->release_model(model_id);
-                in_flight->fetch_sub(1);
-                return;
-            }
-
-            // Offload post-processing to the pool so the scheduler worker
-            // can immediately process the next frame's inference.
-            //
-            // The callback's HalTensor* storage is not owned by this lambda
-            // (async HALs may pass memory from their own callback context).
-            // Copy the structs to the heap so they survive beyond on_complete.
-            // The data pointers are HAL-owned and freed exactly once by
-            // free_outputs() inside the lambda.
-            auto* outputs_copy = new HalTensor[num_outputs];
-            std::memcpy(outputs_copy, outputs, sizeof(HalTensor) * num_outputs);
-
-            auto* mgr = model_mgr_;
-            auto* pool = postprocess_pool_;
-            auto* eb = event_bus_;
-            bool eb_publish = cfg_.event_bus_auto_publish;
-            auto pp = pp_session;
-            auto do_post = enable_post;
-
-            PostprocessPool::Task post_task = [mgr, eb, eb_publish, stream_id, model_id,
-                              frame_seq, ts_ns, outputs_copy, num_outputs,
-                              pp, do_post, in_flight]() {
-                if (do_post && pp) {
-                    HalPostprocessResult post_result{};
-                    int post_rc = mgr->post_process(pp, outputs_copy,
-                                                    num_outputs, &post_result);
-                    if (post_rc == 0) {
-                        // Publish to event-bus
-                        if (eb && eb->connected() && eb_publish) {
-                            std::string topic = "inference/" + stream_id;
-                            std::string payload = post_result_to_json(
-                                stream_id, model_id, frame_seq, ts_ns, post_result);
-                            std::string event_id = stream_id + "-" +
-                                std::to_string(frame_seq);
-                            eb->publish(topic, "auto-infer", ts_ns,
-                                        event_id, payload);
-                        }
-                    }
-                    mgr->free_post_result(&post_result);
+                if (rc != 0) {
+                    LOG_WARN("AutoInfer: scheduler infer failed rc=%d "
+                             "(model=%s stream=%s)",
+                             rc, model_id.c_str(), stream_id.c_str());
+                    return;
                 }
 
-                // Free HAL-allocated output buffers
-                mgr->free_outputs(outputs_copy, num_outputs);
-                delete[] outputs_copy;
+                auto outputs_copy =
+                    std::make_unique<HalTensor[]>(num_outputs);
+                std::memcpy(outputs_copy.get(), outputs,
+                            sizeof(HalTensor) * num_outputs);
 
-                // Release model ref held by the scheduler worker
-                mgr->release_model(model_id);
+                auto deferred = std::make_shared<AutoInferOutputResources>(
+                    model_mgr_, std::move(outputs_copy), num_outputs,
+                    model_id, model_acquired, ticket);
+                immediate.disarm();
 
-                in_flight->fetch_sub(1);
-            };
+                auto* mgr = model_mgr_;
+                auto* pool = postprocess_pool_;
+                auto* eb = event_bus_;
+                const bool eb_publish = cfg_.event_bus_auto_publish;
+                auto pp = pp_session;
+                const bool do_post = enable_post;
 
-            if (!pool->submit(post_task)) {
-                // Queue full — run synchronously (still off the NPU thread)
-                // post_task is NOT moved-from because submit takes Task&
-                post_task();
+                PostprocessPool::Task post_task =
+                    [mgr, eb, eb_publish, stream_id, model_id, frame_seq,
+                     ts_ns, frame_generation, pp, do_post, deferred]() noexcept {
+                    try {
+                        if (do_post && pp) {
+                            HalPostprocessResult post_result{};
+                            struct PostResultGuard {
+                                ModelManager* mgr;
+                                HalPostprocessResult* result;
+                                ~PostResultGuard() noexcept {
+                                    try {
+                                        mgr->free_post_result(result);
+                                    } catch (...) {
+                                        LOG_ERROR("AutoInfer: post-result cleanup threw");
+                                    }
+                                }
+                            } post_guard{mgr, &post_result};
+
+                            int post_rc = mgr->post_process(
+                                pp, deferred->outputs.get(),
+                                deferred->num_outputs, &post_result);
+                            if (post_rc != 0) {
+                                // No response object to flip on the auto path
+                                // (results go to the event bus); a broken
+                                // plugin would silently publish nothing, so
+                                // at least make the failure visible in the
+                                // journal — rate-limited, not per frame.
+                                uint64_t fail_n = 0;
+                                if (mgr->note_post_failure(model_id, post_rc,
+                                                           &fail_n)) {
+                                    LOG_ERROR("AutoInfer: postprocess failed "
+                                              "for model '%s': rc=%d "
+                                              "(failure #%llu) — no result "
+                                              "published",
+                                              model_id.c_str(), post_rc,
+                                              static_cast<unsigned long long>(
+                                                  fail_n));
+                                }
+                            } else if (eb && eb->connected() && eb_publish) {
+                                std::string topic = "inference/" + stream_id;
+                                std::string payload = post_result_to_json(
+                                    stream_id, model_id, frame_seq, ts_ns,
+                                    post_result);
+                                std::string event_id = make_event_id(
+                                    model_id, stream_id, frame_generation,
+                                    frame_seq, ts_ns);
+                                eb->publish(topic, "auto-infer", ts_ns,
+                                            event_id, payload);
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        uint64_t fail_n = 0;
+                        if (mgr->note_post_failure(model_id, -1, &fail_n)) {
+                            LOG_ERROR("AutoInfer: postprocess failed for %s: %s "
+                                      "(failure #%llu) — no result published",
+                                      model_id.c_str(), e.what(),
+                                      static_cast<unsigned long long>(fail_n));
+                        }
+                    } catch (...) {
+                        uint64_t fail_n = 0;
+                        if (mgr->note_post_failure(model_id, -1, &fail_n)) {
+                            LOG_ERROR("AutoInfer: postprocess failed for %s "
+                                      "(failure #%llu) — no result published",
+                                      model_id.c_str(),
+                                      static_cast<unsigned long long>(fail_n));
+                        }
+                    }
+                };
+
+                if (!pool->submit(post_task)) post_task();
+            } catch (const std::exception& e) {
+                LOG_ERROR("AutoInfer: completion failed for %s: %s",
+                          model_id.c_str(), e.what());
+            } catch (...) {
+                LOG_ERROR("AutoInfer: completion failed for %s",
+                          model_id.c_str());
             }
         };
 
         if (!scheduler_->submit(std::move(inf_req))) {
+            request_resources->release_source();
+            ticket.reset();
             LOG_WARN("AutoInfer: failed to submit to scheduler (model=%s stream=%s)",
                      pipe.model_id.c_str(), pipe.stream_id.c_str());
-            fd_receiver_->release_frame(pipe.stream_id, frame.frame_id);
-            std::free(buf_to_free);
-            in_flight->fetch_sub(1);
         }
     }
 
-    session_mgr_->destroy_session(session_id);
-    fd_receiver_->unsubscribe(pipe.stream_id);
     LOG_INFO("AutoInfer: pipeline '%s/%s' stopped", pipe.model_id.c_str(), pipe.stream_id.c_str());
-}
-
-void AutoInfer::publish_result(const std::string& stream_id,
-                               const std::string& model_id,
-                               uint64_t frame_seq,
-                               uint64_t timestamp_ns,
-                               const HalPostprocessResult& result) {
-    if (!event_bus_ || !event_bus_->connected()) return;
-
-    std::string topic = cfg_.event_bus_result_topic_prefix + model_id + "/" + stream_id;
-    std::string payload = post_result_to_json(stream_id, model_id, frame_seq, timestamp_ns, result);
-    std::string event_id = "auto-" + std::to_string(frame_seq) + "-" + std::to_string(timestamp_ns);
-
-    event_bus_->publish(topic, "ai-runtime", timestamp_ns, event_id, payload,
-                        {{"stream_id", stream_id}, {"model_id", model_id}});
 }
 
 }  // namespace aipc::ai_runtime

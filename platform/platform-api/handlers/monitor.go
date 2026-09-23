@@ -488,7 +488,7 @@ func (h *MonitorHandler) getNPUUsageFromRuntime() float64 {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	resp, err := client.GetStats(ctx, &inferencepb.Empty{})
+	resp, err := client.GetStats(ctx, &inferencepb.GetStatsRequest{})
 	if err != nil {
 		return 0
 	}

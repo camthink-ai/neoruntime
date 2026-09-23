@@ -1,0 +1,27 @@
+{
+  "version": "1.0.0",
+  "metadata": {
+    "architecture": "hailo15h",
+    "content_hash": "4dcbb43dd1354f9d716f511cbd43ab29dc44e66caecacf690df10b7d411b2ffb",
+    "description": "",
+    "generation_timestamp": "2026-03-08T10:21:47.763911+00:00"
+  },
+  "application_settings": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/application_settings.json",
+  "encoded_output_streams": [
+    {
+      "encoding": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/encoder_sink0.json",
+      "masking": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/masking_sink0.json",
+      "osd": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/osd_sink0.json",
+      "stream_id": "sink0"
+    },
+    {
+      "encoding": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/encoder_sink1.json",
+      "masking": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/masking_sink1.json",
+      "osd": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/osd_sink1.json",
+      "stream_id": "sink1"
+    }
+  ],
+  "iq_settings": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/iq_settings.json",
+  "sensor_config": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/sensor_config.json",
+  "stabilizer_settings": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/stabilizer_settings.json"
+}

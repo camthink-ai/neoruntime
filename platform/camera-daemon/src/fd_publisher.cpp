@@ -6,6 +6,8 @@
 #include "../include/fd_publisher.h"
 #include "../include/fd_protocol.h"
 #include "../include/frame_router.h"
+#include "../include/dsp_service.h"
+#include "../include/injection_service.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -20,6 +22,39 @@
 extern "C" {
     #include "hal_log.h"
 }
+
+namespace {
+
+/* App identity of a connected UDS peer: SO_PEERCRED pid → /proc/<pid>/
+ * cmdline basename (e.g. "my-app" from "/usr/bin/my-app --flag").
+ * Captured at accept time; "" when the kernel or procfs can't answer. */
+std::string peer_identity_from_fd(int fd) {
+    struct ucred cred;
+    socklen_t cred_len = sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0 ||
+        cred.pid <= 0) {
+        return "";
+    }
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", cred.pid);
+    int proc_fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (proc_fd < 0) {
+        return "";
+    }
+    char buf[256];
+    const ssize_t n = read(proc_fd, buf, sizeof(buf) - 1);
+    close(proc_fd);
+    if (n <= 0) {
+        return "";
+    }
+    buf[n] = '\0';
+    /* cmdline args are NUL-separated; argv[0] is the leading string. */
+    std::string argv0(buf);
+    const size_t slash = argv0.find_last_of('/');
+    return slash == std::string::npos ? argv0 : argv0.substr(slash + 1);
+}
+
+} // namespace
 
 FdPublisher::FdPublisher(FrameRouter* router, const FdPublisherConfig& config)
     : router_(router), config_(config) {}
@@ -106,58 +141,161 @@ void FdPublisher::stop() {
 }
 
 void FdPublisher::on_frame(const std::string& stream_name, ManagedFrame* mf) {
-    // Collect clients subscribed to this stream
-    std::vector<ClientState*> targets;
+    // The whole dispatch pass runs under clients_mu_ (sends are non-blocking,
+    // so the hold is bounded):
+    //   - a client erased by disconnect_client() cannot be freed, and its fd
+    //     cannot be closed/recycled, mid-iteration (the old collect-then-
+    //     unlock loop was a use-after-free: SIGSEGV under connect churn),
+    //   - disconnect's release_all_outstanding() cannot interleave with the
+    //     outstanding insert below, which would leak the retained ref.
+    std::vector<int> desync_fds;
 
     {
         std::lock_guard<std::mutex> lock(clients_mu_);
+
         for (auto& [fd, client] : clients_) {
-            if (client->subscribed && client->stream_name == stream_name) {
-                targets.push_back(client);
-            }
-        }
-    }
-
-    if (targets.empty()) {
-        // No FD clients for this stream — release our ref immediately
-        router_->release(mf);
-        return;
-    }
-
-    // For each target client:
-    //   retain(mf) → bump ref count → send FD → track in outstanding
-    int sent_count = 0;
-
-    for (auto* client : targets) {
-        // Check outstanding limit
-        {
-            std::lock_guard<std::mutex> lock(client->outstanding_mu);
-            if (client->outstanding.size() >= config_.max_outstanding_per_client) {
-                // Client too slow — drop frame for this client
-                std::lock_guard<std::mutex> sl(stats_mu_);
-                stats_.frames_dropped++;
+            if (!client->subscribed || client->stream_name != stream_name) {
                 continue;
             }
+
+            // Retain + track BEFORE sendmsg. A RELEASE can only name a frame
+            // the client already received — this frame is not on the wire
+            // yet, so nothing can release this entry between insert and
+            // send. With the old send-then-track order, a RELEASE landing
+            // in that gap was discarded as "unknown" and pinned one of the
+            // max_outstanding slots until disconnect (permanent delivery
+            // stall for that client, no negative ack to detect it).
+            //
+            // Contract enforcement (P1-7), decided here at dispatch time:
+            //   lease  — any held frame older than lease_ms → refuse new
+            //             frames until the client releases (or disconnects).
+            //             Never a mid-read revocation: the client may still
+            //             be reading the dma-buf. The ~4s router watchdog
+            //             stays as the memory backstop, not the contract.
+            //   quota  — max_outstanding_per_client unreturned frames →
+            //             refuse until something comes back.
+            // Both refusals are counted and WARNed (rate-limited 1/s per
+            // client) so the journal shows live numbers; frames_dropped is
+            // reserved for send-path EAGAIN.
+            bool tracked = false;
+            {
+                std::lock_guard<std::mutex> ol(client->outstanding_mu);
+                const auto now = std::chrono::steady_clock::now();
+                bool lease_violated = false;
+                long long oldest_age_ms = 0;
+
+                if (config_.lease_ms > 0 && !client->outstanding.empty()) {
+                    auto oldest = client->outstanding.begin();
+                    for (auto it = client->outstanding.begin();
+                         it != client->outstanding.end(); ++it) {
+                        if (it->second.lend < oldest->second.lend) {
+                            oldest = it;
+                        }
+                    }
+                    oldest_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        now - oldest->second.lend)
+                                        .count();
+                    lease_violated = oldest_age_ms > static_cast<long long>(config_.lease_ms);
+                }
+
+                if (lease_violated) {
+                    uint64_t quota_rej = 0, lease_rej = 0;
+                    {
+                        std::lock_guard<std::mutex> sl(stats_mu_);
+                        lease_rej = ++stats_.frames_lease_rejected;
+                        quota_rej = stats_.frames_quota_rejected;
+                    }
+                    if (now - client->last_reject_warn >= std::chrono::seconds(1)) {
+                        client->last_reject_warn = now;
+                        HAL_LOG_WARNING(
+                            "FdPublisher: lease reject fd=%d stream=%s: oldest of %zu "
+                            "held frames is %lldms > lease %ums — no new frames until "
+                            "released (quota_rejected=%llu lease_rejected=%llu)",
+                            client->fd, client->stream_name.c_str(),
+                            client->outstanding.size(), oldest_age_ms, config_.lease_ms,
+                            static_cast<unsigned long long>(quota_rej),
+                            static_cast<unsigned long long>(lease_rej));
+                    }
+                } else if (client->outstanding.size() >= config_.max_outstanding_per_client) {
+                    uint64_t quota_rej = 0, lease_rej = 0;
+                    {
+                        std::lock_guard<std::mutex> sl(stats_mu_);
+                        quota_rej = ++stats_.frames_quota_rejected;
+                        lease_rej = stats_.frames_lease_rejected;
+                    }
+                    if (now - client->last_reject_warn >= std::chrono::seconds(1)) {
+                        client->last_reject_warn = now;
+                        HAL_LOG_WARNING(
+                            "FdPublisher: quota reject fd=%d stream=%s: %zu held >= max "
+                            "%u — release a frame to receive more "
+                            "(quota_rejected=%llu lease_rejected=%llu)",
+                            client->fd, client->stream_name.c_str(),
+                            client->outstanding.size(), config_.max_outstanding_per_client,
+                            static_cast<unsigned long long>(quota_rej),
+                            static_cast<unsigned long long>(lease_rej));
+                    }
+                } else {
+                    router_->retain(mf);   // ref first: never publish an un-retained entry
+                    client->outstanding[mf->frame_id] = {mf, now};
+                    tracked = true;
+                }
+            }
+
+            if (!tracked) {
+                continue;  // refusal already counted + logged above
+            }
+
+            switch (send_frame_to_client(client, mf)) {
+            case FrameSendResult::kOk: {
+                std::lock_guard<std::mutex> sl(stats_mu_);
+                stats_.frames_sent++;
+                break;
+            }
+
+            case FrameSendResult::kSlowClient:
+                // EAGAIN: nothing was queued and no fds crossed — the client
+                // is behind. Drop this frame, keep the connection.
+                erase_outstanding(client, mf->frame_id);
+                router_->release(mf);
+                {
+                    std::lock_guard<std::mutex> sl(stats_mu_);
+                    stats_.frames_dropped++;
+                }
+                break;
+
+            case FrameSendResult::kHardError:
+                // Hard error, or a partial send: with SCM_RIGHTS the fds
+                // cross with the first byte, so a partial send desyncs the
+                // client's stream — drop it after the pass.
+                erase_outstanding(client, mf->frame_id);
+                router_->release(mf);
+                {
+                    std::lock_guard<std::mutex> sl(stats_mu_);
+                    stats_.send_errors++;
+                }
+                desync_fds.push_back(fd);
+                break;
+
+            case FrameSendResult::kUndeliverable:
+                // Frame carries no dma-buf fds — drop it for this client,
+                // the connection itself is fine.
+                erase_outstanding(client, mf->frame_id);
+                router_->release(mf);
+                {
+                    std::lock_guard<std::mutex> sl(stats_mu_);
+                    stats_.send_errors++;
+                }
+                break;
+            }
         }
+    }
 
-        // Bump ref count before sending
-        router_->retain(mf);
-
-        if (send_frame_to_client(client, mf)) {
-            // Track in outstanding
-            std::lock_guard<std::mutex> lock(client->outstanding_mu);
-            client->outstanding[mf->frame_id] = mf;
-            sent_count++;
-
-            std::lock_guard<std::mutex> sl(stats_mu_);
-            stats_.frames_sent++;
-        } else {
-            // Send failed — release the retained ref
-            router_->release(mf);
-
-            std::lock_guard<std::mutex> sl(stats_mu_);
-            stats_.send_errors++;
-        }
+    // disconnect_client() takes clients_mu_ itself — call it only after the
+    // dispatch pass released the lock (we are on the router dispatch thread,
+    // so joining the client's recv thread here cannot self-join).
+    for (int fd : desync_fds) {
+        HAL_LOG_WARNING("FdPublisher: Dropping desynced client fd=%d", fd);
+        disconnect_client(fd);
     }
 
     // Release our original ref (from FrameRouter subscription)
@@ -180,9 +318,23 @@ uint32_t FdPublisher::stream_client_count(const std::string& stream_name) const 
     return count;
 }
 
+std::string FdPublisher::client_identity(int fd) const {
+    std::lock_guard<std::mutex> lock(clients_mu_);
+    const auto it = clients_.find(fd);
+    return it == clients_.end() ? std::string() : it->second->identity;
+}
+
 FdPublisher::Stats FdPublisher::get_stats() const {
     std::lock_guard<std::mutex> lock(stats_mu_);
     return stats_;
+}
+
+void FdPublisher::set_dsp_service(DspService* dsp_service) {
+    dsp_service_ = dsp_service;
+}
+
+void FdPublisher::set_injection_service(InjectionService* injection_service) {
+    injection_service_ = injection_service;
 }
 
 /* ========== Private methods ========== */
@@ -207,13 +359,14 @@ void FdPublisher::accept_loop() {
             }
         }
 
-        // Set send non-blocking (frame delivery must not block HAL callback)
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        // Keep recv blocking (client recv thread blocks on recv)
-        // Send will use MSG_NOSIGNAL | MSG_DONTWAIT in sendmsg
+        // Recv stays blocking (client recv threads use blocking recv). Frame
+        // delivery on the dispatch thread sends with a per-call MSG_DONTWAIT
+        // (see send_frame_to_client): O_NONBLOCK on the fd would break the
+        // blocking recv loops, so it must stay per-sendmsg.
 
         auto* client = new ClientState();
         client->fd = client_fd;
+        client->identity = peer_identity_from_fd(client_fd);
 
         {
             std::lock_guard<std::mutex> lock(clients_mu_);
@@ -229,26 +382,55 @@ void FdPublisher::accept_loop() {
             stats_.clients_connected++;
         }
 
-        HAL_LOG_INFO("FdPublisher: Client connected (fd=%d, total=%u)",
-                     client_fd, client_count());
+        HAL_LOG_INFO("FdPublisher: Client connected (fd=%d, identity='%s', "
+                     "total=%u)",
+                     client_fd, client->identity.c_str(), client_count());
     }
 }
 
 void FdPublisher::client_recv_loop(ClientState* client) {
     while (running_.load()) {
-        // Read message header first
+        /* Read message header first — with recvmsg, never plain recv. On a
+         * stream socket SCM_RIGHTS rides with the FIRST byte of the sender's
+         * sendmsg, which is the header: a plain recv consuming that byte
+         * silently drops the ancillary record (the peer's DSP_IMPORT arrives
+         * with fds=0 and the fds leak kernel-side). Every loop iteration
+         * owns whatever lands here — only handle_dsp_import consumes (it
+         * closes them itself); everything else is closed after the switch. */
         FdPubMsgHeader hdr;
-        ssize_t n = recv(client->fd, &hdr, sizeof(hdr), MSG_WAITALL);
-        if (n <= 0) {
+        int msg_fds[FD_PUB_MAX_FDS];
+        int num_msg_fds = 0;
+        size_t hdr_got = 0;
+        bool disconnected = false;
+        while (hdr_got < sizeof(hdr)) {
+            int chunk_fds[FD_PUB_MAX_FDS];
+            int n_chunk_fds = 0;
+            ssize_t n = fd_pub_recvmsg(client->fd, (char*)&hdr + hdr_got,
+                                       sizeof(hdr) - hdr_got, chunk_fds,
+                                       &n_chunk_fds, FD_PUB_MAX_FDS);
+            if (n <= 0) {
+                /* disconnect — we still own fds captured by earlier chunks */
+                for (int i = 0; i < num_msg_fds; ++i) close(msg_fds[i]);
+                num_msg_fds = 0;
+                disconnected = true;
+                break;
+            }
+            for (int i = 0; i < n_chunk_fds; ++i) {
+                if (num_msg_fds < FD_PUB_MAX_FDS) {
+                    msg_fds[num_msg_fds++] = chunk_fds[i];
+                } else {
+                    close(chunk_fds[i]); /* over the wire cap — don't leak */
+                }
+            }
+            hdr_got += (size_t)n;
+        }
+        if (disconnected) {
             // Client disconnected
             break;
         }
 
-        if (n != sizeof(hdr)) {
-            HAL_LOG_WARNING("FdPublisher: Partial header from client fd=%d",
-                           client->fd);
-            break;
-        }
+        bool fds_consumed = false;
+        ssize_t n = 0; /* payload read length for the switch below */
 
         // Read remaining payload
         size_t payload_size = hdr.size - sizeof(hdr);
@@ -282,8 +464,82 @@ void FdPublisher::client_recv_loop(ClientState* client) {
             break;
         }
 
+        case FD_PUB_MSG_DSP_ALLOC: {
+            if (payload_size != sizeof(FdPubDspAllocMsg) - sizeof(hdr)) break;
+
+            char buf[sizeof(FdPubDspAllocMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) break;
+
+            handle_dsp_alloc(client, buf);
+            break;
+        }
+
+        case FD_PUB_MSG_DSP_BUF_RELEASE: {
+            if (payload_size != sizeof(FdPubDspBufReleaseMsg) - sizeof(hdr)) break;
+
+            char buf[sizeof(FdPubDspBufReleaseMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) break;
+
+            handle_dsp_buf_release(client, buf);
+            break;
+        }
+
+        case FD_PUB_MSG_DSP_IMPORT: {
+            if (payload_size != sizeof(FdPubDspImportMsg) - sizeof(hdr)) {
+                break; /* fds (if any) are closed after the switch */
+            }
+            /* The dma-buf fds crossed the stream boundary with the header
+             * (captured in msg_fds above); the payload itself carries no
+             * ancillary data — a plain blocking read is enough. */
+            char buf[sizeof(FdPubDspImportMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) {
+                HAL_LOG_WARNING("FdPublisher: short DSP IMPORT read from fd=%d",
+                                client->fd);
+                break;
+            }
+
+            handle_dsp_import(client, buf, msg_fds, num_msg_fds);
+            fds_consumed = true; /* handler closes every fd it was given */
+            break;
+        }
+
+        case FD_PUB_MSG_DSP_LOOKUP: {
+            if (payload_size != sizeof(FdPubDspLookupMsg) - sizeof(hdr)) break;
+
+            char buf[sizeof(FdPubDspLookupMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) break;
+
+            handle_dsp_lookup(client, buf);
+            break;
+        }
+
+        case FD_PUB_MSG_DSP_LOOKUP_RELEASE: {
+            if (payload_size != sizeof(FdPubDspLookupReleaseMsg) - sizeof(hdr)) break;
+
+            char buf[sizeof(FdPubDspLookupReleaseMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) break;
+
+            handle_dsp_lookup_release(client, buf);
+            break;
+        }
+
         case FD_PUB_MSG_UNSUBSCRIBE: {
-            client->subscribed = false;
+            // subscribed/stream_name are read on the dispatch thread under
+            // clients_mu_ — flip the flag under the same lock.
+            {
+                std::lock_guard<std::mutex> lock(clients_mu_);
+                client->subscribed = false;
+            }
             HAL_LOG_INFO("FdPublisher: Client fd=%d unsubscribed from %s",
                         client->fd, client->stream_name.c_str());
             // Send OK
@@ -305,6 +561,20 @@ void FdPublisher::client_recv_loop(ClientState* client) {
             }
             break;
         }
+
+        /* Ownership fence: fds that arrived with this message but were not
+         * handed to handle_dsp_import (any non-IMPORT message, or an IMPORT
+         * rejected on payload size) are closed here — a received fd belongs
+         * to this process from recvmsg onward, no path may leak it. */
+        if (!fds_consumed) {
+            for (int i = 0; i < num_msg_fds; ++i) close(msg_fds[i]);
+            if (num_msg_fds > 0) {
+                HAL_LOG_WARNING(
+                    "FdPublisher: closed %d unexpected fd(s) on msg type=%u "
+                    "from fd=%d",
+                    num_msg_fds, hdr.type, client->fd);
+            }
+        }
     }
 
     // Client disconnected — clean up
@@ -318,8 +588,14 @@ void FdPublisher::handle_subscribe(ClientState* client, const void* msg_data) {
     char name[FD_PUB_MAX_STREAM_NAME + 1] = {};
     memcpy(name, msg->stream_name, FD_PUB_MAX_STREAM_NAME);
 
-    client->stream_name = name;
-    client->subscribed = true;
+    // stream_name is a std::string read concurrently on the dispatch thread
+    // (under clients_mu_) — a torn concurrent read is UB, not just a stale
+    // value, so the assignment and the flag flip take the same lock.
+    {
+        std::lock_guard<std::mutex> lock(clients_mu_);
+        client->stream_name = name;
+        client->subscribed = true;
+    }
 
     FdPubResponseMsg resp;
     resp.hdr.type = FD_PUB_MSG_OK;
@@ -344,13 +620,195 @@ void FdPublisher::handle_release(ClientState* client, const void* msg_data) {
                            frame_id, client->fd);
             return;
         }
-        mf = it->second;
+        mf = it->second.mf;
         client->outstanding.erase(it);
     }
 
     // Release the ref we retained for this client
     if (mf && router_) {
         router_->release(mf);
+    }
+}
+
+void FdPublisher::handle_dsp_alloc(ClientState* client, const void* msg_data) {
+    auto* msg = static_cast<const FdPubDspAllocMsg*>(msg_data);
+
+    FdPubDspAllocRespMsg resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.hdr.type = FD_PUB_MSG_DSP_ALLOC_RESP;
+    resp.hdr.size = sizeof(resp);
+
+    if (!dsp_service_) {
+        resp.code = DSP_SVC_ERR_UNAVAILABLE;
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    DspService::AllocResult r = dsp_service_->alloc_buffers(
+        client->fd, msg->width, msg->height,
+        static_cast<HalPixelFormat>(msg->format), msg->count);
+    resp.code = r.rc;
+
+    if (r.rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP alloc fd=%d %ux%u fmt=%u n=%u failed: "
+                        "rc=%d (%s)", client->fd, msg->width, msg->height,
+                        msg->format, msg->count, r.rc, r.message.c_str());
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    // count is capped by the service; ids/fds are 1:1 with count*num_planes
+    uint32_t count = std::min<uint32_t>(
+        static_cast<uint32_t>(r.ids.size()), FD_PUB_DSP_MAX_FDS);
+    int num_fds = std::min<int>(static_cast<int>(r.fds.size()),
+                                FD_PUB_DSP_MAX_FDS);
+
+    resp.count = count;
+    resp.num_planes = r.num_planes;
+    for (uint32_t i = 0; i < HAL_MAX_PLANES; i++) {
+        resp.strides[i] = r.strides[i];
+        resp.sizes[i] = r.sizes[i];
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        resp.buffer_ids[i] = r.ids[i];
+    }
+
+    // fds attached via SCM_RIGHTS in buffer-major order (count * num_planes)
+    if (fd_pub_sendmsg_capped(client->fd, &resp, sizeof(resp),
+                              r.fds.data(), num_fds, FD_PUB_DSP_MAX_FDS) != 0) {
+        std::lock_guard<std::mutex> sl(stats_mu_);
+        stats_.send_errors++;
+        HAL_LOG_ERROR("FdPublisher: DSP alloc resp send failed for fd=%d",
+                      client->fd);
+    }
+}
+
+void FdPublisher::handle_dsp_buf_release(ClientState* client,
+                                         const void* msg_data) {
+    auto* msg = static_cast<const FdPubDspBufReleaseMsg*>(msg_data);
+
+    if (!dsp_service_) return;
+
+    int rc = dsp_service_->release_buffer(client->fd, msg->buffer_id);
+    if (rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP buf release id=%lu from fd=%d rc=%d",
+                        (unsigned long)msg->buffer_id, client->fd, rc);
+    }
+}
+
+void FdPublisher::handle_dsp_import(ClientState* client, const void* msg_data,
+                                    const int* fds, int num_fds) {
+    auto* msg = static_cast<const FdPubDspImportMsg*>(msg_data);
+
+    FdPubDspImportRespMsg resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.hdr.type = FD_PUB_MSG_DSP_IMPORT_RESP;
+    resp.hdr.size = sizeof(resp);
+
+    /* The received fds are ours the moment recvmsg returned them — every
+     * path below must close them all. import_buffer() dups what it keeps. */
+    auto close_received = [&]() {
+        for (int i = 0; i < num_fds; ++i) close(fds[i]);
+    };
+
+    if (!dsp_service_) {
+        resp.code = DSP_SVC_ERR_UNAVAILABLE;
+        close_received();
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+    if (msg->num_planes == 0 || msg->num_planes > FD_PUB_MAX_FDS ||
+        num_fds != (int)msg->num_planes) {
+        resp.code = DSP_SVC_ERR_INVALID;
+        HAL_LOG_WARNING("FdPublisher: DSP IMPORT fd=%d plane/fd mismatch "
+                        "(planes=%u fds=%d)", client->fd, msg->num_planes,
+                        num_fds);
+        close_received();
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    DspService::ImportResult r = dsp_service_->import_buffer(
+        client->fd, msg->width, msg->height,
+        static_cast<HalPixelFormat>(msg->format), msg->num_planes,
+        msg->strides, msg->sizes, fds);
+    close_received();
+
+    resp.code = r.rc;
+    if (r.rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP IMPORT fd=%d %ux%u fmt=%u failed: "
+                        "rc=%d (%s)", client->fd, msg->width, msg->height,
+                        msg->format, r.rc, r.message.c_str());
+    } else {
+        resp.import_id = r.id;
+    }
+    send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+}
+
+void FdPublisher::handle_dsp_lookup(ClientState* client, const void* msg_data) {
+    auto* msg = static_cast<const FdPubDspLookupMsg*>(msg_data);
+
+    FdPubDspLookupRespMsg resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.hdr.type = FD_PUB_MSG_DSP_LOOKUP_RESP;
+    resp.hdr.size = sizeof(resp);
+
+    if (!dsp_service_) {
+        resp.code = DSP_SVC_ERR_UNAVAILABLE;
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    DspService::LookupResult r = dsp_service_->lookup_buffer(client->fd,
+                                                             msg->buffer_id);
+    resp.code = r.rc;
+    if (r.rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP LOOKUP id=%lu from fd=%d failed: "
+                        "rc=%d (%s)", (unsigned long)msg->buffer_id,
+                        client->fd, r.rc, r.message.c_str());
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    resp.width = r.width;
+    resp.height = r.height;
+    resp.format = (uint32_t)r.format;
+    resp.num_planes = r.num_planes;
+    for (uint32_t i = 0; i < HAL_MAX_PLANES && i < r.num_planes; ++i) {
+        resp.strides[i] = r.strides[i];
+        resp.sizes[i] = r.sizes[i];
+    }
+
+    /* Plane fds ride with this reply via SCM_RIGHTS. The fds in r are fresh
+     * dup()s made for this caller; whether or not the send succeeds they are
+     * ours to close here — the receiver got its own references on delivery
+     * (SCM_RIGHTS installs new fds at the receiver), and a failed/partial
+     * send never leaves usable fds anywhere else. */
+    if (fd_pub_sendmsg_capped(client->fd, &resp, sizeof(resp),
+                              r.fds.data(), (int)r.fds.size(),
+                              FD_PUB_MAX_FDS) != 0) {
+        std::lock_guard<std::mutex> sl(stats_mu_);
+        stats_.send_errors++;
+        HAL_LOG_ERROR("FdPublisher: DSP LOOKUP resp send failed for fd=%d "
+                      "(lease id=%lu still held — awaiting RELEASE)",
+                      client->fd, (unsigned long)msg->buffer_id);
+    }
+    for (int fd : r.fds) close(fd);
+}
+
+void FdPublisher::handle_dsp_lookup_release(ClientState* client,
+                                            const void* msg_data) {
+    auto* msg = static_cast<const FdPubDspLookupReleaseMsg*>(msg_data);
+
+    if (!dsp_service_) return;
+
+    /* Fire-and-forget like DSP_BUF_RELEASE: the lease is dropped, and a
+     * bogus id merely logs (it cannot outlive the connection anyway). */
+    int rc = dsp_service_->lookup_release(client->fd, msg->buffer_id);
+    if (rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP LOOKUP release id=%lu from fd=%d "
+                        "rc=%d", (unsigned long)msg->buffer_id, client->fd,
+                        rc);
     }
 }
 
@@ -369,6 +827,23 @@ void FdPublisher::disconnect_client(int client_fd) {
 
     // Release all outstanding frames
     release_all_outstanding(client);
+
+    // Close the injection session when (and only when) the disconnecting
+    // client is its owner. Before release_client_buffers: queued pins must
+    // unpin before the registry detaches the entries; before close(): the
+    // fd number is the ownership key and could be reused by a new client.
+    if (injection_service_) {
+        injection_service_->release_owner(client_fd);
+    }
+
+    // Detach every DSP buffer this client owns. Before close(): the fd number
+    // is the registry key and could be reused by a new client after close().
+    if (dsp_service_) {
+        dsp_service_->release_client_buffers(client_fd);
+        // Drop any cross-process lookup leases this borrower still holds.
+        // Same fd-number recycling argument as release_client_buffers.
+        dsp_service_->lookup_release_all(client_fd);
+    }
 
     // Close socket (will unblock recv in client_recv_loop)
     shutdown(client->fd, SHUT_RDWR);
@@ -398,15 +873,21 @@ void FdPublisher::release_all_outstanding(ClientState* client) {
                        client->outstanding.size(), client->fd);
     }
 
-    for (auto& [frame_id, mf] : client->outstanding) {
-        if (mf && router_) {
-            router_->release(mf);
+    for (auto& [frame_id, entry] : client->outstanding) {
+        if (entry.mf && router_) {
+            router_->release(entry.mf);
         }
     }
     client->outstanding.clear();
 }
 
-bool FdPublisher::send_frame_to_client(ClientState* client, ManagedFrame* mf) {
+void FdPublisher::erase_outstanding(ClientState* client, uint64_t frame_id) {
+    std::lock_guard<std::mutex> ol(client->outstanding_mu);
+    client->outstanding.erase(frame_id);
+}
+
+FdPublisher::FrameSendResult
+FdPublisher::send_frame_to_client(ClientState* client, ManagedFrame* mf) {
     const HalFrameBuffer& frame = mf->frame;
 
     // Build frame message
@@ -440,14 +921,23 @@ bool FdPublisher::send_frame_to_client(ClientState* client, ManagedFrame* mf) {
     }
 
     msg.num_fds = num_fds;
+    msg.flags = mf->flags;   // FD_PUB_FRAME_FLAG_* baked-metadata
 
     if (num_fds == 0) {
         // No DMA-BUF fds — this frame type doesn't support FD passing
         HAL_LOG_WARNING("FdPublisher: Frame has no DMA-BUF fds, cannot send to fd=%d",
                        client->fd);
-        return false;
+        return FrameSendResult::kUndeliverable;
     }
 
-    // Send via SCM_RIGHTS (non-blocking via MSG_NOSIGNAL in fd_pub_sendmsg)
-    return fd_pub_sendmsg(client->fd, &msg, sizeof(msg), fds, num_fds) == 0;
+    // Non-blocking send: this runs on the FrameRouter dispatch thread and
+    // must never stall on a slow client. EAGAIN means nothing was queued
+    // (no fds crossed); a partial send sets EMSGSIZE in the helper and has
+    // already desynced the client's stream.
+    if (fd_pub_sendmsg_flags(client->fd, &msg, sizeof(msg), fds, num_fds,
+                             MSG_DONTWAIT) == 0) {
+        return FrameSendResult::kOk;
+    }
+    return (errno == EAGAIN) ? FrameSendResult::kSlowClient
+                             : FrameSendResult::kHardError;
 }

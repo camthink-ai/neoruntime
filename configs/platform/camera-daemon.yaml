@@ -40,11 +40,19 @@ audio:
   mute: false
   # audio_library: optional, monolithic libaipc_hal.so includes HAL_AUDIO_OPS
 
-# Lens geometry overrides. The lens model itself comes from
-# /data/aipc/etc/product.yaml (baked at pack time, LENS_PRODUCT); these
-# fg2009 offsets are bench-calibrated bootstrap values — production units
-# may deviate, retune here rather than in code.
+# Lens geometry overrides. The lens model itself comes from the factory
+# EEPROM HWREV field (factory-station burned; af0832 when unprogrammed) —
+# product.yaml no longer selects the lens. These fg2009 offsets are
+# bench-calibrated bootstrap values — production units may deviate,
+# retune here rather than in code.
 lens:
+  # Archive the last user-settled zoom/focus (event-driven: written only after
+  # the motors settle and the position changed) and restore it at boot,
+  # followed by one autofocus pass. Delete /data/aipc/etc/lens_position.json
+  # to fall back to the config-derived startup position.
+  # NOTE: this key must stay above the fg2009: subsection — the line-based
+  # parser routes everything after fg2009: into that subsection.
+  position_persistence: true
   fg2009:
     ram_steps: 2500         # overshoot that rams the TELE/FAR hard stops
     park_zoom_steps: 2400   # physical steps back from the TELE stop
@@ -61,6 +69,12 @@ autofocus:
   enabled: true
   startup_af: true
   stream_name: main
+  # AF statistics come from the 4K native sensor, so the window percentages in
+  # AF_demo/core must be scaled against 3840x2160 — not the main stream output.
+  # Without these keys the controller falls back to the main stream resolution
+  # and the windows shrink to 1080p proportions.
+  sensor_native_width: 3840
+  sensor_native_height: 2160
   # Empty means use the measured fixed compensation compiled into AF_demo/core.
   calibration_path: ""
   # Seed startup AF from the AF0832 optical table instead of linearly mapping
@@ -108,6 +122,14 @@ autofocus:
 
 infrared:
   enabled: true
+  # Per-lens IR entry in the shared media config: af0832 keeps this name;
+  # fg2009 auto-substitutes "Infrared_Basic_FG2009" at startup. An explicit
+  # NON-default value is respected for bench tuning — but note "Infrared_Basic"
+  # IS the default, so on fg2009 hardware writing it here cannot pin the
+  # af0832 entry; A/B cross-lens IQ via a differently-named profile entry.
+  # On fg2009 the substitution only fires when a media config actually
+  # provides the entry (upgraded units with old imaging trees keep the
+  # shared entry, logging a warning).
   profile_name: Infrared_Basic
   default_mode: day
   near_led_id: 0
@@ -122,10 +144,11 @@ infrared:
 light_sensor:
   enabled: true
   auto_on_boot: false        # start in auto mode on boot (else default_mode from infrared)
-  night_enter: 28            # light_percent <= night_enter => switch to night
-  day_enter: 82              # light_percent >= day_enter   => switch to day
+  night_enter: 25            # light_percent <= night_enter => switch to night (25% ≈ 11.68 lux, bench)
+  day_enter: 80              # light_percent >= day_enter   => switch to day (80% ≈ 25.36 lux, bench)
   sample_interval_ms: 500    # photodiode sampling cadence
   stable_samples: 3          # consecutive qualifying reads before a switch
+  min_hold_s: 15             # anti-flap dwell: after an applied switch, hold this long before allowing another
   dark_mv: 4                 # measured dark-environment endpoint (calibration)
   bright_mv: 1909            # measured bright-environment endpoint (calibration)
 

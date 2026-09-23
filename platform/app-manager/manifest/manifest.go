@@ -3,6 +3,9 @@ package manifest
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 
 	"aipc/platform/common/utils"
@@ -11,111 +14,129 @@ import (
 
 // AppManifest represents the application manifest structure
 type AppManifest struct {
-	APIVersion string   `yaml:"apiVersion"`
-	Kind       string   `yaml:"kind"`
-	Metadata   Metadata `yaml:"metadata"`
-	Spec       Spec     `yaml:"spec"`
+	APIVersion string   `yaml:"apiVersion" json:"apiVersion"`
+	Kind       string   `yaml:"kind" json:"kind"`
+	Metadata   Metadata `yaml:"metadata" json:"metadata"`
+	Spec       Spec     `yaml:"spec" json:"spec"`
 }
 
 type Metadata struct {
-	ID          string `yaml:"id"`
-	Name        string `yaml:"name"`
-	Version     string `yaml:"version"`
-	Description string `yaml:"description"`
-	Author      string `yaml:"author"`
-	Email       string `yaml:"email"`
+	ID          string `yaml:"id" json:"id"`
+	Name        string `yaml:"name" json:"name"`
+	Version     string `yaml:"version" json:"version"`
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+	Author      string `yaml:"author,omitempty" json:"author,omitempty"`
+	Email       string `yaml:"email,omitempty" json:"email,omitempty"`
 }
 
 type Spec struct {
 	// Single container mode (backward compatible)
-	Image              string             `yaml:"image"`
-	Permissions        Permissions        `yaml:"permissions"`
-	Resources          Resources          `yaml:"resources"`
-	Env                []EnvVar           `yaml:"env"`
-	Volumes            []Volume           `yaml:"volumes"`
-	Autostart          bool               `yaml:"autostart"`
-	RestartPolicy      string             `yaml:"restart_policy"`
-	RestartMaxRetries  int                `yaml:"restart_max_retries"`
-	Healthcheck        Healthcheck        `yaml:"healthcheck"`
-	AutoRestart        AutoRestart        `yaml:"auto_restart"`
-	Plugin             *PluginSpec        `yaml:"plugin"`
-	PluginDependencies []PluginDependency `yaml:"plugin_dependencies"`
-	Security           SecuritySpec       `yaml:"security"`
+	Image              string             `yaml:"image,omitempty" json:"image,omitempty"`
+	Permissions        Permissions        `yaml:"permissions,omitempty" json:"permissions,omitempty"`
+	Resources          Resources          `yaml:"resources,omitempty" json:"resources,omitempty"`
+	Env                []EnvVar           `yaml:"env,omitempty" json:"env,omitempty"`
+	Volumes            []Volume           `yaml:"volumes,omitempty" json:"volumes,omitempty"`
+	Autostart          bool               `yaml:"autostart,omitempty" json:"autostart,omitempty"`
+	RestartPolicy      string             `yaml:"restart_policy,omitempty" json:"restart_policy,omitempty"`
+	RestartMaxRetries  int                `yaml:"restart_max_retries,omitempty" json:"restart_max_retries,omitempty"`
+	Healthcheck        Healthcheck        `yaml:"healthcheck,omitempty" json:"healthcheck,omitempty"`
+	AutoRestart        AutoRestart        `yaml:"auto_restart,omitempty" json:"auto_restart,omitempty"`
+	Plugin             *PluginSpec        `yaml:"plugin,omitempty" json:"plugin,omitempty"`
+	PluginDependencies []PluginDependency `yaml:"plugin_dependencies,omitempty" json:"plugin_dependencies,omitempty"`
+	Security           SecuritySpec       `yaml:"security,omitempty" json:"security,omitempty"`
+
+	// Models declares named model dependencies. Key = alias used by the app
+	// (becomes env var AIPC_MODEL_<alias>), value = mapping to a concrete
+	// platform model id.
+	Models map[string]ModelMapping `yaml:"models,omitempty" json:"models,omitempty"`
 
 	// Multi-container mode (Main/Sub architecture)
-	Containers map[string]ContainerSpec `yaml:"containers"`
-	Networking NetworkingConfig         `yaml:"networking"`
-	Lifecycle  LifecycleConfig          `yaml:"lifecycle"`
+	Containers map[string]ContainerSpec `yaml:"containers,omitempty" json:"containers,omitempty"`
+	Networking NetworkingConfig         `yaml:"networking,omitempty" json:"networking,omitempty"`
+	Lifecycle  LifecycleConfig          `yaml:"lifecycle,omitempty" json:"lifecycle,omitempty"`
 
 	// Dev mode for hot reload during development
-	Dev *DevConfig `yaml:"dev,omitempty"`
+	Dev *DevConfig `yaml:"dev,omitempty" json:"dev,omitempty"`
 }
 
 // SecuritySpec allows per-app override of container security settings
 type SecuritySpec struct {
-	NoNewPrivileges *bool `yaml:"no_new_privileges"` // nil = true (default), false = allow privilege escalation
-	ReadonlyRootfs  *bool `yaml:"readonly_rootfs"`   // nil = true (default), false = writable rootfs
+	NoNewPrivileges *bool `yaml:"no_new_privileges" json:"no_new_privileges"` // nil = true (default), false = allow privilege escalation
+	ReadonlyRootfs  *bool `yaml:"readonly_rootfs" json:"readonly_rootfs"`     // nil = true (default), false = writable rootfs
+}
+
+// ModelMapping resolves an app-side alias to a concrete model.
+type ModelMapping struct {
+	ID string `yaml:"id" json:"id"` // model id (required: runtime identity and AIPC_MODEL_<alias> value)
+	// Path is an in-image AMPK model package (.bin) used when the id is not
+	// found on the platform: the package is extracted from the app image,
+	// digest-verified, and registered as a transient (app-bundled) model,
+	// hidden from the model page. The postprocess type and tuning config come
+	// from the package metadata — the manifest no longer declares them.
+	// Absolute container path, no ".." segments, ".bin" extension.
+	Path     string `yaml:"path,omitempty" json:"path,omitempty"`
+	Required bool   `yaml:"required,omitempty" json:"required,omitempty"` // default false: warn when missing; true: block install
 }
 
 // DevConfig enables hot reload for local development.
 // When enabled, source directories are bind-mounted into the container,
 // readonly rootfs is disabled, and a file watcher can auto-reload on changes.
 type DevConfig struct {
-	Enabled      bool           `yaml:"enabled"`
-	WatchPath    string         `yaml:"watch_path"`    // path inside container to watch (default: /app)
-	Sync         []DevSyncMount `yaml:"sync"`          // host→container bind mounts for source code
-	ReloadSignal string         `yaml:"reload_signal"` // SIGHUP or SIGTERM (default: SIGTERM)
-	DebugPort    int            `yaml:"debug_port"`    // optional debugpy port for IDE attach
+	Enabled      bool           `yaml:"enabled" json:"enabled"`
+	WatchPath    string         `yaml:"watch_path" json:"watch_path"`       // path inside container to watch (default: /app)
+	Sync         []DevSyncMount `yaml:"sync" json:"sync"`                   // host→container bind mounts for source code
+	ReloadSignal string         `yaml:"reload_signal" json:"reload_signal"` // SIGHUP or SIGTERM (default: SIGTERM)
+	DebugPort    int            `yaml:"debug_port" json:"debug_port"`       // optional debugpy port for IDE attach
 }
 
 // DevSyncMount maps a host source directory into the container.
 type DevSyncMount struct {
-	Host      string `yaml:"host"`      // relative path from the app directory
-	Container string `yaml:"container"` // absolute path inside the container
+	Host      string `yaml:"host" json:"host"`           // relative path from the app directory
+	Container string `yaml:"container" json:"container"` // absolute path inside the container
 }
 
 type Resources struct {
-	CPU    string `yaml:"cpu"`    // e.g., "50%" or "0.5"
-	Memory string `yaml:"memory"` // e.g., "256Mi" or "1Gi"
+	CPU    string `yaml:"cpu" json:"cpu"`       // e.g., "50%" or "0.5"
+	Memory string `yaml:"memory" json:"memory"` // e.g., "256Mi" or "1Gi"
 }
 
 type Permissions struct {
-	Video     []string       `yaml:"video"`
-	Inference InferencePerms `yaml:"inference"`
-	Events    EventPerms     `yaml:"events"`
-	Device    DevicePerms    `yaml:"device"`
-	Network   NetworkPerms   `yaml:"network"`
+	Video     []string       `yaml:"video" json:"video"`
+	Inference InferencePerms `yaml:"inference" json:"inference"`
+	Events    EventPerms     `yaml:"events" json:"events"`
+	Device    DevicePerms    `yaml:"device" json:"device"`
+	Network   NetworkPerms   `yaml:"network" json:"network"`
 }
 
 type InferencePerms struct {
-	Models        []string `yaml:"models"`
-	MaxQPS        int      `yaml:"max_qps"`
-	MaxConcurrent int      `yaml:"max_concurrent"`
-	AllowRegister bool     `yaml:"allow_register_model"`
+	Models        []string `yaml:"models" json:"models"`
+	MaxQPS        int      `yaml:"max_qps" json:"max_qps"`
+	MaxConcurrent int      `yaml:"max_concurrent" json:"max_concurrent"`
+	AllowRegister bool     `yaml:"allow_register_model" json:"allow_register_model"`
 }
 
 type EventPerms struct {
-	Publish   []string `yaml:"publish"`
-	Subscribe []string `yaml:"subscribe"`
+	Publish   []string `yaml:"publish" json:"publish"`
+	Subscribe []string `yaml:"subscribe" json:"subscribe"`
 }
 
 type DevicePerms struct {
-	Light bool      `yaml:"light"`
-	IrCut bool      `yaml:"ir_cut"`
-	PTZ   bool      `yaml:"ptz"`
-	Lens  bool      `yaml:"lens"`
-	GPIO  GPIOPerms `yaml:"gpio"`
+	Light bool      `yaml:"light" json:"light"`
+	IrCut bool      `yaml:"ir_cut" json:"ir_cut"`
+	PTZ   bool      `yaml:"ptz" json:"ptz"`
+	Lens  bool      `yaml:"lens" json:"lens"`
+	GPIO  GPIOPerms `yaml:"gpio" json:"gpio"`
 }
 
 type GPIOPerms struct {
-	Read  []int `yaml:"read"`
-	Write []int `yaml:"write"`
+	Read  []int `yaml:"read" json:"read"`
+	Write []int `yaml:"write" json:"write"`
 }
 
 type NetworkPerms struct {
-	Outbound []string `yaml:"outbound"`
-	Mode     string   `yaml:"mode"`    // "isolated" (default) or "host"
-	Inbound  []int    `yaml:"inbound"` // Ports exposed to host (only when mode=host)
+	Outbound []string `yaml:"outbound" json:"outbound"`
+	Mode     string   `yaml:"mode" json:"mode"`       // "isolated" (default) or "host"
+	Inbound  []int    `yaml:"inbound" json:"inbound"` // Ports exposed to host (only when mode=host)
 }
 
 // ============================================
@@ -124,129 +145,195 @@ type NetworkPerms struct {
 
 // ContainerSpec defines a single container in a multi-container application
 type ContainerSpec struct {
-	Image       string        `yaml:"image"`
-	Role        string        `yaml:"role"`        // "main" or "sub" - main has platform access
-	Permissions Permissions   `yaml:"permissions"` // Only valid for main container
-	Resources   Resources     `yaml:"resources"`
-	Env         []EnvVar      `yaml:"env"`
-	Ports       []PortSpec    `yaml:"ports"`
-	Command     []string      `yaml:"command"`
-	Args        []string      `yaml:"args"`
-	Healthcheck Healthcheck   `yaml:"healthcheck"`
-	Volumes     []VolumeMount `yaml:"volumes"` // Container-specific volume mounts
-	Security    SecuritySpec  `yaml:"security"`
+	Image       string        `yaml:"image" json:"image"`
+	Role        string        `yaml:"role" json:"role"`               // "main" or "sub" - main has platform access
+	Permissions Permissions   `yaml:"permissions" json:"permissions"` // Only valid for main container
+	Resources   Resources     `yaml:"resources" json:"resources"`
+	Env         []EnvVar      `yaml:"env" json:"env"`
+	Ports       []PortSpec    `yaml:"ports" json:"ports"`
+	Command     []string      `yaml:"command" json:"command"`
+	Args        []string      `yaml:"args" json:"args"`
+	Healthcheck Healthcheck   `yaml:"healthcheck" json:"healthcheck"`
+	Volumes     []VolumeMount `yaml:"volumes" json:"volumes"` // Container-specific volume mounts
+	Security    SecuritySpec  `yaml:"security" json:"security"`
 }
 
 // PortSpec defines a container port
 type PortSpec struct {
-	ContainerPort int    `yaml:"containerPort"`
-	Protocol      string `yaml:"protocol"` // "TCP" or "UDP"
-	Name          string `yaml:"name"`     // Service name for discovery
+	ContainerPort int    `yaml:"containerPort" json:"containerPort"`
+	Protocol      string `yaml:"protocol" json:"protocol"` // "TCP" or "UDP"
+	Name          string `yaml:"name" json:"name"`         // Service name for discovery
 }
 
 // VolumeMount defines a container-specific volume mount
 type VolumeMount struct {
-	Name      string `yaml:"name"`
-	Container string `yaml:"container"`
-	Readonly  bool   `yaml:"readonly"`
+	Name      string `yaml:"name" json:"name"`
+	Container string `yaml:"container" json:"container"`
+	Readonly  bool   `yaml:"readonly" json:"readonly"`
 }
 
 // NetworkingConfig defines networking for multi-container apps
 type NetworkingConfig struct {
-	Mode    string        `yaml:"mode"`    // "internal", "bridge", or "host"
-	Ingress []IngressRule `yaml:"ingress"` // External access rules
+	Mode    string        `yaml:"mode" json:"mode"`       // "internal", "bridge", or "host"
+	Ingress []IngressRule `yaml:"ingress" json:"ingress"` // External access rules
 }
 
 // IngressRule defines how to expose a container port
 type IngressRule struct {
-	Port     int    `yaml:"port"`     // External port
-	Target   string `yaml:"target"`   // "containerName:port"
-	Protocol string `yaml:"protocol"` // "HTTP", "TCP", "UDP"
+	Port     int    `yaml:"port" json:"port"`         // External port
+	Target   string `yaml:"target" json:"target"`     // "containerName:port"
+	Protocol string `yaml:"protocol" json:"protocol"` // "HTTP", "TCP", "UDP"
 }
 
 // LifecycleConfig defines startup/shutdown behavior
 type LifecycleConfig struct {
-	StartupOrder  []string `yaml:"startup_order"`  // Container start order
-	ShutdownOrder []string `yaml:"shutdown_order"` // Container stop order
-	RestartPolicy string   `yaml:"restart_policy"` // "always", "on-failure", "no"
+	StartupOrder  []string `yaml:"startup_order" json:"startup_order"`   // Container start order
+	ShutdownOrder []string `yaml:"shutdown_order" json:"shutdown_order"` // Container stop order
+	RestartPolicy string   `yaml:"restart_policy" json:"restart_policy"` // "always", "on-failure", "no"
 }
 
 // PluginSpec declares plugin capabilities
 type PluginSpec struct {
-	Capabilities []PluginCapability `yaml:"capabilities"`
+	Capabilities []PluginCapability `yaml:"capabilities" json:"capabilities"`
 }
 
 // PluginCapability describes a single capability provided by a plugin
 type PluginCapability struct {
-	ID          string            `yaml:"id"`
-	Version     string            `yaml:"version"`
-	Transport   string            `yaml:"transport"` // "grpc", "event", "both"
-	Description string            `yaml:"description"`
-	Proto       string            `yaml:"proto"`  // gRPC service name (required for grpc/both)
-	Topics      *CapabilityTopics `yaml:"topics"` // Event topics (required for event/both)
+	ID          string            `yaml:"id" json:"id"`
+	Version     string            `yaml:"version" json:"version"`
+	Transport   string            `yaml:"transport" json:"transport"` // "grpc", "event", "both"
+	Description string            `yaml:"description" json:"description"`
+	Proto       string            `yaml:"proto" json:"proto"`   // gRPC service name (required for grpc/both)
+	Topics      *CapabilityTopics `yaml:"topics" json:"topics"` // Event topics (required for event/both)
 }
 
 // CapabilityTopics defines event topics for a capability
 type CapabilityTopics struct {
-	Publish   []string `yaml:"publish"`
-	Subscribe []string `yaml:"subscribe"`
+	Publish   []string `yaml:"publish" json:"publish"`
+	Subscribe []string `yaml:"subscribe" json:"subscribe"`
 }
 
 // PluginDependency declares a dependency on a plugin capability
 type PluginDependency struct {
-	Capability string `yaml:"capability"`
-	MinVersion string `yaml:"min_version"`
-	Required   bool   `yaml:"required"`
+	Capability string `yaml:"capability" json:"capability"`
+	MinVersion string `yaml:"min_version" json:"min_version"`
+	Required   bool   `yaml:"required" json:"required"`
 }
 
 type EnvVar struct {
-	Name  string `yaml:"name"`
-	Value string `yaml:"value"`
+	Name  string `yaml:"name" json:"name"`
+	Value string `yaml:"value" json:"value"`
 }
 
 type Volume struct {
-	Host      string `yaml:"host"`
-	Container string `yaml:"container"`
-	Readonly  bool   `yaml:"readonly"`
+	Host      string `yaml:"host" json:"host"`
+	Container string `yaml:"container" json:"container"`
+	Readonly  bool   `yaml:"readonly" json:"readonly"`
 }
 
 type Healthcheck struct {
-	Enabled                    bool   `yaml:"enabled"`
-	Type                       string `yaml:"type"`    // "command", "http", "tcp"
-	Command                    string `yaml:"command"` // For command type
-	Path                       string `yaml:"path"`    // For http type
-	Port                       int    `yaml:"port"`    // For http/tcp type
-	Interval                   string `yaml:"interval"`
-	TimeoutSeconds             int    `yaml:"timeout_seconds"`
-	Retries                    int    `yaml:"retries"`
-	HealthCheckIntervalSeconds int    `yaml:"health_check_interval_seconds"`
+	Enabled                    bool   `yaml:"enabled" json:"enabled"`
+	Type                       string `yaml:"type" json:"type"`       // "command", "http", "tcp"
+	Command                    string `yaml:"command" json:"command"` // For command type
+	Path                       string `yaml:"path" json:"path"`       // For http type
+	Port                       int    `yaml:"port" json:"port"`       // For http/tcp type
+	Interval                   string `yaml:"interval" json:"interval"`
+	TimeoutSeconds             int    `yaml:"timeout_seconds" json:"timeout_seconds"`
+	Retries                    int    `yaml:"retries" json:"retries"`
+	HealthCheckIntervalSeconds int    `yaml:"health_check_interval_seconds" json:"health_check_interval_seconds"`
 }
 
 type AutoRestart struct {
-	Enabled                    bool    `yaml:"enabled"`
-	MaxRetries                 int     `yaml:"max_retries"`
-	RetryDelaySeconds          int     `yaml:"retry_delay_seconds"`
-	BackoffMultiplier          float64 `yaml:"backoff_multiplier"`
-	HealthCheckIntervalSeconds int     `yaml:"health_check_interval_seconds"`
+	Enabled                    bool    `yaml:"enabled" json:"enabled"`
+	MaxRetries                 int     `yaml:"max_retries" json:"max_retries"`
+	RetryDelaySeconds          int     `yaml:"retry_delay_seconds" json:"retry_delay_seconds"`
+	BackoffMultiplier          float64 `yaml:"backoff_multiplier" json:"backoff_multiplier"`
+	HealthCheckIntervalSeconds int     `yaml:"health_check_interval_seconds" json:"health_check_interval_seconds"`
 }
 
-// LoadManifest loads and parses an app manifest file
+// modelAliasPattern constrains spec.models keys: the alias becomes the suffix
+// of the AIPC_MODEL_<alias> environment variable injected into containers, so
+// it must be a valid environment variable name fragment.
+var modelAliasPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// reservedModelAliases names that would shadow or be confused with
+// platform-injected container env names (AIPC_HOST_PREFIX, APP_ID, APP_ROLE,
+// CONTAINER_NAME). Refusing them keeps the container environment unambiguous.
+var reservedModelAliases = map[string]bool{
+	"HOST_PREFIX":    true,
+	"APP_ID":         true,
+	"APP_ROLE":       true,
+	"CONTAINER_NAME": true,
+}
+
+// LoadManifest loads and parses an app manifest file.
+// Thin wrapper over ParseManifest; see that function for semantics.
 func LoadManifest(path string) (*AppManifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read manifest: %w", err)
 	}
+	return ParseManifest(data)
+}
 
+// ParseManifest parses manifest bytes, validates them, and merges declared
+// model ids (spec.models) into permissions.inference.models.
+//
+// Side effects (in-memory only — the source file is never rewritten):
+//   - every spec.models id is appended to Spec.Permissions.Inference.Models
+//     (deduplicated, order-stable), so install, permission display and the
+//     web API all see one consistent authorization list;
+//   - the merge is idempotent: re-parsing the same bytes (or an already
+//     merged manifest) yields the same result.
+//
+// All manifest entry points (LoadManifest, install, StartApp, permission
+// reads, upload responses) funnel through here, making it the single choke
+// point for schema changes.
+func ParseManifest(data []byte) (*AppManifest, error) {
 	var manifest AppManifest
 	if err := yaml.Unmarshal(data, &manifest); err != nil {
 		return nil, fmt.Errorf("failed to parse manifest: %w", err)
+	}
+
+	if err := rejectLegacyModelTypes(data); err != nil {
+		return nil, err
 	}
 
 	if err := manifest.Validate(); err != nil {
 		return nil, fmt.Errorf("manifest validation failed: %w", err)
 	}
 
+	manifest.MergeModelPermissions()
+
 	return &manifest, nil
+}
+
+// rejectLegacyModelTypes fails manifests that still declare
+// spec.models.<alias>.type. The field was removed from ModelMapping (bundled
+// models take their postprocess type from AMPK package metadata), and
+// yaml.Unmarshal is not strict — without this probe a leftover type key would
+// be silently swallowed and the app would install with a silently different
+// model configuration than its author wrote.
+func rejectLegacyModelTypes(data []byte) error {
+	var probe struct {
+		Spec struct {
+			Models map[string]map[string]interface{} `yaml:"models"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(data, &probe); err != nil {
+		// Shape errors are the first (strict) decode's business; nothing to
+		// probe here.
+		return nil
+	}
+	for alias, mapping := range probe.Spec.Models {
+		if mapping == nil {
+			continue
+		}
+		if _, ok := mapping["type"]; ok {
+			return fmt.Errorf("manifest validation failed: spec.models.%s.type is no longer supported: bundled models install from AMPK .bin packages and take their postprocess type from package metadata", alias)
+		}
+	}
+	return nil
 }
 
 // Validate validates the manifest
@@ -308,6 +395,11 @@ func (m *AppManifest) Validate() error {
 		return fmt.Errorf("network validation failed: %w", err)
 	}
 
+	// Validate declared model dependencies (spec.models)
+	if err := m.ValidateModels(); err != nil {
+		return fmt.Errorf("models validation failed: %w", err)
+	}
+
 	// Validate multi-container configuration
 	if m.IsMultiContainer() {
 		if err := m.ValidateMultiContainer(); err != nil {
@@ -316,6 +408,105 @@ func (m *AppManifest) Validate() error {
 	}
 
 	return nil
+}
+
+// ValidateModels validates spec.models declarations.
+// Alias keys become env var suffixes (AIPC_MODEL_<alias>), so they must be
+// valid identifiers and must not shadow platform-injected env names.
+// A declared path turns the entry into a bundled-model fallback (extracted
+// from the app image when the id is not found on the platform); it must be
+// an absolute, clean container path pointing at an AMPK .bin package.
+func (m *AppManifest) ValidateModels() error {
+	pathsByID := make(map[string]string, len(m.Spec.Models))
+	aliasesByID := make(map[string]string, len(m.Spec.Models))
+	for _, alias := range sortedModelAliases(m.Spec.Models) {
+		mapping := m.Spec.Models[alias]
+		if !modelAliasPattern.MatchString(alias) {
+			return fmt.Errorf("spec.models alias %q must match %s", alias, modelAliasPattern.String())
+		}
+		if reservedModelAliases[alias] {
+			return fmt.Errorf("spec.models alias %q is reserved by the platform", alias)
+		}
+		if mapping.ID == "" {
+			return fmt.Errorf("spec.models.%s.id is required", alias)
+		}
+		if mapping.Path != "" {
+			if !filepath.IsAbs(mapping.Path) || filepath.Clean(mapping.Path) != mapping.Path || mapping.Path == "/" {
+				return fmt.Errorf("spec.models.%s.path must be an absolute container path without '.', '..' or redundant separators (got %q)", alias, mapping.Path)
+			}
+			if ext := filepath.Ext(mapping.Path); ext != ".bin" {
+				return fmt.Errorf("spec.models.%s.path must be a .bin AMPK model package (got %q); bare .hef bundling is no longer supported", alias, mapping.Path)
+			}
+		}
+		if old, ok := pathsByID[mapping.ID]; ok && old != mapping.Path {
+			return fmt.Errorf("spec.models aliases %q and %q declare model id %q with conflicting paths", aliasesByID[mapping.ID], alias, mapping.ID)
+		}
+		pathsByID[mapping.ID], aliasesByID[mapping.ID] = mapping.Path, alias
+	}
+	return nil
+}
+
+// ModelEnvVars returns AIPC_MODEL_<alias>=<id> entries for spec.models,
+// sorted by alias for deterministic container configuration.
+func (m *AppManifest) ModelEnvVars() []string {
+	if len(m.Spec.Models) == 0 {
+		return nil
+	}
+	aliases := sortedModelAliases(m.Spec.Models)
+	envVars := make([]string, 0, len(aliases))
+	for _, alias := range aliases {
+		envVars = append(envVars, fmt.Sprintf("AIPC_MODEL_%s=%s", alias, m.Spec.Models[alias].ID))
+	}
+	return envVars
+}
+
+// MergeModelPermissions appends spec.models ids into
+// permissions.inference.models (deduplicated, order-stable, idempotent).
+// In-memory only: manifests on disk are never rewritten.
+func (m *AppManifest) MergeModelPermissions() {
+	if len(m.Spec.Models) == 0 {
+		return
+	}
+	existing := make(map[string]bool, len(m.Spec.Permissions.Inference.Models))
+	for _, id := range m.Spec.Permissions.Inference.Models {
+		existing[id] = true
+	}
+	for _, alias := range sortedModelAliases(m.Spec.Models) {
+		id := m.Spec.Models[alias].ID
+		if !existing[id] {
+			existing[id] = true
+			m.Spec.Permissions.Inference.Models = append(m.Spec.Permissions.Inference.Models, id)
+		}
+	}
+}
+
+// ModelDependencyIDs returns the distinct model ids declared in spec.models,
+// sorted by alias for deterministic ordering.
+func (m *AppManifest) ModelDependencyIDs() []string {
+	if len(m.Spec.Models) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(m.Spec.Models))
+	ids := make([]string, 0, len(m.Spec.Models))
+	for _, alias := range sortedModelAliases(m.Spec.Models) {
+		id := m.Spec.Models[alias].ID
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// sortedModelAliases returns the map keys sorted; map iteration order is
+// otherwise random, which would make errors and env order nondeterministic.
+func sortedModelAliases(models map[string]ModelMapping) []string {
+	aliases := make([]string, 0, len(models))
+	for alias := range models {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+	return aliases
 }
 
 // Validate validates resources
@@ -540,6 +731,43 @@ func (m *AppManifest) GetMainContainer() (string, *ContainerSpec) {
 		}
 	}
 	return "", nil
+}
+
+// ImageReferences returns the normalized image references the app needs at
+// start time: spec.image for single-container manifests, one entry per
+// container for multi-container manifests (main first, the rest in sorted
+// key order). Empty and duplicate references are skipped.
+func (m *AppManifest) ImageReferences() []string {
+	var refs []string
+	add := func(image string) {
+		if image == "" {
+			return
+		}
+		ref := NormalizeImageName(image)
+		for _, existing := range refs {
+			if existing == ref {
+				return
+			}
+		}
+		refs = append(refs, ref)
+	}
+
+	if m.IsMultiContainer() {
+		if _, main := m.GetMainContainer(); main != nil {
+			add(main.Image)
+		}
+		names := make([]string, 0, len(m.Spec.Containers))
+		for name := range m.Spec.Containers {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			add(m.Spec.Containers[name].Image)
+		}
+		return refs
+	}
+	add(m.Spec.Image)
+	return refs
 }
 
 // GetSubContainers returns all sub containers

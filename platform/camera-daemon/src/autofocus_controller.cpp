@@ -918,6 +918,39 @@ private:
             return HAL_ERR_INVALID_ARG;
         }
 
+        if (config_.startup_seed_from_archive) {
+            // Boot restore: replay the archived motor positions verbatim.
+            // They are already lens-space targets (the last scan's landing,
+            // calibration delta included), so no table lookup, no extra
+            // delta, no clamp beyond focus limits.
+            const int32_t zoom_target = config_.startup_seed_zoom_pos;
+            int32_t focus_target = std::clamp(config_.startup_seed_focus_pos,
+                                              config_.min_focus_pos,
+                                              config_.max_focus_pos);
+            HAL_LOG_INFO("Autofocus: restoring archived lens position "
+                         "zoom=%d focus=%d",
+                         zoom_target, focus_target);
+            set_state(AutofocusState::StartupAf, 0.04,
+                      "restoring archived lens position");
+            if (move_zoom_focus(zoom_target, focus_target,
+                                "archived restore") == HAL_OK) {
+                *focus_center = focus_target;
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    status_.effective_ratio = lens_->pos_to_ratio(zoom_target);
+                    status_.zoom_pos = zoom_target;
+                    status_.focus_pos = focus_target;
+                }
+                return HAL_OK;
+            }
+            // A malformed archive (e.g. out-of-travel zoom) fails the
+            // replay; fall through to the config-derived seed rather than
+            // killing the startup job. FG2009's restore has the equivalent
+            // fallback to its boot one-shot.
+            HAL_LOG_WARNING("Autofocus: archived lens position replay failed; "
+                            "falling back to config startup seed");
+        }
+
         int32_t zoom_target = 0;
         int32_t focus_target = 0;
         int ret = lens_->calc_targets(config_.startup_zoom_ratio,

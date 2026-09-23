@@ -40,6 +40,7 @@ struct ManagedFrame {
     std::chrono::steady_clock::time_point lend_time;
     uint64_t        frame_id;       // Globally unique ID
     std::atomic<bool> reclaimed{false};  // Set by force_reclaim; prevents double HAL release
+    uint32_t        flags = 0;      // FD_PUB_FRAME_FLAG_* baked-metadata (overlay/DPM)
 };
 
 /* ========== Subscriber ========== */
@@ -101,7 +102,8 @@ public:
      * Creates ManagedFrame with shallow metadata copy, enqueues for async
      * dispatch. Releases HAL frame buffer immediately (before subscribers run).
      */
-    void on_frame_arrived(const std::string& stream_name, HalFrameBuffer* frame);
+    void on_frame_arrived(const std::string& stream_name, HalFrameBuffer* frame,
+                          uint32_t frame_flags = 0);
 
     /**
      * @brief Add one reference to a ManagedFrame.

@@ -232,6 +232,21 @@ export interface StorageDevice {
 }
 
 // Wizard Configuration Types
+
+/**
+ * One model dependency (spec.models entry): the model id plus optional
+ * in-image bundling info. Mirrors the Go manifest.ModelMapping json tags.
+ * Declared as a type alias (not interface) so Record values stay assignable
+ * to the YAML emitter's index-signature value type.
+ */
+export type WizardModelMapping = {
+  id: string;
+  /** absolute in-image path of a bundled AMPK model package (.bin) */
+  path?: string;
+  /** install fails when the model is missing on device */
+  required?: boolean;
+};
+
 export interface WizardConfig {
   metadata: {
     id: string;
@@ -241,6 +256,10 @@ export interface WizardConfig {
   };
   image: string;
   image_path?: string;
+  /** explicitly confirmed replacement of an existing app id */
+  force?: boolean;
+  /** model dependencies (spec.models): alias → mapping */
+  models?: Record<string, WizardModelMapping>;
   resources?: {
     cpu?: string;
     memory?: string;
@@ -272,4 +291,67 @@ export interface WizardConfig {
   volumes?: Array<{ host: string; container: string; readonly?: boolean }>;
   autostart?: boolean;
   restart_policy?: string;
+  security?: {
+    no_new_privileges?: boolean;
+    readonly_rootfs?: boolean;
+  };
+}
+
+/**
+ * Full app manifest as returned by upload-manifest / PATCH /apps/manifest
+ * (the `manifest` field). Mirrors the Go manifest structs' json tags for the
+ * wizard-expressible subset; unknown future fields are ignored by design.
+ */
+export interface AppManifestDTO {
+  apiVersion?: string;
+  kind?: string;
+  metadata: {
+    id: string;
+    name: string;
+    version: string;
+    description?: string;
+    author?: string;
+    email?: string;
+  };
+  spec: {
+    image?: string;
+    permissions?: {
+      video?: string[];
+      inference?: {
+        models?: string[];
+        max_qps?: number;
+        max_concurrent?: number;
+        allow_register_model?: boolean;
+      };
+      events?: {
+        publish?: string[];
+        subscribe?: string[];
+      };
+      device?: {
+        light?: boolean;
+        ir_cut?: boolean;
+        ptz?: boolean;
+        lens?: boolean;
+      };
+      network?: {
+        mode?: string;
+        inbound?: number[];
+      };
+    };
+    resources?: {
+      cpu?: string;
+      memory?: string;
+    };
+    env?: Array<{ name: string; value: string }>;
+    volumes?: Array<{ host: string; container: string; readonly?: boolean }>;
+    autostart?: boolean;
+    restart_policy?: string;
+    security?: {
+      no_new_privileges?: boolean | null;
+      readonly_rootfs?: boolean | null;
+    };
+    /** model dependencies (spec.models), shared with the wizard config */
+    models?: Record<string, WizardModelMapping>;
+    containers?: unknown;
+  };
 }

@@ -211,6 +211,12 @@ export const useLensStatus = () => useQuery<LensStatus>({
       const response = await deviceApi.getLensStatus();
       return (response as any).data as LensStatus;
     },
+    // Poll: the fixed-lens verdict lands asynchronously (image probe ~40s
+    // after boot or a lens swap), so an already-open page must observe the
+    // flip without waiting for a remount/window focus; motor positions also
+    // move via other clients. Low frequency — the autofocus poll on this
+    // page runs at 400ms.
+    refetchInterval: 5000,
   });
 
 export const useSetZoomLevel = () => {

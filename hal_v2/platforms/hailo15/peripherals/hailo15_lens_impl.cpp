@@ -77,17 +77,33 @@ static int iris_target_set(void *mcu_ctx, uint16_t target)
     return status_only(mcu_ctx, HOST_LINK_CMD_LENS_IRIS_TGT_SET, &req, sizeof(req));
 }
 
+/* MCU firmware generations answer IRIS_ADC_GET differently: the expected 2-byte
+ * ADC payload, or a 4-byte status frame (firmware that lacks the command, or
+ * reports an error). Read into a padded buffer and decode by reply length so
+ * both shapes map to a meaningful HAL result instead of INSUFFICIENT_BUFFER. */
 static int iris_adc_get(void *mcu_ctx, uint16_t *out_adc)
 {
     if (out_adc == nullptr) return HAL_ERR_INVALID_ARG;
-    host_link_lens_iris_adc_t resp{};
+    uint8_t raw[8] = {0};
     uint16_t resp_len = 0;
     int ret = HAL_MCU_OPS.raw_request(mcu_ctx, HOST_LINK_CMD_LENS_IRIS_ADC_GET, nullptr, 0,
-                                      reinterpret_cast<uint8_t *>(&resp), sizeof(resp), &resp_len);
+                                      raw, sizeof(raw), &resp_len);
     if (ret != HAL_OK) return ret;
-    if (resp_len != sizeof(resp)) return HAL_ERR_INVALID_SIZE;
-    *out_adc = resp.adc;
-    return HAL_OK;
+    if (resp_len == sizeof(host_link_lens_iris_adc_t)) {
+        host_link_lens_iris_adc_t resp{};
+        memcpy(&resp, raw, sizeof(resp));
+        *out_adc = resp.adc;
+        return HAL_OK;
+    }
+    if (resp_len == sizeof(host_link_status_t)) {
+        host_link_status_t st{};
+        memcpy(&st, raw, sizeof(st));
+        HAL_LOG_WARNING("lens: IRIS_ADC_GET answered status %d instead of an ADC value",
+                        (int)st.status);
+        return hailo15_mcu_map_status(st.status);
+    }
+    HAL_LOG_WARNING("lens: IRIS_ADC_GET unexpected reply length %u", (unsigned)resp_len);
+    return HAL_ERR_INVALID_SIZE;
 }
 
 static int zoom_run(void *mcu_ctx, const HalLensMotion *motion) { return motion_cmd(mcu_ctx, HOST_LINK_CMD_LENS_ZOOM_RUN, motion); }

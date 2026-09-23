@@ -83,6 +83,7 @@ type Config struct {
 		RootPath      string `yaml:"root_path"`
 		ModelBlobPath string `yaml:"model_blob_path"`
 		MinFreeBytes  uint64 `yaml:"min_free_bytes"`
+		MaxTotalBytes uint64 `yaml:"max_total_bytes"`
 	} `yaml:"storage"`
 
 	Files struct {
@@ -160,22 +161,23 @@ func (c *Config) Validate() error {
 }
 
 type PlatformAPIServer struct {
-	config         *Config
-	engine         *gin.Engine
-	httpServer     *http.Server
-	tlsServer      *http.Server // non-nil when Config.Service.TLS.Enabled
-	unixServer     *http.Server // non-nil when Config.Service.UnixSocket is set
-	unixSocketPath string       // resolved socket path for cleanup on shutdown
-	tlsCertFile    string
-	tlsKeyFile     string
-	db             *gorm.DB
-	eventLogger    *events.Logger
-	persistCtx     context.Context
-	persistCancel  context.CancelFunc
-	gyroSrc        gyro.Source
-	gyroCancel     context.CancelFunc
-	monitor        *handlers.MonitorHandler
-	grpcClients    struct {
+	config          *Config
+	engine          *gin.Engine
+	httpServer      *http.Server
+	tlsServer       *http.Server // non-nil when Config.Service.TLS.Enabled
+	unixServer      *http.Server // non-nil when Config.Service.UnixSocket is set
+	unixSocketPath  string       // resolved socket path for cleanup on shutdown
+	tlsCertFile     string
+	tlsKeyFile      string
+	db              *gorm.DB
+	eventLogger     *events.Logger
+	persistCtx      context.Context
+	persistCancel   context.CancelFunc
+	gyroSrc         gyro.Source
+	gyroCancel      context.CancelFunc
+	modelHealCancel context.CancelFunc
+	monitor         *handlers.MonitorHandler
+	grpcClients     struct {
 		aiRuntime     *grpc.ClientConn
 		eventBus      *grpc.ClientConn
 		deviceControl *grpc.ClientConn
@@ -402,9 +404,14 @@ func (s *PlatformAPIServer) setupRoutes() {
 	if minFree == 0 {
 		minFree = 100 * 1024 * 1024 // 100MB default
 	}
-	modelStore, err := storage.NewModelStorage(blobPath, minFree)
+	// Total blob budget; 0 leaves the store uncapped (only the free-space
+	// floor applies) so existing deployments keep their current behavior.
+	maxTotal := s.config.Storage.MaxTotalBytes
+	modelStore, err := storage.NewModelStorage(blobPath, minFree, maxTotal)
 	if err != nil {
 		logger.Warn("Failed to initialize model storage: %v (uploads will use legacy path)", err)
+	} else {
+		logModelStorageBudget(modelStore, maxTotal)
 	}
 
 	// Password crypto setup (once per boot, before handlers are built):
@@ -431,6 +438,31 @@ func (s *PlatformAPIServer) setupRoutes() {
 		DeviceControl: s.grpcClients.deviceControl,
 		AppManager:    s.grpcClients.appManager,
 	}, modelStoragePath, modelStore, s.db, s.config.Auth.Username, s.config.Auth.Password, authValidator, rsaPriv, rsaPubPEM, s.eventLogger)
+
+	// Disk-seeded model rows carry no file hash (only web imports compute one).
+	// Backfill in the background — hashing every model can take seconds per
+	// multi-GB file and must not delay startup.
+	go apiHandlers.BackfillMissingHashes()
+
+	// Heal stale model rows against the runtime (e.g. ai-runtime restarted
+	// alone: DB still claims loaded). The models page reconciles on every
+	// list; this pass covers devices nobody is browsing.
+	go apiHandlers.ReconcileRuntimeModels()
+
+	// Correct desired_state on rows registered-but-never-loaded before the
+	// import/disk-seed paths wrote it explicitly (the old column default
+	// "loaded" made the heal loop auto-load them). Must run before the heal
+	// loop's first tick — that pass is the consumer of the stale promise.
+	apiHandlers.DemoteNeverLoadedImports()
+
+	// Periodic desired-state restore: models loaded by the user but lost
+	// from the runtime (solo ai-runtime restart, force_unregister_all wipe,
+	// crash mid-operation) are re-registered automatically every minute —
+	// the recovery consumer for desired_state=loaded. It shares loadModelCore
+	// with the REST load endpoint so behavior is identical.
+	modelHealCtx, modelHealCancel := context.WithCancel(context.Background())
+	s.modelHealCancel = modelHealCancel
+	go apiHandlers.StartModelSelfHeal(modelHealCtx, time.Minute)
 
 	// Phase 2: reconcile the desired-state store with live config at startup.
 	// Currently scopes the media domain (camera-daemon.yaml): confirms the live
@@ -565,13 +597,16 @@ func (s *PlatformAPIServer) setupRoutes() {
 	ai := api.Group("/ai")
 	ai.GET("/capabilities", apiHandlers.GetCapabilities)
 	ai.POST("/models/parse", apiHandlers.ParseModel)
+	ai.POST("/models/parse/abandon", apiHandlers.AbandonStagedModel)
 	ai.POST("/models/upload", apiHandlers.UploadModel)
 	ai.GET("/models", apiHandlers.ListModels)
 	ai.POST("/models/scan", apiHandlers.ScanModels)
 	ai.POST("/models", apiHandlers.RegisterModel)
 	ai.GET("/models/:model_id", apiHandlers.GetModelInfo)
+	ai.PUT("/models/:model_id", apiHandlers.UpdateModel)
 	ai.DELETE("/models/:model_id", apiHandlers.UnregisterModel)
 	ai.GET("/models/:model_id/apps", apiHandlers.GetModelApps)
+	ai.GET("/models/:model_id/export", apiHandlers.ExportModel)
 	ai.POST("/models/:model_id/load", apiHandlers.LoadModel)
 	ai.POST("/models/:model_id/unload", apiHandlers.UnloadModel)
 	ai.GET("/stats", apiHandlers.GetAIStats)
@@ -657,6 +692,9 @@ func (s *PlatformAPIServer) setupRoutes() {
 	apps.POST("/wizard", apiHandlers.WizardInstall)
 	apps.POST("/upload-image", apiHandlers.UploadImage)
 	apps.POST("/upload-manifest", apiHandlers.UploadManifest)
+	apps.POST("/upload-package", apiHandlers.UploadPackage)
+	apps.POST("/staging/abandon", apiHandlers.AbandonAppStaging)
+	apps.PATCH("/manifest", apiHandlers.PatchManifest)
 	apps.POST("/install-package", apiHandlers.InstallPackage)
 	apps.GET("/install-progress/:task_id", apiHandlers.GetInstallProgress)
 	apps.GET("/:app_id/stats", apiHandlers.GetAppStats)
@@ -1004,6 +1042,30 @@ func (s *PlatformAPIServer) setupRoutes() {
 	}
 }
 
+// logModelStorageBudget reports the model store's disk position once at boot:
+// how much the blobs consume, how much is free, and the budget if one is set.
+// Measurement failures degrade to a warn — a missing statfs must not block boot.
+func logModelStorageBudget(store *storage.ModelStorage, maxTotal uint64) {
+	usage, err := store.UsageBytes()
+	if err != nil {
+		logger.Warn("Failed to measure model storage usage: %v", err)
+		return
+	}
+	free, freeErr := store.FreeBytes()
+	if freeErr != nil {
+		logger.Warn("Failed to measure free disk space for model storage: %v", freeErr)
+		return
+	}
+	if maxTotal > 0 {
+		logger.Info("Model storage: %d bytes of blobs, %d bytes free, budget %d bytes", usage, free, maxTotal)
+		if usage >= maxTotal {
+			logger.Warn("Model storage already at its %d-byte budget; new model uploads will be refused", maxTotal)
+		}
+		return
+	}
+	logger.Info("Model storage: %d bytes of blobs, %d bytes free (no total budget configured)", usage, free)
+}
+
 func (s *PlatformAPIServer) setupSwaggerRoutes() {
 	// Serve swagger.yaml
 	s.engine.GET("/api/v1/swagger.yaml", func(c *gin.Context) {
@@ -1085,6 +1147,23 @@ func resolveGyroCalibration(cfg GyroConfig, mount [9]float64) (resolvedMount [9]
 
 func (s *PlatformAPIServer) Start() error {
 	logger.Info("Starting Platform API server on %s", s.config.Service.HTTPAddr)
+	// Reap abandoned import staging from previous process lifetimes, then keep
+	// doing so periodically. Cleanup is token-directory-only and never follows
+	// symlinks outside the staging root.
+	handlers.CleanupAppStaging(time.Now())
+	stagingCleanupStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case now := <-ticker.C:
+				handlers.CleanupAppStaging(now)
+			case <-stagingCleanupStop:
+				return
+			}
+		}
+	}()
 
 	// Handle shutdown gracefully
 	sigChan := make(chan os.Signal, 1)
@@ -1092,6 +1171,7 @@ func (s *PlatformAPIServer) Start() error {
 
 	go func() {
 		<-sigChan
+		close(stagingCleanupStop)
 		logger.Info("Shutting down Platform API server...")
 
 		// Stop persist loop
@@ -1101,6 +1181,10 @@ func (s *PlatformAPIServer) Start() error {
 		// Stop gyro source read loop
 		if s.gyroCancel != nil {
 			s.gyroCancel()
+		}
+		// Stop periodic model self-heal loop
+		if s.modelHealCancel != nil {
+			s.modelHealCancel()
 		}
 		// Stop background CPU sampler goroutine
 		if s.monitor != nil {

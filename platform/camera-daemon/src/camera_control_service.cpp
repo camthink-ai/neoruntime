@@ -1,11 +1,19 @@
 #include "camera_control_service.h"
 #include "camera_daemon.h"
 #include "hal_loader.h"
+#include "dsp_service.h"
+#include "injection_service.h"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 extern "C" {
     #include "hal_log.h"
@@ -51,6 +59,8 @@ void fill_infrared_status(const IlluminationStatus& status, bool success,
 CameraControlServiceImpl::CameraControlServiceImpl(CameraDaemon* daemon)
     : daemon_(daemon) {
 }
+/* ~CameraControlServiceImpl is defined at the end of this file:
+ * JpegShotState (held by unique_ptr) is incomplete until then. */
 
 grpc::Status CameraControlServiceImpl::StartOneShotAutofocus(
     grpc::ServerContext*, const aipc::camera::Empty*,
@@ -265,17 +275,32 @@ grpc::Status CameraControlServiceImpl::UpdateAiOverlay(
         return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
     }
 
-    HAL_LOG_INFO("[CameraControl] Update AI Overlay: enabled=%s labels=%s confidence=%s thickness=%u",
+    HAL_LOG_INFO("[CameraControl] Update AI Overlay: enabled=%s labels=%s confidence=%s thickness=%u face_blur=%s strict=%s cap=%s",
                  request->enabled() ? "true" : "false",
                  request->show_label() ? "true" : "false",
                  request->show_confidence() ? "true" : "false",
-                 request->line_thickness());
+                 request->line_thickness(),
+                 request->has_enable_face_blur()
+                     ? (request->enable_face_blur() ? "true" : "false") : "keep",
+                 request->has_strict_frame_lock()
+                     ? (request->strict_frame_lock() ? "true" : "false") : "keep",
+                 request->has_strict_wait_cap_ms()
+                     ? std::to_string(request->strict_wait_cap_ms()).c_str() : "keep");
 
     bool success = daemon_->update_ai_overlay_config(
         request->enabled(),
         request->show_label(),
         request->show_confidence(),
-        request->line_thickness()
+        request->line_thickness(),
+        request->has_enable_face_blur()
+            ? std::optional<bool>(request->enable_face_blur())
+            : std::optional<bool>{},
+        request->has_strict_frame_lock()
+            ? std::optional<bool>(request->strict_frame_lock())
+            : std::optional<bool>{},
+        request->has_strict_wait_cap_ms()
+            ? std::optional<uint32_t>(request->strict_wait_cap_ms())
+            : std::optional<uint32_t>{}
     );
 
     response->set_success(success);
@@ -1515,5 +1540,837 @@ grpc::Status CameraControlServiceImpl::GetConfigField(
     HAL_LOG_INFO("[CameraControl] GetConfigField: %s -> success=%d value=%s",
                  request->field_path().c_str(), success ? 1 : 0,
                  success ? value.c_str() : "(n/a)");
+    return grpc::Status::OK;
+}
+
+bool CameraControlServiceImpl::FillDspJobDesc(
+    const aipc::camera::DspJobRequest* request,
+    DspJobDesc& desc,
+    aipc::camera::DspJobResponse* response) {
+
+    // DspOp is NOT a numeric mirror of HalDspOpType: proto orders RESIZE first
+    // and CONVERT last, HAL puts CONVERT_FORMAT at 0 — explicit switch, no cast.
+    switch (request->op()) {
+    case aipc::camera::DSP_OP_RESIZE:
+        desc.op = HAL_DSP_OP_RESIZE; break;
+    case aipc::camera::DSP_OP_CROP_AND_RESIZE:
+        desc.op = HAL_DSP_OP_CROP_RESIZE; break;
+    case aipc::camera::DSP_OP_MULTI_CROP_AND_RESIZE:
+        desc.op = HAL_DSP_OP_MULTI_CROP_RESIZE; break;
+    case aipc::camera::DSP_OP_CONVERT_FORMAT:
+        desc.op = HAL_DSP_OP_CONVERT_FORMAT; break;
+    case aipc::camera::DSP_OP_BLEND:
+        desc.op = HAL_DSP_OP_BLEND; break;
+    default:
+        response->set_success(false);
+        response->set_message("unknown DspOp " +
+                              std::to_string(static_cast<int>(request->op())));
+        response->set_error_code(DSP_SVC_ERR_INVALID);
+        return false;
+    }
+
+    // Interpolation + scaling mode ARE order-identical 0..3 in proto and HAL.
+    int interp = static_cast<int>(request->interpolation());
+    int scaling = static_cast<int>(request->scaling_mode());
+    if (interp < static_cast<int>(aipc::camera::DSP_INTERP_NEAREST) ||
+        interp > static_cast<int>(aipc::camera::DSP_INTERP_BICUBIC) ||
+        scaling < static_cast<int>(aipc::camera::DSP_SCALING_STRETCH) ||
+        scaling > static_cast<int>(aipc::camera::DSP_SCALING_SCALE_AND_CROP)) {
+        response->set_success(false);
+        response->set_message("DspInterpolation/DspScalingMode out of range");
+        response->set_error_code(DSP_SVC_ERR_INVALID);
+        return false;
+    }
+    desc.interpolation = static_cast<HalDspInterpolation>(interp);
+    desc.scaling_mode = static_cast<HalDspScalingMode>(scaling);
+
+    desc.src_id = request->src_buffer_id();
+    for (uint64_t id : request->dst_buffer_ids()) {
+        desc.dst_ids.push_back(id);
+    }
+    for (const auto& r : request->rects()) {
+        DspRect dr;
+        dr.x = r.x();
+        dr.y = r.y();
+        dr.width = r.width();
+        dr.height = r.height();
+        dr.dst_width = r.dst_width();
+        dr.dst_height = r.dst_height();
+        desc.rects.push_back(dr);
+    }
+    desc.priority = (request->priority() == aipc::camera::DSP_PRIORITY_BACKGROUND)
+                        ? DspPriority::Background
+                        : DspPriority::Normal;
+    return true;
+}
+
+grpc::Status CameraControlServiceImpl::SubmitDspJob(
+    grpc::ServerContext* context,
+    const aipc::camera::DspJobRequest* request,
+    aipc::camera::DspJobResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        response->set_error_code(DSP_SVC_ERR_UNAVAILABLE);
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    DspService* svc = daemon_->dsp_service();
+    if (!svc || !svc->is_running()) {
+        response->set_success(false);
+        response->set_message("DSP offload service unavailable");
+        response->set_error_code(DSP_SVC_ERR_UNAVAILABLE);
+        return grpc::Status::OK;
+    }
+
+    DspJobDesc desc;
+    if (!FillDspJobDesc(request, desc, response)) return grpc::Status::OK;
+
+    HAL_LOG_INFO("[CameraControl] SubmitDspJob: op=%d src=%lu dsts=%zu rects=%zu",
+                 static_cast<int>(request->op()),
+                 (unsigned long)desc.src_id, desc.dst_ids.size(),
+                 desc.rects.size());
+
+    DspJobResult result = svc->submit_job(desc);
+    bool ok = (result.rc == DSP_SVC_OK);
+    response->set_success(ok);
+    response->set_message(ok && result.message.empty() ? "OK" : result.message);
+    response->set_error_code(result.rc);
+    response->set_elapsed_ms(result.elapsed_ms);
+    // Server-side trace for failed DSP jobs: without it a firmware-level
+    // failure surfaced only on the client and the daemon journal kept zero
+    // evidence for post-mortems. Successes stay at INFO above; failures
+    // log at ERROR with rc + service message.
+    if (!ok) {
+        HAL_LOG_ERROR("[CameraControl] SubmitDspJob FAILED: op=%d src=%lu "
+                      "dsts=%zu rects=%zu rc=%d elapsed_ms=%u msg='%s'",
+                      static_cast<int>(request->op()),
+                      (unsigned long)desc.src_id, desc.dst_ids.size(),
+                      desc.rects.size(), result.rc, result.elapsed_ms,
+                      result.message.c_str());
+    }
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::SubmitDspJobAsync(
+    grpc::ServerContext* context,
+    const aipc::camera::DspJobRequest* request,
+    aipc::camera::DspJobResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        response->set_error_code(DSP_SVC_ERR_UNAVAILABLE);
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    DspService* svc = daemon_->dsp_service();
+    if (!svc || !svc->is_running()) {
+        response->set_success(false);
+        response->set_message("DSP offload service unavailable");
+        response->set_error_code(DSP_SVC_ERR_UNAVAILABLE);
+        return grpc::Status::OK;
+    }
+
+    DspJobDesc desc;
+    if (!FillDspJobDesc(request, desc, response)) return grpc::Status::OK;
+
+    HAL_LOG_INFO("[CameraControl] SubmitDspJobAsync: op=%d src=%lu dsts=%zu rects=%zu",
+                 static_cast<int>(request->op()),
+                 (unsigned long)desc.src_id, desc.dst_ids.size(),
+                 desc.rects.size());
+
+    uint64_t job_id = 0;
+    DspJobResult result = svc->submit_job_async(desc, job_id);
+    bool ok = (result.rc == DSP_SVC_OK);
+    response->set_success(ok);
+    response->set_message(result.message);
+    response->set_error_code(result.rc);
+    response->set_job_id(job_id);
+    response->set_done(false); /* enqueued, not executed */
+    // Same server-side failure trace as the sync path.
+    if (!ok) {
+        HAL_LOG_ERROR("[CameraControl] SubmitDspJobAsync FAILED: op=%d src=%lu "
+                      "dsts=%zu rects=%zu rc=%d msg='%s'",
+                      static_cast<int>(request->op()),
+                      (unsigned long)desc.src_id, desc.dst_ids.size(),
+                      desc.rects.size(), result.rc,
+                      result.message.c_str());
+    }
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::WaitDspJob(
+    grpc::ServerContext* context,
+    const aipc::camera::DspWaitRequest* request,
+    aipc::camera::DspJobResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        response->set_error_code(DSP_SVC_ERR_UNAVAILABLE);
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    DspService* svc = daemon_->dsp_service();
+    if (!svc || !svc->is_running()) {
+        response->set_success(false);
+        response->set_message("DSP offload service unavailable");
+        response->set_error_code(DSP_SVC_ERR_UNAVAILABLE);
+        return grpc::Status::OK;
+    }
+
+    bool done = false;
+    DspJobResult result;
+    const uint32_t wait_ms = std::min(request->timeout_ms(),
+                                      svc->max_wait_job_timeout_ms());
+    if (wait_ms == 0) {
+        result = svc->wait_job(request->job_id(), 0, done);
+    } else {
+        constexpr uint32_t kCancellationPollMs = 100;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(wait_ms);
+        for (;;) {
+            if (context->IsCancelled()) {
+                return grpc::Status(grpc::StatusCode::CANCELLED,
+                                    "DSP job wait canceled");
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                result = svc->wait_job(request->job_id(), 0, done);
+                break;
+            }
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline - now).count();
+            const uint32_t slice_ms = std::min<uint32_t>(
+                kCancellationPollMs,
+                static_cast<uint32_t>(std::max<int64_t>(remaining, 1)));
+            result = svc->wait_job(request->job_id(), slice_ms, done);
+            if (result.rc != DSP_SVC_ERR_TIMEOUT) break;
+        }
+    }
+    bool ok = (result.rc == DSP_SVC_OK);
+    response->set_success(ok);
+    response->set_message(ok && result.message.empty() ? "OK" : result.message);
+    response->set_error_code(result.rc);
+    response->set_elapsed_ms(result.elapsed_ms);
+    response->set_job_id(request->job_id());
+    /* false = still pending (timeout / poll) or unknown id — the error_code
+     * separates those two cases. */
+    response->set_done(ok);
+    // Failure trace — but skip ERR_TIMEOUT: clients poll wait_job in a loop
+    // and a timeout return is the normal "still pending" poll result, not a
+    // job failure. Logging it would flood the journal once per poll.
+    if (!ok && result.rc != DSP_SVC_ERR_TIMEOUT) {
+        HAL_LOG_ERROR("[CameraControl] WaitDspJob FAILED: job_id=%lu rc=%d "
+                      "elapsed_ms=%u msg='%s'",
+                      (unsigned long)request->job_id(), result.rc,
+                      result.elapsed_ms, result.message.c_str());
+    }
+    return grpc::Status::OK;
+}
+
+/* ================================================================== */
+/* EncodeImage — one-shot JPEG encode of a DSP-registry buffer (S-3(a)) */
+/* ================================================================== */
+
+namespace {
+
+/* Wall-clock budget for one JPEG frame through the standalone encoder
+ * (first-call GStreamer pipeline spin-up included). Mirrors the DSP
+ * service's job_timeout_ms convention: a slow encode fails the RPC. */
+constexpr std::chrono::milliseconds kJpegShotTimeout(2000);
+constexpr uint32_t kJpegShotDefaultQuality = 85;
+
+} // namespace
+
+/**
+ * Daemon-owned standalone MJPEG encoder backing EncodeImage.
+ *
+ * One HAL codec context, recreated when (width, height, format, quality)
+ * changes — and after a timed-out or failed encode, which is also the
+ * stale-packet guard: a late packet from a destroyed context can never
+ * match the fresh wait (wait_ctx_ is compared against the codec_ctx the
+ * packet arrived on). Encodes are serialized on ctx_mu_ (single-stream
+ * appsrc pipeline underneath); the wait state has its own wait_mu_ so the
+ * packet callback never contends with context teardown — unsubscribe
+ * drains in-flight callbacks and the callback must be able to finish.
+ *
+ * The callback copies the JPEG bytes under wait_mu_ and releases the
+ * packet itself, so no packet pointer ever crosses threads.
+ */
+struct JpegShotState {
+    struct Shot {
+        int rc = HAL_OK;          /* 0, negative HAL rc, or DspServiceError */
+        std::string message;
+        std::vector<uint8_t> jpeg;
+        uint32_t elapsed_ms = 0;
+    };
+
+    explicit JpegShotState(HalCodecOps* ops) : ops_(ops) {}
+
+    Shot encode(HalFrameBuffer* fb, uint32_t quality) {
+        Shot shot;
+        const auto t0 = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> ctx_lk(ctx_mu_);
+
+        std::string why;
+        int rc = ensure_ctx_locked(fb, quality, why);
+        if (rc != HAL_OK) {
+            shot.rc = rc;
+            shot.message = why;
+            return shot;
+        }
+
+        /* Arm the wait, then feed the frame. */
+        {
+            std::lock_guard<std::mutex> wait_lk(wait_mu_);
+            out_.clear();
+            wait_done_ = false;
+            wait_active_ = true;
+            wait_ctx_ = handle_;
+        }
+
+        rc = ops_->input_frame(handle_, fb);
+        if (rc != HAL_OK) {
+            {
+                std::lock_guard<std::mutex> wait_lk(wait_mu_);
+                wait_active_ = false;
+                wait_ctx_ = nullptr;
+            }
+            /* The pipeline may be wedged — start clean on the next shot. */
+            destroy_ctx_locked();
+            shot.rc = rc;
+            shot.message = "encoder rejected the frame";
+            return shot;
+        }
+
+        bool done = false;
+        {
+            std::unique_lock<std::mutex> wait_lk(wait_mu_);
+            done = cv_.wait_for(wait_lk, kJpegShotTimeout,
+                                [this] { return wait_done_; });
+            wait_active_ = false;
+            wait_ctx_ = nullptr;
+            if (done) shot.jpeg = std::move(out_);
+        }
+        shot.elapsed_ms = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+
+        if (!done) {
+            destroy_ctx_locked();
+            shot.rc = DSP_SVC_ERR_TIMEOUT;
+            shot.message = "jpeg encode timed out";
+            return shot;
+        }
+        if (shot.jpeg.empty()) {
+            destroy_ctx_locked();
+            shot.rc = HAL_ERR_RESULT;
+            shot.message = "encoder produced an empty packet";
+            return shot;
+        }
+        return shot;
+    }
+
+    static void on_packet_thunk(void* codec_ctx, HalPacketBuffer* pkt, void* userdata) {
+        auto* self = static_cast<JpegShotState*>(userdata);
+        if (!self) return;
+        bool mine = false;
+        if (pkt && pkt->type == HAL_PACKET_TYPE_MJPEG && pkt->data && pkt->size > 0u) {
+            std::lock_guard<std::mutex> lk(self->wait_mu_);
+            if (self->wait_active_ && self->wait_ctx_ == codec_ctx) {
+                self->out_.assign(pkt->data, pkt->data + pkt->size);
+                self->wait_done_ = true;
+                mine = true;
+            }
+        }
+        if (mine) self->cv_.notify_one();
+        /* The HAL fills every packet with a heap priv holding a shared
+         * buffer ref — release it on every path, matching or not. */
+        if (pkt) self->ops_->release_packet(codec_ctx, pkt);
+    }
+
+    ~JpegShotState() {
+        std::lock_guard<std::mutex> lk(ctx_mu_);
+        destroy_ctx_locked();
+    }
+
+    HalCodecOps* ops_;
+
+    /* Context lifecycle (encode() holds ctx_mu_ for its whole call). */
+    std::mutex ctx_mu_;
+    void* handle_ = nullptr;
+    std::string key_;
+
+    /* Wait state, shared with on_packet_thunk. */
+    std::mutex wait_mu_;
+    std::condition_variable cv_;
+    bool wait_active_ = false;
+    void* wait_ctx_ = nullptr;
+    bool wait_done_ = false;
+    std::vector<uint8_t> out_;
+
+private:
+    int ensure_ctx_locked(HalFrameBuffer* fb, uint32_t quality, std::string& why) {
+        char key[64];
+        std::snprintf(key, sizeof(key), "%ux%u:%d:q%u", fb->width, fb->height,
+                      static_cast<int>(fb->format), quality);
+        if (handle_ && key_ == key) return HAL_OK;
+
+        destroy_ctx_locked();
+
+        HalCodecConfig cfg = {};
+        cfg.type = HAL_CODEC_TYPE_HW;
+        cfg.packet_type = HAL_PACKET_TYPE_MJPEG;
+        cfg.width = fb->width;
+        cfg.height = fb->height;
+        cfg.format = fb->format;
+        cfg.framerate = 30; /* caps only — one-shot use, not a stream */
+        cfg.jpeg_quality = quality;
+
+        void* handle = nullptr;
+        int rc = ops_->init(&cfg, &handle);
+        if (rc != HAL_OK || !handle) {
+            why = "standalone jpeg encoder init failed";
+            return rc != HAL_OK ? rc : HAL_ERR_RESULT;
+        }
+        rc = ops_->subscribe(handle, &JpegShotState::on_packet_thunk, this);
+        if (rc != HAL_OK) {
+            why = "standalone jpeg encoder subscribe failed";
+            ops_->deinit(handle);
+            return rc;
+        }
+        rc = ops_->start(handle);
+        if (rc != HAL_OK) {
+            why = "standalone jpeg encoder start failed";
+            ops_->unsubscribe(handle, &JpegShotState::on_packet_thunk);
+            ops_->deinit(handle);
+            return rc;
+        }
+        handle_ = handle;
+        key_ = key;
+        HAL_LOG_INFO("EncodeImage: standalone jpeg encoder up (%s)", key);
+        return HAL_OK;
+    }
+
+    void destroy_ctx_locked() {
+        if (!handle_) return;
+        /* Not holding wait_mu_ here on purpose: unsubscribe drains
+         * in-flight callbacks and on_packet_thunk takes wait_mu_. */
+        ops_->unsubscribe(handle_, &JpegShotState::on_packet_thunk);
+        ops_->deinit(handle_);
+        handle_ = nullptr;
+        key_.clear();
+    }
+};
+
+grpc::Status CameraControlServiceImpl::EncodeImage(
+    grpc::ServerContext* /*context*/,
+    const aipc::camera::EncodeImageRequest* request,
+    aipc::camera::EncodeImageResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        response->set_error_code(DSP_SVC_ERR_UNAVAILABLE);
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    DspService* dsp = daemon_->dsp_service();
+    if (!dsp || !dsp->is_running()) {
+        response->set_success(false);
+        response->set_message("DSP buffer registry unavailable");
+        response->set_error_code(DSP_SVC_ERR_UNAVAILABLE);
+        return grpc::Status::OK;
+    }
+
+    HalCodecOps* codec_ops = daemon_->hal_loader()->codec();
+    if (!codec_ops || !codec_ops->init || !codec_ops->subscribe ||
+        !codec_ops->input_frame) {
+        response->set_success(false);
+        response->set_message("codec HAL unavailable");
+        response->set_error_code(DSP_SVC_ERR_UNAVAILABLE);
+        return grpc::Status::OK;
+    }
+
+    if (request->quality() > 100u) {
+        response->set_success(false);
+        response->set_message("quality out of range [0..100]");
+        response->set_error_code(DSP_SVC_ERR_INVALID);
+        return grpc::Status::OK;
+    }
+    const uint32_t quality = request->quality() == 0u
+                                 ? kJpegShotDefaultQuality
+                                 : request->quality();
+
+    DspService::BufferPin pin = dsp->pin_buffer(request->src_buffer_id());
+    if (!pin.ok()) {
+        response->set_success(false);
+        response->set_message("unknown or foreign buffer id");
+        response->set_error_code(pin.rc());
+        return grpc::Status::OK;
+    }
+
+    HalFrameBuffer* fb = pin.fb();
+    if (!fb || fb->width == 0u || fb->height == 0u ||
+        fb->mem_type != HAL_MEM_DMABUF || fb->num_planes == 0u) {
+        response->set_success(false);
+        response->set_message("buffer is not a usable dma-buf frame");
+        response->set_error_code(DSP_SVC_ERR_INVALID);
+        return grpc::Status::OK;
+    }
+
+    /* Normalize to NV12 before the encoder: every hailoencodebin carries an
+     * OSD element with NV12-only pad templates, so any other input format
+     * fails caps negotiation deep inside the pipeline. NV12 feeds the
+     * encoder directly (zero-copy); RGB/BGR ride the DSP CONVERT job into a
+     * per-call scratch NV12 buffer; the rest is rejected with a clear
+     * message — the SDK client takes that as a normal hardware miss and
+     * falls back to its CPU leg. */
+    HalFrameBuffer* encode_fb = fb;
+    DspService::BufferPin nv12_pin;
+    if (fb->format != HAL_PIX_FMT_NV12) {
+        if (fb->format != HAL_PIX_FMT_RGB24 && fb->format != HAL_PIX_FMT_BGR24) {
+            response->set_success(false);
+            response->set_message(
+                "source format not supported by hardware jpeg encoder "
+                "(nv12/rgb24/bgr24)");
+            response->set_error_code(DSP_SVC_ERR_INVALID);
+            return grpc::Status::OK;
+        }
+
+        DspService::AllocResult scratch = dsp->alloc_buffers(
+            pin.owner_fd(), fb->width, fb->height, HAL_PIX_FMT_NV12, 1);
+        if (scratch.rc != DSP_SVC_OK || scratch.ids.empty()) {
+            response->set_success(false);
+            response->set_message("scratch nv12 buffer alloc failed: " +
+                                  scratch.message);
+            response->set_error_code(scratch.rc != DSP_SVC_OK ? scratch.rc
+                                                             : DSP_SVC_ERR_NO_MEM);
+            return grpc::Status::OK;
+        }
+
+        DspJobDesc conv;
+        conv.op = HAL_DSP_OP_CONVERT_FORMAT;
+        conv.src_id = request->src_buffer_id();
+        conv.dst_ids = scratch.ids;
+        DspJobResult conv_res = dsp->submit_job(conv);
+        if (conv_res.rc != DSP_SVC_OK) {
+            dsp->release_buffer(pin.owner_fd(), scratch.ids[0]);
+            response->set_success(false);
+            response->set_message("dsp convert rgb->nv12 failed: " +
+                                  conv_res.message);
+            response->set_error_code(conv_res.rc);
+            return grpc::Status::OK;
+        }
+
+        nv12_pin = dsp->pin_buffer(scratch.ids[0]);
+        /* Detach the id now — the pin keeps the HAL buffer alive to the end
+         * of this call even if the client vanishes mid-encode. */
+        dsp->release_buffer(pin.owner_fd(), scratch.ids[0]);
+        if (!nv12_pin.ok() || !nv12_pin.fb()) {
+            response->set_success(false);
+            response->set_message("converted nv12 buffer vanished");
+            response->set_error_code(DSP_SVC_ERR_NO_BUFFER);
+            return grpc::Status::OK;
+        }
+        encode_fb = nv12_pin.fb();
+    }
+
+    /* Serialize encoder-context use: JpegShotState's internals are guarded,
+     * but the jpeg_ pointer itself (lazy create + shutdown teardown) is not
+     * RPC-thread safe. One-shot snapshots simply queue behind each other. */
+    std::lock_guard<std::mutex> jpeg_lk(jpeg_mu_);
+    if (!jpeg_ || jpeg_->ops_ != codec_ops) {
+        jpeg_ = std::make_unique<JpegShotState>(codec_ops);
+    }
+
+    HAL_LOG_INFO("[CameraControl] EncodeImage: src=%lu %ux%u fmt=%d q=%u%s",
+                 (unsigned long)request->src_buffer_id(), fb->width, fb->height,
+                 static_cast<int>(fb->format), quality,
+                 encode_fb == fb ? "" : " +dsp-convert->nv12");
+
+    JpegShotState::Shot shot = jpeg_->encode(encode_fb, quality);
+    const bool ok = (shot.rc == HAL_OK);
+    response->set_success(ok);
+    response->set_message(ok ? "OK" : shot.message);
+    response->set_error_code(shot.rc);
+    response->set_elapsed_ms(shot.elapsed_ms);
+    if (ok) response->set_jpeg(shot.jpeg.data(), shot.jpeg.size());
+    return grpc::Status::OK;
+}
+
+CameraControlServiceImpl::~CameraControlServiceImpl() {
+    /* Out-of-line and placed after JpegShotState's definition: destroying
+     * jpeg_ (unique_ptr<JpegShotState>) needs the complete type. */
+    std::lock_guard<std::mutex> lk(jpeg_mu_);
+    jpeg_.reset();
+}
+
+// ---- App frame injection (PushFrame P0-P2) ------------------------------
+//
+// All handlers are metadata-only: the pixel buffer arrives over the
+// camera.sock UDS (SCM_RIGHTS, DSP_IMPORT handshake) and is referenced by
+// its DSP-registry id — no fd number crosses gRPC here. REPLACE takes an
+// NV12 dma-buf (full-frame content copy); OVERLAY additionally takes an
+// ARGB32 buffer (CPU alpha blend at dest_x/dest_y) and requires an
+// explicit stream_id target; empty stream_id keeps the P0 legacy
+// dims-matching REPLACE semantics. Accepted frames queue (cap 3,
+// drop-oldest; take_frame applies pts pacing — newest due wins) and the
+// bake site drains them via InjectionService::take_frame() ahead of each
+// encoder push (camera_daemon.cpp handle_video_frame_for_routing); the
+// pure ISP path restores at the next IDR after StopInjection/session
+// close. PushFrameStream (P2) is the client-streaming variant: same
+// per-request semantics, first rejection ends the stream, an
+// end_of_stream request closes the session, a clean half-close without
+// one keeps it.
+
+namespace {
+/* Write-lease reporting (Fix-1): mirror InjectionServiceStatus's
+ * in-flight snapshot (queued + mid-bake registry ids) into a response.
+ * Works for both PushFrameResponse and InjectionStatusResponse — the
+ * field name/number are identical by design. Old SDKs ignore the
+ * unknown field; the SDK detects the protocol via
+ * InjectionStatusResponse.reports_in_flight_buffers. */
+template <typename ResponseT>
+void fill_in_flight(const InjectionServiceStatus& st, ResponseT* response) {
+    for (uint64_t id : st.in_flight_buffer_ids)
+        response->add_in_flight_buffer_ids(id);
+}
+} // namespace
+
+grpc::Status CameraControlServiceImpl::PushFrame(
+    grpc::ServerContext* context,
+    const aipc::camera::PushFrameRequest* request,
+    aipc::camera::PushFrameResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    InjectionService* inj = daemon_->injection_service();
+    if (!inj || !inj->is_running()) {
+        response->set_success(false);
+        response->set_message("frame injection unavailable (DSP registry off?)");
+        response->set_error_code(INJ_SVC_ERR_UNAVAILABLE);
+        return grpc::Status::OK;
+    }
+
+    InjectionFrameDesc desc;
+    desc.buffer_id = request->buffer_id();
+    desc.width = request->width();
+    desc.height = request->height();
+    desc.stride = request->stride();
+    desc.mode = (request->mode() == aipc::camera::INJECT_OVERLAY)
+                    ? InjectionMode::Overlay
+                    : InjectionMode::Replace;
+    desc.pts_ns = request->pts_ns();
+    desc.dest_x = request->dest_x();
+    desc.dest_y = request->dest_y();
+    desc.stream_id = request->stream_id();
+    desc.end_of_stream = request->end_of_stream();
+    desc.session_id = request->session_id();
+
+    const InjectionPushResult res = inj->push_frame(desc);
+    response->set_success(res.rc == INJ_SVC_OK);
+    response->set_message(res.message);
+    response->set_error_code(res.rc);
+    response->set_injected_frame_id(res.frame_id);
+    response->set_session_id(request->session_id()); /* pure echo: the
+                                                      * caller's tag for
+                                                      * correlating this
+                                                      * reply, "" untagged */
+    /* Post-push lease snapshot: this frame's id is in the set (queued);
+     * ids absent since the last response are free to rewrite. */
+    fill_in_flight(inj->status(), response);
+
+    /* Per-frame RPC: log rejections only — session open/close is already
+     * INFO-logged inside InjectionService, and a per-accept INFO line would
+     * fire at stream fps. */
+    if (res.rc != INJ_SVC_OK) {
+        HAL_LOG_WARNING("[CameraControl] PushFrame rejected: %s (rc=%d)",
+                        res.message.c_str(), res.rc);
+    }
+    return grpc::Status::OK;
+}
+
+// Client-streaming variant (P2): the app pushes frames over one RPC at
+// stream fps instead of one unary call per frame. Reuses PushFrame's
+// per-request semantics exactly (same InjectionFrameDesc mapping); the
+// differences are stream-level:
+//   - first non-OK push ends the stream — every push_frame rejection is
+//     deterministic (geometry/permission/owner conflict), so retrying at
+//     fps would only repeat it; the response carries that rc+message and
+//     the accepted count;
+//   - a request with end_of_stream=true is forwarded (closes the
+//     session) and the stream returns;
+//   - a clean half-close WITHOUT end_of_stream returns normally and
+//     LEAVES the session open — the app may resume with PushFrame or a
+//     new PushFrameStream, or close via StopInjection (the session is
+//     owner-fd anchored, and both transports ride the same gRPC
+//     channel's UDS buffer imports, so the owner does not change).
+grpc::Status CameraControlServiceImpl::PushFrameStream(
+    grpc::ServerContext* context,
+    grpc::ServerReader<aipc::camera::PushFrameRequest>* reader,
+    aipc::camera::PushFrameResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    InjectionService* inj = daemon_->injection_service();
+    if (!inj || !inj->is_running()) {
+        response->set_success(false);
+        response->set_message("frame injection unavailable (DSP registry off?)");
+        response->set_error_code(INJ_SVC_ERR_UNAVAILABLE);
+        return grpc::Status::OK;
+    }
+
+    uint64_t accepted = 0;
+    std::string last_session_id; /* latest non-empty request tag, for the
+                                  * stream-level reply's echo */
+    aipc::camera::PushFrameRequest request;
+    while (reader->Read(&request)) {
+        InjectionFrameDesc desc;
+        desc.buffer_id = request.buffer_id();
+        desc.width = request.width();
+        desc.height = request.height();
+        desc.stride = request.stride();
+        desc.mode = (request.mode() == aipc::camera::INJECT_OVERLAY)
+                        ? InjectionMode::Overlay
+                        : InjectionMode::Replace;
+        desc.pts_ns = request.pts_ns();
+        desc.dest_x = request.dest_x();
+        desc.dest_y = request.dest_y();
+        desc.stream_id = request.stream_id();
+        desc.end_of_stream = request.end_of_stream();
+        desc.session_id = request.session_id();
+        if (!desc.session_id.empty()) last_session_id = desc.session_id;
+
+        const InjectionPushResult res = inj->push_frame(desc);
+        if (res.rc != INJ_SVC_OK) {
+            /* Deterministic rejection: surface it and stop draining. The
+             * session state (if any) is InjectionService's to hold — an
+             * already-open session stays open for StopInjection cleanup. */
+            HAL_LOG_WARNING("[CameraControl] PushFrameStream rejected after "
+                            "%lu frame(s): %s (rc=%d)",
+                            (unsigned long)accepted, res.message.c_str(),
+                            res.rc);
+            response->set_success(false);
+            response->set_message(res.message);
+            response->set_error_code(res.rc);
+            response->set_accepted_frame_count(accepted);
+            response->set_session_id(last_session_id);
+            fill_in_flight(inj->status(), response);
+            return grpc::Status::OK;
+        }
+        if (desc.end_of_stream) {
+            /* Session closed by request: acknowledge and finish. */
+            response->set_success(true);
+            response->set_message(res.message);
+            response->set_accepted_frame_count(accepted);
+            response->set_session_id(last_session_id);
+            fill_in_flight(inj->status(), response);
+            return grpc::Status::OK;
+        }
+        ++accepted;
+    }
+
+    /* Clean half-close without an EOS request: keep the session. */
+    response->set_success(true);
+    response->set_message("client half-close: injection session kept open");
+    response->set_accepted_frame_count(accepted);
+    response->set_session_id(last_session_id);
+    /* Final-response snapshot only: client-streaming has no per-frame
+     * acks, so a lease-aware SDK paces the generator on
+     * GetInjectionStatus polling instead (the snapshot field exists on
+     * both messages for exactly that reason). */
+    fill_in_flight(inj->status(), response);
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::GetInjectionStatus(
+    grpc::ServerContext* context,
+    const aipc::camera::Empty* request,
+    aipc::camera::InjectionStatusResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    InjectionService* inj = daemon_->injection_service();
+    if (!inj || !inj->is_running()) {
+        response->set_success(false);
+        response->set_message("frame injection unavailable (DSP registry off?)");
+        return grpc::Status::OK;
+    }
+
+    const InjectionServiceStatus st = inj->status();
+    response->set_success(true);
+    response->set_message("OK");
+    response->set_active(st.active);
+    response->set_mode(st.mode == InjectionMode::Overlay
+                           ? aipc::camera::INJECT_OVERLAY
+                           : aipc::camera::INJECT_REPLACE);
+    response->set_frames_injected(st.frames_injected);
+    response->set_frames_dropped(st.frames_dropped);
+    response->set_queue_depth(st.queue_depth);
+    response->set_session_id(st.session_id);
+    fill_in_flight(st, response);
+    /* Capability flag: this daemon speaks the write-lease protocol. A
+     * lease-aware SDK that sees false (old daemon) falls back to
+     * depth-only pacing guidance and warns once. */
+    response->set_reports_in_flight_buffers(true);
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::StopInjection(
+    grpc::ServerContext* context,
+    const aipc::camera::Empty* request,
+    aipc::camera::InjectionStatusResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    InjectionService* inj = daemon_->injection_service();
+    if (!inj || !inj->is_running()) {
+        response->set_success(false);
+        response->set_message("frame injection unavailable (DSP registry off?)");
+        return grpc::Status::OK;
+    }
+
+    HAL_LOG_INFO("[CameraControl] StopInjection: flushing inject queue");
+    inj->stop_injection();
+
+    /* Post-flush snapshot: active=false, queue_depth=0, counters retained. */
+    const InjectionServiceStatus st = inj->status();
+    response->set_success(true);
+    response->set_message("injection stopped (queue flushed)");
+    response->set_active(st.active);
+    response->set_mode(st.mode == InjectionMode::Overlay
+                           ? aipc::camera::INJECT_OVERLAY
+                           : aipc::camera::INJECT_REPLACE);
+    response->set_frames_injected(st.frames_injected);
+    response->set_frames_dropped(st.frames_dropped);
+    response->set_queue_depth(st.queue_depth);
+    response->set_session_id(st.session_id); /* "" here: close clears the
+                                              * tag with the session */
+    /* Post-flush lease snapshot: queue ids are gone; any remaining ids
+     * are mid-bake composes the daemon is still reading — the SDK must
+     * not recycle those pool slots yet. */
+    fill_in_flight(st, response);
+    response->set_reports_in_flight_buffers(true);
     return grpc::Status::OK;
 }

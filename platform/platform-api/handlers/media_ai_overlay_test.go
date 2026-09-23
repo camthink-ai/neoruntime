@@ -7,9 +7,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// aiOverlayBaseline is the full ai_overlay section including the 5 yaml-only
-// keys (event_bus_endpoint, topic_prefix, draw_landmarks, enable_face_blur,
-// stream_map) that the gRPC overlay request does NOT carry and must survive.
+// aiOverlayBaseline is the full ai_overlay section including the yaml-only
+// keys (event_bus_endpoint, topic_prefix, draw_landmarks,
+// face_blur_block_size, stream_map) that the gRPC overlay request does NOT
+// carry and must survive. enable_face_blur IS request-carried but optional:
+// it must survive when the request omits it.
 const aiOverlayBaseline = `ai_overlay:
   enabled: true
   event_bus_endpoint: "unix:///run/aipc/event-bus.sock"
@@ -18,21 +20,23 @@ const aiOverlayBaseline = `ai_overlay:
   draw_confidence: false
   draw_landmarks: true
   enable_face_blur: false
+  face_blur_block_size: 16
   box_thickness: 2
   stream_map: "third:main,sub:main"
 `
 
 // TestWriteAiOverlayConfig_TranslatesFieldsAndPreservesYamlOnlyKeys asserts the
 // proto→yaml field-name translation (show_label→draw_labels,
-// show_confidence→draw_confidence, line_thickness→box_thickness) and that the
-// five yaml-only keys are preserved by the read-modify-write.
+// show_confidence→draw_confidence, line_thickness→box_thickness), that the
+// yaml-only keys are preserved by the read-modify-write, and that an omitted
+// enable_face_blur pointer keeps the stored value.
 func TestWriteAiOverlayConfig_TranslatesFieldsAndPreservesYamlOnlyKeys(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	path := writeTempYaml(t, aiOverlayBaseline)
 	h := &MediaHandlers{configPath: path}
 
 	h.writeAiOverlayConfig(context.Background(), "bob",
-		false /*enabled*/, true /*showLabel*/, false /*showConfidence*/, 5 /*lineThickness*/)
+		false /*enabled*/, true /*showLabel*/, false /*showConfidence*/, 5 /*lineThickness*/, nil /*enableFaceBlur*/)
 
 	ov := readYamlMap(t, path)["ai_overlay"].(map[string]interface{})
 	// Translated fields.
@@ -48,14 +52,34 @@ func TestWriteAiOverlayConfig_TranslatesFieldsAndPreservesYamlOnlyKeys(t *testin
 	if ov["box_thickness"] != 5 {
 		t.Errorf("box_thickness = %v, want 5 (translated from line_thickness)", ov["box_thickness"])
 	}
+	// Omitted face-blur flag keeps the stored value.
+	if ov["enable_face_blur"] != false {
+		t.Errorf("enable_face_blur = %v, want preserved false (nil pointer)", ov["enable_face_blur"])
+	}
 	// yaml-only keys preserved.
-	for _, k := range []string{"event_bus_endpoint", "topic_prefix", "draw_landmarks", "enable_face_blur", "stream_map"} {
+	for _, k := range []string{"event_bus_endpoint", "topic_prefix", "draw_landmarks", "face_blur_block_size", "stream_map"} {
 		if _, ok := ov[k]; !ok {
 			t.Errorf("yaml-only key %q was dropped by writeback", k)
 		}
 	}
 	if ov["event_bus_endpoint"] != "unix:///run/aipc/event-bus.sock" {
 		t.Errorf("event_bus_endpoint = %v, want preserved value", ov["event_bus_endpoint"])
+	}
+}
+
+// TestWriteAiOverlayConfig_WritesFaceBlurWhenCarried asserts a request-carried
+// enable_face_blur is persisted (API-managed key, not just preserved).
+func TestWriteAiOverlayConfig_WritesFaceBlurWhenCarried(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	path := writeTempYaml(t, aiOverlayBaseline)
+	h := &MediaHandlers{configPath: path}
+
+	faceBlur := true
+	h.writeAiOverlayConfig(context.Background(), "", true, true, true, 2, &faceBlur)
+
+	ov := readYamlMap(t, path)["ai_overlay"].(map[string]interface{})
+	if ov["enable_face_blur"] != true {
+		t.Errorf("enable_face_blur = %v, want true (written from request)", ov["enable_face_blur"])
 	}
 }
 
@@ -68,7 +92,7 @@ func TestWriteAiOverlayConfig_CreatesSectionIfMissing(t *testing.T) {
 `)
 	h := &MediaHandlers{configPath: path}
 
-	h.writeAiOverlayConfig(context.Background(), "", true, true, true, 3)
+	h.writeAiOverlayConfig(context.Background(), "", true, true, true, 3, nil)
 
 	ov, ok := readYamlMap(t, path)["ai_overlay"].(map[string]interface{})
 	if !ok {
@@ -76,5 +100,8 @@ func TestWriteAiOverlayConfig_CreatesSectionIfMissing(t *testing.T) {
 	}
 	if ov["enabled"] != true || ov["draw_labels"] != true || ov["box_thickness"] != 3 {
 		t.Fatalf("created ai_overlay fields wrong: %+v", ov)
+	}
+	if _, ok := ov["enable_face_blur"]; ok {
+		t.Errorf("omitted enable_face_blur should not create the key: %+v", ov)
 	}
 }

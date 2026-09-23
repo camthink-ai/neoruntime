@@ -28,10 +28,11 @@ struct LightSensorConfig
 {
     bool enabled = true;
     bool auto_on_boot = false;       /* start in auto mode on boot */
-    int night_enter = 28;           /* light_percent <= night_enter => Night */
-    int day_enter = 82;             /* light_percent >= day_enter   => Day   */
+    int night_enter = 25;           /* light_percent <= night_enter => Night (25% ≈ 11.68 lux, bench) */
+    int day_enter = 80;             /* light_percent >= day_enter   => Day   (80% ≈ 25.36 lux, bench) */
     int sample_interval_ms = 500;   /* sampling cadence of the auto monitor */
     int stable_samples = 3;         /* consecutive qualifying reads before a switch */
+    int min_hold_ms = 15000;        /* anti-flap dwell: no new switch within this window after an applied one */
     int dark_mv = 4;                /* measured dark-environment endpoint (calibration) */
     int bright_mv = 1909;           /* measured bright-environment endpoint (calibration) */
 };
@@ -51,7 +52,8 @@ enum class LightSwitchDecision
     None,         /* nothing to do */
     ToDay,        /* confirmed transition to day */
     ToNight,      /* confirmed transition to night */
-    DeferPending  /* confirmed but a lens/AF op is in progress; saved as pending */
+    DeferPending, /* confirmed but a lens/AF op is in progress; saved as pending */
+    Held          /* confirmed but suppressed by the min_hold_ms anti-flap dwell */
 };
 
 /** Persistent policy scratch updated by evaluate(). */
@@ -62,6 +64,7 @@ struct DayNightPolicyState
     LightMode accum_target = LightMode::Day;    /* target currently being accumulated */
     bool has_pending = false;                   /* confirmed switch deferred due to lens/AF op */
     LightMode pending_target = LightMode::Day;
+    uint64_t last_switch_ms = 0;                /* steady-clock ms of the last APPLIED switch; 0 = none yet */
     LightSample last;
 };
 
@@ -86,8 +89,18 @@ const char *light_mode_name(LightMode mode);
  * pending (DeferPending) instead of applied, so it does not interrupt a
  * lens/AF operation.
  *
- * On a ToDay/ToNight return the policy's `mode` has already been updated and
- * `stable_count` reset; the caller performs the hardware side-effects.
+ * Anti-flap dwell: a confirmed switch is suppressed (Held, state unchanged,
+ * accumulation kept) while now_ms is within min_hold_ms of the last APPLIED
+ * switch, so light hovering across a threshold — or the IR-LED feedback it
+ * triggers — cannot chatter the optical state. It fires on the next tick
+ * after the dwell expires (still light-confirmed). Pass now_ms as
+ * steady-clock milliseconds since epoch; the default 0 disables the dwell
+ * for tests/legacy callers.
+ *
+ * On a ToDay/ToNight return the policy's `mode` has already been updated,
+ * `stable_count` reset and `last_switch_ms` armed; the caller performs the
+ * hardware side-effects.
  */
 LightSwitchDecision evaluate(DayNightPolicyState &policy, const LightSample &sample,
-                             const LightSensorConfig &config, bool lens_op_active);
+                             const LightSensorConfig &config, bool lens_op_active,
+                             uint64_t now_ms = 0);

@@ -50,6 +50,14 @@ struct AutofocusConfig {
     std::string calibration_path;
     float startup_zoom_ratio = 1.0f;
     float startup_focus_distance_m = 3.0f;
+    // Lens-position persistence: when set, the startup seed replays these
+    // archived motor positions verbatim instead of deriving targets from
+    // startup_zoom_ratio/startup_focus_distance_m (the archived focus already
+    // contains the calibration delta the last scan settled on). FG2009 never
+    // runs the startup job (its boot restore lives in CameraDaemon).
+    bool startup_seed_from_archive = false;
+    int32_t startup_seed_zoom_pos = 0;
+    int32_t startup_seed_focus_pos = 0;
     int startup_wait_frames = 15;
     int startup_recovery_span = 320;
     int startup_ready_timeout_ms = 120000;

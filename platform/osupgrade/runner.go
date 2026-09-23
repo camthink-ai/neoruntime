@@ -512,6 +512,27 @@ func (r *Runner) Reboot() error {
 	return exec.Command("reboot").Run()
 }
 
+// NeedsVerification reports whether the active OS-upgrade job needs the
+// post-boot verifier.  The active-job pointer intentionally survives after a
+// job reaches a terminal state, so checking for the pointer's existence alone
+// is not sufficient to decide whether a boot should start the AIPC runtime.
+func (r *Runner) NeedsVerification() (bool, error) {
+	job, err := r.Store.Active()
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	switch job.State {
+	case StateInstalled, StateAwaitingReboot, StateRebooting, StateVerifying, StateRollback:
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
 func (r *Runner) Verify() error {
 	lock, acquired, err := r.tryLockOperation()
 	if err != nil {

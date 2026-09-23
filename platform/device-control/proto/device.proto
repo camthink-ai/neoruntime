@@ -178,6 +178,7 @@ message LensStatusResponse {
   string lens_model = 11;   // "af0832" | "fg2009" (empty on old camera-daemon)
   float zoom_ratio = 12;    // current optical ratio (fg2009 position model)
   ZoomRatioRange zoom_ratio_range = 13;
+  bool fixed_lens = 14;     // image probe says no motors: UIs hide lens controls
 }
 
 // Optical zoom ratio bounds for the factory-fitted lens

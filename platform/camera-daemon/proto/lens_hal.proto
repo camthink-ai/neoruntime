@@ -22,6 +22,9 @@ message LensState {
   bool   focus_rz_done = 5;
   int32  zoom_pos     = 6;
   int32  focus_pos    = 7;
+  // Image probe determined this lens has no motors (fixed lens): all motion
+  // RPCs are gated with HAL_ERR_NOT_SUPPORTED. UIs hide motor controls.
+  bool   fixed_lens   = 8;
 }
 
 message LensLimit {

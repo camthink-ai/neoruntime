@@ -173,6 +173,36 @@ GPIO numbers are HAL-global indices (NE503 device tree / mapping). This is separ
 
 ---
 
+## Factory EEPROM (`hal_factory`)
+
+Accesses the factory identity block (AT24C02, CTFB v1 A/B layout) through the
+HAL factory component — the same on-disk format as the platform
+`factory-eeprom.sh` tool. `factory_init` opens the storage (Linux at24 sysfs
+backend by default, `/sys/bus/i2c/devices/1-0050/eeprom`); `factory_deinit`
+closes it. The CLI uses the default backend; other backends (HailoRT I2C,
+custom) are selectable via the `HalFactoryConfig` passed to `init` in library
+callers.
+
+Typical flow: `factory_init` → `factory_info` / `factory_get` →
+`factory_set` → `factory_deinit`.
+
+| Command | Arguments | Description |
+|---------|-----------|-------------|
+| `factory_init` | (none) | Open factory storage. |
+| `factory_deinit` | (none) | Close factory storage. |
+| `factory_ver` | (none) | Print the factory HAL version string. |
+| `factory_info` | (none) | Read the active slot: `valid`, `active_slot` (A/B), `seq`, then SN / MAC / PN / BATCH / HWREV. |
+| `factory_get` | `<SN\|MAC\|PN\|BATCH\|HWREV>` | Read a single field from the active slot. |
+| `factory_set` | `<SN\|MAC\|PN\|BATCH\|HWREV> <value>` | Write one field (writes the inactive slot, seq+1, CRC re-signed, read-back verified). MAC format `aa:bb:cc:dd:ee:ff`. |
+| `factory_erase` | (none) | **DESTRUCTIVE** — erase the whole 256-byte image to `0xFF`. |
+
+**Field aliases** accepted by `factory_get` / `factory_set`: `sn`/`serial` → SN,
+`mac` → MAC, `pn`/`part` → PN, `batch` → BATCH, `hwrev` → HWREV.
+
+> `factory_erase` is irreversible and intended for factory re-programming only.
+
+---
+
 ## Other
 
 | Command | Description |

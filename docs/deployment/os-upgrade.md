@@ -61,7 +61,10 @@ runtime and loader configuration always come from the new OS image.
 - `aipc-os-updater.service` writes only the inactive A/B copy. A failed
   `swupdate` never changes the selected boot copy.
 - `aipc-os-reboot.service` records the rebooting state before reboot.
-- `aipc-os-verify.service` checks the selected copy, OS version, restore
+- `aipc-os-verify.service` first runs `aipc-os-updater needs-verify`. Ordinary
+  boots and stale terminal jobs skip without pulling in any runtime service;
+  a pending post-boot verify/rollback job explicitly restarts
+  `aipc-autostart`, then checks the selected copy, OS version, restore
   completion, and service health for 60 seconds. A failure selects the
   previous copy and reboots. Application compatibility is advisory here —
   an incompatible app yields terminal `success` with

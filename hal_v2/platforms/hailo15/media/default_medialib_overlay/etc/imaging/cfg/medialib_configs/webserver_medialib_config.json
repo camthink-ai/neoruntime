@@ -2,7 +2,7 @@
   "version": "2.0.0",
   "metadata": {
     "architecture": "hailo15h",
-    "content_hash": "997c946efe888edd09100e20cb429a4a5e3c12e456f965291877dda4fa7fe19d",
+    "content_hash": "992b06e663fabc3e8a91e74e3c804db52b6634fd0c310cf1a0e2be7b26664152",
     "description": "",
     "generation_timestamp": "2026-05-18T06:03:51.089256+00:00"
   },
@@ -31,7 +31,11 @@
     },
     {
       "name": "Infrared_Basic",
-      "config_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/gst_example_IR/gst_example_IR_profile.json"
+      "config_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/AF_IR_profile.json"
+    },
+    {
+      "config_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/gst_example_IR/gst_example_IR_profile.json",
+      "name": "Infrared_Basic_FG2009"
     }
   ]
 }

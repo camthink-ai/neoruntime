@@ -102,6 +102,7 @@ export const useUpdateAiOverlay = () => useMutation({
       show_label?: boolean;
       show_confidence?: boolean;
       line_thickness?: number;
+      enable_face_blur?: boolean;
     }) => updateAiOverlay(data),
     onSuccess: () => {
       toast.success('AI 叠加配置已生效');

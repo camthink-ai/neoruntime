@@ -1,4 +1,12 @@
-import { useMemo, useRef, useState, useEffect } from 'react';
+import {
+  Suspense,
+  lazy,
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+  useEffect,
+} from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -11,39 +19,19 @@ import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Checkbox } from '@/components/ui/checkbox';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { Progress } from '@/components/ui/progress';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import {
   Globe,
   UploadCloud,
   CheckCircle2,
-  Check,
   ArrowRight,
   ArrowLeft,
-  Package,
-  Settings,
-  Shield,
-  Eye,
-  Wrench,
-  X,
-  Plus,
   Loader2,
   AlertCircle,
-  FileText,
 } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { aiApi, streamsApi, appsApi, filesApi } from '@/services/api';
+import { aiApi, streamsApi, appsApi } from '@/services/api';
 import { useWizardInstall, useInstallProgress } from '@/hooks';
-import FileUpload from '@/components/file-upload';
-import ImageUpload from './ImageUpload';
 import type { WizardConfig } from '@/services/types';
 import {
   translateInstallError,
@@ -53,87 +41,38 @@ import {
   translateInstallProgress,
   translateInstallPhase,
 } from '../lib/installProgressMessage';
+import {
+  manifestToWizardConfig,
+  changedPatchFields,
+  isDirty,
+} from '../lib/manifestHydrate';
+import { resolveYamlViewMode, wizardConfigToYaml } from '../lib/wizardYaml';
+import {
+  resolveLocalMode,
+  isValidContainerImageRef,
+  collectInstallErrors,
+  type ImportSectionId,
+} from '../lib/importFlow';
+import BasicInfoSection from './import/BasicInfoSection';
+import ResourcesSection from './import/ResourcesSection';
+import ModelsSection from './import/ModelsSection';
+import PermissionsSection from './import/PermissionsSection';
+import AdvancedSection from './import/AdvancedSection';
+import SourceLocalForm, { type LocalUpload } from './import/SourceLocalForm';
+import SectionNav from './import/SectionNav';
+import EditViewSwitch, { type EditView } from './import/EditViewSwitch';
+import {
+  useManifestYaml,
+  type ManifestUploadResult,
+} from './import/useManifestYaml';
+
+// Monaco is heavy and CDN-loaded — keep it out of the dialog's critical
+// chunk; it only loads the first time the YAML view is opened.
+const YamlEditorPane = lazy(() => import('./import/YamlEditorPane'));
 
 export interface ImportAppDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-}
-
-const MEMORY_OPTIONS = ['128Mi', '256Mi', '512Mi', '1Gi', '2Gi'];
-
-/** backing 仍为 `N%`，输入框仅展示数字 0–100 */
-function cpuPercentToInputValue(cpu: string | undefined): string {
-  if (!cpu?.trim()) return '';
-  const t = cpu.trim();
-  const m = t.match(/^(\d{1,3})\s*%$/);
-  if (m) {
-    const n = Math.min(100, Math.max(0, parseInt(m[1], 10)));
-    return String(n);
-  }
-  const plain = t.match(/^(\d{1,3})$/);
-  if (plain) {
-    const n = Math.min(100, Math.max(0, parseInt(plain[1], 10)));
-    return String(n);
-  }
-  return '';
-}
-
-function inputDigitsToCpuPercent(raw: string): string {
-  const digits = raw.replace(/\D/g, '');
-  if (digits === '') return '0%';
-  let n = parseInt(digits, 10);
-  if (Number.isNaN(n) || n < 0) n = 0;
-  if (n > 100) n = 100;
-  return `${n}%`;
-}
-
-/**
- * 容器镜像地址（Docker/OCI 风格）的表单校验：registry/仓库名[:tag] 或 @sha256:… digest
- */
-function isValidContainerImageRef(ref: string): boolean {
-  const s = ref.trim();
-  if (s.length < 1 || s.length > 1024) return false;
-  if (/\s/.test(s) || s.includes('://')) return false;
-  if (s.startsWith('/') || s.endsWith('/') || s.includes('..')) return false;
-
-  let remainder = s;
-  if (remainder.includes('@')) {
-    const at = remainder.lastIndexOf('@');
-    const name = remainder.slice(0, at);
-    const digest = remainder.slice(at + 1);
-    if (!name || !/^sha256:[a-f0-9]{64}$/i.test(digest)) return false;
-    remainder = name;
-  }
-
-  const parts = remainder.split('/');
-  if (parts.some(p => !p)) return false;
-
-  const segment = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
-  const lastSegment = /^[a-zA-Z0-9][a-zA-Z0-9._-]*(?::[a-zA-Z0-9._-]{1,128})?$/;
-
-  const isHostPort = (p: string): boolean => {
-    const m = p.match(/^(.+):(\d{1,5})$/);
-    if (!m) return false;
-    const port = Number(m[2]);
-    if (!Number.isFinite(port) || port < 1 || port > 65535) return false;
-    const host = m[1];
-    return (
-      /^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/.test(host)
-      || /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
-    );
-  };
-
-  for (let i = 0; i < parts.length; i++) {
-    const p = parts[i];
-    const isLast = i === parts.length - 1;
-    if (isLast) {
-      if (!lastSegment.test(p)) return false;
-    } else if (i === 0 && isHostPort(p)) {
-      continue;
-    } else if (!segment.test(p)) return false;
-  }
-
-  return true;
 }
 
 const defaultConfig: WizardConfig = {
@@ -159,6 +98,21 @@ const defaultConfig: WizardConfig = {
   restart_policy: 'on-failure',
 };
 
+/** Two frames — enough for a view-switch setState to reach the DOM before
+ * scroll math runs in the same async handler. */
+const nextPaint = () => new Promise<void>(resolve => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
+
+/**
+ * Import dialog shell: a source screen (镜像仓库 / 本地上传) followed by a
+ * single-page form with a left anchor nav. The local source merges the old
+ * upload (tar only → form generates the manifest) and package (app.yaml is
+ * the source of truth, edits PATCH back) flows — which one applies is
+ * derived from what was uploaded, never chosen by the user.
+ */
 export default function ImportAppDialog({
   open,
   onOpenChange,
@@ -166,18 +120,20 @@ export default function ImportAppDialog({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const [step, setStep] = useState(0);
-  const [sourceType, setSourceType] = useState<
-    'registry' | 'upload' | 'package'
-  >('registry');
+
+  // The old 6-step stepper collapses into three screens.
+  const [page, setPage] = useState<'source' | 'form' | 'progress'>('source');
+  // Local upload is the default: on-device installs are usually offline
+  // (.neoapp package / image tar); registry pulls need network access.
+  const [sourceType, setSourceType] = useState<'registry' | 'local'>('local');
   const [config, setConfig] = useState<WizardConfig>({ ...defaultConfig });
-  const [isUploadingImage, setIsUploadingImage] = useState(false);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [imageAddressError, setImageAddressError] = useState<string | null>(
     null
   );
 
-  // Package mode state
+  // Local source state: one yaml slot + one unified tar slot (the old
+  // packageImagePath / uploadedImageRef dual track is gone).
   const [manifestPath, setManifestPath] = useState('');
   const [manifestMeta, setManifestMeta] = useState<{
     id: string;
@@ -185,72 +141,163 @@ export default function ImportAppDialog({
     version: string;
     description: string;
   } | null>(null);
-  const [packageImagePath, setPackageImagePath] = useState('');
-  const [packageImageName, setPackageImageName] = useState('');
-  const [isUploadingManifest, setIsUploadingManifest] = useState(false);
+  const [imageTarPath, setImageTarPath] = useState('');
+  const [imageTarName, setImageTarName] = useState('');
+  // The single upload slot: a .neoapp package (server unpacks it into the two
+  // slots above) or a bare image tar. Drives the slot UI + upload progress.
+  const [localUpload, setLocalUpload] = useState<LocalUpload | null>(null);
+  const [isUploadingLocal, setIsUploadingLocal] = useState(false);
+  const [localProgress, setLocalProgress] = useState(0);
+  // the uploaded manifest is multi-container (spec.containers) — the wizard
+  // cannot express it, so edits are never written back.
+  const [isMultiContainer, setIsMultiContainer] = useState(false);
+
+  const [activeSection, setActiveSection] =    useState<ImportSectionId>('basic_info');
+
+  // Form/YAML dual view on the form screen. Leaving the YAML view always
+  // flushes pending text (re-upload) first — so yamlDirty can only ever be
+  // true while ON the yaml view.
+  const [editView, setEditView] = useState<EditView>('form');
+  // Mount the (lazy) YAML pane on first visit and keep it alive so Monaco's
+  // undo history survives view toggles; visibility is a class toggle.
+  const [yamlMounted, setYamlMounted] = useState(false);
 
   const cancelRequestedRef = useRef(false);
-  const uploadedImageRef = useRef({ path: '', name: '', size: 0 });
+  // snapshot of the config hydrated from the uploaded manifest; dirty
+  // checks and the PATCH body diff against it.
+  const hydratedConfigRef = useRef<WizardConfig | null>(null);
+  // Snapshot written synchronously by each YAML flush — lets the install
+  // handler branch on post-flush truth instead of awaiting re-renders.
+  const lastFlushedRef = useRef<{
+    path: string;
+    config: WizardConfig;
+    hydrated: WizardConfig;
+    multiContainer: boolean;
+  } | null>(null);
 
-  const isStep0SourceReady =    sourceType === 'registry'
-      ? !!config.image.trim() && isValidContainerImageRef(config.image)
-      : sourceType === 'package'
-        ? !!manifestPath
-        : !!(config.image_path || uploadedImageRef.current.path);
+  const hasManifest = !!manifestPath;
+  const localMode = resolveLocalMode({ manifestPath, imageTarPath });
+  const isIdReadOnly = sourceType === 'local' && hasManifest;
 
-  const steps = [
-    {
-      title: t('sys.apps.import.source'),
-      icon: Package,
-      validate: () => isStep0SourceReady,
-    },
-    {
-      title: t('sys.apps.import.basic_info'),
-      icon: Settings,
-      validate: () => !!config.metadata.id.trim() && !!config.metadata.name.trim(),
-    },
-    {
-      title: t('sys.apps.import.resources'),
-      icon: Settings,
-      validate: () => true,
-    },
-    {
-      title: t('sys.apps.import.permissions'),
-      icon: Shield,
-      validate: () => true,
-    },
-    {
-      title: t('sys.apps.import.advanced', 'Advanced Config'),
-      icon: Wrench,
-      validate: () => true,
-    },
-    { title: t('sys.apps.import.review'), icon: Eye, validate: () => true },
-  ];
+  const isSourceReady =    sourceType === 'registry'
+      ? isValidContainerImageRef(config.image)
+      : !!(manifestPath || imageTarPath);
 
   const installMutation = useWizardInstall();
   const { data: progress } = useInstallProgress(taskId);
 
+  // ---- YAML view state (text-side; flush = re-upload via the server) ----
+
+  // Stable: setState-only + refs, so flushYaml's onApplied never goes stale.
+  const applyManifestResponse = useCallback(
+    (data: ManifestUploadResult, ctx: { source: 'upload' | 'flush' }) => {
+      if (!data?.path) return;
+      setManifestPath(data.path);
+      setManifestMeta(
+        data.metadata
+          ? {
+              id: data.metadata.id,
+              name: data.metadata.name ?? '',
+              version: data.metadata.version ?? '',
+              description: data.metadata.description ?? '',
+            }
+          : null
+      );
+      if (!data.manifest) {
+        hydratedConfigRef.current = null;
+        setIsMultiContainer(false);
+        return;
+      }
+      // With live sync the flushed text already carries the form state, so
+      // flush and upload are the same operation: replace the form outright.
+      // config and the dirty-check snapshot are independent mappings.
+      const next = manifestToWizardConfig(data.manifest);
+      const formState = manifestToWizardConfig(data.manifest);
+      lastFlushedRef.current =        ctx.source === 'flush'
+          ? {
+              path: data.path,
+              config: formState,
+              hydrated: next,
+              multiContainer: !!data.multi_container,
+            }
+          : null;
+      setConfig(formState);
+      hydratedConfigRef.current = next;
+      setIsMultiContainer(!!data.multi_container);
+    },
+    []
+  );
+
+  // Live YAML → form hydration: the edited text parsed cleanly and maps onto
+  // this config. It becomes BOTH the form state and the dirty-check snapshot,
+  // so text-side edits stay text-dirty (yamlDirty) instead of form-dirty and
+  // install via the view-leave flush.
+  const handleLiveParse = useCallback((next: WizardConfig) => {
+    setConfig(next);
+    hydratedConfigRef.current = next;
+  }, []);
+
+  const yaml = useManifestYaml({
+    onApplied: applyManifestResponse,
+    onLiveParse: handleLiveParse,
+  });
+
+  // Form → text projection: every config change is AST-written onto the
+  // editor text. The hook no-ops it while the editor is focused, while
+  // flushing, or when the text does not parse (the user's text wins).
+  useEffect(() => {
+    yaml.applyConfig(config);
+  }, [config, yaml.applyConfig]);
+
+  // dirty tracking against the uploaded file: how many whitelisted fields
+  // diverge. 0 → install the original bytes untouched.
+  const editedFieldCount =    sourceType === 'local' && hasManifest
+      ? Object.keys(changedPatchFields(config, hydratedConfigRef.current))
+          .length
+      : 0;
+  const manifestDirty =    sourceType === 'local'
+    && hasManifest
+    && isDirty(config, hydratedConfigRef.current);
+
+  const yamlViewMode = resolveYamlViewMode({ sourceType, hasManifest });
+  const previewYaml = useMemo(
+    () => (yamlViewMode === 'preview' ? wizardConfigToYaml(config) : ''),
+    [yamlViewMode, config]
+  );
+
   const cleanupPaths = useMemo(() => {
-    const paths = [manifestPath, packageImagePath, config.image_path].filter(
-      Boolean
-    ) as string[];
+    const paths = [
+      manifestPath,
+      imageTarPath,
+      ...yaml.uploadedPathsRef.current,
+    ].filter(Boolean) as string[];
     return Array.from(new Set(paths));
-  }, [manifestPath, packageImagePath, config.image_path]);
+    // uploadedPathsRef content is read at recompute time; every flush also
+    // changes manifestPath, so the deps cover ref mutations.
+  }, [manifestPath, imageTarPath]);
 
   const resetWizardState = () => {
-    setStep(0);
-    setSourceType('registry');
+    setPage('source');
+    setSourceType('local');
     setConfig({ ...defaultConfig });
-    setIsUploadingImage(false);
     setTaskId(null);
     setImageAddressError(null);
-    uploadedImageRef.current = { path: '', name: '', size: 0 };
 
     setManifestPath('');
     setManifestMeta(null);
-    setPackageImagePath('');
-    setPackageImageName('');
-    setIsUploadingManifest(false);
+    setImageTarPath('');
+    setImageTarName('');
+    setLocalUpload(null);
+    setIsUploadingLocal(false);
+    setLocalProgress(0);
+    setIsMultiContainer(false);
+    hydratedConfigRef.current = null;
+    setActiveSection('basic_info');
+
+    setEditView('form');
+    setYamlMounted(false);
+    lastFlushedRef.current = null;
+    yaml.reset();
 
     installMutation.reset();
   };
@@ -259,9 +306,9 @@ export default function ImportAppDialog({
     const uniq = Array.from(new Set(paths.filter(Boolean)));
     if (uniq.length === 0) return;
     try {
-      await filesApi.batchDelete(uniq);
+      await appsApi.abandonStaging(uniq);
     } catch {
-      // best-effort cleanup
+      // best-effort cleanup; TTL cleanup handles process/browser loss
     }
   };
 
@@ -269,10 +316,13 @@ export default function ImportAppDialog({
     cancelRequestedRef.current = true;
 
     // Stop async polling immediately (best effort; backend task may still run)
+    const hadTask = !!taskId;
     setTaskId(null);
 
-    // Cleanup uploaded artifacts (best effort)
-    cleanupUploadedFiles(cleanupPaths);
+    // An install task was started — its manifest/image files may still be
+    // consumed server-side; deleting them here would break the install.
+    // (Closing while a task runs is the same as 后台运行: it keeps the files.)
+    if (!hadTask) cleanupUploadedFiles(cleanupPaths);
 
     // Reset local wizard state and close
     resetWizardState();
@@ -282,18 +332,44 @@ export default function ImportAppDialog({
     navigate('/apps');
   };
 
+  /** Progress-page exit: stop polling and close — the install task keeps
+   * running server-side, so the uploaded files stay in place. */
+  const handleRunInBackground = () => {
+    setTaskId(null);
+    resetWizardState();
+    onOpenChange(false);
+    // The list page's cached rows predate the install; refresh them.
+    queryClient.invalidateQueries({ queryKey: ['apps'] });
+    queryClient.invalidateQueries({ queryKey: ['store', 'apps'] });
+    navigate('/apps');
+  };
+
   // Fetch existing apps for duplicate check
   const { data: existingAppsData } = useQuery({
     queryKey: ['apps'],
-    queryFn: () => appsApi.list().then(res => res.data || {}),
+    queryFn: () => appsApi.list().then(res => res.data || []),
     enabled: open,
   });
+  const existingApps = Array.isArray(existingAppsData)
+    ? existingAppsData
+    : existingAppsData?.apps || [];
   const existingAppIds: Set<string> = new Set(
-    (existingAppsData?.apps || []).map((a: any) => a.id || a.app_id)
+    existingApps.map((a: any) => a.id || a.app_id)
   );
 
+  const confirmForceInstall = (appId: string): boolean => {
+    if (!existingAppIds.has(appId)) return false;
+    return window.confirm(
+      t(
+        'sys.apps.import.duplicate_confirm',
+        `App ID "${appId}" already exists. Replace the installed app?`,
+        { appId }
+      )
+    );
+  };
+
   // Fetch available models
-  const { data: modelsData } = useQuery({
+  const { data: modelsData, isSuccess: modelsLoaded } = useQuery({
     queryKey: ['models'],
     queryFn: () => aiApi.list().then(res => res.data || {}),
     enabled: open,
@@ -323,65 +399,395 @@ export default function ImportAppDialog({
       return;
     }
 
-    setStep(0);
-    setSourceType('registry');
+    setPage('source');
+    setSourceType('local');
     setConfig({ ...defaultConfig });
     setTaskId(null);
     setImageAddressError(null);
-    uploadedImageRef.current = { path: '', name: '', size: 0 };
     setManifestPath('');
     setManifestMeta(null);
-    setPackageImagePath('');
-    setPackageImageName('');
-    setIsUploadingManifest(false);
+    setImageTarPath('');
+    setImageTarName('');
+    setLocalUpload(null);
+    setIsUploadingLocal(false);
+    setLocalProgress(0);
+    setIsMultiContainer(false);
+    hydratedConfigRef.current = null;
+    setActiveSection('basic_info');
+    setEditView('form');
+    setYamlMounted(false);
+    lastFlushedRef.current = null;
+    yaml.reset();
     installMutation.reset();
-  }, [open]);
+  }, [open, yaml.reset]);
 
-  const toggleModel = (modelId: string) => {
-    const current = config.permissions?.inference?.models || [];
-    const updated = current.includes(modelId)
-      ? current.filter(m => m !== modelId)
-      : [...current, modelId];
-    setConfig({
-      ...config,
-      permissions: {
-        ...config.permissions!,
-        inference: { ...config.permissions!.inference!, models: updated },
-      },
-    });
+  // ---- Local source handlers (upload side effects stay in the shell) ----
+
+  /** Wipe the manifest-derived wizard state (both slots keep their upload
+   * paths — cleanup is the caller's job). */
+  const clearManifestState = () => {
+    setManifestPath('');
+    setManifestMeta(null);
+    hydratedConfigRef.current = null;
+    setIsMultiContainer(false);
+    lastFlushedRef.current = null;
+    setEditView('form');
+    yaml.reset();
   };
 
-  const handleInstall = () => {
-    if (sourceType === 'package') {
-      // Package mode: use install-package endpoint
+  // ---- single local slot: .neoapp package (server-side unpack fills both
+  // slots) vs bare image tar (the form below generates the manifest) ----
+
+  const handlePackageUpload = async (file: File) => {
+    setIsUploadingLocal(true);
+    setLocalProgress(0);
+    try {
+      const res = await appsApi.uploadPackage(file, p => setLocalProgress(p));
+      const data = res?.data;
+      if (data?.path && data?.image_path) {
+        if (cancelRequestedRef.current) {
+          cleanupUploadedFiles([data.path, data.image_path]);
+          return;
+        }
+        // The package brings both halves — drop a previously uploaded image
+        // tar (manifest versions are tracked by uploadedPathsRef instead).
+        if (imageTarPath) cleanupUploadedFiles([imageTarPath]);
+        yaml.recordPath(data.path);
+        applyManifestResponse(data, { source: 'upload' });
+        // The original yaml text rides along in the response; feeding it
+        // through the File path keeps the YAML editor baseline byte-exact
+        // (comments, key order, unknown fields).
+        yaml.attachUpload(
+          new File([data.manifest_yaml ?? ''], 'app.yaml', {
+            type: 'application/x-yaml',
+          })
+        );
+        setImageTarPath(data.image_path);
+        setImageTarName(data.image || file.name);
+        setLocalUpload({
+          kind: 'package',
+          fileName: data.filename || file.name,
+          size: data.size,
+        });
+      }
+    } catch (err: unknown) {
+      toast.error(
+        resolveInstallApiError(err, t)
+          || t('sys.apps.import.package_upload_failed', 'Package upload failed')
+      );
+    } finally {
+      setIsUploadingLocal(false);
+      setLocalProgress(0);
+    }
+  };
+
+  const handleImageUpload = async (file: File) => {
+    setIsUploadingLocal(true);
+    setLocalProgress(0);
+    try {
+      const res = await appsApi.uploadImage(file, p => setLocalProgress(p));
+      const data = res?.data;
+      if (!data?.path) {
+        throw new Error(
+          t('sys.apps.import.upload_no_path', '上传成功但未返回文件路径')
+        );
+      }
+      if (cancelRequestedRef.current) {
+        cleanupUploadedFiles([data.path]);
+        return;
+      }
+      // A bare tar only fills the image half; the manifest comes from the
+      // form (or a later .neoapp upload, which replaces this state outright).
+      setImageTarPath(data.path);
+      setImageTarName(data.image || data.filename || file.name);
+      setLocalUpload({
+        kind: 'image',
+        fileName: data.filename || file.name,
+        size: data.size ?? file.size,
+      });
+    } catch (err: unknown) {
+      toast.error(
+        resolveInstallApiError(err, t)
+          || t('sys.apps.import.image_upload_failed', '镜像上传失败')
+      );
+    } finally {
+      setIsUploadingLocal(false);
+      setLocalProgress(0);
+    }
+  };
+
+  /** Extension routing for the single slot: .neoapp → package unpack,
+   * tar-ish → image only, anything else is rejected outright. */
+  const handleLocalUpload = (file: File) => {
+    const name = file.name.toLowerCase();
+    if (name.endsWith('.neoapp')) return handlePackageUpload(file);
+    if (
+      name.endsWith('.tar')
+      || name.endsWith('.tar.gz')
+      || name.endsWith('.tgz')
+    ) {
+      return handleImageUpload(file);
+    }
+    return toast.error(
+      t(
+        'sys.apps.import.invalid_local_file',
+        '仅支持 .neoapp 应用包或 .tar / .tar.gz / .tgz 镜像'
+      )
+    );
+  };
+
+  /** Clearing the slot: a package clears both halves it unpacked into
+   * (all or nothing); a bare image only clears the image half. */
+  const handleLocalClear = () => {
+    if (localUpload?.kind === 'package') {
+      cleanupUploadedFiles([manifestPath, imageTarPath]);
+      clearManifestState();
+      setImageTarPath('');
+      setImageTarName('');
+    } else {
+      if (imageTarPath) cleanupUploadedFiles([imageTarPath]);
+      setImageTarPath('');
+      setImageTarName('');
+    }
+    setLocalUpload(null);
+  };
+
+  // ---- Navigation ----
+
+  const handleActiveChange = useCallback((id: string) => {
+    setActiveSection(id as ImportSectionId);
+  }, []);
+
+  // Pagination: jumping to a page is a plain state switch — the pane
+  // renders one section at a time and never scrolls between them.
+  const scrollToSection = (id: ImportSectionId) => {
+    setActiveSection(id);
+  };
+
+  // ---- Form/YAML dual view ----
+
+  /**
+   * Flush pending YAML text and return to the form view. Returns false (and
+   * stays on the YAML view) when the server rejects the text; on success the
+   * returned snapshot mirrors what was just applied — async callers must not
+   * trust the `manifestPath`/`config` closure values past this point.
+   */
+  const leaveYamlView = async (): Promise<
+    { ok: false } | { ok: true; flushed?: boolean }
+  > => {
+    if (editView !== 'yaml') return { ok: true };
+    const res = await yaml.flushYaml();
+    if (!res.ok) return { ok: false };
+    setEditView('form');
+    const flushed = !!res.path;
+    if (flushed) await nextPaint();
+    return { ok: true, flushed };
+  };
+
+  const handleViewChange = async (next: EditView) => {
+    if (next === editView) return;
+    if (next === 'yaml') {
+      setYamlMounted(true);
+      setEditView('yaml');
+      return;
+    }
+    await leaveYamlView();
+  };
+
+  /** Anchor click while in the YAML view: flush first, scroll only on
+   * success (a rejected file keeps the user editing the YAML). */
+  const handleBeforeNavigate = async () => {
+    const res = await leaveYamlView();
+    return res.ok;
+  };
+
+  const handleContinue = () => {
+    if (sourceType === 'registry') {
+      const v = config.image.trim();
+      if (!v) {
+        setImageAddressError(
+          t('sys.apps.import.image_required', 'Image address is required')
+        );
+        return;
+      }
+      if (!isValidContainerImageRef(v)) {
+        setImageAddressError(
+          t(
+            'sys.apps.import.invalid_image_ref',
+            'Invalid image address. Use a valid registry path, e.g. docker.io/library/nginx:latest'
+          )
+        );
+        return;
+      }
+      setImageAddressError(null);
+      setPage('form');
+      setEditView('form');
+      return;
+    }
+
+    if (isUploadingLocal) {
+      toast.error(
+        t(
+          'sys.apps.import.image_uploading',
+          'Image upload is still in progress, please wait'
+        )
+      );
+      return;
+    }
+    if (!manifestPath && !imageTarPath) {
+      toast.error(
+        t(
+          'sys.apps.import.local_source_required',
+          '请先上传 .neoapp 应用包或镜像 tar 文件'
+        )
+      );
+      return;
+    }
+    setPage('form');
+    setActiveSection('basic_info');
+    setEditView('form');
+  };
+
+  // ---- Install ----
+
+  const handleInstall = async () => {
+    // Flush pending text before deciding the install path — both direct
+    // yaml-view edits and form edits live-synced onto the text. A rejected
+    // file surfaces its error and stops the install.
+    let flushed: {
+      path: string;
+      config: WizardConfig;
+      hydrated: WizardConfig;
+      multiContainer: boolean;
+    } | null = null;
+    if (editView === 'yaml') {
+      const res = await leaveYamlView();
+      if (!res.ok) return;
+      // Only trust the snapshot when this run actually uploaded a new file;
+      // a clean no-op flush must fall back to the render-time values.
+      if (res.flushed) flushed = lastFlushedRef.current;
+    } else if (yaml.yamlDirty) {
+      // Form view: the text carries unflushed form edits — apply them so the
+      // manifest on the server matches what the user sees, then install it
+      // as-is (the PATCH fallback below no longer fires for form edits).
+      const res = await yaml.flushYaml();
+      if (!res.ok) {
+        // The persisted error lives on the YAML pane — bring the user there.
+        setYamlMounted(true);
+        setEditView('yaml');
+        return;
+      }
+      if (res.path) {
+        await nextPaint();
+        flushed = lastFlushedRef.current;
+      }
+    }
+
+    // Post-flush truth: when this run just flushed, the closure values of
+    // manifestPath/config/isMultiContainer are one flush behind — read the
+    // snapshot the flush wrote instead.
+    const effectiveManifestPath = flushed?.path ?? manifestPath;
+    const effectiveConfig = flushed?.config ?? config;
+    const effectiveHydrated = flushed?.hydrated ?? hydratedConfigRef.current;
+    const effectiveMulti = flushed?.multiContainer ?? isMultiContainer;
+
+    // One-page form: run the full validation at once and jump to the
+    // first offending section (the old wizard gated step by step).
+    const issues = collectInstallErrors(effectiveConfig, {
+      sourceType,
+      sourceReady: isSourceReady,
+      // undefined while loading → availability check skipped (backend still
+      // fast-fails); once loaded, an empty list is a real empty device.
+      availableModelIds: modelsLoaded
+        ? availableModels.map(m => m.model_id)
+        : undefined,
+    });
+    if (issues.length > 0) {
+      toast.error(t(`sys.apps.import.${issues[0].reason}`));
+      scrollToSection(issues[0].section);
+      return;
+    }
+
+    const duplicate = existingAppIds.has(effectiveConfig.metadata.id);
+    if (duplicate && !confirmForceInstall(effectiveConfig.metadata.id)) return;
+    const force = duplicate;
+
+    if (sourceType === 'local' && effectiveManifestPath) {
+      // Manifest mode: patch the uploaded manifest with the wizard's
+      // edits (when possible), then install from it.
+      const startPackageInstall = () => {
+        appsApi
+          .installPackage({
+            manifest_path: effectiveManifestPath,
+            image_path: imageTarPath || undefined,
+            force,
+          })
+          .then((res: any) => {
+            const tid = res?.data?.task_id;
+            if (tid) {
+              setTaskId(tid);
+              setPage('progress');
+            } else {
+              toast.success(
+                t('sys.apps.toast.installSuccess', 'App installed')
+              );
+              queryClient.invalidateQueries({ queryKey: ['apps'] });
+              onOpenChange(false);
+            }
+          })
+          .catch((error: unknown) => {
+            toast.error(resolveInstallApiError(error, t));
+          });
+      };
+
+      const dirty = isDirty(effectiveConfig, effectiveHydrated);
+
+      // Untouched walkthrough → install the uploaded bytes as-is (byte-faithful).
+      if (!dirty) {
+        startPackageInstall();
+        return;
+      }
+      // Multi-container manifests are not wizard-expressible; the server
+      // rejects patching them, so install the original file unchanged.
+      if (effectiveMulti) {
+        toast.info(t('sys.apps.import.multi_container_hint'));
+        startPackageInstall();
+        return;
+      }
+
+      const fields = changedPatchFields(effectiveConfig, effectiveHydrated);
       appsApi
-        .installPackage({
-          manifest_path: manifestPath,
-          image_path: packageImagePath || undefined,
-        })
-        .then((res: any) => {
-          const tid = res?.data?.task_id;
-          if (tid) {
-            setTaskId(tid);
-            setStep(steps.length);
-          } else {
-            toast.success(t('sys.apps.toast.installSuccess', 'App installed'));
-            queryClient.invalidateQueries({ queryKey: ['apps'] });
-            onOpenChange(false);
-          }
-        })
+        .patchManifest({ manifest_path: effectiveManifestPath, fields })
+        .then(startPackageInstall)
         .catch((error: unknown) => {
-          toast.error(resolveInstallApiError(error, t));
+          toast.error(
+            resolveInstallApiError(error, t)
+              || t(
+                'sys.apps.import.patch_failed',
+                'Failed to apply manifest edits'
+              )
+          );
         });
       return;
     }
 
-    installMutation.mutate(config, {
+    // Registry / tar-only local: wizard install. The tar path is only
+    // merged into the payload here — config itself never stores it, so
+    // re-entering the source screen can't leak stale state.
+    const installConfig: WizardConfig =      sourceType === 'local'
+        ? {
+            ...effectiveConfig,
+            image_path: imageTarPath,
+            image: imageTarName || effectiveConfig.image,
+            force,
+          }
+        : { ...effectiveConfig, force };
+    installMutation.mutate(installConfig, {
       onSuccess: (data: any) => {
         const tid = data?.task_id;
         if (tid) {
           setTaskId(tid);
-          setStep(steps.length); // Move to progress step
+          setPage('progress');
         } else {
           // Fallback: no task_id returned, treat as sync success
           toast.success(t('sys.apps.toast.installSuccess', 'App installed'));
@@ -411,1425 +817,397 @@ export default function ImportAppDialog({
     }
   }, [progress?.phase]);
 
-  const nextStep = () => {
-    // Validate current step before proceeding
-    if (!steps[step].validate()) {
-      if (step === 0) {
-        if (sourceType === 'registry') {
-          const v = config.image.trim();
-          if (!v) {
-            setImageAddressError(
-              t('sys.apps.import.image_required', 'Image address is required')
-            );
-          } else if (!isValidContainerImageRef(v)) {
-            setImageAddressError(
-              t(
-                'sys.apps.import.invalid_image_ref',
-                'Invalid image address. Use a valid registry path, e.g. docker.io/library/nginx:latest'
-              )
-            );
-          } else {
+  // ---- Derived render data ----
+
+  const sections: { id: ImportSectionId; label: string }[] = [
+    { id: 'basic_info', label: t('sys.apps.import.basic_info') },
+    { id: 'resources', label: t('sys.apps.import.resources') },
+    { id: 'models', label: t('sys.apps.import.models_section', '模型配置') },
+    { id: 'permissions', label: t('sys.apps.import.permissions') },
+    { id: 'advanced', label: t('sys.apps.import.advanced', 'Advanced Config') },
+  ];
+
+  const installDisabled =    installMutation.isPending || isUploadingLocal || yaml.isFlushing;
+
+  const navHeader = (
+    <div className="space-y-3">
+      <div className="rounded-lg border border-border bg-muted/40 px-3 py-2">
+        <p className="text-sm font-medium text-foreground">
+          {sourceType === 'registry'
+            ? t('sys.apps.import.registry_title')
+            : t('sys.apps.import.local_title', '本地上传')}
+        </p>
+        {sourceType === 'local' && (
+          <p className="mt-0.5 truncate text-xs text-muted-foreground">
+            {/* Manifest mode = a .neoapp package (or a flushed app.yaml);
+             * show what the user actually uploaded. */}
+            {localMode === 'manifest'
+              ? localUpload?.kind === 'package'
+                ? localUpload.fileName
+                : 'app.yaml'
+              : imageTarName || 'image.tar'}
+          </p>
+        )}
+      </div>
+      {sourceType === 'local' && hasManifest && (
+        <div
+          className={`rounded-lg border px-3 py-2 text-xs ${
+            manifestDirty
+              ? 'border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+              : 'border-border bg-muted/40 text-muted-foreground'
+          }`}
+        >
+          {manifestDirty
+            ? isMultiContainer
+              ? t('sys.apps.import.multi_container_edited', {
+                  n: editedFieldCount,
+                })
+              : t('sys.apps.import.manifest_edited', {
+                  n: editedFieldCount,
+                })
+            : t('sys.apps.import.manifest_untouched')}
+        </div>
+      )}
+    </div>
+  );
+
+  // ---- Screens ----
+
+  const sourceScreen = (
+    <div className="px-4 py-4 sm:px-6 sm:py-5 md:px-10 lg:px-12">
+      <h2 className="mb-2 text-center text-xl font-bold text-foreground sm:text-2xl">
+        {t('sys.apps.import.source_title')}
+      </h2>
+      <p className="mb-6 text-center text-muted-foreground sm:mb-8">
+        {t('sys.apps.import.source_desc')}
+      </p>
+
+      <div className="mb-6 grid grid-cols-1 gap-4 sm:mb-8 sm:grid-cols-2 sm:gap-4">
+        {/* Local upload card first — it is the default source (on-device
+         * installs are usually offline), so reading order matches default. */}
+        <div
+          className={`relative flex cursor-pointer flex-col items-center rounded-xl border-2 p-4 transition-all sm:p-6 ${
+            sourceType === 'local'
+              ? 'border-primary bg-primary/5'
+              : 'border-border hover:border-primary/50'
+          }`}
+          onClick={() => {
+            if (sourceType === 'local') return;
+            setSourceType('local');
             setImageAddressError(null);
-          }
-        } else if (sourceType === 'upload') {
-          if (isUploadingImage) {
-            toast.error(
-              t(
-                'sys.apps.import.image_uploading',
-                'Image upload is still in progress, please wait'
-              )
-            );
-          } else {
-            toast.error(
-              t(
-                'sys.apps.import.image_upload_required',
-                'Please upload an image file'
-              )
-            );
-          }
-        } else {
-          toast.error(
-            t('sys.apps.import.manifest_required', 'Please upload app.yaml')
-          );
-        }
-      } else {
-        toast.error(
-          t(
-            'sys.apps.import.validation_error',
-            'Please fill in all required fields'
-          )
-        );
-      }
-      return;
-    }
-
-    if (step === 0) setImageAddressError(null);
-
-    if (step === 0 && sourceType === 'upload') {
-      const { path, name } = uploadedImageRef.current;
-      if (path && path !== config.image_path) {
-        setConfig(prev => ({
-          ...prev,
-          image_path: path,
-          image: name || prev.image,
-        }));
-      }
-    }
-
-    // Package mode: install directly from step 0
-    if (sourceType === 'package' && step === 0) {
-      handleInstall();
-      return;
-    }
-
-    if (step === steps.length - 1) {
-      handleInstall();
-    } else {
-      setStep(step + 1);
-    }
-  };
-
-  const prevStep = () => {
-    if (step > 0) setStep(step - 1);
-  };
-
-  const renderStep = () => {
-    switch (step) {
-      case 0: // Source
-        return (
-          <div className="px-4 py-4 sm:px-6 sm:py-5 md:px-10 lg:px-12">
-            <h2 className="mb-2 text-center text-xl font-bold text-foreground sm:text-2xl">
-              {t('sys.apps.import.source_title')}
-            </h2>
-            <p className="mb-6 text-center text-muted-foreground sm:mb-8">
-              {t('sys.apps.import.source_desc')}
-            </p>
-
-            <div className="mb-6 grid grid-cols-1 gap-4 sm:mb-8 sm:grid-cols-3 sm:gap-4">
-              <div
-                className={`relative flex cursor-pointer flex-col items-center rounded-xl border-2 p-4 transition-all sm:p-6 ${
-                  sourceType === 'registry'
-                    ? 'border-primary bg-primary/5'
-                    : 'border-border hover:border-primary/50'
-                }`}
-                onClick={() => {
-                  if (sourceType === 'registry') return;
-                  setSourceType('registry');
-                  setImageAddressError(null);
-                  uploadedImageRef.current = { path: '', name: '', size: 0 };
-                  // Avoid mixing states between different source modes
-                  setConfig(prev => ({ ...prev, image_path: '' }));
-                }}
-              >
-                {sourceType === 'registry' && (
-                  <div className="absolute top-2 right-2 text-primary">
-                    <CheckCircle2
-                      className="w-5 h-5"
-                      fill="currentColor"
-                      stroke="white"
-                    />
-                  </div>
-                )}
-                <div className="w-12 h-12 bg-primary rounded-xl flex items-center justify-center text-primary-foreground mb-4">
-                  <Globe className="w-6 h-6" />
-                </div>
-                <h3 className="font-semibold text-foreground mb-1">
-                  {t('sys.apps.import.registry_title')}
-                </h3>
-                <p className="text-sm text-muted-foreground text-center">
-                  {t('sys.apps.import.registry_desc')}
-                </p>
-              </div>
-
-              <div
-                className={`relative flex cursor-pointer flex-col items-center rounded-xl border-2 p-4 transition-all sm:p-6 ${
-                  sourceType === 'upload'
-                    ? 'border-primary bg-primary/5'
-                    : 'border-border hover:border-primary/50'
-                }`}
-                onClick={() => {
-                  if (sourceType === 'upload') return;
-                  setSourceType('upload');
-                  setImageAddressError(null);
-                  uploadedImageRef.current = { path: '', name: '', size: 0 };
-                  // Avoid mixing states between different source modes
-                  setConfig(prev => ({ ...prev, image: '', image_path: '' }));
-                }}
-              >
-                {sourceType === 'upload' && (
-                  <div className="absolute top-2 right-2 text-primary">
-                    <CheckCircle2
-                      className="w-5 h-5"
-                      fill="currentColor"
-                      stroke="white"
-                    />
-                  </div>
-                )}
-                <div className="w-12 h-12 bg-primary rounded-xl flex items-center justify-center text-primary-foreground mb-4">
-                  <UploadCloud className="w-6 h-6" />
-                </div>
-                <h3 className="font-semibold text-foreground mb-1">
-                  {t('sys.apps.import.upload_title')}
-                </h3>
-                <p className="text-sm text-muted-foreground text-center">
-                  {t('sys.apps.import.upload_desc')}
-                </p>
-              </div>
-
-              <div
-                className={`relative flex cursor-pointer flex-col items-center rounded-xl border-2 p-4 transition-all sm:p-6 ${
-                  sourceType === 'package'
-                    ? 'border-primary bg-primary/5'
-                    : 'border-border hover:border-primary/50'
-                }`}
-                onClick={() => {
-                  if (sourceType === 'package') return;
-                  setSourceType('package');
-                  setImageAddressError(null);
-                  uploadedImageRef.current = { path: '', name: '', size: 0 };
-                  // Avoid mixing states between different source modes
-                  setConfig(prev => ({ ...prev, image: '', image_path: '' }));
-                }}
-              >
-                {sourceType === 'package' && (
-                  <div className="absolute top-2 right-2 text-primary">
-                    <CheckCircle2
-                      className="w-5 h-5"
-                      fill="currentColor"
-                      stroke="white"
-                    />
-                  </div>
-                )}
-                <div className="w-12 h-12 bg-primary rounded-xl flex items-center justify-center text-primary-foreground mb-4">
-                  <FileText className="w-6 h-6" />
-                </div>
-                <h3 className="font-semibold text-foreground mb-1">
-                  {t('sys.apps.import.package_title', 'Upload Package')}
-                </h3>
-                <p className="text-sm text-muted-foreground text-center">
-                  {t(
-                    'sys.apps.import.package_desc',
-                    'Upload app.yaml + image for complete app configuration'
-                  )}
-                </p>
-              </div>
+          }}
+        >
+          {sourceType === 'local' && (
+            <div className="absolute top-2 right-2 text-primary">
+              <CheckCircle2
+                className="w-5 h-5"
+                fill="currentColor"
+                stroke="white"
+              />
             </div>
+          )}
+          <div className="w-12 h-12 bg-primary rounded-xl flex items-center justify-center text-primary-foreground mb-4">
+            <UploadCloud className="w-6 h-6" />
+          </div>
+          <h3 className="font-semibold text-foreground mb-1">
+            {t('sys.apps.import.local_title', '本地上传')}
+          </h3>
+          <p className="text-sm text-muted-foreground text-center">
+            {t(
+              'sys.apps.import.local_desc',
+              '上传 .neoapp 应用包或镜像 tar 文件'
+            )}
+          </p>
+        </div>
 
-            {sourceType === 'registry' ? (
-              <div>
-                <Label>
-                  {t('sys.apps.import.image_address')}
-                  <span className="text-red-500 ml-1">*</span>
-                </Label>
-                <Input
-                  placeholder="docker.io/library/nginx:latest"
-                  value={config.image}
-                  onChange={e => {
-                    setConfig({ ...config, image: e.target.value });
-                    setImageAddressError(null);
-                  }}
-                  className={`mt-2 ${imageAddressError ? 'border-red-500 focus-visible:ring-red-500' : ''}`}
+        {/* Registry card */}
+        <div
+          className={`relative flex cursor-pointer flex-col items-center rounded-xl border-2 p-4 transition-all sm:p-6 ${
+            sourceType === 'registry'
+              ? 'border-primary bg-primary/5'
+              : 'border-border hover:border-primary/50'
+          }`}
+          onClick={() => {
+            if (sourceType === 'registry') return;
+            setSourceType('registry');
+            setImageAddressError(null);
+          }}
+        >
+          {sourceType === 'registry' && (
+            <div className="absolute top-2 right-2 text-primary">
+              <CheckCircle2
+                className="w-5 h-5"
+                fill="currentColor"
+                stroke="white"
+              />
+            </div>
+          )}
+          <div className="w-12 h-12 bg-primary rounded-xl flex items-center justify-center text-primary-foreground mb-4">
+            <Globe className="w-6 h-6" />
+          </div>
+          <h3 className="font-semibold text-foreground mb-1">
+            {t('sys.apps.import.registry_title')}
+          </h3>
+          <p className="text-sm text-muted-foreground text-center">
+            {t('sys.apps.import.registry_desc')}
+          </p>
+        </div>
+      </div>
+
+      {/* Both panels stack in one grid cell; the inactive one keeps its
+       * layout via visibility (not display), so the cell sizes to the
+       * taller panel — switching cards never resizes the dialog and there
+       * is no hand-tuned height constant to drift out of sync. */}
+      <div className="grid">
+        <div
+          className={`col-start-1 row-start-1 ${
+            sourceType === 'registry' ? '' : 'invisible pointer-events-none'
+          }`}
+          aria-hidden={sourceType !== 'registry'}
+        >
+          <Label className="mb-2 block text-base font-semibold">
+            {t('sys.apps.import.image_address')}
+            <span className="text-red-500 ml-1">*</span>
+          </Label>
+          <Input
+            placeholder="docker.io/library/nginx:latest"
+            value={config.image}
+            onChange={e => {
+              setConfig({ ...config, image: e.target.value });
+              setImageAddressError(null);
+            }}
+            className={`${imageAddressError ? 'border-red-500 focus-visible:ring-red-500' : ''}`}
+          />
+          {imageAddressError && (
+            <div className="mt-2 text-sm text-red-500">{imageAddressError}</div>
+          )}
+          {/* Same muted-hint idiom as the local panel's mode banner — plain
+           * text, no icon: the card above already carries the Globe. */}
+          <div className="mt-3 rounded-lg border border-border bg-muted/40 p-3 text-sm text-muted-foreground">
+            {t(
+              'sys.apps.import.registry_network_hint',
+              '从注册表拉取镜像需要设备能够访问外网（如 docker.io）；离线设备请改用本地上传'
+            )}
+          </div>
+        </div>
+
+        <div
+          className={`col-start-1 row-start-1 ${
+            sourceType === 'local' ? '' : 'invisible pointer-events-none'
+          }`}
+          aria-hidden={sourceType !== 'local'}
+        >
+          <SourceLocalForm
+            upload={localUpload}
+            isUploading={isUploadingLocal}
+            progress={localProgress}
+            manifestMeta={manifestMeta}
+            imageTarName={imageTarName}
+            existingAppIds={existingAppIds}
+            localMode={localMode}
+            onUpload={handleLocalUpload}
+            onClear={handleLocalClear}
+          />
+        </div>
+      </div>
+    </div>
+  );
+
+  const sectionHeading = (label: string) => (
+    <h3 className="mb-4 text-base font-semibold text-foreground">{label}</h3>
+  );
+
+  const formScreen = (
+    <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
+      <SectionNav
+        sections={sections}
+        activeId={activeSection}
+        onActiveChange={handleActiveChange}
+        onBeforeNavigate={handleBeforeNavigate}
+        header={navHeader}
+      />
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-2 sm:px-6">
+          <EditViewSwitch
+            view={editView}
+            yamlDirty={yaml.yamlDirty}
+            onChange={handleViewChange}
+          />
+        </div>
+
+        {/* The form pane and the YAML pane stay mounted (visibility is a
+         * class toggle) so Monaco's undo history survives view switches;
+         * the YAML pane only mounts on first visit (lazy). Each nav entry
+         * is one page — only the active section renders, so the pane never
+         * scrolls between sections (long lists scroll inside their own
+         * ScrollArea). */}
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div
+            className={`min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8 ${
+              editView === 'yaml' ? 'hidden' : ''
+            }`}
+          >
+            {activeSection === 'basic_info' && (
+              <>
+                {sectionHeading(t('sys.apps.import.basic_info'))}
+                <BasicInfoSection
+                  config={config}
+                  onChange={setConfig}
+                  isIdReadOnly={isIdReadOnly}
+                  existingAppIds={existingAppIds}
                 />
-                {imageAddressError && (
-                  <div className="mt-2 text-sm text-red-500">
-                    {imageAddressError}
+              </>
+            )}
+
+            {activeSection === 'resources' && (
+              <>
+                {sectionHeading(t('sys.apps.import.resources'))}
+                <ResourcesSection config={config} onChange={setConfig} />
+              </>
+            )}
+
+            {activeSection === 'models' && (
+              <>
+                {sectionHeading(
+                  t('sys.apps.import.models_section', '模型配置')
+                )}
+                <ModelsSection
+                  config={config}
+                  onChange={setConfig}
+                  availableModels={availableModels}
+                />
+              </>
+            )}
+
+            {activeSection === 'permissions' && (
+              <>
+                {sectionHeading(t('sys.apps.import.permissions'))}
+                <PermissionsSection
+                  config={config}
+                  onChange={setConfig}
+                  availableStreams={availableStreams}
+                />
+              </>
+            )}
+
+            {activeSection === 'advanced' && (
+              <>
+                {sectionHeading(
+                  t('sys.apps.import.advanced', 'Advanced Config')
+                )}
+                <AdvancedSection config={config} onChange={setConfig} />
+              </>
+            )}
+          </div>
+
+          {yamlMounted && (
+            <div
+              className={`min-h-0 flex-1 flex-col ${
+                editView === 'yaml' ? 'flex' : 'hidden'
+              }`}
+            >
+              <Suspense
+                fallback={(
+                  <div className="flex min-h-0 flex-1 items-center justify-center bg-muted/30 text-sm text-muted-foreground">
+                    {t('sys.apps.import.yaml_loading', '加载编辑器…')}
                   </div>
                 )}
-              </div>
-            ) : sourceType === 'upload' ? (
-              <ImageUpload
-                onUploadSuccess={(path, imageName, size) => {
-                  if (cancelRequestedRef.current) {
-                    cleanupUploadedFiles([path]);
-                    return;
+              >
+                <YamlEditorPane
+                  mode={yamlViewMode}
+                  value={
+                    yamlViewMode === 'editable'
+                      ? yaml.manifestText
+                      : previewYaml
                   }
-                  uploadedImageRef.current = { path, name: imageName, size };
-                  setConfig(prev => ({
-                    ...prev,
-                    image_path: path,
-                    image: imageName,
-                  }));
-                }}
-                onUploadingChange={setIsUploadingImage}
-                onClear={(path?: string) => {
-                  const pathToDelete =                    path || uploadedImageRef.current.path || config.image_path;
-                  if (pathToDelete) cleanupUploadedFiles([pathToDelete]);
-                  uploadedImageRef.current = { path: '', name: '', size: 0 };
-                  setConfig(prev => ({ ...prev, image_path: '', image: '' }));
-                }}
-                initialFile={
-                  config.image_path
-                    ? {
-                        path: config.image_path,
-                        filename: config.image,
-                        size: uploadedImageRef.current.size || undefined,
-                      }
-                    : undefined
-                }
-              />
-            ) : (
-              /* Package mode: upload app.yaml + image.tar */
-              <div className="space-y-6">
-                {/* Manifest upload */}
-                <div>
-                  <Label className="text-base font-semibold mb-2 block">
-                    {t(
-                      'sys.apps.import.manifest_file',
-                      'App Manifest (app.yaml)'
-                    )}
-                    <span className="text-red-500 ml-1">*</span>
-                  </Label>
-                  {manifestPath ? (
-                    <>
-                      <div className="flex items-center justify-between gap-2 text-sm border rounded-lg p-3">
-                        <div className="flex items-center gap-2 min-w-0">
-                          <CheckCircle2 className="w-5 h-5 text-green-500 shrink-0" />
-                          <span className="font-medium text-foreground truncate">
-                            {manifestMeta?.id || 'app.yaml'}
-                          </span>
-                          <span className="text-muted-foreground truncate">
-                            {manifestMeta?.name
-                              && `(${manifestMeta.name} v${manifestMeta?.version || '1.0.0'})`}
-                          </span>
-                        </div>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => {
-                            setManifestPath('');
-                            setManifestMeta(null);
-                          }}
-                        >
-                          <X className="w-4 h-4" />
-                        </Button>
-                      </div>
-                      {manifestMeta?.id
-                        && existingAppIds.has(manifestMeta.id) && (
-                          <p className="mt-1 text-sm text-red-500">
-                            {t(
-                              'sys.apps.import.duplicate_id_warning',
-                              '此应用ID已存在，安装时将覆盖已有应用'
-                            )}
-                          </p>
-                        )}
-                    </>
-                  ) : (
-                    <FileUpload
-                      single
-                      loading={isUploadingManifest}
-                      accept={{
-                        'application/x-yaml': ['.yaml', '.yml'],
-                        'text/yaml': ['.yaml', '.yml'],
-                        'text/plain': ['.yaml', '.yml'],
-                      }}
-                      placeholder={t(
-                        'sys.apps.import.click_upload_manifest',
-                        'Click to upload app.yaml'
-                      )}
-                      onUpload={async files => {
-                        const file = files[0];
-                        if (!file) return;
-                        setIsUploadingManifest(true);
-                        try {
-                          const res = await appsApi.uploadManifest(file);
-                          const data = res?.data;
-                          if (data?.path) {
-                            setManifestPath(data.path);
-                            setManifestMeta(data.metadata || null);
-                          }
-                        } catch (err: unknown) {
-                          toast.error(
-                            resolveInstallApiError(err, t)
-                              || t(
-                                'sys.apps.import.manifest_upload_failed',
-                                'Manifest upload failed'
-                              )
-                          );
-                        } finally {
-                          setIsUploadingManifest(false);
-                        }
-                      }}
-                    />
-                  )}
-                </div>
-
-                {/* Image upload (optional — app.yaml may reference registry image) */}
-                <div>
-                  <Label className="text-base font-semibold mb-2 block">
-                    {t('sys.apps.import.package_image', 'Container Image')}
-                    <span className="text-xs text-muted-foreground ml-2 font-normal">
-                      {t(
-                        'sys.apps.import.package_image_hint',
-                        'Optional if app.yaml uses registry image'
-                      )}
-                    </span>
-                  </Label>
-                  {packageImagePath ? (
-                    <div className="flex items-center gap-2 text-sm border rounded-lg p-3">
-                      <Package className="w-5 h-5 text-muted-foreground" />
-                      <span className="font-medium text-foreground">
-                        {packageImageName || 'image.tar'}
-                      </span>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => {
-                          cleanupUploadedFiles([packageImagePath]);
-                          setPackageImagePath('');
-                          setPackageImageName('');
-                        }}
-                      >
-                        <X className="w-4 h-4" />
-                      </Button>
-                    </div>
-                  ) : (
-                    <ImageUpload
-                      onUploadSuccess={(path, imageName, size) => {
-                        if (cancelRequestedRef.current) {
-                          cleanupUploadedFiles([path]);
-                          return;
-                        }
-                        setPackageImagePath(path);
-                        setPackageImageName(imageName);
-                        uploadedImageRef.current = {
-                          path,
-                          name: imageName,
-                          size,
-                        };
-                      }}
-                      onUploadingChange={setIsUploadingImage}
-                      onClear={(path?: string) => {
-                        const pathToDelete = path || packageImagePath;
-                        if (pathToDelete) cleanupUploadedFiles([pathToDelete]);
-                        setPackageImagePath('');
-                        setPackageImageName('');
-                      }}
-                    />
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        );
-
-      case 1: // Basic Info
-        return (
-          <div className="px-4 py-4 sm:px-6 sm:py-5 md:px-10 lg:px-12 space-y-4">
-            <div>
-              <Label>{t('sys.apps.import.app_id')}</Label>
-              <Input
-                placeholder="my-app"
-                value={config.metadata.id}
-                onChange={e => setConfig({
-                    ...config,
-                    metadata: { ...config.metadata, id: e.target.value },
-                  })}
-                className={`mt-2 ${existingAppIds.has(config.metadata.id.trim()) ? 'border-red-500 focus-visible:ring-red-500' : ''}`}
-              />
-              {existingAppIds.has(config.metadata.id.trim()) && (
-                <p className="mt-1 text-sm text-red-500">
-                  {t(
-                    'sys.apps.import.duplicate_id_warning',
-                    '此应用ID已存在，安装时将覆盖已有应用'
-                  )}
-                </p>
-              )}
-            </div>
-
-            <div>
-              <Label>{t('sys.apps.import.app_name')}</Label>
-              <Input
-                placeholder="My Application"
-                value={config.metadata.name}
-                onChange={e => setConfig({
-                    ...config,
-                    metadata: { ...config.metadata, name: e.target.value },
-                  })}
-                className="mt-2"
-              />
-            </div>
-
-            <div>
-              <Label>{t('sys.apps.import.version')}</Label>
-              <Input
-                placeholder="1.0.0"
-                value={config.metadata.version}
-                onChange={e => setConfig({
-                    ...config,
-                    metadata: { ...config.metadata, version: e.target.value },
-                  })}
-                className="mt-2"
-              />
-            </div>
-
-            <div>
-              <Label>{t('sys.apps.import.description')}</Label>
-              <Input
-                placeholder="Application description"
-                value={config.metadata.description}
-                onChange={e => setConfig({
-                    ...config,
-                    metadata: {
-                      ...config.metadata,
-                      description: e.target.value,
-                    },
-                  })}
-                className="mt-2"
-              />
-            </div>
-          </div>
-        );
-
-      case 2: // Resources
-        return (
-          <div className="px-4 py-4 sm:px-6 sm:py-5 md:px-10 lg:px-12 space-y-6">
-            <ScrollArea className="max-h-[400px] border rounded-lg">
-              <div className="space-y-4 p-6">
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                  <div>
-                    <Label>{t('sys.apps.import.cpu_limit')}</Label>
-                    <div className="mt-2 flex items-center gap-2">
-                      <Input
-                        inputMode="numeric"
-                        autoComplete="off"
-                        maxLength={3}
-                        placeholder="50"
-                        className="flex-1 min-w-0"
-                        value={cpuPercentToInputValue(config.resources?.cpu)}
-                        onChange={e => setConfig({
-                            ...config,
-                            resources: {
-                              ...config.resources!,
-                              cpu: inputDigitsToCpuPercent(e.target.value),
-                            },
-                          })}
-                      />
-                      <span className="shrink-0 text-sm text-muted-foreground tabular-nums">
-                        %
-                      </span>
-                    </div>
-                  </div>
-
-                  <div>
-                    <Label>{t('sys.apps.import.memory_limit')}</Label>
-                    <Select
-                      value={config.resources?.memory}
-                      onValueChange={value => setConfig({
-                          ...config,
-                          resources: { ...config.resources!, memory: value },
-                        })}
-                    >
-                      <SelectTrigger className="mt-2">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {MEMORY_OPTIONS.map(opt => (
-                          <SelectItem key={opt} value={opt}>
-                            {opt}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-
-                <div>
-                  <Label className="text-base font-semibold mb-3 block">
-                    {t('sys.apps.import.runtime_options', 'Runtime Options')}
-                  </Label>
-
-                  <div className="flex items-center space-x-2">
-                    <Checkbox
-                      checked={config.autostart}
-                      onCheckedChange={checked => setConfig({ ...config, autostart: !!checked })}
-                    />
-                    <Label className="font-normal">
-                      {t('sys.apps.import.autostart', 'Auto Start')}
-                    </Label>
-                  </div>
-
-                  <div className="mt-6">
-                    <Label>
-                      {t('sys.apps.import.restart_policy', 'Restart Policy')}
-                    </Label>
-                    <Select
-                      value={config.restart_policy}
-                      onValueChange={value => setConfig({ ...config, restart_policy: value })}
-                    >
-                      <SelectTrigger className="mt-2">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="no">
-                          {t('sys.apps.import.restart_no', 'No Restart')}
-                        </SelectItem>
-                        <SelectItem value="on-failure">
-                          {t(
-                            'sys.apps.import.restart_on_failure',
-                            '失败时重启'
-                          )}
-                        </SelectItem>
-                        <SelectItem value="always">
-                          {t(
-                            'sys.apps.import.restart_always',
-                            'Always Restart'
-                          )}
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-              </div>
-            </ScrollArea>
-          </div>
-        );
-
-      case 3: // Permissions
-        return (
-          <ScrollArea>
-            <div className="px-4 py-4 sm:px-6 sm:py-5 md:px-10 lg:px-12 space-y-6 pr-2 sm:pr-4">
-              {/* AI Models */}
-              <div>
-                <Label className="text-base font-semibold mb-3 block">
-                  {t('sys.apps.import.ai_models')}
-                </Label>
-                <ScrollArea className="h-[200px] rounded-lg border">
-                  <div className="space-y-2 p-3">
-                    {availableModels.length > 0 ? (
-                      availableModels.map(model => (
-                        <div
-                          key={model.model_id}
-                          className="flex items-center space-x-2"
-                        >
-                          <Checkbox
-                            checked={config.permissions?.inference?.models?.includes(
-                              model.model_id
-                            )}
-                            onCheckedChange={() => toggleModel(model.model_id)}
-                          />
-                          <Label className="font-normal">
-                            {model.name || model.model_id}
-                          </Label>
-                        </div>
-                      ))
-                    ) : (
-                      <p className="text-sm text-muted-foreground">
-                        {t('sys.apps.import.no_models')}
-                      </p>
-                    )}
-                  </div>
-                </ScrollArea>
-              </div>
-
-              {/* Max QPS */}
-              <div>
-                <Label>
-                  {t('sys.apps.import.max_qps', 'Max Inference QPS')}
-                </Label>
-                <Input
-                  type="number"
-                  min={1}
-                  max={1000}
-                  value={config.permissions?.inference?.max_qps || 10}
-                  onChange={e => setConfig({
-                      ...config,
-                      permissions: {
-                        ...config.permissions!,
-                        inference: {
-                          ...config.permissions!.inference!,
-                          max_qps: parseInt(e.target.value, 10) || 10,
-                        },
-                      },
-                    })}
-                  className="mt-2 w-full max-w-48 sm:w-32"
-                />
-              </div>
-
-              {/* Max Concurrent */}
-              <div>
-                <Label>
-                  {t(
-                    'sys.apps.import.max_concurrent',
-                    'Max Concurrent Inference'
-                  )}
-                </Label>
-                <Input
-                  type="number"
-                  min={0}
-                  max={100}
-                  placeholder="0"
-                  value={config.permissions?.inference?.max_concurrent || ''}
-                  onChange={e => setConfig({
-                      ...config,
-                      permissions: {
-                        ...config.permissions!,
-                        inference: {
-                          ...config.permissions!.inference!,
-                          max_concurrent: parseInt(e.target.value, 10) || 0,
-                        },
-                      },
-                    })}
-                  className="mt-2 w-full max-w-48 sm:w-32"
-                />
-              </div>
-
-              {/* Allow Register Model */}
-              <div>
-                <div className="flex items-center space-x-2">
-                  <Checkbox
-                    checked={
-                      config.permissions?.inference?.allow_register_model
-                    }
-                    onCheckedChange={checked => setConfig({
-                        ...config,
-                        permissions: {
-                          ...config.permissions!,
-                          inference: {
-                            ...config.permissions!.inference!,
-                            allow_register_model: !!checked,
-                          },
-                        },
-                      })}
-                  />
-                  <Label className="font-normal">
-                    {t(
-                      'sys.apps.import.allow_register_model',
-                      'Allow Dynamic Model Registration'
-                    )}
-                  </Label>
-                </div>
-                <p className="text-xs text-muted-foreground mt-1">
-                  {t(
-                    'sys.apps.import.allow_register_model_hint',
-                    'Allow app to discover and register models at runtime'
-                  )}
-                </p>
-              </div>
-
-              {/* Video Streams */}
-              <div>
-                <Label className="text-base font-semibold mb-3 block">
-                  {t(
-                    'sys.apps.import.video_streams',
-                    'Video Stream Permissions'
-                  )}
-                </Label>
-                <ScrollArea className="max-h-[200px] border rounded-lg p-3">
-                  <div className="flex flex-wrap gap-2 pr-4">
-                    {availableStreams.length > 0 ? (
-                      availableStreams.map(stream => {
-                        const streamValue = stream.stream_id;
-                        return (
-                          <label
-                            key={stream.stream_id}
-                            className={`inline-flex items-center space-x-2 px-3 py-1.5 rounded-full border cursor-pointer transition-all ${
-                              config.permissions?.video?.includes(streamValue)
-                                ? 'border-[#f24a00] bg-[#fff5f0] text-[#f24a00]'
-                                : 'border-gray-200 hover:border-gray-300'
-                            }`}
-                          >
-                            <Checkbox
-                              checked={config.permissions?.video?.includes(
-                                streamValue
-                              )}
-                              onCheckedChange={checked => {
-                                const current = config.permissions?.video || [];
-                                const updated = checked
-                                  ? [...current, streamValue]
-                                  : current.filter(v => v !== streamValue);
-                                setConfig({
-                                  ...config,
-                                  permissions: {
-                                    ...config.permissions!,
-                                    video: updated,
-                                  },
-                                });
-                              }}
-                              className="sr-only"
-                            />
-                            <span className="text-sm">
-                              {stream.stream_id}
-                              {stream.width && stream.height && (
-                                <span className="text-xs text-gray-400 ml-1">
-                                  ({stream.width}x{stream.height}
-                                  {stream.fps ? `@${stream.fps}` : ''})
-                                </span>
-                              )}
-                            </span>
-                          </label>
-                        );
-                      })
-                    ) : (
-                      <p className="text-sm text-gray-500">
-                        {t(
-                          'sys.apps.import.no_streams',
-                          'No available video streams'
-                        )}
-                      </p>
-                    )}
-                  </div>
-                </ScrollArea>
-              </div>
-
-              {/* Events */}
-              <div>
-                <Label className="text-base font-semibold mb-3 block">
-                  {t('sys.apps.import.events', 'Event Permissions')}
-                </Label>
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                  <div>
-                    <Label className="text-sm text-muted-foreground">
-                      {t('sys.apps.import.events_publish', 'Publish Topics')}
-                    </Label>
-                    <Input
-                      placeholder="app/output"
-                      value={
-                        config.permissions?.events?.publish?.join(', ') || ''
-                      }
-                      onChange={e => setConfig({
-                          ...config,
-                          permissions: {
-                            ...config.permissions!,
-                            events: {
-                              ...config.permissions!.events!,
-                              publish: e.target.value
-                                .split(',')
-                                .map(s => s.trim())
-                                .filter(Boolean),
-                            },
-                          },
-                        })}
-                      className="mt-1"
-                    />
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t(
-                        'sys.apps.import.events_hint',
-                        'Separate topics with commas'
-                      )}
-                    </p>
-                  </div>
-                  <div>
-                    <Label className="text-sm text-muted-foreground">
-                      {t(
-                        'sys.apps.import.events_subscribe',
-                        'Subscribe Topics'
-                      )}
-                    </Label>
-                    <Input
-                      placeholder="camera/*, sensor/#"
-                      value={
-                        config.permissions?.events?.subscribe?.join(', ') || ''
-                      }
-                      onChange={e => setConfig({
-                          ...config,
-                          permissions: {
-                            ...config.permissions!,
-                            events: {
-                              ...config.permissions!.events!,
-                              subscribe: e.target.value
-                                .split(',')
-                                .map(s => s.trim())
-                                .filter(Boolean),
-                            },
-                          },
-                        })}
-                      className="mt-1"
-                    />
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t(
-                        'sys.apps.import.events_hint',
-                        'Separate topics with commas'
-                      )}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {/* Network */}
-              <div>
-                <Label className="text-base font-semibold mb-3 block">
-                  {t('sys.apps.import.network', 'Network Mode')}
-                </Label>
-                <Select
-                  value={config.permissions?.network?.mode || 'isolated'}
-                  onValueChange={value => setConfig({
-                      ...config,
-                      permissions: {
-                        ...config.permissions!,
-                        network: {
-                          ...config.permissions!.network,
-                          mode: value,
-                        },
-                      },
-                    })}
-                >
-                  <SelectTrigger className="mt-2 w-full sm:w-48">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="isolated">
-                      {t('sys.apps.import.network_isolated', 'Isolated')}
-                    </SelectItem>
-                    <SelectItem value="host">
-                      {t('sys.apps.import.network_host', 'Host')}
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-                <p className="text-xs text-gray-400 mt-1">
-                  {t(
-                    'sys.apps.import.network_hint',
-                    '隔离模式：无网络访问；主机模式：共享主机网络'
-                  )}
-                </p>
-                {config.permissions?.network?.mode === 'host' && (
-                  <div className="mt-3">
-                    <Label className="text-sm text-muted-foreground">
-                      {t('sys.apps.import.inbound_ports', '入站端口')}
-                    </Label>
-                    <Input
-                      className="mt-1 w-full sm:w-48"
-                      placeholder="e.g. 8889"
-                      value={(config.permissions?.network?.inbound || []).join(
-                        ', '
-                      )}
-                      onChange={e => {
-                        const ports = e.target.value
-                          .split(/[,\s]+/)
-                          .map(s => parseInt(s.trim(), 10))
-                          .filter(n => !Number.isNaN(n) && n > 0 && n < 65536);
-                        setConfig({
-                          ...config,
-                          permissions: {
-                            ...config.permissions!,
-                            network: {
-                              ...config.permissions!.network!,
-                              inbound: ports,
-                            },
-                          },
-                        });
-                      }}
-                    />
-                    <p className="text-xs text-gray-400 mt-1">
-                      {t(
-                        'sys.apps.import.inbound_hint',
-                        '应用对外暴露的端口，多个用逗号分隔'
-                      )}
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              {/* Device Control */}
-              <div>
-                <Label className="text-base font-semibold mb-3 block">
-                  {t('sys.apps.import.device_control')}
-                </Label>
-                <div className="space-y-2 pr-4 border rounded-lg p-3">
-                  <div className="flex items-center space-x-2">
-                    <Checkbox
-                      checked={config.permissions?.device?.light}
-                      onCheckedChange={checked => setConfig({
-                          ...config,
-                          permissions: {
-                            ...config.permissions!,
-                            device: {
-                              ...config.permissions!.device!,
-                              light: !!checked,
-                            },
-                          },
-                        })}
-                    />
-                    <Label className="font-normal">
-                      {t('sys.apps.import.light_control')}
-                    </Label>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <Checkbox
-                      checked={config.permissions?.device?.ir_cut}
-                      onCheckedChange={checked => setConfig({
-                          ...config,
-                          permissions: {
-                            ...config.permissions!,
-                            device: {
-                              ...config.permissions!.device!,
-                              ir_cut: !!checked,
-                            },
-                          },
-                        })}
-                    />
-                    <Label className="font-normal">
-                      {t('sys.apps.import.ir_cut')}
-                    </Label>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <Checkbox
-                      checked={config.permissions?.device?.ptz}
-                      onCheckedChange={checked => setConfig({
-                          ...config,
-                          permissions: {
-                            ...config.permissions!,
-                            device: {
-                              ...config.permissions!.device!,
-                              ptz: !!checked,
-                            },
-                          },
-                        })}
-                    />
-                    <Label className="font-normal">
-                      {t('sys.apps.import.ptz_control')}
-                    </Label>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <Checkbox
-                      checked={config.permissions?.device?.lens}
-                      onCheckedChange={checked => setConfig({
-                          ...config,
-                          permissions: {
-                            ...config.permissions!,
-                            device: {
-                              ...config.permissions!.device!,
-                              lens: !!checked,
-                            },
-                          },
-                        })}
-                    />
-                    <Label className="font-normal">
-                      {t('sys.apps.import.lens_control', 'Lens Control')}
-                    </Label>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </ScrollArea>
-        );
-
-      case 4: // Advanced (Env & Volumes)
-        return (
-          <div className="px-4 py-4 sm:px-6 sm:py-5 md:px-10 lg:px-12 space-y-6">
-            {/* Environment Variables */}
-            <div>
-              <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <Label className="text-base font-semibold">
-                  {t('sys.apps.import.env_vars', 'Environment Variables')}
-                </Label>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="w-full shrink-0 sm:w-auto"
-                  onClick={() => setConfig({
-                      ...config,
-                      env: [...(config.env || []), { name: '', value: '' }],
-                    })}
-                >
-                  <Plus className="w-4 h-4 mr-1" />
-                  {t('common.add', 'Add')}
-                </Button>
-              </div>
-              <div className="space-y-2 border rounded-lg p-4">
-                {config.env?.map((env, index) => (
-                  <div
-                    key={index}
-                    className="flex flex-col gap-2 sm:flex-row sm:items-center"
-                  >
-                    <Input
-                      placeholder="NAME"
-                      value={env.name}
-                      onChange={e => {
-                        const newEnv = [...(config.env || [])];
-                        newEnv[index] = {
-                          ...newEnv[index],
-                          name: e.target.value,
-                        };
-                        setConfig({ ...config, env: newEnv });
-                      }}
-                      className="flex-1"
-                    />
-                    <Input
-                      placeholder="value"
-                      value={env.value}
-                      onChange={e => {
-                        const newEnv = [...(config.env || [])];
-                        newEnv[index] = {
-                          ...newEnv[index],
-                          value: e.target.value,
-                        };
-                        setConfig({ ...config, env: newEnv });
-                      }}
-                      className="flex-1"
-                    />
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => {
-                        const newEnv = config.env?.filter(
-                          (_, i) => i !== index
-                        );
-                        setConfig({ ...config, env: newEnv });
-                      }}
-                    >
-                      <X className="w-4 h-4" />
-                    </Button>
-                  </div>
-                ))}
-                {(!config.env || config.env.length === 0) && (
-                  <p className="text-sm text-muted-foreground py-2">
-                    {t(
-                      'sys.apps.import.no_env_vars',
-                      'No environment variables'
-                    )}
-                  </p>
-                )}
-              </div>
-            </div>
-
-            {/* Volumes */}
-            <div>
-              <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <Label className="text-base font-semibold">
-                  {t('sys.apps.import.volumes', 'Volume Mounts')}
-                </Label>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="w-full shrink-0 sm:w-auto"
-                  onClick={() => setConfig({
-                      ...config,
-                      volumes: [
-                        ...(config.volumes || []),
-                        { host: '', container: '', readonly: false },
-                      ],
-                    })}
-                >
-                  <Plus className="w-4 h-4 mr-1" />
-                  {t('common.add', 'Add')}
-                </Button>
-              </div>
-              <div className="space-y-2 border rounded-lg p-4">
-                {config.volumes?.map((vol, index) => (
-                  <div
-                    key={index}
-                    className="flex flex-col gap-2 sm:flex-row sm:items-center"
-                  >
-                    <Input
-                      placeholder={t('sys.apps.import.host_path', 'Host Path')}
-                      value={vol.host}
-                      onChange={e => {
-                        const newVols = [...(config.volumes || [])];
-                        newVols[index] = {
-                          ...newVols[index],
-                          host: e.target.value,
-                        };
-                        setConfig({ ...config, volumes: newVols });
-                      }}
-                      className="flex-1"
-                    />
-                    <Input
-                      placeholder={t(
-                        'sys.apps.import.container_path',
-                        '容器路径'
-                      )}
-                      value={vol.container}
-                      onChange={e => {
-                        const newVols = [...(config.volumes || [])];
-                        newVols[index] = {
-                          ...newVols[index],
-                          container: e.target.value,
-                        };
-                        setConfig({ ...config, volumes: newVols });
-                      }}
-                      className="flex-1"
-                    />
-                    <label className="flex items-center space-x-1 text-sm whitespace-nowrap">
-                      <Checkbox
-                        checked={vol.readonly}
-                        onCheckedChange={checked => {
-                          const newVols = [...(config.volumes || [])];
-                          newVols[index] = {
-                            ...newVols[index],
-                            readonly: !!checked,
-                          };
-                          setConfig({ ...config, volumes: newVols });
-                        }}
-                      />
-                      <span>RO</span>
-                    </label>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => {
-                        const newVols = config.volumes?.filter(
-                          (_, i) => i !== index
-                        );
-                        setConfig({ ...config, volumes: newVols });
-                      }}
-                    >
-                      <X className="w-4 h-4" />
-                    </Button>
-                  </div>
-                ))}
-                {(!config.volumes || config.volumes.length === 0) && (
-                  <p className="text-sm text-muted-foreground py-2">
-                    {t('sys.apps.import.no_volumes', 'No volume mounts')}
-                  </p>
-                )}
-              </div>
-            </div>
-          </div>
-        );
-
-      case 5: // Review
-        return (
-          <div className="px-4 py-4 sm:px-6 sm:py-5 md:px-10 lg:px-12">
-            <h2 className="mb-4 text-center text-xl font-bold text-foreground sm:mb-6 sm:text-2xl">
-              {t('sys.apps.import.review_title')}
-            </h2>
-
-            <div className="space-y-4 pr-0 sm:pr-4">
-              {/* Basic Info */}
-              <div className="border-b border-border pb-3">
-                <p className="text-xs font-semibold text-muted-foreground uppercase mb-2">
-                  {t('sys.apps.import.basic_info', 'Basic Info')}
-                </p>
-                <div className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
-                  <div>
-                    <span className="text-muted-foreground">ID:</span>
-                    <span className="ml-2 font-medium text-foreground">
-                      {config.metadata.id || '-'}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-muted-foreground">
-                      {t('sys.apps.import.app_name')}:
-                    </span>
-                    <span className="ml-2 font-medium text-foreground">
-                      {config.metadata.name || '-'}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-muted-foreground">
-                      {t('sys.apps.import.version')}:
-                    </span>
-                    <span className="ml-2 text-foreground">
-                      {config.metadata.version || '-'}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Image */}
-              <div className="border-b border-border pb-3">
-                <p className="text-xs font-semibold text-muted-foreground uppercase mb-2">
-                  {t('sys.apps.import.source', 'Image')}
-                </p>
-                <p className="font-mono text-sm break-all text-foreground">
-                  {config.image || config.image_path || '-'}
-                </p>
-              </div>
-
-              {/* Resources */}
-              <div className="border-b border-border pb-3">
-                <p className="text-xs font-semibold text-muted-foreground uppercase mb-2">
-                  {t('sys.apps.import.resources', 'Resources')}
-                </p>
-                <div className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
-                  <div>
-                    <span className="text-muted-foreground">CPU:</span>{' '}
-                    <span className="text-foreground">
-                      {config.resources?.cpu}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-muted-foreground">Memory:</span>{' '}
-                    <span className="text-foreground">
-                      {config.resources?.memory}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-muted-foreground">
-                      {t('sys.apps.import.autostart', 'Auto Start')}:
-                    </span>{' '}
-                    <span className="text-foreground">
-                      {config.autostart ? '✓' : '-'}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-muted-foreground">
-                      {t('sys.apps.import.restart_policy', 'Restart')}:
-                    </span>{' '}
-                    <span className="text-foreground">
-                      {config.restart_policy}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Permissions */}
-              <div className="border-b border-border pb-3">
-                <p className="text-xs font-semibold text-muted-foreground uppercase mb-2">
-                  {t('sys.apps.import.permissions', 'Permissions')}
-                </p>
-                <div className="space-y-1 text-sm">
-                  <div className="flex flex-col gap-1 text-sm sm:flex-row sm:gap-4">
-                    <span className="shrink-0 text-muted-foreground sm:w-20">
-                      Models:
-                    </span>
-                    <span className="min-w-0 text-foreground">
-                      {config.permissions?.inference?.models?.length || 0}{' '}
-                      selected
-                    </span>
-                  </div>
-                  <div className="flex flex-col gap-1 sm:flex-row sm:gap-4">
-                    <span className="shrink-0 text-muted-foreground sm:w-20">
-                      Max QPS:
-                    </span>
-                    <span className="min-w-0 text-foreground">
-                      {config.permissions?.inference?.max_qps || 10}
-                    </span>
-                  </div>
-                  <div className="flex flex-col gap-1 sm:flex-row sm:gap-4">
-                    <span className="shrink-0 text-muted-foreground sm:w-20">
-                      Concurrent:
-                    </span>
-                    <span className="min-w-0 text-foreground">
-                      {config.permissions?.inference?.max_concurrent || '-'}
-                    </span>
-                  </div>
-                  <div className="flex flex-col gap-1 sm:flex-row sm:gap-4">
-                    <span className="shrink-0 text-muted-foreground sm:w-20">
-                      Register:
-                    </span>
-                    <span className="min-w-0 text-foreground">
-                      {config.permissions?.inference?.allow_register_model
-                        ? 'Enabled'
-                        : '-'}
-                    </span>
-                  </div>
-                  <div className="flex flex-col gap-1 sm:flex-row sm:gap-4">
-                    <span className="shrink-0 text-muted-foreground sm:w-20">
-                      Video:
-                    </span>
-                    <span className="min-w-0 break-all text-foreground">
-                      {config.permissions?.video?.join(', ') || '-'}
-                    </span>
-                  </div>
-                  <div className="flex flex-col gap-1 sm:flex-row sm:gap-4">
-                    <span className="shrink-0 text-muted-foreground sm:w-20">
-                      Network:
-                    </span>
-                    <span className="min-w-0 text-foreground">
-                      {config.permissions?.network?.mode || 'isolated'}
-                    </span>
-                  </div>
-                  <div className="flex flex-col gap-1 sm:flex-row sm:gap-4">
-                    <span className="shrink-0 text-muted-foreground sm:w-20">
-                      Device:
-                    </span>
-                    <span className="min-w-0 text-foreground">
-                      {[
-                        config.permissions?.device?.light && 'Light',
-                        config.permissions?.device?.ir_cut && 'IR-Cut',
-                        config.permissions?.device?.ptz && 'PTZ',
-                        config.permissions?.device?.lens && 'Lens',
-                      ]
-                        .filter(Boolean)
-                        .join(', ') || '-'}
-                    </span>
-                  </div>
-                  <div className="flex flex-col gap-1 sm:flex-row sm:gap-4">
-                    <span className="shrink-0 text-muted-foreground sm:w-20">
-                      Events:
-                    </span>
-                    <span className="min-w-0 break-all text-foreground">
-                      {config.permissions?.events?.publish?.length || 0} pub /{' '}
-                      {config.permissions?.events?.subscribe?.length || 0} sub
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Env & Volumes */}
-              <div>
-                <p className="text-xs font-semibold text-muted-foreground uppercase mb-2">
-                  {t('sys.apps.import.advanced', 'Advanced')}
-                </p>
-                <div className="space-y-1 text-sm">
-                  <div className="flex flex-col gap-1 sm:flex-row sm:gap-4">
-                    <span className="shrink-0 text-muted-foreground sm:w-20">
-                      Env:
-                    </span>
-                    <span className="min-w-0 text-foreground">
-                      {config.env?.length || 0} vars
-                    </span>
-                  </div>
-                  <div className="flex flex-col gap-1 sm:flex-row sm:gap-4">
-                    <span className="shrink-0 text-muted-foreground sm:w-20">
-                      Volumes:
-                    </span>
-                    <span className="min-w-0 text-foreground">
-                      {config.volumes?.length || 0} mounts
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        );
-
-      case steps.length: // Progress (installing)
-        return (
-          <div className="flex flex-col items-center px-4 py-8 sm:px-8 sm:py-10 md:px-12 lg:px-12">
-            {progress?.phase === 'error' ? (
-              <>
-                <div className="w-16 h-16 bg-destructive/10 rounded-full flex items-center justify-center mb-4">
-                  <AlertCircle className="w-8 h-8 text-destructive" />
-                </div>
-                <h2 className="text-xl font-bold text-foreground mb-2">
-                  {t('sys.apps.import.install_failed', 'Install Failed')}
-                </h2>
-                <p className="text-sm text-muted-foreground mb-6 max-w-md text-center">
-                  {translateInstallError(
-                    progress?.error || progress?.message,
-                    t
-                  )}
-                </p>
-                <Button
-                  variant="carbon"
-                  onClick={() => {
-                    setTaskId(null);
-                    setStep(0);
-                    installMutation.reset();
+                  originalValue={yaml.originalText}
+                  dirty={yaml.yamlDirty}
+                  isFlushing={yaml.isFlushing}
+                  yamlError={yaml.yamlError}
+                  // Editable only: the editor's text is the manifest's.
+                  // Preview shows form-generated YAML — wiring its onChange
+                  // to setManifestText would let the controlled editor push
+                  // the generated text into the (empty) manifest state,
+                  // marking it dirty and making every view switch try to
+                  // "flush" a file that was never uploaded.
+                  onChange={
+                    yamlViewMode === 'editable'
+                      ? yaml.setManifestText
+                      : undefined
+                  }
+                  onApply={() => {
+                    yaml.flushYaml();
                   }}
-                >
-                  {t('common.retry', 'Retry')}
-                </Button>
-              </>
-            ) : (
-              <>
-                <div className="w-16 h-16 bg-primary/10 rounded-full flex items-center justify-center mb-4">
-                  <Loader2 className="w-8 h-8 text-primary animate-spin" />
-                </div>
-                <h2 className="text-xl font-bold text-foreground mb-2">
-                  {t('sys.apps.import.installing_title', 'Installing app...')}
-                </h2>
-                <p className="text-sm text-muted-foreground mb-6">
-                  {translateInstallProgress(progress, t)}
-                </p>
-                <div className="w-full max-w-md">
-                  <Progress value={progress?.percent ?? 0} className="h-2" />
-                  <div className="flex justify-between mt-2 text-xs text-muted-foreground">
-                    <span>{translateInstallPhase(progress?.phase, t)}</span>
-                    <span>{Math.round(progress?.percent ?? 0)}%</span>
-                  </div>
-                </div>
-              </>
-            )}
-          </div>
-        );
+                  onFocusChange={yaml.setFocused}
+                />
+              </Suspense>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 
-      default:
-        return null;
-    }
-  };
+  const progressScreen = (
+    <div className="flex flex-col items-center px-4 py-8 sm:px-8 sm:py-10 md:px-12 lg:px-12">
+      {progress?.phase === 'error' ? (
+        <>
+          <div className="w-16 h-16 bg-destructive/10 rounded-full flex items-center justify-center mb-4">
+            <AlertCircle className="w-8 h-8 text-destructive" />
+          </div>
+          <h2 className="text-xl font-bold text-foreground mb-2">
+            {t('sys.apps.import.install_failed', 'Install Failed')}
+          </h2>
+          <p className="text-sm text-muted-foreground mb-6 max-w-md text-center">
+            {translateInstallError(progress?.error || progress?.message, t)}
+          </p>
+          <div className="flex items-center justify-center gap-3">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setTaskId(null);
+                installMutation.reset();
+                setPage('form');
+              }}
+            >
+              {t('sys.apps.import.back_to_edit', '返回修改')}
+            </Button>
+            <Button
+              variant="carbon"
+              onClick={() => {
+                // Uploaded files and form state survive the failure —
+                // retry re-runs the install with them unchanged.
+                setTaskId(null);
+                installMutation.reset();
+                handleInstall();
+              }}
+            >
+              {t('common.retry', 'Retry')}
+            </Button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="w-16 h-16 bg-primary/10 rounded-full flex items-center justify-center mb-4">
+            <Loader2 className="w-8 h-8 text-primary animate-spin" />
+          </div>
+          <h2 className="text-xl font-bold text-foreground mb-2">
+            {t('sys.apps.import.installing_title', 'Installing app...')}
+          </h2>
+          <p className="text-sm text-muted-foreground mb-6">
+            {translateInstallProgress(progress, t)}
+          </p>
+          <div className="w-full max-w-md">
+            <Progress value={progress?.percent ?? 0} className="h-2" />
+            <div className="flex justify-between mt-2 text-xs text-muted-foreground">
+              <span>{translateInstallPhase(progress?.phase, t)}</span>
+              <span>{Math.round(progress?.percent ?? 0)}%</span>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
 
   return (
     <Dialog
@@ -1844,69 +1222,47 @@ export default function ImportAppDialog({
       }}
     >
       <DialogContent
-        className="flex max-h-[90vh] w-full max-w-[calc(100%-1rem)] flex-col overflow-hidden rounded-2xl border-none p-0 shadow-2xl max-sm:fixed max-sm:inset-0 max-sm:left-0 max-sm:top-0 max-sm:h-dvh max-sm:max-h-dvh max-sm:max-w-none max-sm:translate-x-0 max-sm:translate-y-0 max-sm:rounded-none sm:max-w-[800px]"
+        className={`flex max-h-[90vh] w-full max-w-[calc(100%-1rem)] flex-col overflow-hidden rounded-2xl border-none p-0 shadow-2xl max-sm:fixed max-sm:inset-0 max-sm:left-0 max-sm:top-0 max-sm:h-dvh max-sm:max-h-dvh max-sm:max-w-none max-sm:translate-x-0 max-sm:translate-y-0 max-sm:rounded-none sm:max-w-[1050px] ${
+          // Fixed height on the form screen: the YAML pane is a flex child
+          // with no intrinsic height, so a content-sized dialog would
+          // collapse the moment the form column hides.
+          page === 'form' ? 'sm:h-[90vh]' : ''
+        }`}
         onInteractOutside={e => e.preventDefault()}
       >
         <div className="p-4 pb-2 sm:p-6 sm:pb-2">
-          <DialogTitle className="pr-10 text-lg font-bold text-foreground sm:mb-6 sm:text-xl">
+          <DialogTitle className="pr-10 text-lg font-bold text-foreground sm:text-xl">
             {t('sys.apps.import.wizard_title', 'Application Setup Wizard')}
           </DialogTitle>
           <DialogDescription className="hidden">
             {t('sys.apps.import.wizard_description', 'Setup Wizard')}
           </DialogDescription>
-
-          {/* Step Indicator — scroll on narrow screens */}
-          <div className="-mx-1 mt-6 mb-4 overflow-x-auto pb-1 sm:mx-0 sm:mt-0 sm:overflow-visible sm:pb-0">
-            <div className="flex min-w-max items-start justify-center gap-1 px-1 sm:min-w-0 sm:gap-0 sm:space-x-2">
-              {steps.map((s, i) => (
-                <div key={i} className="flex items-start">
-                  <div className="flex flex-col items-center">
-                    <div
-                      className={`mb-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border-2 text-xs transition-all sm:h-8 sm:w-8 sm:text-sm ${
-                        i === step
-                          ? 'border-primary bg-primary text-primary-foreground'
-                          : i < step
-                            ? 'border-green-500 bg-green-500 text-white'
-                            : 'border-border bg-background text-muted-foreground'
-                      }`}
-                    >
-                      {i < step ? (
-                        <Check className="h-4 w-4 sm:h-5 sm:w-5" />
-                      ) : (
-                        i + 1
-                      )}
-                    </div>
-                    <span
-                      className={`max-w-17 px-0.5 text-center text-[10px] leading-tight break-words sm:max-w-24 sm:text-xs ${i === step ? 'text-primary font-medium' : 'text-muted-foreground'}`}
-                    >
-                      {s.title}
-                    </span>
-                  </div>
-                  {i < steps.length - 1 && (
-                    <div
-                      className={`mt-3.5 h-px w-6 shrink-0 sm:mt-4 sm:w-12 ${i < step ? 'bg-green-500' : 'bg-border'}`}
-                    />
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
         </div>
-        <div className="flex-1 min-h-0 overflow-y-auto">{renderStep()}</div>
 
-        {step < steps.length && (
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          {page === 'source' && (
+            <div className="min-h-0 flex-1 overflow-y-auto">{sourceScreen}</div>
+          )}
+          {page === 'form' && formScreen}
+          {page === 'progress' && (
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              {progressScreen}
+            </div>
+          )}
+        </div>
+
+        {page === 'source' && (
           <div className="flex flex-row items-center gap-2 border-t border-border bg-muted/20 px-4 py-3 sm:justify-between sm:px-6 sm:py-4">
             <Button
               variant="outline"
-              className="flex-1 text-muted-foreground hover:text-foreground sm:flex-none"
-              onClick={prevStep}
-              disabled={step === 0 || installMutation.isPending}
+              className="flex-1 text-muted-foreground hover:text-foreground sm:hidden"
+              onClick={handleCancel}
+              disabled={installMutation.isPending}
             >
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              {t('sys.apps.import.previous')}
+              {t('common.cancel')}
             </Button>
 
-            <div className="flex flex-1 items-center gap-2 sm:flex-none sm:gap-4">
+            <div className="flex flex-1 items-center justify-end gap-2 sm:flex-none sm:gap-4">
               <Button
                 variant="outline"
                 className="hidden text-muted-foreground hover:text-foreground sm:inline-flex"
@@ -1918,23 +1274,59 @@ export default function ImportAppDialog({
               <Button
                 variant="carbon"
                 className="flex-1 sm:flex-none"
-                onClick={nextStep}
+                onClick={handleContinue}
                 disabled={
-                  installMutation.isPending
-                  || isUploadingImage
-                  || isUploadingManifest
-                  || (step === 0 && !isStep0SourceReady)
+                  !isSourceReady
+                  || isUploadingLocal
+                  || installMutation.isPending
                 }
               >
-                {(sourceType === 'package' && step === 0)
-                || step === steps.length - 1
-                  ? installMutation.isPending
-                    ? t('sys.apps.import.installing')
-                    : t('common.install', 'Install')
-                  : t('sys.apps.import.continue')}
+                {t('sys.apps.import.continue')}
                 <ArrowRight className="ml-2 h-4 w-4" />
               </Button>
             </div>
+          </div>
+        )}
+
+        {page === 'form' && (
+          <div className="flex flex-row items-center gap-2 border-t border-border bg-muted/20 px-4 py-3 sm:justify-between sm:px-6 sm:py-4">
+            <div className="flex flex-1 items-center gap-2 sm:flex-none sm:gap-4">
+              <Button
+                variant="outline"
+                className="flex-1 text-muted-foreground hover:text-foreground sm:flex-none"
+                onClick={() => setPage('source')}
+                disabled={installMutation.isPending}
+              >
+                <ArrowLeft className="mr-2 h-4 w-4" />
+                {t('sys.apps.import.back_to_source', '返回来源')}
+              </Button>
+              <Button
+                variant="outline"
+                className="hidden text-muted-foreground hover:text-foreground sm:inline-flex"
+                onClick={handleCancel}
+                disabled={installMutation.isPending}
+              >
+                {t('common.cancel')}
+              </Button>
+            </div>
+            <Button
+              variant="carbon"
+              className="flex-1 sm:flex-none"
+              onClick={handleInstall}
+              disabled={installDisabled}
+            >
+              {installMutation.isPending
+                ? t('sys.apps.import.installing', 'Installing…')
+                : t('common.install', 'Install')}
+            </Button>
+          </div>
+        )}
+
+        {page === 'progress' && progress?.phase !== 'error' && (
+          <div className="flex flex-row items-center justify-end border-t border-border bg-muted/20 px-4 py-3 sm:px-6 sm:py-4">
+            <Button variant="outline" onClick={handleRunInBackground}>
+              {t('sys.apps.import.run_in_background', '后台运行')}
+            </Button>
           </div>
         )}
       </DialogContent>

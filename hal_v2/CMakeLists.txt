@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
 option(HAL_V2_BUILD_MONOLITHIC "Build a single libaipc_hal.so instead of many component .so files" ON)
+option(HAL_V2_BUILD_TESTS "Build HAL v2 native tests" OFF)
 
 if(NOT HAL_PLATFORM)
     set(HAL_PLATFORM "hailo15" CACHE STRING "HAL platform: hailo15 | stub (no vendor media/ISP/OSD)")
@@ -46,6 +47,7 @@ set(_HAL_V2_COMMON_SOURCES
     common/hal_udp_stream.cpp
     common/host_link/host_link_core.c
     common/host_link/host_link_port_posix.c
+    common/devices/hal_factory_format.c
 )
 
 if(HAL_V2_BUILD_MONOLITHIC)
@@ -212,7 +214,10 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         # ---- SDK's webserver config for the Basic profiles; references rewritten to a scratch
         # ---- dir so no on-device config path is needed at runtime.
         set(HAL_V2_EMBED_DEFAULT_MEDIALIB ON CACHE BOOL "Embed a self-contained default medialib config in the HAL")
-        set(HAL_V2_DEFAULT_MEDIALIB_PROFILES "Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic,Infrared_Basic" CACHE STRING "Profiles embedded in the default medialib config")
+        # FORCE: the profile list is source-managed (nothing overrides it via
+        # -D); without FORCE a stale CMakeCache value silently keeps old
+        # profiles out of the bundle on incremental builds.
+        set(HAL_V2_DEFAULT_MEDIALIB_PROFILES "Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic,Infrared_Basic,Infrared_Basic_FG2009" CACHE STRING "Profiles embedded in the default medialib config" FORCE)
         set(HAL_V2_DEFAULT_MEDIALIB_SCRATCH_ROOT "/var/tmp/hal_medialib_default" CACHE STRING "Runtime scratch dir for the embedded default medialib config")
         set(HAL_V2_DEFAULT_MEDIALIB_WS_CFG "etc/imaging/cfg/medialib_configs/webserver_medialib_config.json" CACHE STRING "Webserver medialib config path (relative to SDK sysroot)")
         get_filename_component(_HAL_SDK_SYSROOT "${HAILO_MEDIALIB_INC_DIR}/../../.." ABSOLUTE)
@@ -224,9 +229,21 @@ if(HAL_PLATFORM STREQUAL "hailo15")
             # iq_settings/calib files regenerate the bundle on incremental builds.
             file(GLOB_RECURSE _HAL_OVERLAY_FILES CONFIGURE_DEPENDS
                     "${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/default_medialib_overlay/*")
+            file(GLOB_RECURSE _HAL_REPO_IMAGING_FILES CONFIGURE_DEPENDS
+                    "${CMAKE_CURRENT_SOURCE_DIR}/../configs/imaging/*")
             add_custom_command(
                 OUTPUT ${_GEN_BUNDLE}
                 COMMAND ${CMAKE_COMMAND} -E make_directory ${_GEN_BUNDLE_DIR}
+                # Fail the build when the compiled-in overlay tree and the
+                # pack-release configs/imaging tree drift apart (retuned file
+                # committed to one tree only, entry added to one container
+                # only, or a dangling config_file ref).
+                COMMAND ${HAL_PYTHON3}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/check_medialib_overlay.py
+                        --overlay ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/default_medialib_overlay
+                        --repo-configs ${CMAKE_CURRENT_SOURCE_DIR}/../configs/imaging
+                        --sysroot ${_HAL_SDK_SYSROOT}
+                        --profiles ${HAL_V2_DEFAULT_MEDIALIB_PROFILES}
                 COMMAND ${HAL_PYTHON3}
                         ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/gen_default_medialib_bundle.py
                         --sysroot ${_HAL_SDK_SYSROOT}
@@ -236,8 +253,10 @@ if(HAL_PLATFORM STREQUAL "hailo15")
                         --profiles ${HAL_V2_DEFAULT_MEDIALIB_PROFILES}
                         --out ${_GEN_BUNDLE}
                 DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/gen_default_medialib_bundle.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/check_medialib_overlay.py
                         ${_HAL_OVERLAY_FILES}
-                COMMENT "Generating self-contained default medialib bundle (5 Basic + Infrared profiles)"
+                        ${_HAL_REPO_IMAGING_FILES}
+                COMMENT "Generating self-contained default medialib bundle (Basic + per-lens Infrared profiles)"
                 VERBATIM
             )
             set(_DEFAULT_MEDIALIB_SOURCES
@@ -511,6 +530,21 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         target_link_libraries(hal-hailo15-ota PRIVATE hal-hailo15-mcu)
     endif()
 
+    # Factory EEPROM (AT24C02): Linux at24 sysfs backend (default) has no vendor
+    # dependency; the HailoRT I2C backend is compiled in only when hailort is
+    # available (guarded by HAL_HAVE_HAILORT inside the .cpp).
+    hal_hailo15_plain_target(hal-hailo15-factory platforms/hailo15/peripherals/hailo15_factory_impl.cpp)
+    if(HAVE_HAILORT)
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_include_directories(hal PRIVATE ${HAILORT_INC_DIR})
+            target_link_libraries(hal PRIVATE ${HAILORT_LIB})
+        else()
+            target_include_directories(hal-hailo15-factory PRIVATE ${HAILORT_INC_DIR})
+            target_link_libraries(hal-hailo15-factory PRIVATE ${HAILORT_LIB})
+            target_compile_definitions(hal-hailo15-factory PRIVATE HAL_HAVE_HAILORT=1)
+        endif()
+    endif()
+
     # Optional: HailoDSP library for image processing (crop/resize, convert, blend, privacy mask).
     find_path(HAILODSP_INC_DIR
         NAMES hailo/hailodsp.h
@@ -753,6 +787,73 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         endif()
         target_compile_options(hal-dsp-media-udp-resize-test PRIVATE -Wall -Wextra -fPIC)
 
+        add_executable(hal-dsp-rotate-dewarp-test
+            examples/dsp_rotate_dewarp_test/dsp_rotate_dewarp_test.cpp
+        )
+        target_include_directories(hal-dsp-rotate-dewarp-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-dsp-rotate-dewarp-test PRIVATE hal)
+        else()
+            target_link_libraries(hal-dsp-rotate-dewarp-test PRIVATE
+                hal-hailo15-dsp
+                hal-common
+            )
+        endif()
+        target_compile_options(hal-dsp-rotate-dewarp-test PRIVATE -Wall -Wextra -fPIC)
+
+        add_executable(hal-nms-threshold-test
+            examples/nms_threshold_test/nms_threshold_test.cpp
+        )
+        target_include_directories(hal-nms-threshold-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-nms-threshold-test PRIVATE hal pthread)
+        else()
+            target_link_libraries(hal-nms-threshold-test PRIVATE hal-hailo15-model hal-common pthread)
+        endif()
+        target_compile_options(hal-nms-threshold-test PRIVATE -Wall -Wextra -fPIC)
+
+        add_executable(hal-dmabuf-infer-test
+            examples/dmabuf_infer_test/dmabuf_infer_test.cpp
+        )
+        target_include_directories(hal-dmabuf-infer-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-dmabuf-infer-test PRIVATE hal pthread)
+        else()
+            target_link_libraries(hal-dmabuf-infer-test PRIVATE hal-hailo15-model hal-hailo15-media hal-common pthread)
+        endif()
+        target_compile_options(hal-dmabuf-infer-test PRIVATE -Wall -Wextra -fPIC)
+
+        add_executable(hal-dma-bind-ab-test
+            examples/dma_bind_ab_test/dma_bind_ab_test.cpp
+        )
+        target_include_directories(hal-dma-bind-ab-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-dma-bind-ab-test PRIVATE hal pthread)
+        else()
+            target_link_libraries(hal-dma-bind-ab-test PRIVATE hal-hailo15-model hal-common pthread)
+        endif()
+        target_compile_options(hal-dma-bind-ab-test PRIVATE -Wall -Wextra -fPIC)
+
+        add_executable(hal-motion-test examples/motion_test/motion_test.cpp)
+        target_include_directories(hal-motion-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-motion-test PRIVATE hal pthread)
+        else()
+            target_link_libraries(hal-motion-test PRIVATE
+                hal-hailo15-media hal-hailo15-video hal-hailo15-codec hal-hailo15-isp hal-common pthread)
+        endif()
+        target_compile_options(hal-motion-test PRIVATE -Wall -Wextra -fPIC)
+
+        add_executable(hal-codec-effect-test examples/codec_effect_test/codec_effect_test.cpp)
+        target_include_directories(hal-codec-effect-test PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-codec-effect-test PRIVATE hal pthread)
+        else()
+            target_link_libraries(hal-codec-effect-test PRIVATE
+                hal-hailo15-media hal-hailo15-video hal-hailo15-codec hal-hailo15-isp hal-common pthread)
+        endif()
+        target_compile_options(hal-codec-effect-test PRIVATE -Wall -Wextra -fPIC)
+
         add_executable(hal-ai-example-v2
             examples/ai_example_v2/ai_example_v2.cpp
             common/hal_clip_text_encoder.cpp
@@ -861,6 +962,7 @@ if(HAL_PLATFORM STREQUAL "hailo15")
             hal-hailo15-rs485
             hal-hailo15-lens
             hal-hailo15-env-ctrl
+            hal-hailo15-factory
             hal-devices
             hal-common
         )
@@ -906,6 +1008,27 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         target_compile_options(hal-genai-example-v2 PRIVATE -Wall -Wextra -fPIC)
     endif()
 
+    if(HAVE_HAILO_MEDIALIB)
+        add_executable(hal-jpeg-web-test examples/jpeg_web_test/jpeg_web_test.cpp)
+        target_include_directories(hal-jpeg-web-test PRIVATE
+            ${HAL_V2_INC}
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib
+        )
+        if(HAL_V2_BUILD_MONOLITHIC)
+            target_link_libraries(hal-jpeg-web-test PRIVATE hal pthread)
+        else()
+            target_link_libraries(hal-jpeg-web-test PRIVATE
+                hal-hailo15-media
+                hal-hailo15-video
+                hal-hailo15-codec
+                hal-hailo15-isp
+                hal-common
+                pthread
+            )
+        endif()
+        target_compile_options(hal-jpeg-web-test PRIVATE -Wall -Wextra -fPIC)
+    endif()
+
     add_executable(hal-ota-test-v2 examples/ota_test_v2/ota_test_v2.cpp)
     target_include_directories(hal-ota-test-v2 PRIVATE ${HAL_V2_ROOT} ${HAL_V2_INC})
     if(HAL_V2_BUILD_MONOLITHIC)
@@ -945,6 +1068,7 @@ elseif(HAL_PLATFORM STREQUAL "stub")
         platforms/stub/peripherals/stub_lens_impl.c
         platforms/stub/peripherals/stub_env_ctrl_impl.c
         platforms/stub/peripherals/stub_ota_impl.c
+        platforms/stub/peripherals/stub_factory_impl.c
     )
     if(HAL_V2_BUILD_MONOLITHIC)
         target_sources(hal PRIVATE ${_HAL_V2_STUB_SOURCES})
@@ -989,4 +1113,28 @@ elseif(HAL_PLATFORM STREQUAL "stub")
         target_link_libraries(ne503_boot_prep PRIVATE hal-common pthread)
     endif()
     target_compile_options(ne503_boot_prep PRIVATE -Wall -Wextra -fPIC)
+endif()
+
+if(HAL_V2_BUILD_TESTS)
+    include(CTest)
+    find_package(Threads REQUIRED)
+
+    add_executable(hal-hailo15-async-provider-lifecycle-test
+        tests/hailo15_async_provider_lifecycle_test.cpp
+    )
+    target_include_directories(hal-hailo15-async-provider-lifecycle-test PRIVATE
+        ${HAL_V2_ROOT}
+        ${HAL_V2_INC}
+    )
+    target_link_libraries(hal-hailo15-async-provider-lifecycle-test PRIVATE
+        Threads::Threads
+    )
+    target_compile_options(hal-hailo15-async-provider-lifecycle-test PRIVATE
+        -Wall -Wextra -Werror
+    )
+
+    add_test(
+        NAME hailo15_async_provider_lifecycle
+        COMMAND hal-hailo15-async-provider-lifecycle-test
+    )
 endif()
