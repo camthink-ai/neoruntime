@@ -11,6 +11,7 @@
 #ifdef HAS_GRPC
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <memory>
@@ -140,6 +141,11 @@ class LensHalServiceImpl;  // defined in .cpp
 struct LensHalServiceBundle {
     std::unique_ptr<grpc::Service> service;
     LensController* controller = nullptr;  // owned by service
+    // Boot-time self-init hook (headless-boot fix): runs the same sequence
+    // as the Init RPC when — and only when — the lens is not yet
+    // initialized. Idempotent, mutex-serialized against all RPCs. Valid
+    // only while `service` is alive.
+    std::function<int()> ensure_bootstrapped;
 };
 
 // Factory function defined in lens_hal_service.cpp. The service owns the

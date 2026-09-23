@@ -11,16 +11,20 @@
 #include "../include/osd_manager.h"
 #include "../include/encoder_manager.h"
 #include "../include/fd_publisher.h"
+#include "../include/fd_protocol.h"
 #include "../include/rtsp_server.h"
 #include "../include/encoded_publisher.h"
 #include "../include/ai_overlay_subscriber.h"
 #include "../include/dpm_worker.h"
+#include "../include/dsp_service.h"
 #include <dlfcn.h>
 
 #ifdef HAS_GRPC
 #include "../include/camera_control_service.h"
 #include "../include/lens_hal_service.h"
+#include "../include/lens_image_probe.h"
 #include "camera.pb.h"
+#include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
 #endif
 
@@ -41,6 +45,9 @@
 #include <iomanip>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 #include <unistd.h>
 
 extern "C" {
@@ -88,6 +95,13 @@ constexpr const char* kPrivacyMaskConfigPath = "/data/aipc/etc/privacy_mask.json
 // /data/aipc/etc default-root convention.
 constexpr const char* kTransformConfigPath = "/data/aipc/etc/transform_config.json";
 
+// Sidecar recording the lens model the persisted transform was last written
+// for — LEGACY v1 fallback only. Current writes embed the lens model inside
+// the transform mirror itself (one atomic file); this sidecar is consulted
+// just for mirrors written before that format existed, and a lens swap
+// (identity != probed model) re-seeds the optics-dependent dewarp default.
+constexpr const char* kTransformLensHintPath = "/data/aipc/etc/transform_lens_hint.txt";
+
 // Scalar config-field persistence mirror. Same convention as the transform/OSD/
 // privacy/ISP mirrors: /data/aipc/etc is the persistent p3 root and a .json
 // suffix is NOT clobbered by deploy.sh (which only rewrites etc/*.yaml), so
@@ -127,6 +141,20 @@ constexpr const char* kIspConfigPath = "/data/aipc/etc/isp_config.json";
 // {"profile_name":"..."} (no proto) so the helpers are unconditional. Hardcoded
 // (KISS) to match the C++ side's /data/aipc/etc default-root convention.
 constexpr const char* kProfileConfigPath = "/data/aipc/etc/profile_config.json";
+
+// Last user-settled lens position (zoom/focus motor positions + ratio).
+// Same persistence convention as the profile mirror: /data/aipc/etc/*.json
+// survives restarts and deploys. The recorder only rewrites it after the
+// motors settle on a position that differs from the archived one, and the
+// model field makes a lens swap (af0832 <-> fg2009) discard the stale entry.
+constexpr const char* kLensPositionPath = "/data/aipc/etc/lens_position.json";
+
+// Operator-tuned day/night switch thresholds (web sliders -> set_light_thresholds).
+// Same persistence convention as the lens-position archive: /data/aipc/etc/*.json
+// survives restart/deploy, and the mirror overrides the YAML defaults at boot so
+// the operator's tuning survives a power cycle. Delete the file to fall back to
+// the YAML values.
+constexpr const char* kDayNightThresholdsPath = "/data/aipc/etc/daynight_thresholds.json";
 
 int dpm_render_mode_from_string(const std::string& s) {
     if (s == "blur") return kDpmRenderBlur;
@@ -290,6 +318,30 @@ bool runtime_stream_reconfiguration_enabled() {
              std::strcmp(value, "no") == 0);
 }
 
+/* Lens-keyed dewarp default. The only distortion calibration on the rootfs is
+ * the Hailo SDK reference fisheye table (135.7 deg diagonal FOV): close enough
+ * to the fg2009 motorized zoom (~120 deg) to be worth enabling, but a gross
+ * over-correction for the narrow-FOV af0832 (~43 deg). Seed dewarp from the
+ * probed lens model; every other transform field keeps its persisted value. */
+bool lens_dewarp_default(const std::string& lens_model) {
+    return lens_model == "fg2009";
+}
+
+/* Lens hint sidecar (legacy v1): one plain-text line. Missing/corrupt reads
+ * as "unknown", which makes the next boot re-seed — the safe direction. */
+bool load_transform_lens_hint(std::string* lens_model) {
+    std::ifstream in(kTransformLensHintPath);
+    if (!in.is_open()) return false;
+    std::string line;
+    if (!std::getline(in, line)) return false;
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.pop_back();
+    }
+    if (line.empty()) return false;
+    *lens_model = line;
+    return true;
+}
+
 }  // namespace
 
 CameraDaemon::CameraDaemon() = default;
@@ -337,21 +389,66 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     }
     // Reapply persisted transform (rotation/flip/dewarp/grayscale/dis/eis).
     // init_media() ran above so media_ctx_ is live and set_transform_config can
-    // apply immediately. On miss/corrupt/identity load_transform_config returns
-    // false and we start from the YAML defaults. Re-applying re-persists
-    // (idempotent, one cheap startup write) — same shape as the OSD/privacy
-    // replays above. NOTE: dewarp replay only re-enables the dewarp image field;
-    // the MEDIALIB_DEWARP_DSP_OPTIMIZATION env (kept at 0, the sp805-watchdog-
-    // safe setting) is a separate process env, not touched here.
+    // apply immediately. Re-applying re-persists (idempotent, one cheap startup
+    // write) — same shape as the OSD/privacy replays above. NOTE: dewarp replay
+    // only re-enables the dewarp image field; the MEDIALIB_DEWARP_DSP_OPTIMIZATION
+    // env (kept at 0, the sp805-watchdog-safe setting) is a separate process
+    // env, not touched here.
+    // Dewarp is optics-dependent: if the persisted transform was written for a
+    // different lens, re-seed dewarp from the probed lens model before
+    // replaying. The mirror embeds the lens it was written for (v2, one atomic
+    // file); legacy v1 mirrors fall back to the sidecar hint. Manual toggles
+    // persist the current lens alongside the transform, so they survive reboots
+    // until the lens hardware changes.
+    // The replay runs unconditionally: init_media() seeded the pipeline from
+    // the PROFILE iq_settings (dewarp defaults to enabled there), so skipping
+    // the apply would leave the profile default standing instead of the
+    // persisted/seeded state.
+    // With no valid mirror (missing/corrupt), seed the request from the LIVE
+    // media config and override only dewarp — replaying a zero proto would
+    // also wipe profile-set rotation/flip/grayscale/dis/eis on first boot. A
+    // missing mirror also re-seeds: the profile-seeded dewarp is not a
+    // deliberate choice for this lens.
     {
         aipc::camera::TransformConfig persisted;
-        if (load_transform_config(&persisted)) {
-            HAL_LOG_INFO("CameraDaemon: applying persisted transform config (rot=%d flip=%d dewarp=%d gray=%d dis=%d eis=%d)",
-                         (int)persisted.rotation(), (int)persisted.flip(),
-                         persisted.dewarp() ? 1 : 0, persisted.grayscale() ? 1 : 0,
-                         persisted.dis() ? 1 : 0, persisted.eis() ? 1 : 0);
-            set_transform_config(persisted);
+        std::string mirror_lens;  // lens embedded in a v2 mirror; "" = v1/none
+        const bool mirrored = load_transform_config(&persisted, &mirror_lens);
+        if (!mirrored && !get_transform_config(persisted)) {
+            HAL_LOG_WARNING("CameraDaemon: no transform mirror and live config read "
+                            "failed; replaying lens-seeded defaults only");
         }
+        std::string written_for;
+        bool written_for_ok = false;
+        if (mirrored && !mirror_lens.empty()) {
+            written_for = mirror_lens;
+            written_for_ok = true;
+        } else {
+            std::string hint;
+            if (load_transform_lens_hint(&hint)) {
+                written_for = hint;
+                written_for_ok = true;
+            }
+        }
+        if (!mirrored || !written_for_ok || written_for != config_.lens_model) {
+            const bool want = lens_dewarp_default(config_.lens_model);
+            if (persisted.dewarp() != want) {
+                HAL_LOG_INFO("CameraDaemon: lens %s (transform last written for %s): "
+                             "re-seeding dewarp=%d",
+                             config_.lens_model.c_str(),
+                             written_for_ok ? written_for.c_str() : "<none>", want ? 1 : 0);
+                persisted.set_dewarp(want);
+            }
+        }
+        HAL_LOG_INFO("CameraDaemon: applying %s transform config (rot=%d flip=%d dewarp=%d gray=%d dis=%d eis=%d)",
+                     mirrored ? "persisted" : "live-seeded",
+                     (int)persisted.rotation(), (int)persisted.flip(),
+                     persisted.dewarp() ? 1 : 0, persisted.grayscale() ? 1 : 0,
+                     persisted.dis() ? 1 : 0, persisted.eis() ? 1 : 0);
+        // No separate lens stamp exists: the apply persists the transform AND
+        // the current lens in one atomic mirror write, and a failure leaves
+        // the previous mirror+identity standing so the next boot retries the
+        // re-seed.
+        set_transform_config(persisted);
     }
     // Reapply persisted scalar config fields (replay-on-boot: platform mirror
     // wins over HAL profile defaults, resolving the two-writer ambiguity — HAL's
@@ -453,7 +550,76 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     fd_cfg.sock_path = config_.fd_pub_sock_path;
     fd_cfg.max_clients = config_.fd_pub_max_clients;
     fd_cfg.max_outstanding_per_client = config_.fd_pub_max_outstanding;
+    fd_cfg.lease_ms = config_.fd_pub_lease_ms;
     fd_pub_ = std::make_unique<FdPublisher>(frame_router_.get(), fd_cfg);
+
+    // DSP offload service (PLAT-1..5): one HAL DSP context + dma-buf buffer
+    // registry shared by all app jobs. Started BEFORE the FD publisher so a
+    // UDS DSP_ALLOC can never race service startup; the publisher dispatches
+    // DSP_ALLOC/DSP_BUF_RELEASE to it (set_dsp_service wires the pointer).
+    if (hal_loader_ && hal_loader_->has_dsp() && hal_loader_->has_frame_buffer()) {
+        // P2: knobs come from the `dsp:` YAML section (defaults in
+        // dsp_service.h) — quota applies per owning client connection.
+        const DspServiceConfig dsp_cfg = config_.dsp;
+        dsp_service_ = std::make_unique<DspService>(hal_loader_->dsp(),
+                                                    hal_loader_->frame_buffer(),
+                                                    dsp_cfg);
+        if (dsp_service_->start()) {
+            fd_pub_->set_dsp_service(dsp_service_.get());
+            HAL_LOG_INFO("CameraDaemon: DSP offload service started "
+                         "(max_batch=%u, timeout=%ums, quota=%.0f jobs/s %.0f MPix/s)",
+                         dsp_cfg.max_batch, dsp_cfg.job_timeout_ms,
+                         dsp_cfg.quota_jobs_per_sec, dsp_cfg.quota_mpix_per_sec);
+        } else {
+            HAL_LOG_WARNING("CameraDaemon: DSP service failed to start, "
+                            "app DSP offload disabled");
+            dsp_service_.reset();
+        }
+    } else {
+        HAL_LOG_INFO("CameraDaemon: HAL DSP/frame_buffer ops unavailable, "
+                     "app DSP offload disabled");
+    }
+
+    // App frame injection (PushFrame P0-P2): rides the DSP registry above
+    // (buffers pinned by id, never a raw fd). Constructed only when the
+    // registry exists; the master gate (config_.injection.enabled, ships
+    // false) decides whether PushFrame accepts frames. The bake-site
+    // handoff (take_frame + compose in handle_video_frame_for_routing)
+    // consumes frames targeted at this stream (stream_id) or legacy
+    // matching-dims REPLACE pushes; see inject_nv12_copy /
+    // inject_argb_blend there. P2-12 resolvers: the identity resolver
+    // anchors the manifest permission gate to the FdPublisher's
+    // SO_PEERCRED identities; the stream-dims resolver answers push-time
+    // geometry checks from the live bake-site dims cache.
+    if (dsp_service_) {
+        injection_service_ = std::make_unique<InjectionService>(
+            dsp_service_.get(), config_.injection);
+        if (fd_pub_) {
+            injection_service_->set_identity_resolver(
+                [this](int owner_fd) {
+                    return fd_pub_->client_identity(owner_fd);
+                });
+            // P2-13: a disconnect closes the owner's injection session
+            // (queue flush + pin release) instead of wedging it.
+            fd_pub_->set_injection_service(injection_service_.get());
+        }
+        injection_service_->set_stream_dims_resolver(
+            [this](const std::string& name, uint32_t& w, uint32_t& h) {
+                std::shared_lock<std::shared_mutex> lk(stream_dims_mu_);
+                const auto it = stream_dims_.find(name);
+                if (it == stream_dims_.end()) {
+                    return false;
+                }
+                w = it->second.first;
+                h = it->second.second;
+                return true;
+            });
+        injection_service_->start();
+        HAL_LOG_INFO("CameraDaemon: frame injection service started "
+                     "(enabled=%s, queue=%u)",
+                     config_.injection.enabled ? "true" : "false",
+                     config_.injection.queue_capacity);
+    }
 
     // Register all subscribers with FrameRouter
     register_subscribers();
@@ -487,6 +653,18 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     {
         std::string persisted_profile;
         if (load_profile_config(&persisted_profile)) {
+            // Pre-per-lens images persisted the shared IR entry name. Map it
+            // to this lens's effective entry so the guard and the replay use
+            // the same name the daemon would switch to (and so the guard
+            // still recognizes it as an infrared profile to force day on
+            // boot, instead of replaying the other lens's IQ tuning).
+            if (persisted_profile == "Infrared_Basic" &&
+                config_.infrared.infrared_profile == "Infrared_Basic_FG2009") {
+                HAL_LOG_INFO("CameraDaemon: mapping persisted IR profile '%s' -> '%s' (per-lens)",
+                             persisted_profile.c_str(),
+                             config_.infrared.infrared_profile.c_str());
+                persisted_profile = config_.infrared.infrared_profile;
+            }
             std::string current = get_current_profile();
             const bool force_day_on_boot = config_.infrared.enabled &&
                 config_.infrared.default_mode != "infrared";
@@ -777,7 +955,12 @@ bool CameraDaemon::get_transform_config(aipc::camera::TransformConfig& config) {
     return true;
 }
 
-bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& config) {
+bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& config,
+                                        bool* persisted_ok) {
+    // Out-param starts false so every early-return path below reads as "not
+    // durably persisted"; only the applied+mirrored tail sets it true.
+    if (persisted_ok) *persisted_ok = false;
+
     // Serialize the full transform (light override OR full medialib reinit +
     // post-rebuild consumer restart + frame verify). A rotation may run a
     // blocking HAL reconfigure with op_mu_ released below; without this guard a
@@ -898,13 +1081,26 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
     last_image_config_ = ic;
     have_last_image_config_ = true;
 
-    // Persist the applied transform so it survives restart/deploy/OS-upgrade.
-    // Best-effort: a failure logs but never aborts the (already-applied) apply.
-    // set_transform_config is compiled unconditionally, but the persist helper
-    // (and the proto/json_util headers it needs) live under HAS_GRPC, so the
-    // call is guarded to match (same pattern as persist_privacy_mask_config).
+    // Persist the applied transform WITH the lens it was written for — one
+    // atomic tmp+rename file, so a reader can never observe a transform whose
+    // lens attribution is missing or stale (the split state the old two-file
+    // sidecar design allowed). A write failure logs but never aborts the
+    // (already-applied) HAL apply; it only reports persisted_ok=false so init
+    // retries the lens re-seed on the next boot. set_transform_config is
+    // compiled unconditionally, but the persist helper (and the proto/
+    // json_util headers it needs) live under HAS_GRPC, so the call is guarded
+    // to match (same pattern as persist_privacy_mask_config).
 #ifdef HAS_GRPC
-    persist_transform_config(config);
+    const bool mirrored = persist_transform_config(config, config_.lens_model);
+    if (!mirrored) {
+        HAL_LOG_WARNING("CameraDaemon: transform mirror write failed; lens "
+                        "re-seed retries next boot");
+    }
+    if (persisted_ok) *persisted_ok = mirrored;
+#else
+    // No persistence layer in this build: the applied state is the durable
+    // state, nothing is pending.
+    if (persisted_ok) *persisted_ok = true;
 #endif
 
     if (full_reinit) {
@@ -935,6 +1131,19 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
         reapply_osd_config_after_pipeline_rebuild("transform reinit");
 #endif
         restart_data_consumers();
+
+        // Whole-pipeline rebuild: every stream's frame generation restarted.
+        // Bump the overlay epoch per encoder stream so app commands tagged
+        // to the old generation are rejected (and its layers purged)
+        // instead of decorating the new one.
+        {
+            std::shared_lock<std::shared_mutex> lk(op_mu_);
+            if (ai_overlay_) {
+                for (const auto& ec : config_.encoders) {
+                    ai_overlay_->note_stream_restart(ec.stream_name);
+                }
+            }
+        }
 
         // Verify the rebuilt pipeline actually produces frames. Rotation
         // rebuilds all ISP pipelines; if the post-rebuild encoder path is dead
@@ -1423,10 +1632,245 @@ void CameraDaemon::bind_video_source_callbacks() {
     }
 }
 
+// Copy an injected NV12 dma-buf frame (PushFrame REPLACE full-frame or
+// OVERLAY opaque inset) onto the pipeline frame's planes at (dst_x,
+// dst_y). The source is a DSP-registry pin: real dma-buf imports carry
+// no CPU mapping (fb->planes[] stay NULL — DSP hardware consumes the
+// fds), so each plane is mapped PROT_READ for exactly the copy,
+// bracketed by DMA_BUF_IOCTL_SYNC (START|READ before, END|READ after);
+// the per-frame map/unmap keeps zero cache-lifetime coupling with the
+// registry. NV12 is strided rows of `width` payload bytes — Y: height
+// rows at (dst_x, dst_y), UV: height/2 rows at (dst_x, dst_y/2) — each
+// plane at its own src/dst stride (dst_x/dst_y even keeps the chroma
+// grid aligned). Any failure logs and leaves the ISP pixels intact:
+// the stream degrades to the camera, never to garbage.
+static void inject_nv12_copy(const InjectionService::QueuedFrame& qf,
+                             HalFrameBuffer* frame,
+                             uint32_t dst_x, uint32_t dst_y) {
+    const HalFrameBuffer* src = qf.pin.fb();
+    if (!src || src->num_planes < 2u || frame->num_planes < 2u ||
+        !frame->planes[0] || !frame->planes[1]) {
+        HAL_LOG_WARNING("CameraDaemon: injected frame unusable, keeping ISP pixels");
+        return;
+    }
+
+    const uint32_t rows[2] = {qf.height, qf.height / 2u};
+    const uint32_t src_stride[2] = {
+        qf.stride, src->strides[1] != 0u ? src->strides[1] : qf.stride};
+    for (uint32_t p = 0; p < 2u; ++p) {
+        if (src->dma_fds[p] < 0 ||
+            src->sizes[p] < (rows[p] - 1u) * src_stride[p] + qf.width) {
+            HAL_LOG_WARNING("CameraDaemon: injected plane %u too small, keeping ISP pixels", p);
+            return;
+        }
+    }
+
+    uint8_t* maps[2] = {nullptr, nullptr};
+    for (uint32_t p = 0; p < 2u; ++p) {
+        const int fd = src->dma_fds[p];
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+        if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+            HAL_LOG_WARNING("CameraDaemon: injected plane %u sync failed, keeping ISP pixels", p);
+            break;
+        }
+        void* m = mmap(nullptr, src->sizes[p], PROT_READ, MAP_SHARED, fd, 0);
+        if (m == MAP_FAILED) {
+            sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+            (void)ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+            HAL_LOG_WARNING("CameraDaemon: injected plane %u mmap failed, keeping ISP pixels", p);
+            break;
+        }
+        maps[p] = static_cast<uint8_t*>(m);
+    }
+
+    if (maps[0] && maps[1]) {
+        /* Y rows land at dst_y+r; UV rows at dst_y/2+r (both planes take
+         * dst_x as the byte column offset — NV12 packs one UV byte pair
+         * per pixel column). */
+        const uint32_t dst_row_off[2] = {dst_y, dst_y / 2u};
+        for (uint32_t p = 0; p < 2u; ++p) {
+            const uint8_t* sp = maps[p];
+            uint8_t* dp = static_cast<uint8_t*>(frame->planes[p]) +
+                          static_cast<size_t>(dst_row_off[p]) * frame->strides[p] +
+                          dst_x;
+            for (uint32_t r = 0; r < rows[p]; ++r) {
+                memcpy(dp + static_cast<size_t>(r) * frame->strides[p],
+                       sp + static_cast<size_t>(r) * src_stride[p],
+                       qf.width);
+            }
+        }
+    }
+
+    /* Unmap/sync-end exactly what was mapped (planes map in order, so
+     * break-on-null is exact). */
+    for (uint32_t p = 0; p < 2u && maps[p]; ++p) {
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+        (void)ioctl(src->dma_fds[p], DMA_BUF_IOCTL_SYNC, &sync);
+        (void)munmap(maps[p], src->sizes[p]);
+    }
+}
+
+/* ARGB32 → NV12 color conversion (BT.601 limited range). ARGB32 memory
+ * byte order is [A,R,G,B] (the SDK's dsp.py packs the same layout). */
+static inline uint8_t argb_y_of(uint8_t r, uint8_t g, uint8_t b) {
+    const int32_t v = ((16829 * r + 33039 * g + 6416 * b + 32768) >> 16) + 16;
+    return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+static inline uint8_t argb_u_of(uint8_t r, uint8_t g, uint8_t b) {
+    const int32_t v = ((-9714 * r - 19076 * g + 28784 * b + 32768) >> 16) + 128;
+    return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+static inline uint8_t argb_v_of(uint8_t r, uint8_t g, uint8_t b) {
+    const int32_t v = ((28784 * r - 24113 * g - 4655 * b + 32768) >> 16) + 128;
+    return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+// Alpha-blend an injected ARGB32 frame (PushFrame P2 OVERLAY) over the
+// pipeline NV12 frame at (dest_x, dest_y), on the CPU. Rationale: the
+// DSP build_blend op needs a registry-resident base frame and the
+// pipeline buffer is not one, and the DSP queue is a single congested
+// worker (P1-9 unfixed) — the bake site blends on CPU instead. Layout:
+// NV12 chroma is a 2x2 macroblock grid, so the blend walks 2x2 source
+// pixel blocks; per-pixel luma blends with that pixel's alpha, chroma
+// blends once per block with the block's total coverage (sw = sum of
+// the 4 alphas, 0..1020; u/v source are the alpha-weighted average of
+// the block's converted chroma). Fully transparent blocks (sw == 0)
+// leave the frame untouched. The source mapping follows the registry
+// layout: dma-buf imports map PROT_READ per use (sync-bracketed, same
+// as inject_nv12_copy), memfd/malloc imports already carry planes[0].
+// Validation guarantees even width/height/even dest, so macroblocks
+// tile the source exactly. Any failure logs and leaves the ISP pixels
+// intact.
+static void inject_argb_blend(const InjectionService::QueuedFrame& qf,
+                              HalFrameBuffer* frame) {
+    const HalFrameBuffer* src = qf.pin.fb();
+    if (!src || src->num_planes < 1u || frame->num_planes < 2u ||
+        !frame->planes[0] || !frame->planes[1]) {
+        HAL_LOG_WARNING("CameraDaemon: injected frame unusable, keeping ISP pixels");
+        return;
+    }
+    if (src->sizes[0] < (qf.height - 1u) * qf.stride + qf.width * 4u) {
+        HAL_LOG_WARNING("CameraDaemon: injected ARGB32 plane too small, keeping ISP pixels");
+        return;
+    }
+
+    uint8_t* map = nullptr;
+    const uint8_t* argb = static_cast<const uint8_t*>(src->planes[0]);
+    if (!argb) {
+        if (src->dma_fds[0] < 0) {
+            HAL_LOG_WARNING("CameraDaemon: injected ARGB32 has no mapping or fd");
+            return;
+        }
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+        if (ioctl(src->dma_fds[0], DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+            HAL_LOG_WARNING("CameraDaemon: injected ARGB32 sync failed, keeping ISP pixels");
+            return;
+        }
+        map = static_cast<uint8_t*>(
+            mmap(nullptr, src->sizes[0], PROT_READ, MAP_SHARED,
+                 src->dma_fds[0], 0));
+        if (map == MAP_FAILED) {
+            sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+            (void)ioctl(src->dma_fds[0], DMA_BUF_IOCTL_SYNC, &sync);
+            HAL_LOG_WARNING("CameraDaemon: injected ARGB32 mmap failed, keeping ISP pixels");
+            return;
+        }
+        argb = map;
+    }
+
+    uint8_t* y_plane = static_cast<uint8_t*>(frame->planes[0]);
+    uint8_t* uv_plane = static_cast<uint8_t*>(frame->planes[1]);
+    const uint32_t y_stride = frame->strides[0];
+    const uint32_t uv_stride = frame->strides[1];
+    const uint32_t dx = qf.dest_x;
+    const uint32_t dy = qf.dest_y;
+
+    for (uint32_t by = 0; by < qf.height; by += 2u) {
+        const uint8_t* srow0 = argb + static_cast<size_t>(by) * qf.stride;
+        const uint8_t* srow1 = (by + 1u < qf.height)
+            ? srow0 + qf.stride : nullptr;
+        uint8_t* yrow0 = y_plane + static_cast<size_t>(dy + by) * y_stride + dx;
+        uint8_t* yrow1 = (by + 1u < qf.height) ? yrow0 + y_stride : nullptr;
+        uint8_t* uvrow = uv_plane +
+                         static_cast<size_t>((dy + by) / 2u) * uv_stride + dx;
+
+        for (uint32_t bx = 0; bx < qf.width; bx += 2u) {
+            const bool two_cols = (bx + 1u < qf.width);
+            uint32_t sw = 0;          /* total coverage: sum of 4 alphas */
+            int32_t su = 0, sv = 0;   /* alpha-weighted source chroma sums */
+
+            /* Per-pixel luma blend + chroma accumulation, 2x2 block. */
+            for (uint32_t py = 0; py < 2u; ++py) {
+                const uint8_t* srow = py == 0u ? srow0 : srow1;
+                uint8_t* yrow = py == 0u ? yrow0 : yrow1;
+                if (!srow || !yrow) continue; /* odd trailing row can't happen (even h) */
+                for (uint32_t px = 0; px < 2u; ++px) {
+                    if (px == 1u && !two_cols) continue; /* even w, also can't happen */
+                    const uint8_t* p = srow + static_cast<size_t>(bx + px) * 4u;
+                    const uint8_t a = p[0];
+                    const uint8_t r = p[1];
+                    const uint8_t g = p[2];
+                    const uint8_t b = p[3];
+                    if (a == 0u) continue;
+                    const uint8_t yd = yrow[bx + px];
+                    yrow[bx + px] = static_cast<uint8_t>(
+                        (a * argb_y_of(r, g, b) + (255u - a) * yd + 128u) >> 8);
+                    sw += a;
+                    su += a * argb_u_of(r, g, b);
+                    sv += a * argb_v_of(r, g, b);
+                }
+            }
+
+            if (sw == 0u) {
+                continue; /* fully transparent block */
+            }
+            /* Block chroma: source = alpha-weighted average color;
+             * dest = coverage-weighted mix with the existing chroma. */
+            const uint8_t u_src = static_cast<uint8_t>((su + sw / 2u) / sw);
+            const uint8_t v_src = static_cast<uint8_t>((sv + sw / 2u) / sw);
+            /* UV addressing is in BYTES, like inject_nv12_copy: one u,v pair
+             * (2 bytes) per 2 luma columns, so block bx (luma cols dx+bx,
+             * dx+bx+1) sits at byte offset dx+bx of the uv row — uvrow
+             * already carries the dx base, the per-block step is just bx.
+             * A bx*2 step writes every other chroma sample and spills past
+             * the row end into the next chroma row's left edge. */
+            uint8_t* uvp = uvrow + static_cast<size_t>(bx);
+            uvp[0] = static_cast<uint8_t>((sw * u_src + (1020u - sw) * uvp[0] + 510u) / 1020u);
+            uvp[1] = static_cast<uint8_t>((sw * v_src + (1020u - sw) * uvp[1] + 510u) / 1020u);
+        }
+    }
+
+    if (map) {
+        struct dma_buf_sync sync{};
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+        (void)ioctl(src->dma_fds[0], DMA_BUF_IOCTL_SYNC, &sync);
+        (void)munmap(map, src->sizes[0]);
+    }
+}
+
 void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_name,
                                                   HalFrameBuffer* frame) {
     if (!frame) {
         return;
+    }
+
+    // Live stream dims cache (P2-12): cheap shared-lock compare every
+    // frame, unique-lock write only on change. Feeds the InjectionService
+    // stream_dims resolver so push-time geometry checks work even before
+    // the first frame of a freshly (re)started stream.
+    {
+        std::shared_lock<std::shared_mutex> lk(stream_dims_mu_);
+        const auto it = stream_dims_.find(dispatch_name);
+        if (it == stream_dims_.end() ||
+            it->second.first != frame->width ||
+            it->second.second != frame->height) {
+            lk.unlock();
+            std::unique_lock<std::shared_mutex> ulk(stream_dims_mu_);
+            stream_dims_[dispatch_name] = {frame->width, frame->height};
+        }
     }
 
     // Dynamic Privacy Mask: bake the worker-produced bytemask onto
@@ -1464,6 +1908,73 @@ void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_na
         }
         if (dpm_capture && dpm_capture->is_running()) {
             dpm_capture->offer_frame(frame);
+        }
+    }
+
+    // App frame injection (PushFrame P0-P2): with the DPM offer above
+    // already made on the real ISP pixels (its DSP resize is
+    // synchronous, so the worker's copies are already made), compose the
+    // newest due queued app frame FOR THIS STREAM over THIS pipeline
+    // buffer. Everything below — DPM mask/mosaic, AI overlay,
+    // frame_router subscribers and the frontend bridge's encoder
+    // add_buffer — then consumes the composed pixels, while platform
+    // masking draws on top by construction (frame-injection.md risk 4:
+    // the worker never sees injected content and the mask always wins
+    // over REPLACE). Dispatch: stream-targeted items follow their
+    // stream_id; legacy (empty stream_id) REPLACE items follow the P0
+    // dims-match rule. pts pacing (pts_ns vs frame timestamp, device
+    // CLOCK_MONOTONIC domain) picks the newest due item and drops
+    // superseded older ones inside take_frame. Composition by mode:
+    //   REPLACE  NV12 content copy over the whole frame (dims must equal
+    //            the encode dims — push-time checks are best-effort, a
+    //            mid-session reconfigure ends here as a WARN skip);
+    //   OVERLAY  NV12 opaque inset paste at (dest_x, dest_y), or ARGB32
+    //            CPU alpha blend (bounds hard-checked against this
+    //            frame).
+    // With no session, nothing due, or a mismatch it is an O(1) miss
+    // and the ISP pixels flow on untouched. The queued pin releases at
+    // this scope's exit, after the compose.
+    if (injection_service_) {
+        InjectionService::QueuedFrame qf;
+        if (injection_service_->take_frame(dispatch_name, frame->width,
+                                           frame->height,
+                                           frame->timestamp_ns, qf)) {
+            const HalFrameBuffer* src = qf.pin.fb();
+            if (qf.mode == InjectionMode::Replace) {
+                if (qf.width == frame->width && qf.height == frame->height &&
+                    src && src->format == HAL_PIX_FMT_NV12) {
+                    inject_nv12_copy(qf, frame, 0, 0);
+                } else {
+                    HAL_LOG_WARNING("CameraDaemon: injected REPLACE %ux%u does "
+                                    "not match stream '%s' %ux%u, dropping it",
+                                    qf.width, qf.height, dispatch_name.c_str(),
+                                    frame->width, frame->height);
+                }
+            } else if (src && qf.dest_x + qf.width <= frame->width &&
+                       qf.dest_y + qf.height <= frame->height) {
+                if (src->format == HAL_PIX_FMT_NV12) {
+                    inject_nv12_copy(qf, frame, qf.dest_x, qf.dest_y);
+                } else if (src->format == HAL_PIX_FMT_ARGB32) {
+                    inject_argb_blend(qf, frame);
+                } else {
+                    HAL_LOG_WARNING("CameraDaemon: injected OVERLAY has "
+                                    "unsupported format %d, dropping it",
+                                    static_cast<int>(src->format));
+                }
+            } else {
+                HAL_LOG_WARNING("CameraDaemon: injected OVERLAY %u+%u, %u+%u "
+                                "exceeds stream '%s' %ux%u, dropping it",
+                                qf.dest_x, qf.width, qf.dest_y, qf.height,
+                                dispatch_name.c_str(), frame->width,
+                                frame->height);
+            }
+            // Write-lease release (Fix-1): every path above has finished
+            // reading the injected pixels (compose or skip), so the SDK
+            // may rewrite this pool slot from the next PushFrame response
+            // on. Before this ack the id stays in the daemon's in-flight
+            // set even across an EOS/owner-disconnect session close that
+            // lands mid-bake.
+            injection_service_->note_bake_done(qf.buffer_id);
         }
     }
 
@@ -1555,8 +2066,97 @@ void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_na
         }
     }
 
-    if (frame_router_) {
-        frame_router_->on_frame_arrived(dispatch_name, frame);
+    // AI overlay: same bake point as DPM. The frontend bridge invokes this
+    // callback BEFORE auto-feeding the encoder (hailo15_ml_frontend_bridge
+    // runs cb() ahead of add_buffer() on the same buffer), so pixels drawn
+    // here reach the encoded stream in BOTH auto_feed and manual mode.
+    // ai_overlay_ is swapped under op_mu_ (update_ai_overlay_config resets
+    // it under the write lock), so take the read lock around the call.
+    // Semantics mirror DPM: the overlay is baked into the shared pipeline
+    // buffer, so zero-copy subscribers of an overlaid stream see it too —
+    // apps that need clean inference input should subscribe a stream that
+    // is not an overlay target (ai_overlay.stream_map models that split).
+    // apply_overlay no-ops in O(1) when no fresh result matches the stream.
+    //
+    // Strict frame-lock (P1-6) reorders the two steps for identity-fed
+    // streams: the frame is dispatched to the router FIRST — the router
+    // feed is what carries it to ai-runtime, so gating ahead of the
+    // dispatch would wait for a result that can never arrive — and only
+    // then blocks in apply_overlay's bounded wait for the frame's own
+    // result. The bridge still runs this whole callback ahead of the
+    // encoder's add_buffer, so the locked draw still precedes encoding.
+    bool strict_bake = false;
+    {
+        std::shared_lock<std::shared_mutex> lk(op_mu_);
+        if (ai_overlay_) {
+            strict_bake = ai_overlay_->strict_gate_active(dispatch_name);
+        }
+    }
+    if (strict_bake && !encoder_auto_feed_enabled_.load()) {
+        // Manual feed has no bridge-ordering guarantee that a draw after
+        // the router dispatch lands before the encoder consumes this
+        // frame — the wait could miss the encode entirely. Strict stays
+        // auto-feed only; this configuration falls back to preview.
+        static bool warned_manual_strict = false;
+        if (!warned_manual_strict) {
+            warned_manual_strict = true;
+            HAL_LOG_WARNING(
+                "CameraDaemon: strict_frame_lock ignored in manual encoder "
+                "feed mode, falling back to preview (stream=%s)",
+                dispatch_name.c_str());
+        }
+        strict_bake = false;
+    }
+
+    // Frame metadata flags (P1-7): coarse "bake active" truth, computed once
+    // per frame before either dispatch order so strict and preview modes
+    // carry identical bits. This is NOT per-frame draw truth — an empty
+    // scene or a SKIP verdict still sets the bit when the pass is active,
+    // because "did anything draw this frame" flaps and can never promise a
+    // clean frame. The flag answers "is this stream in the baked set",
+    // i.e. the runtime counterpart of the stream_map config split: the
+    // OVERLAY bit is scoped to bake targets (stream_map values — identity
+    // D→D and cross-fed I→D displays). A stream that is only an inference
+    // source (key mapped to a foreign display, e.g. the clean inference
+    // feed) carries flag 0 and apply_overlay skips it, so the bit always
+    // matches stream_map and never lies about pixel truth. DPM stays
+    // global: it draws on every stream via its own mask logic.
+    uint32_t frame_flags = 0;
+    {
+        std::shared_lock<std::shared_mutex> lk(op_mu_);
+        if (ai_overlay_ && ai_overlay_->is_running() &&
+            ai_overlay_->is_bake_target(dispatch_name)) {
+            frame_flags |= FD_PUB_FRAME_FLAG_OVERLAY_BAKED;
+        }
+    }
+    if (dpm && dpm->is_running() && hal_loader_ && hal_loader_->has_draw()) {
+        frame_flags |= FD_PUB_FRAME_FLAG_DPM_BAKED;
+    }
+
+    if (strict_bake && frame_router_) {
+        frame_router_->on_frame_arrived(dispatch_name, frame, frame_flags);
+    }
+
+    {
+        std::shared_lock<std::shared_mutex> lk(op_mu_);
+        if (ai_overlay_) {
+            // The HAL frame's own sequence (the shared media-context counter
+            // the FD publisher and ai-runtime both re-export verbatim) is the
+            // frame-generation authority at the bake site: it anchors the
+            // app-command late-frame judgement and bounds frame-bound layer
+            // drawing in the SAME counter space the SDK's frame_sequence
+            // metadata lives in. The frame_router's per-dispatch counter must
+            // NOT be used here: it counts only this stream's callbacks while
+            // the HAL counter ticks once per frontend callback across ALL
+            // streams — mixing the two spaces drops every bound annotation
+            // on a multi-stream deployment as a "late command".
+            ai_overlay_->apply_overlay(dispatch_name, frame,
+                                       frame ? frame->sequence : 0);
+        }
+    }
+
+    if (!strict_bake && frame_router_) {
+        frame_router_->on_frame_arrived(dispatch_name, frame, frame_flags);
     }
 }
 
@@ -1811,6 +2411,18 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
                 response.set_interrupt_ms(interrupt_ms);
                 return false;
             }
+            // Pipeline restart = every stream's frame generation restarted.
+            // Bump the overlay epoch per encoder stream so app commands
+            // tagged to the old generation are rejected (and its layers
+            // purged) instead of decorating the new one.
+            {
+                std::shared_lock<std::shared_mutex> lk(op_mu_);
+                if (ai_overlay_) {
+                    for (const auto& ec : config_.encoders) {
+                        ai_overlay_->note_stream_restart(ec.stream_name);
+                    }
+                }
+            }
             // Some HAL/MediaLibrary paths reset feed mode after stop/start.
             // Restore auto-feed so encoded sockets continue producing packets.
             if (encoder_auto_feed_enabled_.load() && media_ops->set_encoder_auto_feed) {
@@ -1999,8 +2611,21 @@ bool CameraDaemon::set_rtsp_enabled(bool enabled) {
     return true;
 }
 
-bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence, uint32_t box_thickness) {
+bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence,
+                                            uint32_t box_thickness,
+                                            std::optional<bool> enable_face_blur,
+                                            std::optional<bool> strict_frame_lock,
+                                            std::optional<uint32_t> strict_wait_cap_ms) {
     std::unique_lock<std::shared_mutex> lock(op_mu_);
+    // Absent flag keeps the current face-blur state (yaml value until first set).
+    const bool face_blur = enable_face_blur.value_or(config_.ai_overlay_enable_face_blur);
+    // Strict frame-lock hot path: persist first so init_ai_overlay (used when
+    // the overlay is being enabled right now) picks the new values up too.
+    if (strict_frame_lock.has_value())
+        config_.ai_overlay_strict_frame_lock = strict_frame_lock.value();
+    if (strict_wait_cap_ms.has_value())
+        config_.ai_overlay_strict_wait_cap_ms = strict_wait_cap_ms.value();
+
     if (enabled && !ai_overlay_) {
         if (!hal_loader_ || !hal_loader_->has_draw()) {
             HAL_LOG_ERROR("CameraDaemon: Cannot enable AI overlay without HAL draw ops");
@@ -2011,6 +2636,7 @@ bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool
         config_.ai_overlay_draw_labels = draw_labels;
         config_.ai_overlay_draw_confidence = draw_confidence;
         config_.ai_overlay_box_thickness = box_thickness;
+        config_.ai_overlay_enable_face_blur = face_blur;
 
         return init_ai_overlay();
     }
@@ -2025,10 +2651,14 @@ bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool
 
     // Update existing AI overlay config
     if (ai_overlay_) {
-        ai_overlay_->update_config(draw_labels, draw_confidence, box_thickness);
+        ai_overlay_->update_config(draw_labels, draw_confidence, box_thickness, face_blur);
         config_.ai_overlay_draw_labels = draw_labels;
         config_.ai_overlay_draw_confidence = draw_confidence;
         config_.ai_overlay_box_thickness = box_thickness;
+        config_.ai_overlay_enable_face_blur = face_blur;
+        if (strict_frame_lock.has_value() || strict_wait_cap_ms.has_value())
+            ai_overlay_->update_strict(config_.ai_overlay_strict_frame_lock,
+                                       config_.ai_overlay_strict_wait_cap_ms);
     }
 
     return true;
@@ -2447,10 +3077,14 @@ bool CameraDaemon::load_privacy_mask_config(aipc::camera::PrivacyMaskConfig* req
     return true;
 }
 
-// Persist the transform config (rotation/flip/dewarp/grayscale/dis/eis) to the
-// side-file atomically (tmp + rename). Best-effort: a serialize/write/rename
-// failure logs but never aborts the (already-applied) HAL apply in the caller.
-void CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig& req) {
+// Persist the transform config together with the lens identity it was written
+// for — ONE atomic side-file (tmp + rename): {"lens_model": "…",
+// "transform": {…}}. Readers can therefore never observe a transform whose
+// lens attribution is missing or stale. Returns false on serialize/write/
+// rename failure so the caller knows nothing durable landed; a failure never
+// aborts the already-applied HAL transform.
+bool CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig& req,
+                                            const std::string& lens_model) {
     google::protobuf::util::JsonPrintOptions opts;
     opts.add_whitespace = true;
     opts.always_print_primitive_fields = true;
@@ -2459,7 +3093,27 @@ void CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig&
     if (!st.ok()) {
         HAL_LOG_ERROR("CameraDaemon: persist transform: serialize failed: %s",
                       std::string(st.message()).c_str());
-        return;
+        return false;
+    }
+    google::protobuf::Struct nested;
+    st = google::protobuf::util::JsonStringToMessage(json, &nested);
+    if (!st.ok()) {
+        HAL_LOG_ERROR("CameraDaemon: persist transform: reparse failed: %s",
+                      std::string(st.message()).c_str());
+        return false;
+    }
+    google::protobuf::Struct wrapper;
+    (*wrapper.mutable_fields())["lens_model"].set_string_value(lens_model);
+    *(*wrapper.mutable_fields())["transform"].mutable_struct_value() = std::move(nested);
+    // NOTE: MessageToJsonString APPENDS to the output string — |json| still
+    // holds the bare-transform text from the serialize above, so the wrapper
+    // must go to a fresh string or the file ends up with both documents.
+    std::string wrapper_json;
+    st = google::protobuf::util::MessageToJsonString(wrapper, &wrapper_json, opts);
+    if (!st.ok()) {
+        HAL_LOG_ERROR("CameraDaemon: persist transform: wrapper serialize failed: %s",
+                      std::string(st.message()).c_str());
+        return false;
     }
 
     const std::string tmp = std::string(kTransformConfigPath) + ".tmp";
@@ -2467,14 +3121,14 @@ void CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig&
         std::ofstream out(tmp, std::ios::out | std::ios::trunc);
         if (!out.is_open()) {
             HAL_LOG_ERROR("CameraDaemon: persist transform: open(%s) failed", tmp.c_str());
-            return;
+            return false;
         }
-        out << json;
+        out << wrapper_json;
         out.flush();
         if (!out.good()) {
             HAL_LOG_ERROR("CameraDaemon: persist transform: write(%s) failed", tmp.c_str());
             ::unlink(tmp.c_str());
-            return;
+            return false;
         }
     }  // ofstream flushed + closed here
 
@@ -2482,18 +3136,19 @@ void CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig&
         HAL_LOG_ERROR("CameraDaemon: persist transform: rename(%s -> %s) failed",
                       tmp.c_str(), kTransformConfigPath);
         ::unlink(tmp.c_str());
-        return;
+        return false;
     }
+    return true;
 }
 
-// Read the transform mirror at startup. Returns false on missing file (first
-// boot / never configured — INFO, not an error), unparseable JSON (WARNING +
-// Clear — a corrupt file never aborts init), or an identity config (rotation==0
-// && flip==0 && !dewarp && !grayscale && !dis && !eis — nothing to reapply, and
-// re-pushing identity would issue a needless dynamic_change_image_config call).
-// Never aborts init; the caller (init, under HAS_GRPC) proceeds with YAML
-// defaults.
-bool CameraDaemon::load_transform_config(aipc::camera::TransformConfig* req) {
+// Read the transform mirror at startup. v2 mirrors embed the lens the
+// transform was written for; *lens_model receives it (empty for v1/legacy).
+// Returns false on missing file (first boot / never configured — INFO, not an
+// error) or unparseable JSON (WARNING + Clear — a corrupt file never aborts
+// init); the caller then seeds from the live media config instead of a zero
+// proto. Never aborts init.
+bool CameraDaemon::load_transform_config(aipc::camera::TransformConfig* req,
+                                         std::string* lens_model) {
     std::ifstream in(kTransformConfigPath);
     if (!in.is_open()) {
         HAL_LOG_INFO("CameraDaemon: no persisted transform config (%s); starting clean",
@@ -2504,18 +3159,58 @@ bool CameraDaemon::load_transform_config(aipc::camera::TransformConfig* req) {
     ss << in.rdbuf();
     in.close();
 
-    req->Clear();
-    auto st = google::protobuf::util::JsonStringToMessage(ss.str(), req);
+    lens_model->clear();
+    google::protobuf::Struct doc;
+    auto st = google::protobuf::util::JsonStringToMessage(ss.str(), &doc);
     if (!st.ok()) {
         HAL_LOG_WARNING("CameraDaemon: persisted transform config unparseable: %s; starting clean",
                         std::string(st.message()).c_str());
         req->Clear();
         return false;
     }
-    if (req->rotation() == 0 && req->flip() == 0 &&
-        !req->dewarp() && !req->grayscale() && !req->dis() && !req->eis()) {
-        return false;  // identity == nothing to reapply
+
+    // Re-serialize the chosen sub-object to JSON and parse it into the
+    // message (Struct has no direct message conversion).
+    const auto parse_from = [&](const google::protobuf::Struct& s) -> bool {
+        std::string json;
+        return google::protobuf::util::MessageToJsonString(s, &json).ok()
+            && google::protobuf::util::JsonStringToMessage(json, req).ok();
+    };
+
+    const auto& fields = doc.fields();
+    const auto transform_it = fields.find("transform");
+    if (transform_it != fields.end()
+        && transform_it->second.kind_case() == google::protobuf::Value::kStructValue) {
+        // v2 wrapper: lens attribution lives next to the transform, atomically.
+        const auto lens_it = fields.find("lens_model");
+        if (lens_it != fields.end()
+            && lens_it->second.kind_case() == google::protobuf::Value::kStringValue) {
+            *lens_model = lens_it->second.string_value();
+        }
+        if (!parse_from(transform_it->second.struct_value())) {
+            HAL_LOG_WARNING("CameraDaemon: persisted transform config (v2) unparseable; "
+                            "starting clean");
+            req->Clear();
+            lens_model->clear();
+            return false;
+        }
+        return true;
     }
+
+    // v1 legacy: the document is the bare transform; the caller falls back to
+    // the sidecar hint for lens attribution (first successful write upgrades
+    // the mirror to v2).
+    if (!parse_from(doc)) {
+        HAL_LOG_WARNING("CameraDaemon: persisted transform config (v1) unparseable: %s; "
+                        "starting clean");
+        req->Clear();
+        return false;
+    }
+    // NOTE: an all-identity config still counts as "have". The media pipeline
+    // seeds image settings from the PROFILE iq_settings (bundled profiles
+    // default dewarp to enabled), so treating identity as "nothing to reapply"
+    // silently reverts dewarp to the profile default on every boot — exactly
+    // what the persisted all-off state exists to override.
     return true;
 }
 
@@ -2909,7 +3604,328 @@ static void apply_fg2009_autofocus_overrides(const DaemonConfig& cfg,
     af->startup_ready_timeout_ms = 300000;
 }
 
+namespace {
+
+/* Day/night threshold persistence mirror — see kDayNightThresholdsPath for the
+ * convention. Load validates the pair before returning it; anything malformed
+ * or out of range keeps the YAML defaults. */
+struct DayNightThresholds {
+    int night_enter = 0;
+    int day_enter = 0;
+};
+
+/* Steady-clock milliseconds since epoch — monotonic time feed for the
+ * day/night anti-flap dwell (immune to the wall-clock jumps bench boards see). */
+static uint64_t daynight_steady_now_ms() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+bool load_daynight_thresholds(DayNightThresholds* out) {
+    std::ifstream in(kDayNightThresholdsPath);
+    if (!in.is_open()) {
+        HAL_LOG_INFO("CameraDaemon: no persisted day/night thresholds (%s); "
+                     "using YAML defaults", kDayNightThresholdsPath);
+        return false; /* no mirror yet: YAML defaults stand */
+    }
+    int night_enter = 0;
+    int day_enter = 0;
+    try {
+        const nlohmann::json j = nlohmann::json::parse(in);
+        night_enter = j.at("night_enter").get<int>();
+        day_enter = j.at("day_enter").get<int>();
+    } catch (const std::exception& e) {
+        HAL_LOG_WARNING("CameraDaemon: day/night threshold mirror malformed (%s); "
+                        "keeping YAML defaults", e.what());
+        return false;
+    }
+    std::string err;
+    if (!validate_light_thresholds(night_enter, day_enter, &err)) {
+        HAL_LOG_WARNING("CameraDaemon: day/night threshold mirror invalid (%s); "
+                        "keeping YAML defaults", err.c_str());
+        return false;
+    }
+    out->night_enter = night_enter;
+    out->day_enter = day_enter;
+    return true;
+}
+
+bool save_daynight_thresholds(int night_enter, int day_enter) {
+    const nlohmann::json j = {
+        {"night_enter", night_enter},
+        {"day_enter", day_enter},
+        {"saved_at", static_cast<int64_t>(std::time(nullptr))},
+    };
+    const std::string tmp = std::string(kDayNightThresholdsPath) + ".tmp";
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        HAL_LOG_WARNING("CameraDaemon: failed to open day/night threshold mirror for write: %s",
+                        tmp.c_str());
+        return false;
+    }
+    out << j.dump() << "\n";
+    out.close();
+    if (!out) {
+        HAL_LOG_WARNING("CameraDaemon: failed to write day/night threshold mirror: %s",
+                        tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), kDayNightThresholdsPath) != 0) {
+        HAL_LOG_WARNING("CameraDaemon: failed to rename day/night threshold mirror %s -> %s",
+                        tmp.c_str(), kDayNightThresholdsPath);
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
 #ifdef HAS_GRPC
+CameraDaemon::ArchivedLensPosition CameraDaemon::load_archived_lens_position() {
+    ArchivedLensPosition pos;
+    std::ifstream in(kLensPositionPath);
+    if (!in.is_open()) {
+        HAL_LOG_INFO("CameraDaemon: no archived lens position (%s); "
+                     "boot keeps the config-derived startup position",
+                     kLensPositionPath);
+        return pos;
+    }
+    try {
+        const nlohmann::json j = nlohmann::json::parse(in);
+        pos.model = j.at("model").get<std::string>();
+        pos.zoom_pos = j.at("zoom_pos").get<int32_t>();
+        pos.focus_pos = j.at("focus_pos").get<int32_t>();
+        if (j.contains("zoom_ratio")) pos.zoom_ratio = j["zoom_ratio"].get<float>();
+        if (j.contains("saved_at")) pos.saved_at = j["saved_at"].get<int64_t>();
+    } catch (const std::exception& e) {
+        HAL_LOG_WARNING("CameraDaemon: archived lens position malformed (%s); "
+                        "ignoring", e.what());
+        return ArchivedLensPosition{};
+    }
+    if (pos.valid() && pos.model != config_.lens_model) {
+        HAL_LOG_WARNING("CameraDaemon: discarding archived lens position "
+                        "(saved for %s, current lens %s)",
+                        pos.model.c_str(), config_.lens_model.c_str());
+        return ArchivedLensPosition{};
+    }
+    return pos;
+}
+
+bool CameraDaemon::save_archived_lens_position(const ArchivedLensPosition& pos) {
+    const nlohmann::json j = {
+        {"model", pos.model},
+        {"zoom_ratio", pos.zoom_ratio},
+        {"zoom_pos", pos.zoom_pos},
+        {"focus_pos", pos.focus_pos},
+        {"saved_at", pos.saved_at},
+    };
+    const std::string tmp = std::string(kLensPositionPath) + ".tmp";
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        HAL_LOG_WARNING("CameraDaemon: failed to open lens position archive for write: %s",
+                        tmp.c_str());
+        return false;
+    }
+    out << j.dump() << "\n";
+    out.close();
+    if (!out) {
+        HAL_LOG_WARNING("CameraDaemon: failed to write lens position archive: %s",
+                        tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), kLensPositionPath) != 0) {
+        HAL_LOG_WARNING("CameraDaemon: failed to rename lens position archive %s -> %s",
+                        tmp.c_str(), kLensPositionPath);
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+void CameraDaemon::start_lens_position_recorder() {
+    if (!config_.lens_position_persistence || !lens_controller_) return;
+    {
+        // load_archived_lens_position() already discards model mismatches.
+        std::lock_guard<std::mutex> lock(lens_recorder_mu_);
+        lens_archive_cache_ = load_archived_lens_position();
+    }
+    lens_controller_->set_motion_listener([this]() {
+        lens_recorder_dirty_ = true;
+        lens_recorder_cv_.notify_all();
+    });
+    lens_recorder_stop_ = false;
+    lens_recorder_thread_ = std::thread(&CameraDaemon::lens_position_recorder_loop, this);
+    HAL_LOG_INFO("CameraDaemon: lens position recorder armed (%s)", kLensPositionPath);
+}
+
+void CameraDaemon::stop_lens_position_recorder() {
+    if (lens_controller_) lens_controller_->set_motion_listener(nullptr);
+    lens_recorder_stop_ = true;
+    lens_recorder_cv_.notify_all();
+    if (lens_recorder_thread_.joinable()) lens_recorder_thread_.join();
+}
+
+void CameraDaemon::lens_position_recorder_loop() {
+    while (!lens_recorder_stop_) {
+        std::unique_lock<std::mutex> lock(lens_recorder_mu_);
+        lens_recorder_cv_.wait(lock, [this] {
+            return lens_recorder_dirty_.load() || lens_recorder_stop_.load();
+        });
+        if (lens_recorder_stop_) return;
+        lens_recorder_dirty_ = false;
+        lock.unlock();
+
+        // Settle confirm: motors stopped AND two consecutive identical state
+        // reads 300 ms apart. Identical integer positions alone are not
+        // proof — a slow fire-and-forget move can sample the same coarse
+        // position twice mid-flight, and FG2009's dead-reckoned model jumps
+        // to its target at issue time — so the motor-state gate is what
+        // actually marks the move done. If the 10 s cap expires with the
+        // motors still running, skip: keeping the previous archive beats
+        // saving an in-flight sample (no arm fires on natural completion).
+        LensControllerState last{};
+        bool have_last = false;
+        {
+            LensControllerState prev{};
+            bool have_prev = false;
+            for (int waited = 0; waited < 10000 && !lens_recorder_stop_;
+                 waited += 300) {
+                LensControllerState cur{};
+                if (!lens_controller_ ||
+                    lens_controller_->state_get(&cur) != HAL_OK ||
+                    cur.zoom_state != 1 || cur.focus_state != 1) {
+                    // Read error or motors running: restart the settle
+                    // window; a running sample is never a settle candidate.
+                    have_prev = false;
+                    have_last = false;
+                } else if (have_prev && cur.zoom_pos == prev.zoom_pos &&
+                           cur.focus_pos == prev.focus_pos) {
+                    last = cur;
+                    have_last = true;
+                    break;
+                } else {
+                    prev = cur;
+                    have_prev = true;
+                    last = cur;
+                    have_last = true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            }
+        }
+        if (!have_last || lens_recorder_stop_) continue;
+
+        ArchivedLensPosition pos;
+        pos.model = config_.lens_model;
+        pos.zoom_ratio = lens_controller_->pos_to_ratio(last.zoom_pos);
+        pos.zoom_pos = last.zoom_pos;
+        pos.focus_pos = last.focus_pos;
+        pos.saved_at = std::time(nullptr);
+
+        std::lock_guard<std::mutex> lock2(lens_recorder_mu_);
+        if (lens_archive_cache_.valid() &&
+            lens_archive_cache_.model == pos.model &&
+            lens_archive_cache_.zoom_pos == pos.zoom_pos &&
+            lens_archive_cache_.focus_pos == pos.focus_pos) {
+            continue;  // boot-restore replays and no-op moves land here
+        }
+        if (save_archived_lens_position(pos)) {
+            lens_archive_cache_ = pos;
+            HAL_LOG_INFO("CameraDaemon: lens position archived "
+                         "(zoom_ratio=%.3f zoom=%d focus=%d)",
+                         static_cast<double>(pos.zoom_ratio),
+                         static_cast<int>(pos.zoom_pos),
+                         static_cast<int>(pos.focus_pos));
+        }
+    }
+}
+
+void CameraDaemon::fg2009_restore_loop(const ArchivedLensPosition pos) {
+    // Clear the in-progress flag on every exit so the image probe knows the
+    // replay (or its fallback) is finished.
+    struct RestoreDone {
+        std::atomic<bool>& flag;
+        ~RestoreDone() { flag.store(false); }
+    } restore_done{fg2009_restore_active_};
+    // Mirror AutofocusController::wait_lens_ready: the FG2009 lens parks
+    // during Init (ram + park), so wait for initialized/anchored plus five
+    // consecutive still-motor reads before replaying the archive. Same
+    // readiness budget as autofocus: after an initial MCU failure the
+    // re-init can take well over a minute.
+    const int ready_timeout_ms =
+        std::max(1000, config_.autofocus.startup_ready_timeout_ms);
+    auto motors_still = [this]() {
+        LensControllerState st{};
+        return lens_controller_ &&
+               lens_controller_->state_get(&st) == HAL_OK &&
+               st.zoom_state == 1 && st.focus_state == 1;
+    };
+    int stable_reads = 0;
+    bool ready = false;
+    for (int waited = 0; waited < ready_timeout_ms && !fg2009_restore_stop_;
+         waited += 100) {
+        if (lens_controller_ && lens_controller_->initialized() &&
+            lens_controller_->af0832_bootstrapped() && motors_still()) {
+            if (++stable_reads >= 5) {
+                ready = true;
+                break;
+            }
+        } else {
+            stable_reads = 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!ready) {
+        // The readiness window expired (e.g. the lens parks only after a
+        // slow MCU re-init). The normal boot one-shot was suppressed in
+        // favor of this restore, so queue it here instead — its own
+        // wait_lens_ready runs with a fresh readiness window.
+        HAL_LOG_WARNING("CameraDaemon: fg2009 lens never became ready; "
+                        "skipping archived position restore, falling back "
+                        "to boot autofocus");
+        if (autofocus_controller_) {
+            uint64_t job = 0;
+            std::string error;
+            autofocus_controller_->start_one_shot(&job, &error);
+        }
+        return;
+    }
+
+    constexpr uint32_t kMoveTimeoutMs = 20000;
+    const int zret = lens_controller_->zoom_abs_wait(
+        config_.lens_fg2009.zoom_pps, pos.zoom_pos, kMoveTimeoutMs);
+    const int fret = lens_controller_->focus_abs_wait(
+        config_.lens_fg2009.focus_pps, pos.focus_pos, kMoveTimeoutMs);
+    if (zret != HAL_OK || fret != HAL_OK) {
+        HAL_LOG_WARNING("CameraDaemon: archived lens position restore move failed "
+                        "(zoom=%d focus=%d); falling back to boot autofocus",
+                        zret, fret);
+        if (autofocus_controller_) {
+            uint64_t job = 0;
+            std::string error;
+            autofocus_controller_->start_one_shot(&job, &error);
+        }
+        return;
+    }
+    HAL_LOG_INFO("CameraDaemon: archived lens position restored "
+                 "(zoom_ratio=%.3f zoom=%d focus=%d); autofocus will refine",
+                 static_cast<double>(pos.zoom_ratio),
+                 static_cast<int>(pos.zoom_pos), static_cast<int>(pos.focus_pos));
+    // If the restore zoom delta was zero the zoom-motion observer never
+    // fired and nothing queued a refinement; if it did fire, this enqueue is
+    // rejected while that job is busy. Either way exactly one pass runs.
+    if (autofocus_controller_) {
+        uint64_t job = 0;
+        std::string error;
+        if (autofocus_controller_->start_one_shot(&job, &error)) {
+            HAL_LOG_INFO("CameraDaemon: post-restore autofocus job %llu queued",
+                         static_cast<unsigned long long>(job));
+        }
+    }
+}
+
 void CameraDaemon::start_grpc_server() {
     std::string server_address("unix:///run/aipc/camera-control.sock");
 
@@ -2933,6 +3949,7 @@ void CameraDaemon::start_grpc_server() {
         auto lens_bundle = CreateLensHalService(lens_cfg);
         lens_controller_ = lens_bundle.controller;
         lens_hal_service_ = std::move(lens_bundle.service);
+        lens_ensure_bootstrapped_ = std::move(lens_bundle.ensure_bootstrapped);
         if (lens_hal_service_) {
             builder.RegisterService(lens_hal_service_.get());
             HAL_LOG_INFO("CameraDaemon: LensHAL service registered (bridge=%s)", config_.lens_bridge_lib.c_str());
@@ -2986,6 +4003,16 @@ void CameraDaemon::start_grpc_server() {
     {
         std::lock_guard<std::mutex> lk(daynight_mu_);
         light_sensor_cfg_ = config_.light_sensor;
+        /* Operator-tuned thresholds (web sliders) outlive restarts via the
+         * mirror file; once present they own the values, YAML is the fallback. */
+        DayNightThresholds tuned;
+        if (load_daynight_thresholds(&tuned)) {
+            light_sensor_cfg_.night_enter = tuned.night_enter;
+            light_sensor_cfg_.day_enter = tuned.day_enter;
+            HAL_LOG_INFO("CameraDaemon: restored day/night thresholds "
+                         "night_enter=%d day_enter=%d from %s",
+                         tuned.night_enter, tuned.day_enter, kDayNightThresholdsPath);
+        }
         daynight_state_.mode = LightMode::Day;
     }
     if (config_.light_sensor.enabled && config_.light_sensor.auto_on_boot) {
@@ -2996,9 +4023,30 @@ void CameraDaemon::start_grpc_server() {
                              ? SelectedMode::Infrared : SelectedMode::Day;
     }
 
+    // Lens position archive: loaded before the autofocus wiring so both the
+    // AF0832 startup seed and the FG2009 restore thread (below) consume it.
+    ArchivedLensPosition lens_archive;
+    if (config_.lens_position_persistence) {
+        lens_archive = load_archived_lens_position();
+    }
+
     AutofocusConfig af_cfg = config_.autofocus;
     if (config_.lens_model == "fg2009") {
         apply_fg2009_autofocus_overrides(config_, &af_cfg);
+    }
+    if (lens_archive.valid()) {
+        // AF0832: replay the archived motor positions as the startup seed
+        // (they already carry the calibration delta the last scan settled
+        // on). FG2009 never runs the startup job (startup_af forced off);
+        // its restore is the dedicated thread below.
+        af_cfg.startup_seed_from_archive = true;
+        af_cfg.startup_seed_zoom_pos = lens_archive.zoom_pos;
+        af_cfg.startup_seed_focus_pos = lens_archive.focus_pos;
+        HAL_LOG_INFO("CameraDaemon: boot will restore archived lens position "
+                     "(zoom=%d focus=%d zoom_ratio=%.3f)",
+                     static_cast<int>(lens_archive.zoom_pos),
+                     static_cast<int>(lens_archive.focus_pos),
+                     static_cast<double>(lens_archive.zoom_ratio));
     }
     if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
         hal_loader_->has_isp() && video_source_ && frame_router_) {
@@ -3023,9 +4071,29 @@ void CameraDaemon::start_grpc_server() {
     chmod(sock_path, 0660);
     chown(sock_path, -1, 1001);
 
+    start_lens_position_recorder();
+
+    // Headless-boot lens self-init (FG2009). The lens bootstrap normally
+    // only runs when lens API traffic reaches device-control's
+    // ensureLensBootstrapped; on a boot nobody polls, that never happens
+    // and the restore / identity-probe threads wait on a lens that never
+    // initializes (overnight 2026-09-21 incident: fixed lens shipped
+    // motorized UI until the first page view). The loop gives the RPC path
+    // a grace period to win, then triggers the same Init sequence itself.
+    if (config_.lens_model == "fg2009" && config_.lens_self_init_enabled &&
+        lens_ensure_bootstrapped_) {
+        HAL_LOG_INFO("CameraDaemon: lens boot self-init armed");
+        lens_boot_ensure_stop_ = false;
+        lens_boot_ensure_thread_ =
+            std::thread(&CameraDaemon::lens_boot_ensure_loop, this);
+    }
+
     if (autofocus_controller_) {
         autofocus_controller_->start();
-        if (config_.lens_model == "fg2009" && config_.lens_fg2009_af_boot_oneshot) {
+        const bool restore_instead =
+            config_.lens_model == "fg2009" && lens_archive.valid();
+        if (config_.lens_model == "fg2009" && config_.lens_fg2009_af_boot_oneshot &&
+            !restore_instead) {
             // Boot focus: the FG2009 park lands on the INF curve; refine once
             // right after the lens parks.  The queued job blocks in
             // wait_lens_ready until the bootstrap finishes and the motors
@@ -3041,10 +4109,192 @@ void CameraDaemon::start_grpc_server() {
                                 af_error.c_str());
             }
         }
+        if (restore_instead) {
+            // Archived-position replay replaces the boot one-shot: restore
+            // first, then exactly one refinement pass (the restore zoom move
+            // fires on_fg2009_zoom_moved which queues one; the thread's own
+            // enqueue is then rejected as busy — or covers the case where
+            // the zoom delta was zero and nothing fired).
+            fg2009_restore_stop_ = false;
+            fg2009_restore_active_ = true;
+            fg2009_restore_thread_ = std::thread(
+                &CameraDaemon::fg2009_restore_loop, this, lens_archive);
+        }
+    }
+
+    // Stage-2 lens identity (image-sharpness probe): the iris probe filed
+    // this unit as fg2009, which is also what a motorless fixed lens looks
+    // like electrically. The probe jogs focus once after the boot autofocus
+    // pass parks the lens and lets the ISP statistics arbitrate. Identity
+    // is adaptive-only: even a factory EEPROM that stamps fg2009 does not
+    // short-circuit the probe — a fixed lens mis-stamped at the factory
+    // still gets caught here.
+    if (config_.lens_model == "fg2009" && !config_.lens_image_probe_enabled) {
+        HAL_LOG_INFO("CameraDaemon: lens image probe disabled by config");
+    } else if (config_.lens_model == "fg2009" && lens_controller_ &&
+               hal_loader_ && hal_loader_->has_isp() && video_source_ &&
+               frame_router_) {
+        HAL_LOG_INFO("CameraDaemon: lens image probe armed");
+        lens_image_probe_stop_ = false;
+        lens_image_probe_thread_ = std::thread(
+            &CameraDaemon::lens_image_probe_loop, this);
+    }
+}
+
+void CameraDaemon::lens_boot_ensure_loop() {
+    // Grace window: a lens API burst right after boot (open web page,
+    // device-control ensureLensBootstrapped) initializes the lens through
+    // the existing path — let it win and touch no motors.
+    for (int waited = 0; waited < 3000; waited += 200) {
+        if (lens_boot_ensure_stop_.load()) return;
+        if (lens_controller_ && lens_controller_->initialized()) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    if (lens_boot_ensure_stop_.load()) return;
+    if (!lens_controller_ || !lens_ensure_bootstrapped_) return;
+    if (lens_controller_->initialized()) return;
+
+    // Bounded retries: a boot-time UART/MCU hiccup must not strand the
+    // lens for the whole uptime (the probe's readiness wait cannot recover
+    // an init that never ran). Total span ~2 min, inside the probe's 300 s
+    // readiness budget; each attempt re-checks the RPC trigger first.
+    for (int attempt = 1; attempt <= 4; ++attempt) {
+        if (lens_boot_ensure_stop_.load() || !lens_ensure_bootstrapped_) return;
+        if (lens_controller_ && lens_controller_->initialized()) return;
+        HAL_LOG_INFO("CameraDaemon: lens boot self-init attempt %d "
+                     "(no RPC init observed)", attempt);
+        const int ret = lens_ensure_bootstrapped_();
+        if (ret == 0) {
+            HAL_LOG_INFO("CameraDaemon: lens boot self-init complete");
+            return;
+        }
+        HAL_LOG_WARNING("CameraDaemon: lens boot self-init failed: %d", ret);
+        for (int slept = 0; slept < 30000; slept += 500) {
+            if (lens_boot_ensure_stop_.load()) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
+    HAL_LOG_WARNING("CameraDaemon: lens boot self-init gave up; lens API "
+                    "traffic can still initialize the lens");
+}
+
+void CameraDaemon::lens_image_probe_loop() {
+    LensImageProbeConfig pc;
+    pc.steps = config_.lens_image_probe_steps;
+    pc.frames = config_.lens_image_probe_frames;
+    pc.settle_ms = config_.lens_image_probe_settle_ms;
+    pc.pps = config_.lens_image_probe_pps;
+    pc.ready_timeout_ms = config_.lens_image_probe_ready_timeout_ms;
+    pc.move_timeout_ms = config_.lens_image_probe_move_timeout_ms;
+    pc.frame_wait_timeout_ms = 900;
+    pc.texture_floor = config_.lens_image_probe_texture_floor;
+    pc.motor_ratio = config_.lens_image_probe_motor_ratio;
+    pc.flat_ratio = config_.lens_image_probe_flat_ratio;
+    pc.return_ratio = config_.lens_image_probe_return_ratio;
+    pc.luma_guard_ratio = config_.lens_image_probe_luma_guard_ratio;
+    pc.stream_name = config_.autofocus.stream_name;
+
+    /* Retry with backoff when inconclusive: readiness misses (lens init
+     * slower than the window, transient AF activity) and low-texture scenes
+     * must not strand the identity for the whole boot — the fg2009 default
+     * leaves motor controls live on a motorless lens. Confident verdicts
+     * (fixed/motorized) apply once and stop. */
+    const int total_attempts = 1 + std::max(0, config_.lens_image_probe_retries);
+    const int retry_interval_ms =
+        std::max(1000, config_.lens_image_probe_retry_interval_ms);
+    int attempts_left = total_attempts;
+    while (true) {
+        /* Serialize with the archived-position restore: its replay moves run
+         * outside any autofocus job (no busy flag, no operation lock), so a
+         * probe starting mid-restore would interleave focus commands with its
+         * measurement and could produce an invalid verdict or final position.
+         * The restore thread always terminates on its own (bounded readiness
+         * wait + bounded moves); the cap only guards future regressions. */
+        const auto restore_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::minutes(10);
+        while (fg2009_restore_active_.load()) {
+            if (lens_image_probe_stop_.load()) return;
+            if (std::chrono::steady_clock::now() >= restore_deadline) {
+                HAL_LOG_WARNING("CameraDaemon: lens image probe skipped "
+                                "(position restore still running)");
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+
+        double return_dev = 1.0;
+        const LensImageProbeResult result = run_lens_image_probe(
+            hal_loader_->isp(), video_source_->video_ctx(), frame_router_.get(),
+            lens_controller_, autofocus_controller_.get(), pc,
+            &lens_image_probe_stop_, &return_dev);
+        HAL_LOG_INFO("CameraDaemon: lens image probe verdict: %s",
+                     lens_image_probe_result_name(result));
+        if (result == LensImageProbeResult::FixedLens) {
+            // Verified motorless: reject every motion request from now on and
+            // leave the identity decision out of the user's hands.
+            if (lens_controller_) lens_controller_->mark_fixed_lens();
+            return;
+        }
+        if (result == LensImageProbeResult::Motorized) {
+            // The probe proved the motor; its return jog may have left the
+            // focus short of the baseline (open-loop hysteresis). Refine once
+            // so the shipped image is as sharp as before the probe touched
+            // the lens.
+            if (return_dev > pc.return_ratio && autofocus_controller_) {
+                uint64_t refine_job = 0;
+                std::string refine_error;
+                if (autofocus_controller_->start_one_shot(&refine_job, &refine_error)) {
+                    HAL_LOG_INFO("CameraDaemon: post-probe focus refinement job %llu "
+                                 "queued (return deviation %.1f%%)",
+                                 (unsigned long long)refine_job, return_dev * 100.0);
+                } else {
+                    HAL_LOG_WARNING("CameraDaemon: post-probe refinement rejected: %s",
+                                    refine_error.c_str());
+                }
+            }
+            return;
+        }
+        if (--attempts_left <= 0) {
+            HAL_LOG_WARNING("CameraDaemon: lens image probe inconclusive after "
+                            "%d attempt(s); identity stays fg2009",
+                            total_attempts);
+            return;
+        }
+        HAL_LOG_INFO("CameraDaemon: lens image probe inconclusive; retrying in "
+                     "%d ms (%d attempt(s) left)",
+                     retry_interval_ms, attempts_left);
+        for (int slept = 0; slept < retry_interval_ms; slept += 500) {
+            if (lens_image_probe_stop_.load()) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
     }
 }
 
 void CameraDaemon::stop_grpc_server() {
+    // Join the boot self-init thread first: it calls into the lens service,
+    // which is torn down below. An in-flight attempt holds the lens mutex
+    // for at most one bootstrap (~30 s), so this join can only block that
+    // long during the boot window.
+    if (lens_boot_ensure_thread_.joinable()) {
+        lens_boot_ensure_stop_ = true;
+        lens_boot_ensure_thread_.join();
+    }
+    // Join the image probe first: it moves the lens and samples ISP stats,
+    // both torn down below (lens service, AF controller, video pipeline).
+    if (lens_image_probe_thread_.joinable()) {
+        lens_image_probe_stop_ = true;
+        lens_image_probe_thread_.join();
+    }
+    // Join the boot-restore thread next: it moves the lens and enqueues
+    // autofocus jobs, both of which are torn down right after.
+    if (fg2009_restore_thread_.joinable()) {
+        fg2009_restore_stop_ = true;
+        fg2009_restore_thread_.join();
+    }
+    // Stop the lens-position recorder next: its settle reads call into the
+    // lens service, which is torn down below.
+    stop_lens_position_recorder();
+
     if (autofocus_controller_) {
         autofocus_controller_->stop();
         autofocus_controller_.reset();
@@ -3055,6 +4305,7 @@ void CameraDaemon::stop_grpc_server() {
     }
     lens_controller_ = nullptr;
     lens_hal_service_.reset();
+    lens_ensure_bootstrapped_ = nullptr;
     camera_control_service_.reset();
     illumination_controller_.reset();
 }
@@ -3331,6 +4582,8 @@ void* CameraDaemon::refresh_autofocus_video_context() {
 
     // init_from_context clears callbacks and running flags. Rebind the frame
     // router before subscribing to the refreshed contexts.
+    // Route through handle_video_frame_for_routing (not straight into the
+    // router) so the DPM bake and AI overlay keep applying after the refresh.
     for (auto& slot : video_source_->streams()) {
         std::string dispatch_name = slot.name;
         auto it = video_name_map_.find(slot.name);
@@ -3338,7 +4591,7 @@ void* CameraDaemon::refresh_autofocus_video_context() {
 
         video_source_->set_frame_callback(slot.name,
             [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
-                frame_router_->on_frame_arrived(dispatch_name, frame);
+                handle_video_frame_for_routing(dispatch_name, frame);
             });
     }
     for (auto& slot : video_source_->streams()) {
@@ -3788,14 +5041,27 @@ bool CameraDaemon::init_ai_overlay() {
     cfg.draw_confidence     = config_.ai_overlay_draw_confidence;
     cfg.draw_landmarks      = config_.ai_overlay_draw_landmarks;
     cfg.enable_face_blur    = config_.ai_overlay_enable_face_blur;
+    cfg.face_blur_block_size = config_.ai_overlay_face_blur_block_size;
     cfg.box_thickness       = config_.ai_overlay_box_thickness;
+    cfg.result_ttl_ms       = config_.ai_overlay_result_ttl_ms;
+    cfg.strict_frame_lock   = config_.ai_overlay_strict_frame_lock;
+    cfg.strict_wait_cap_ms  = config_.ai_overlay_strict_wait_cap_ms;
+    cfg.legacy_auto_bind    = config_.ai_overlay_legacy_auto_bind;
+    if (!config_.ai_overlay_bindings.empty())
+        cfg.bindings = config_.ai_overlay_bindings;
+    if (!config_.ai_overlay_stream_result_ttls.empty())
+        cfg.stream_result_ttls = config_.ai_overlay_stream_result_ttls;
     cfg.draw_ops            = hal_loader_->draw();
 
     // Stream mapping: inference stream_id → display encoder stream.
     if (!config_.ai_overlay_stream_map.empty()) {
         cfg.stream_map = config_.ai_overlay_stream_map;
-    } else {
-        // Auto-generate: map every configured stream → first encoder stream
+    } else if (cfg.legacy_auto_bind) {
+        // Legacy auto-generate (every stream → first encoder) only under
+        // the legacy switch: the new default must not silently bind every
+        // stream and re-couple a bare subscribe() to the video. Operators
+        // who want the old behavior declare legacy_auto_bind: 1 (or list
+        // explicit bindings).
         std::string primary_encoder;
         if (!config_.encoders.empty()) {
             primary_encoder = config_.encoders[0].stream_name;
@@ -3809,9 +5075,39 @@ bool CameraDaemon::init_ai_overlay() {
             cfg.stream_map["ai"]        = primary_encoder;
         }
     }
+    for (auto& [k, v] : cfg.bindings) {
+        HAL_LOG_INFO("CameraDaemon: AI overlay binding: %s → %s", k.c_str(), v.c_str());
+    }
+
+    // fps per display stream (from [streams]) feeds the derived default TTL:
+    // resolve_result_ttl_ms turns 30fps into ~67ms (≈2 frame periods).
+    for (auto& s : config_.streams) {
+        if (!s.name.empty() && s.fps > 0)
+            cfg.stream_fps[s.name] = s.fps;
+    }
 
     for (auto& [k, v] : cfg.stream_map) {
         HAL_LOG_INFO("CameraDaemon: AI overlay stream_map: %s → %s", k.c_str(), v.c_str());
+    }
+
+    // Strict frame-lock diagnosis (log-once at init): which display streams
+    // the strict gate will actually gate. The gate applies only to identity
+    // feeds (map D→D); cross-fed display streams (map I→D, I≠D) always keep
+    // preview semantics because a cross-fed result never carries the display
+    // stream's own frame_sequence.
+    if (cfg.strict_frame_lock) {
+        for (auto& [infer_stream, display_stream] : cfg.stream_map) {
+            if (infer_stream == display_stream) {
+                HAL_LOG_INFO("CameraDaemon: strict frame lock ACTIVE on stream=%s "
+                             "(cap=%u ms%s)",
+                             display_stream.c_str(), cfg.strict_wait_cap_ms,
+                             cfg.strict_wait_cap_ms == 0 ? ", derived from fps" : "");
+            } else if (cfg.stream_map.count(display_stream) == 0) {
+                HAL_LOG_INFO("CameraDaemon: strict frame lock not applicable to "
+                             "cross-fed stream=%s (inference source=%s)",
+                             display_stream.c_str(), infer_stream.c_str());
+            }
+        }
     }
 
     ai_overlay_ = std::make_unique<AiOverlaySubscriber>(cfg);
@@ -3855,8 +5151,11 @@ void CameraDaemon::register_subscribers() {
                 });
         }
 
-        // --- Priority 2: Encoder subscriber (AI overlay → OSD → encode → FPS update) ---
-        // Skip in media pipeline auto_feed mode — encoder gets frames from pipeline directly
+        // --- Priority 2: Encoder subscriber (OSD → encode → FPS update) ---
+        // Skip in media pipeline auto_feed mode — encoder gets frames from pipeline directly.
+        // AI overlay is NOT drawn here anymore: it bakes at the frontend callback
+        // (handle_video_frame_for_routing) so it reaches the encoded stream in
+        // auto_feed mode too; drawing here as well would double-render in manual mode.
         if (!auto_feed && has_encoder && encoder_mgr_) {
             std::string sname = s.name;
             std::string enc_name = s.name;
@@ -3869,9 +5168,6 @@ void CameraDaemon::register_subscribers() {
             fps_trackers_[sname] = FpsTracker{};
             frame_router_->subscribe(s.name, "encoder_" + s.name,
                 [this, sname, enc_name](ManagedFrame* mf) {
-                    if (ai_overlay_) {
-                        ai_overlay_->apply_overlay(sname, &mf->frame);
-                    }
                     encoder_mgr_->encode_frame(enc_name, &mf->frame);
                     frame_router_->release(mf);
 
@@ -4263,16 +5559,31 @@ bool CameraDaemon::set_imaging_mode(ImagingMode mode, std::string* message) {
         if (ok) ok = illumination_controller_->set_mode(ImagingMode::Infrared, ratio, &error);
         if (ok) ok = wait_stable();
         if (ok) {
-            day_profile_before_infrared_ = previous_profile;
+            // Capture the profile to return to ONLY on a genuine day->IR crossing.
+            // Re-entering IR while already on the IR profile (gate-2 no-op skip, or
+            // an auto-monitor re-assert after a throttled switch) must not overwrite
+            // the remembered day profile with the IR profile itself — that turned
+            // every later day-mode apply into "already on Infrared_Basic, skipped"
+            // and left the pipeline stuck in night IQ (bench log 2026-09-10 16:31).
+            if (previous_profile != config_.infrared.infrared_profile) {
+                day_profile_before_infrared_ = previous_profile;
+            }
             // Always boot into the saved daytime/AI profile. Infrared remains
             // an explicit mode selection and is never replayed after reboot.
-            persist_profile_config(previous_profile);
+            persist_profile_config(day_profile_before_infrared_.empty()
+                                       ? previous_profile
+                                       : day_profile_before_infrared_);
         }
     } else {
         illumination_controller_->set_mode(ImagingMode::Day, ratio, nullptr);
         ok = set_ircut(0);
-        const std::string day_profile = day_profile_before_infrared_.empty()
-            ? "Daylight_Basic" : day_profile_before_infrared_;
+        // Sanitize a poisoned capture (equal to the IR profile) so a day-mode
+        // apply can never resolve to "stay on infrared".
+        const std::string day_profile =
+            day_profile_before_infrared_.empty() ||
+                    day_profile_before_infrared_ == config_.infrared.infrared_profile
+                ? "Daylight_Basic"
+                : day_profile_before_infrared_;
         if (ok) ok = switch_profile_internal(day_profile, false, &error);
         if (ok) ok = wait_stable();
     }
@@ -4372,6 +5683,7 @@ void CameraDaemon::light_monitor_loop() {
 
         if (sel == SelectedMode::Auto) {
             const LightSample sample = read_light_sample();
+            const uint64_t now_ms = daynight_steady_now_ms();
             bool apply = false;
             LightMode apply_target = LightMode::Day;
             {
@@ -4379,19 +5691,33 @@ void CameraDaemon::light_monitor_loop() {
                 if (selected_mode_ == SelectedMode::Auto) {
                     const bool lens_active =
                         (lens_controller_ && lens_controller_->autofocus_operation_active());
+                    const uint64_t hold_ms =
+                        light_sensor_cfg_.min_hold_ms > 0
+                            ? static_cast<uint64_t>(light_sensor_cfg_.min_hold_ms)
+                            : 0u;
                     const auto decision =
-                        evaluate(daynight_state_, sample, light_sensor_cfg_, lens_active);
+                        evaluate(daynight_state_, sample, light_sensor_cfg_, lens_active, now_ms);
                     if (decision == LightSwitchDecision::ToDay ||
                         decision == LightSwitchDecision::ToNight) {
                         apply = true;
                         apply_target = daynight_state_.mode;
-                    } else if (daynight_state_.has_pending && !lens_active) {
-                        /* apply a switch that was deferred while a lens/AF op was active */
+                    } else if (decision == LightSwitchDecision::Held) {
+                        HAL_LOG_DEBUG(
+                            "CameraDaemon: day/night switch confirmed but held "
+                            "(min_hold_ms=%u, light percent=%d)",
+                            static_cast<unsigned>(light_sensor_cfg_.min_hold_ms),
+                            sample.percent);
+                    } else if (daynight_state_.has_pending && !lens_active &&
+                               (daynight_state_.last_switch_ms == 0 ||
+                                now_ms - daynight_state_.last_switch_ms >= hold_ms)) {
+                        /* apply a switch that was deferred while a lens/AF op was active;
+                         * a pending switch still respects the anti-flap dwell */
                         apply = true;
                         apply_target = daynight_state_.pending_target;
                         daynight_state_.has_pending = false;
                         daynight_state_.mode = apply_target;
                         daynight_state_.stable_count = 0;
+                        daynight_state_.last_switch_ms = now_ms;
                     }
                 }
             }
@@ -4434,6 +5760,9 @@ bool CameraDaemon::set_selected_mode(const std::string& mode, std::string* messa
             daynight_state_.mode = optical_night ? LightMode::Night : LightMode::Day;
             daynight_state_.stable_count = 0;
             daynight_state_.has_pending = false;
+            /* Entering auto arms the anti-flap dwell so the monitor cannot
+             * immediately undo the optical state the operator just left. */
+            daynight_state_.last_switch_ms = daynight_steady_now_ms();
         }
         start_light_monitor();
         HAL_LOG_INFO("CameraDaemon: selected mode = auto (light-driven)");
@@ -4461,10 +5790,20 @@ bool CameraDaemon::set_light_thresholds(int night_enter, int day_enter, std::str
         if (message) *message = err;
         return false;
     }
-    std::lock_guard<std::mutex> lk(daynight_mu_);
-    light_sensor_cfg_.night_enter = night_enter;
-    light_sensor_cfg_.day_enter = day_enter;
-    daynight_state_.stable_count = 0; /* reset accumulation on threshold change */
+    {
+        std::lock_guard<std::mutex> lk(daynight_mu_);
+        light_sensor_cfg_.night_enter = night_enter;
+        light_sensor_cfg_.day_enter = day_enter;
+        daynight_state_.stable_count = 0; /* reset accumulation on threshold change */
+        /* Persist under daynight_mu_ (same convention as write_ir_presets_locked):
+         * keeps the file-write order identical to the member-update order when
+         * two SetInfraredSettings RPCs race. Best-effort — a write failure only
+         * costs the across-reboot tuning, not this session. */
+        if (!save_daynight_thresholds(night_enter, day_enter)) {
+            HAL_LOG_WARNING("CameraDaemon: day/night thresholds applied but not persisted "
+                            "(night_enter=%d day_enter=%d)", night_enter, day_enter);
+        }
+    }
     HAL_LOG_INFO("CameraDaemon: light thresholds updated night_enter=%d day_enter=%d",
                  night_enter, day_enter);
     return true;
@@ -4813,6 +6152,43 @@ void CameraDaemon::get_stream_status(aipc::camera::GetStreamStatusResponse& resp
 
         uint64_t ms = encoder_mgr_->ms_since_last_packet(enc_name);
         info->set_ms_since_last_frame(ms);  // UINT64_MAX sentinel → JSON null on the Go side
+
+        // Unified drop/throughput observability (P1-10): publisher-side
+        // counters (seq assignments, overflow evictions, per-client
+        // skips/failures) and overlay bake-side counters on one surface.
+        // Fields stay zero when a layer is absent (publisher disabled /
+        // stream never through the bake site) so the response shape is
+        // stable. Publisher streams are keyed by config name — the encoder
+        // output callback translates media names back to it.
+        EncodedPublisher::StreamDropStats ds{};
+        if (encoded_pub_ && encoded_pub_->get_stream_stats(ec.stream_name, &ds)) {
+            info->set_packets_published(ds.packets_published);
+            info->set_queue_overflow_drops(ds.queue_overflow_drops);
+            info->set_client_send_drops(ds.client_send_drops);
+            info->set_client_send_failures(ds.client_send_failures);
+            info->set_client_disconnects(ds.client_disconnects);
+            info->set_last_packet_seq(ds.last_packet_seq);
+            info->set_publisher_clients(ds.clients);
+        }
+
+        AiOverlaySubscriber::OverlayStreamStats os{};
+        if (ai_overlay_) {
+            ai_overlay_->snapshot_stream_stats(ec.stream_name, &os);
+            info->set_bake_skips(os.bake_skips);
+            info->set_strict_locked(os.strict_locked);
+            info->set_strict_degraded(os.strict_degraded);
+            info->set_strict_skips(os.strict_skips);
+            // Behavior-decoupling + frame-sync observability (fields 24-28):
+            // epoch / live layer count for the app-side restart handshake,
+            // the two app-event ingest rejections, and the unbound platform
+            // drop counter. Aggregated across every infer stream routed onto
+            // this display by snapshot_stream_stats itself.
+            info->set_stream_epoch(os.stream_epoch);
+            info->set_overlay_layer_count(os.overlay_layer_count);
+            info->set_overlay_late_commands(os.overlay_late_commands);
+            info->set_overlay_epoch_rejects(os.overlay_epoch_rejects);
+            info->set_overlay_no_binding_drops(os.overlay_no_binding_drops);
+        }
 
         bool stalled = encoder_mgr_->is_stream_stalled(enc_name, kStallThresholdMs, kStartupGraceMs);
         bool seen    = encoder_mgr_->seen_first_packet(enc_name);
@@ -5736,6 +7112,9 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
 
                 // init_from_context clears the old stream slots and callbacks.
                 // Rebind them before restarting frame delivery.
+                // Same as the AF-refresh rebind: go through
+                // handle_video_frame_for_routing so DPM bake and AI overlay
+                // survive the profile switch.
                 for (auto& slot : video_source_->streams()) {
                     std::string dispatch_name = slot.name;
                     auto vnit = video_name_map_.find(slot.name);
@@ -5743,7 +7122,7 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
 
                     video_source_->set_frame_callback(slot.name,
                         [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
-                            frame_router_->on_frame_arrived(dispatch_name, frame);
+                            handle_video_frame_for_routing(dispatch_name, frame);
                         });
                 }
                 for (auto& slot : video_source_->streams()) {
@@ -6270,6 +7649,22 @@ void CameraDaemon::shutdown() {
     // 3d. Stop FD publisher (releases DMA-BUF references)
     if (fd_pub_) {
         fd_pub_->stop();
+    }
+
+    // 3d-1. Stop frame injection FIRST: its queue holds BufferPins against
+    //       the DSP registry that 3e below is about to drain and destroy.
+    if (injection_service_) {
+        injection_service_->stop();
+        injection_service_.reset();
+    }
+
+    // 3e. Stop DSP offload service (drains leftover jobs, frees remaining
+    //     registry buffers, deinits the HAL DSP context). Must run AFTER
+    //     fd_pub_->stop(): client disconnects above already detached their
+    //     buffers; must run BEFORE HAL unload below.
+    if (dsp_service_) {
+        dsp_service_->stop();
+        dsp_service_.reset();
     }
 
     // 3e. Stop FrameRouter dispatch thread (drains pending frames)

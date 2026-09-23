@@ -1,10 +1,14 @@
 package cmd
 
 import (
+	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	"aipc/tools/aipc-cli/pkg/output"
 )
 
 // The CLI must manage exactly the unit set that aipc-autostart.sh enables and
@@ -32,6 +36,50 @@ func TestAipcServicesMatchAutostartScript(t *testing.T) {
 		if aipcServices[i] != name {
 			t.Fatalf("unit list drift at index %d: CLI=%q autostart=%q (full CLI list %v)",
 				i, aipcServices[i], name, aipcServices)
+		}
+	}
+}
+
+func TestSystemDisableQuiescesAutostartBeforeRuntime(t *testing.T) {
+	oldPrinter := printer
+	printer = output.NewPrinter("table", false)
+	printer.SetWriter(io.Discard)
+	t.Cleanup(func() { printer = oldPrinter })
+
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "systemctl.log")
+	fakeSystemctl := filepath.Join(tmp, "systemctl")
+	if err := os.WriteFile(fakeSystemctl, []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+exit 0
+`), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", tmp+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("SYSTEMCTL_LOG", logPath)
+
+	if err := serviceDisableCmd.RunE(serviceDisableCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var actions []string
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if !strings.HasPrefix(line, "cat ") {
+			actions = append(actions, line)
+		}
+	}
+	if len(actions) == 0 {
+		t.Fatal("system disable did not invoke systemctl")
+	}
+	if actions[0] != "disable --now aipc-autostart.service" {
+		t.Fatalf("first systemctl action = %q, want autostart disable --now; all actions: %v", actions[0], actions)
+	}
+	for _, action := range actions[1:] {
+		if strings.Contains(action, "aipc-autostart.service") {
+			t.Fatalf("autostart was managed again after runtime operations: %v", actions)
 		}
 	}
 }

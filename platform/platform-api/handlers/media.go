@@ -1276,11 +1276,12 @@ func (h *MediaHandlers) SetRtspEnabled(c *gin.Context) {
 // writeAiOverlayConfig persists AI overlay settings to camera-daemon.yaml so
 // they survive a daemon restart. The proto field names differ from the yaml
 // keys (show_label→draw_labels, show_confidence→draw_confidence,
-// line_thickness→box_thickness); the remaining yaml-only keys
-// (event_bus_endpoint, topic_prefix, draw_landmarks, enable_face_blur,
-// stream_map) are preserved by the read-modify-write of the whole map. Called
-// only after the gRPC hot-reload succeeds.
-func (h *MediaHandlers) writeAiOverlayConfig(ctx context.Context, actor string, enabled bool, showLabel, showConfidence bool, lineThickness uint32) {
+// line_thickness→box_thickness); enable_face_blur is written only when the
+// request carries it, so pre-upgrade callers keep the stored value. The
+// remaining yaml-only keys (event_bus_endpoint, topic_prefix, draw_landmarks,
+// face_blur_block_size, stream_map) are preserved by the read-modify-write of
+// the whole map. Called only after the gRPC hot-reload succeeds.
+func (h *MediaHandlers) writeAiOverlayConfig(ctx context.Context, actor string, enabled bool, showLabel, showConfidence bool, lineThickness uint32, enableFaceBlur *bool) {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
 
@@ -1302,6 +1303,9 @@ func (h *MediaHandlers) writeAiOverlayConfig(ctx context.Context, actor string, 
 	overlay["draw_labels"] = showLabel
 	overlay["draw_confidence"] = showConfidence
 	overlay["box_thickness"] = int(lineThickness)
+	if enableFaceBlur != nil {
+		overlay["enable_face_blur"] = *enableFaceBlur
+	}
 
 	outData, err := marshalMediaConfig(config)
 	if err != nil {
@@ -1322,6 +1326,9 @@ func (h *MediaHandlers) UpdateAiOverlay(c *gin.Context) {
 		ShowLabel      bool   `json:"show_label"`
 		ShowConfidence bool   `json:"show_confidence"`
 		LineThickness  uint32 `json:"line_thickness"`
+		// Optional: mosaic detections labeled "face". nil keeps the current
+		// daemon-side setting (proto3 optional → pointer field).
+		EnableFaceBlur *bool `json:"enable_face_blur"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1338,6 +1345,7 @@ func (h *MediaHandlers) UpdateAiOverlay(c *gin.Context) {
 		ShowLabel:      req.ShowLabel,
 		ShowConfidence: req.ShowConfidence,
 		LineThickness:  req.LineThickness,
+		EnableFaceBlur: req.EnableFaceBlur,
 	})
 
 	if err != nil {
@@ -1352,12 +1360,13 @@ func (h *MediaHandlers) UpdateAiOverlay(c *gin.Context) {
 
 	// Persist so overlay settings survive a daemon restart.
 	h.writeAiOverlayConfig(context.Background(), getUsernameFromContext(c),
-		req.Enabled, req.ShowLabel, req.ShowConfidence, req.LineThickness)
+		req.Enabled, req.ShowLabel, req.ShowConfidence, req.LineThickness, req.EnableFaceBlur)
 
 	if h.eventLogger != nil {
 		h.eventLogger.LogWithCodeAsync("media.ai_overlay.changed", eventLoggerPkg.MessageParams{"enabled": req.Enabled,
-			"show_label":      req.ShowLabel,
-			"show_confidence": req.ShowConfidence}, getUsernameFromContext(c))
+			"show_label":       req.ShowLabel,
+			"show_confidence":  req.ShowConfidence,
+			"enable_face_blur": req.EnableFaceBlur}, getUsernameFromContext(c))
 	}
 
 	Resp(c).OK(gin.H{"message": "AI overlay config updated successfully"})

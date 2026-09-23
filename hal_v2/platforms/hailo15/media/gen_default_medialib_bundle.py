@@ -247,6 +247,7 @@ def normalize_profile(files, profile_path):
     - application_input_streams.resolutions -> 3 entries.
     - encoded_output_streams -> 3 entries; sink1/sink2 get cloned encoder/masking/osd files
       (derived from sink0). Each encoder gets its dimensions + bitrate set per resolution.
+    - iq_settings.dewarp.enabled forced True (lens correction on by default in every mode).
     """
     if profile_path not in files:
         return
@@ -275,10 +276,11 @@ def normalize_profile(files, profile_path):
         hailort.setdefault("device-id", "device0")
         hailort["use-hailort-service"] = True
 
-    # Force lens dewarp (anti-distortion) off by default.
+    # Force lens dewarp (anti-distortion) on by default in every mode (daylight/HDR/
+    # AI_ISP/IR): the camera ships with a fixed lens, so correction is always wanted.
     iq_ref = profile.get("iq_settings")
     if isinstance(iq_ref, str) and iq_ref in files:
-        files[iq_ref].setdefault("dewarp", {})["enabled"] = False
+        files[iq_ref].setdefault("dewarp", {})["enabled"] = True
 
     # encoded_output_streams
     eos = profile.get("encoded_output_streams")

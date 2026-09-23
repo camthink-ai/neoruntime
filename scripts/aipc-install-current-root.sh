@@ -16,11 +16,20 @@ LDCONFIG="${AIPC_LDCONFIG:-ldconfig}"
 ACTIVATE="${AIPC_ACTIVATE:-1}"
 TAG="aipc-current-root"
 
+# A non-empty rootfs prefix normally means that an inactive OS copy is being
+# prepared and must not be activated.  The test-only override lets the unit
+# harness exercise activation safely inside a temporary rootfs.
+TEST_ACTIVATE_WITH_ROOTFS_PREFIX="${AIPC_TEST_ACTIVATE_WITH_ROOTFS_PREFIX:-0}"
+
 root_path() { printf '%s%s' "$ROOTFS_PREFIX" "$1"; }
 NGINX_ROOT="$(root_path "${AIPC_NGINX_ROOT:-/data/nginx}")"
 log() { echo "[$TAG] $*"; }
 warn() { echo "[$TAG] WARN: $*" >&2; }
 fail() { echo "[$TAG] ERROR: $*" >&2; exit 1; }
+
+activation_requested() {
+    [[ "$ACTIVATE" == "1" && ( -z "$ROOTFS_PREFIX" || "$TEST_ACTIVATE_WITH_ROOTFS_PREFIX" == "1" ) ]]
+}
 
 copy_file_no_self() {
     local source="$1" dest="$2" mode="${3:-}"
@@ -200,7 +209,7 @@ done
 for file in "$DATA_ROOT"/etc/sysctl.d/*.conf; do
     [[ -f "$file" ]] || continue
     copy_file_no_self "$file" "$SYSCTL_DIR/$(basename -- "$file")" 0644
-    if [[ -z "$ROOTFS_PREFIX" && "$ACTIVATE" == "1" ]]; then
+    if activation_requested; then
         "$SYSCTL" -p "$SYSCTL_DIR/$(basename -- "$file")" >/dev/null 2>&1 || \
             warn "failed to apply $(basename -- "$file")"
     fi
@@ -217,7 +226,7 @@ install_nginx_gateway
 SYSTEMD_DIR="$(root_path /etc/systemd/system)"
 mkdir -p "$SYSTEMD_DIR"
 for legacy in nginx-data.service aipc-nginx-app-routes.service; do
-    if [[ -z "$ROOTFS_PREFIX" && "$ACTIVATE" == "1" ]]; then
+    if activation_requested; then
         "$SYSTEMCTL" disable --now "$legacy" >/dev/null 2>&1 || true
     fi
     rm -f "$SYSTEMD_DIR/$legacy"
@@ -226,35 +235,72 @@ shopt -s nullglob
 units=("$UNIT_SOURCE"/*.service "$UNIT_SOURCE"/*.timer "$UNIT_SOURCE"/*.target)
 (( ${#units[@]} > 0 )) || fail "canonical systemd unit set is empty"
 
+# The generic OS bootstrap runs this installer on every boot, not only on a
+# freshly written rootfs.  Record the pre-install unit state before replacing
+# unit files so an ordinary boot cannot turn an explicit `system disable` back
+# into enabled services.  Units absent from the current root are new and keep
+# the historical first-install default of enabled.
+declare -A unit_preexisting=()
+declare -A unit_enable_state=()
+if activation_requested; then
+    for unit in "${units[@]}"; do
+        name="$(basename -- "$unit")"
+        if [[ -e "$SYSTEMD_DIR/$name" || -L "$SYSTEMD_DIR/$name" ]]; then
+            unit_preexisting["$name"]=1
+            unit_enable_state["$name"]="$("$SYSTEMCTL" is-enabled "$name" 2>/dev/null || true)"
+        fi
+    done
+fi
+
 for unit in "${units[@]}"; do
     name="$(basename -- "$unit")"
     copy_file_no_self "$unit" "$SYSTEMD_DIR/$name" 0644
-    if [[ -z "$ROOTFS_PREFIX" && "$ACTIVATE" == "1" ]]; then
-        "$SYSTEMCTL" enable "$name" >/dev/null 2>&1 || warn "could not enable $name"
+    if activation_requested; then
+        if [[ "${unit_preexisting[$name]:-0}" == "1" ]]; then
+            log "preserved $name state: ${unit_enable_state[$name]:-unknown}"
+        else
+            "$SYSTEMCTL" enable "$name" >/dev/null 2>&1 || warn "could not enable $name"
+        fi
     fi
 done
 
 [[ -f "$SYSTEMD_DIR/aipc-platform.target" ]] || fail "aipc-platform.target is missing from canonical units"
 
-if [[ -z "$ROOTFS_PREFIX" && "$ACTIVATE" == "1" ]]; then
+if activation_requested; then
     "$LDCONFIG" 2>/dev/null || warn "ldconfig failed"
     "$SYSTEMCTL" daemon-reexec 2>/dev/null || "$SYSTEMCTL" daemon-reload 2>/dev/null || \
         fail "systemd reload failed"
     "$SYSTEMCTL" try-restart systemd-journald.service >/dev/null 2>&1 || true
-    # Start only the application boot chain and stable platform target. Starting
-    # every copied oneshot would incorrectly trigger maintenance-only services
-    # such as aipc-os-updater or aipc-os-reboot.
+    # Start only enabled/new members of the application boot chain.  In
+    # particular, never explicitly start a disabled aipc-autostart unit and do
+    # not start aipc-platform.target here: that target Wants every runtime unit
+    # and would bypass the persisted disable state.  aipc-autostart remains the
+    # single runtime lifecycle chokepoint.
     boot_units=(
         aipc-restore.service
         aipc-firstboot.service
         aipc-mcu-prep.service
         aipc-autostart.service
-        aipc-platform.target
         aipc-os-verify.service
         aipc-logrotate.timer
     )
-    "$SYSTEMCTL" start --no-block "${boot_units[@]}" >/dev/null 2>&1 || \
-        fail "failed to queue promoted AIPC units"
+    start_units=()
+    for name in "${boot_units[@]}"; do
+        [[ -f "$SYSTEMD_DIR/$name" || -L "$SYSTEMD_DIR/$name" ]] || continue
+        if [[ "${unit_preexisting[$name]:-0}" == "1" ]]; then
+            case "${unit_enable_state[$name]:-}" in
+                disabled|masked|masked-runtime)
+                    log "not starting $name (preserved ${unit_enable_state[$name]} state)"
+                    continue
+                    ;;
+            esac
+        fi
+        start_units+=("$name")
+    done
+    if (( ${#start_units[@]} > 0 )); then
+        "$SYSTEMCTL" start --no-block "${start_units[@]}" >/dev/null 2>&1 || \
+            fail "failed to queue promoted AIPC units"
+    fi
 fi
 
 log "installed ${#units[@]} unit(s) and rebuilt current-root integration"

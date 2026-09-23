@@ -25,10 +25,14 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <dlfcn.h>
+
+#include "peripheral/devices/hal_factory.h"
 
 extern "C" {
     #include "hal_log.h"
     #include "crash_handler.h"
+    #include "peripheral/devices/hal_lens.h"
 }
 
 static CameraDaemon* g_daemon = nullptr;
@@ -214,11 +218,14 @@ static bool media_config_contains_profile(const std::string& path,
            json.find(quoted_name) != std::string::npos;
 }
 
-static void select_product_media_config_for_infrared(DaemonConfig& config) {
-    static constexpr const char* kProductMediaConfig =
-        "/data/aipc/etc/imaging/hailo15h/imx678/theia_sl410m/4k/"
-        "medialib_configs/webserver_medialib_config.json";
+/* Pack-installed product media config: the fallback container when the
+ * configured media file does not provide the IR profile. Shared by the
+ * per-lens substitution below and by select_product_media_config_for_infrared. */
+static constexpr const char* kProductMediaConfig =
+    "/data/aipc/etc/imaging/hailo15h/imx678/theia_sl410m/4k/"
+    "medialib_configs/webserver_medialib_config.json";
 
+static void select_product_media_config_for_infrared(DaemonConfig& config) {
     if (!config.infrared.enabled ||
         media_config_contains_profile(config.media_config_path,
                                       config.infrared.infrared_profile)) {
@@ -237,58 +244,263 @@ static void select_product_media_config_for_infrared(DaemonConfig& config) {
     config.media_config_path = kProductMediaConfig;
 }
 
-/* Lens product model is baked at pack time into product.yaml; the only
- * key consumed here is lens.model. Returns "" when the file is absent or
- * carries no lens model. */
-static std::string parse_product_lens_model(const std::string& path) {
-    std::ifstream file(path);
-    if (!file.is_open()) return "";
-
-    std::string line;
-    bool in_lens_section = false;
-    while (std::getline(file, line)) {
-        line = strip_inline_comment(line);
-        const std::string trimmed = trim(line);
-        if (trimmed.empty() || trimmed[0] == '#') continue;
-
-        const bool indented = (line[0] == ' ' || line[0] == '\t');
-        if (trimmed.find("lens:") == 0 && !indented) {
-            in_lens_section = true;
-            continue;
-        }
-        if (!indented) {
-            in_lens_section = false;  // any other top-level key ends the section
-            continue;
-        }
-        if (in_lens_section && config_key_is(trimmed, "model"))
-            return get_value(trimmed);
+/* Adaptive lens probe (differential iris test). AF0832 carries a physical
+ * iris driven by a Hall closed loop; FG2009 has none — iris register writes
+ * still succeed (the driver chip is shared), but the ADC reading cannot move.
+ * Drive the iris to a target far from the current reading and re-read:
+ * movement toward the target = af0832, no movement = fg2009. Runs before the
+ * lens service owns the UART: opens the lens bridge, probes, tears the
+ * session down (the service re-initializes the MCU afterwards, same as a
+ * daemon restart). Returns "af0832"/"fg2009", or "" when the probe could not
+ * run (no bridge, MCU not answering, ambiguous movement) so the caller falls
+ * back to the af0832 default. */
+static std::string probe_lens_model(const DaemonConfig& config) {
+    const std::string& lib_path = config.lens_bridge_lib;
+    if (lib_path.empty()) {
+        HAL_LOG_INFO("Lens probe: no lens bridge configured; skipped");
+        return "";
     }
-    return "";
+    void* handle = dlopen(lib_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) {
+        HAL_LOG_INFO("Lens probe: cannot load '%s' (%s)", lib_path.c_str(), dlerror());
+        return "";
+    }
+    using IoInitFn = int (*)(const char*, uint32_t, uint32_t);
+    using HandleFn = int (*)(int);
+    using ModeFn = int (*)(int, int);
+    using RunFn = int (*)(int, int, int);
+    using AdcFn = int (*)(int, void*);
+    using ProfileSetFn = int (*)(int, uint32_t);
+    using StateGetFn = int (*)(int, HalLensState*);
+    IoInitFn io_init = nullptr;
+    HandleFn io_deinit = nullptr, lens_init = nullptr, lens_deinit = nullptr,
+             iris_stop = nullptr;
+    ModeFn lens_config = nullptr;
+    RunFn iris_run = nullptr;
+    ModeFn iris_target_set = nullptr;  // (handle, target)
+    AdcFn iris_adc_get = nullptr;
+    ProfileSetFn profile_set = nullptr;   // optional: MCU 0.1.8+ only
+    HandleFn zoom_rz = nullptr;           // optional: PI end-stop probe
+    StateGetFn state_get = nullptr;       // optional: zoom_rz_done polling
+    *reinterpret_cast<void**>(&io_init) = dlsym(handle, "hal_bridge_io_init");
+    *reinterpret_cast<void**>(&io_deinit) = dlsym(handle, "hal_bridge_io_deinit");
+    *reinterpret_cast<void**>(&lens_init) = dlsym(handle, "hal_bridge_lens_init");
+    *reinterpret_cast<void**>(&lens_deinit) = dlsym(handle, "hal_bridge_lens_deinit");
+    *reinterpret_cast<void**>(&lens_config) = dlsym(handle, "hal_bridge_lens_config");
+    *reinterpret_cast<void**>(&iris_run) = dlsym(handle, "hal_bridge_iris_run");
+    *reinterpret_cast<void**>(&iris_stop) = dlsym(handle, "hal_bridge_iris_stop");
+    *reinterpret_cast<void**>(&iris_target_set) = dlsym(handle, "hal_bridge_iris_target_set");
+    *reinterpret_cast<void**>(&iris_adc_get) = dlsym(handle, "hal_bridge_iris_adc_get");
+    *reinterpret_cast<void**>(&profile_set) = dlsym(handle, "hal_bridge_profile_set");
+    *reinterpret_cast<void**>(&zoom_rz) = dlsym(handle, "hal_bridge_zoom_rz");
+    *reinterpret_cast<void**>(&state_get) = dlsym(handle, "hal_bridge_lens_state_get");
+    if (!io_init || !io_deinit || !lens_init || !lens_deinit || !lens_config ||
+        !iris_run || !iris_stop || !iris_target_set || !iris_adc_get) {
+        HAL_LOG_INFO("Lens probe: '%s' missing lens/iris symbols; skipped", lib_path.c_str());
+        dlclose(handle);
+        return "";
+    }
+
+    std::string result;
+    if (io_init(config.lens_serial_device.c_str(),
+                config.lens_baud_rate, config.lens_timeout_ms) == 0) {
+        int ret = lens_init(1);
+        if (ret != 0) {  // same retry shape as the lens service Init RPC
+            lens_deinit(1);
+            usleep(100 * 1000);
+            ret = lens_init(1);
+        }
+        const int cfg_ret = ret == 0 ? lens_config(1, 0) : ret;
+        if (cfg_ret != 0) {
+            HAL_LOG_WARNING("Lens probe: MCU session failed (init=%d cfg=%d); falling back",
+                            ret, cfg_ret);
+        } else {
+            /* MCU 0.1.8 gates iris ops by the active lens profile; a sticky
+             * FG2009 profile from a previous session vetoes the probe with
+             * NOT_SUPPORTED. Force AF0832 (iris ungated) for the probe — the
+             * lens service re-pushes the final profile during Init. Firmware
+             * without PROFILE_SET (0.1.7) replies an error, which is fine:
+             * it never gates iris either. */
+            if (profile_set) {
+                const int pset = profile_set(1, 0 /* HAL_LENS_MODEL_AF0832 */);
+                if (pset != 0) {
+                    HAL_LOG_INFO("Lens probe: profile_set(af0832) ret=%d (pre-0.1.8 MCU; ignored)",
+                                 pset);
+                }
+            }
+            usleep(200 * 1000);  // let the MCU finish applying the config
+            /* First read after boot can race the MCU's own init; retry. */
+            auto read_adc = [&](uint16_t* out) -> int {
+                for (int attempt = 1; attempt <= 3; ++attempt) {
+                    const int ret = iris_adc_get(1, out);
+                    if (ret == 0) return 0;
+                    HAL_LOG_WARNING("Lens probe: iris ADC read attempt %d failed (ret=%d)",
+                                    attempt, ret);
+                    usleep(250 * 1000);
+                }
+                return -1;
+            };
+            uint16_t a0 = 0, a0b = 0, a1 = 0;
+            bool iris_perturbed = false;
+            if (read_adc(&a0) != 0 || read_adc(&a0b) != 0) {
+                HAL_LOG_WARNING("Lens probe: iris ADC unreadable; falling back");
+            } else {
+                /* Target far from the current reading so a converged iris
+                 * cannot already sit on it (10-bit ADC scale). */
+                int target;
+                if (a0 < 512) {
+                    target = static_cast<int>(a0b) + 400;
+                    if (target > 1023) target = 1023;
+                } else {
+                    target = static_cast<int>(a0b) - 400;
+                    if (target < 0) target = 0;
+                }
+                /* A failed drive leaves the ADC untouched, which here would
+                 * read as "no iris" and misfile a real AF0832 as fg2009.
+                 * Treat a command failure as an inconclusive probe (result
+                 * stays empty) and let the identity chain fall back to the
+                 * af0832 default. */
+                bool drive_ok = false;
+                if (iris_target_set(1, target) == 0 && iris_run(1, 0, 0) == 0) {
+                    iris_perturbed = true;
+                    drive_ok = true;
+                } else {
+                    HAL_LOG_WARNING("Lens probe: iris drive command failed; falling back");
+                }
+                usleep(drive_ok ? 1200 * 1000 : 0);  // iris mechanical settle
+                const int get_ret = drive_ok ? read_adc(&a1) : -1;
+                iris_stop(1);
+                if (!drive_ok) {
+                    // skipped: drive failed, result stays empty
+                } else if (get_ret != 0) {
+                    HAL_LOG_WARNING("Lens probe: iris ADC re-read failed; falling back");
+                } else {
+                    const int moved = static_cast<int>(a1) > static_cast<int>(a0b)
+                                          ? static_cast<int>(a1) - static_cast<int>(a0b)
+                                          : static_cast<int>(a0b) - static_cast<int>(a1);
+                    const int d_new = static_cast<int>(a1) > target
+                                          ? static_cast<int>(a1) - target
+                                          : target - static_cast<int>(a1);
+                    const int d_old = static_cast<int>(a0b) > target
+                                          ? static_cast<int>(a0b) - target
+                                          : target - static_cast<int>(a0b);
+                    HAL_LOG_INFO("Lens probe: iris adc %u->%u (target %d, moved %d%s)",
+                                 a0b, a1, target, moved, a0 != a0b ? ", base noisy" : "");
+                    if (moved >= 40 && d_new < d_old) {
+                        result = "af0832";
+                    } else if (moved < 40) {
+                        result = "fg2009";
+                    } else if (zoom_rz && state_get) {
+                        /* Auxiliary PI probe for the ambiguous middle ground.
+                         * AF0832 has the zoom photo-interrupter, so reset-zero
+                         * completes (zoom_rz_done sets); FG2009 has none, the
+                         * MCU motor times out (~5s) and done never sets. Still
+                         * under the forced AF0832 profile, so 0.1.8 firmware
+                         * does not gate the command. */
+                        HalLensState st0{};
+                        if (state_get(1, &st0) == 0 && st0.zoom_rz_done) {
+                            result = "af0832";  // homed earlier => PI fired once
+                            HAL_LOG_INFO("Lens probe: PI probe skipped (already homed) -> af0832");
+                        } else if (zoom_rz(1) == 0) {
+                            HAL_LOG_INFO("Lens probe: iris ambiguous; running zoom reset-zero (PI) probe");
+                            for (int waited_ms = 0; waited_ms < 7000; waited_ms += 300) {
+                                usleep(300 * 1000);
+                                HalLensState st{};
+                                if (state_get(1, &st) == 0 && st.zoom_rz_done) {
+                                    result = "af0832";
+                                    break;
+                                }
+                            }
+                            if (result.empty()) result = "fg2009";
+                            HAL_LOG_INFO("Lens probe: PI probe -> %s", result.c_str());
+                        } else {
+                            HAL_LOG_WARNING("Lens probe: ambiguous movement, zoom RZ start failed; falling back");
+                        }
+                    } else {
+                        HAL_LOG_WARNING("Lens probe: ambiguous movement; falling back");
+                    }
+                }
+            }
+            /* Restore the AF0832 default iris: the probe chased a far target,
+             * so drive the physical iris back to the system default (target 0,
+             * g_default_iris_config.iris_tgt). Skipped when the probe itself
+             * decided fg2009 — no physical iris exists there to restore. */
+            if (iris_perturbed && result != "fg2009") {
+                if (iris_target_set(1, 0) == 0 && iris_run(1, 0, 0) == 0) {
+                    usleep(1200 * 1000);  // settle at the default target
+                    iris_stop(1);
+                    uint16_t a2 = 0;
+                    if (iris_adc_get(1, &a2) == 0) {
+                        HAL_LOG_INFO("Lens probe: iris restored to default target 0 (adc %u)", a2);
+                    }
+                } else {
+                    HAL_LOG_WARNING("Lens probe: iris restore command failed; "
+                                    "iris left perturbed");
+                }
+            }
+        }
+        lens_deinit(1);
+        io_deinit(1);
+    } else {
+        HAL_LOG_WARNING("Lens probe: io_init on %s failed; falling back",
+                        config.lens_serial_device.c_str());
+    }
+    dlclose(handle);
+    return result;
 }
 
-/* Applies the factory lens model from <prefix>/etc/product.yaml.
- * Missing file keeps the af0832 default (legacy images); an unknown model
- * fails fast so a mis-built image cannot drive the wrong lens geometry. */
-static bool apply_product_lens_model(DaemonConfig& config,
-                                     const std::string& config_path) {
-    const std::string product_path =
-        derive_install_prefix(config_path) + "/etc/product.yaml";
-    const std::string model = parse_product_lens_model(product_path);
+/* Applies the lens model identity: pure software adaptivity only. The
+ * adaptive iris probe (with its PI auxiliary probe) decides; af0832 is the
+ * last-resort default so an unprobed unit still boots. The factory EEPROM
+ * is deliberately not consulted — lens identity must not depend on what a
+ * factory station burned (a mis-stamped unit would boot the wrong lens
+ * branch with no runtime correction). */
+static void apply_lens_model_identity(DaemonConfig& config) {
+    const std::string probed = probe_lens_model(config);
+    if (!probed.empty()) {
+        config.lens_model = probed;
+        HAL_LOG_INFO("Lens product model: %s (adaptive iris probe)", probed.c_str());
+        return;
+    }
+    config.lens_model = "af0832";
+    HAL_LOG_INFO("Lens product model: af0832 (probe carried no lens model)");
+}
 
-    if (model.empty()) {
-        HAL_LOG_WARNING("No lens model in '%s'; defaulting to af0832",
-                        product_path.c_str());
-        return true;
+/* Per-lens IR profile: both lens versions share one media config, but each
+ * carries its own Infrared_* entry (optics differ, so does the IQ tuning).
+ * When the yaml still has the AF default name, the FG2009 motorized-zoom
+ * lens switches to its own entry; an explicit non-default profile_name is
+ * respected for bench tuning — same contract as the FG2009 IR zoom LUT
+ * substitution. Resolved once here so every later consumer (mode checks,
+ * profile switch, boot persistence guard) sees the effective name.
+ *
+ * The substitution only fires when something can actually resolve the new
+ * name: an empty config_path means the compiled-in default bundle (whose
+ * profile list is build-gated to carry both entries), otherwise either the
+ * configured or the pack product container must list it. An upgraded unit
+ * running new binaries against preserved pre-per-lens imaging trees keeps
+ * the shared Infrared_Basic entry (correct FG2009 tuning) instead of
+ * renaming into a profile nothing can serve — night mode degrades to the
+ * previous behavior rather than failing HAL_ERR_PROFILE_INVALID. */
+static void apply_lens_infrared_profile(DaemonConfig& config) {
+    if (config.lens_model != "fg2009" ||
+        config.infrared.infrared_profile != "Infrared_Basic") {
+        return;
     }
-    if (model != "af0832" && model != "fg2009") {
-        HAL_LOG_ERROR("Unknown lens model '%s' in %s (expected af0832|fg2009)",
-                      model.c_str(), product_path.c_str());
-        return false;
+    static const std::string kFg2009IrProfile = "Infrared_Basic_FG2009";
+    if (!config.media_config_path.empty() &&
+        !media_config_contains_profile(config.media_config_path,
+                                       kFg2009IrProfile) &&
+        !media_config_contains_profile(kProductMediaConfig, kFg2009IrProfile)) {
+        HAL_LOG_WARNING("FG2009 lens but no media config provides '%s'; keeping "
+                        "'%s' (upgrade the imaging trees for per-lens IR)",
+                        kFg2009IrProfile.c_str(),
+                        config.infrared.infrared_profile.c_str());
+        return;
     }
-    config.lens_model = model;
-    HAL_LOG_INFO("Lens product model: %s (from %s)",
-                 model.c_str(), product_path.c_str());
-    return true;
+    config.infrared.infrared_profile = kFg2009IrProfile;
+    HAL_LOG_INFO("FG2009 lens; IR profile -> %s",
+                 config.infrared.infrared_profile.c_str());
 }
 
 static DaemonConfig load_config(const std::string& path) {
@@ -309,6 +521,7 @@ static DaemonConfig load_config(const std::string& path) {
     cfg.fd_pub_sock_path = "/run/aipc/camera.sock";
     cfg.fd_pub_max_clients = 16;
     cfg.fd_pub_max_outstanding = 3;
+    cfg.fd_pub_lease_ms = 200;
     cfg.rtsp_enabled = true;
     cfg.rtsp_port = 8554;
     cfg.encoded_pub_enabled = true;
@@ -377,6 +590,8 @@ static DaemonConfig load_config(const std::string& path) {
         if (trimmed.find("light_sensor:") == 0) { section = "light_sensor"; continue; }
         if (trimmed.find("service:") == 0) { section = "service"; continue; }
         if (trimmed.find("lens:") == 0) { section = "lens"; lens_subsection.clear(); continue; }
+        if (trimmed.find("dsp:") == 0) { section = "dsp"; continue; }
+        if (trimmed.find("injection:") == 0) { section = "injection"; continue; }
         if (trimmed.find("streams:") == 0) { section = "streams"; cfg.streams.clear(); continue; }
         if (trimmed.find("encoders:") == 0) { section = "encoders"; cfg.encoders.clear(); continue; }
 
@@ -415,6 +630,63 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.watchdog_timeout_ms = parse_u32_config(val, "watchdog.frame_timeout_ms");
             else if (trimmed.find("warn_threshold_ms:") != std::string::npos)
                 cfg.watchdog_warn_ms = parse_u32_config(val, "watchdog.warn_threshold_ms");
+        } else if (section == "dsp") {
+            // P2: DspServiceConfig knobs (defaults live in dsp_service.h).
+            // Quota and retained-resource caps are per process incarnation.
+            if (trimmed.find("quota_jobs_per_sec:") != std::string::npos)
+                cfg.dsp.quota_jobs_per_sec = parse_float_config(val, "dsp.quota_jobs_per_sec");
+            else if (trimmed.find("quota_mpix_per_sec:") != std::string::npos)
+                cfg.dsp.quota_mpix_per_sec = parse_float_config(val, "dsp.quota_mpix_per_sec");
+            else if (trimmed.find("job_timeout_ms:") != std::string::npos)
+                cfg.dsp.job_timeout_ms = parse_u32_config(val, "dsp.job_timeout_ms");
+            else if (trimmed.find("max_batch:") != std::string::npos)
+                cfg.dsp.max_batch = parse_u32_config(val, "dsp.max_batch");
+            else if (trimmed.find("max_buffers_per_client:") != std::string::npos)
+                cfg.dsp.max_buffers_per_client = parse_u32_config(val, "dsp.max_buffers_per_client");
+            else if (trimmed.find("max_client_pixels:") != std::string::npos)
+                cfg.dsp.max_client_pixels = parse_u32_config(val, "dsp.max_client_pixels");
+            else if (trimmed.find("max_total_buffers:") != std::string::npos)
+                cfg.dsp.max_total_buffers = parse_u32_config(val, "dsp.max_total_buffers");
+            else if (trimmed.find("max_total_buffer_pixels:") != std::string::npos)
+                cfg.dsp.max_total_buffer_pixels = parse_u32_config(val, "dsp.max_total_buffer_pixels");
+            else if (trimmed.find("max_imports_per_client:") != std::string::npos)
+                cfg.dsp.max_imports_per_client = parse_u32_config(val, "dsp.max_imports_per_client");
+            else if (trimmed.find("max_import_bytes_per_client:") != std::string::npos)
+                cfg.dsp.max_import_bytes_per_client = parse_u32_config(val, "dsp.max_import_bytes_per_client");
+            else if (trimmed.find("max_total_imports:") != std::string::npos)
+                cfg.dsp.max_total_imports = parse_u32_config(val, "dsp.max_total_imports");
+            else if (trimmed.find("max_total_import_bytes:") != std::string::npos)
+                cfg.dsp.max_total_import_bytes = parse_u32_config(val, "dsp.max_total_import_bytes");
+            else if (trimmed.find("max_async_jobs_per_client:") != std::string::npos)
+                cfg.dsp.max_async_jobs_per_client = parse_u32_config(val, "dsp.max_async_jobs_per_client");
+        } else if (section == "injection") {
+            // P0-P2: app frame injection knobs (defaults live in
+            // injection_service.h). `enabled` is the master gate and ships
+            // false: opt-in, enable per deployment.
+            if (trimmed.find("enabled:") != std::string::npos)
+                cfg.injection.enabled = (val == "true" || val == "1");
+            else if (trimmed.find("queue_capacity:") != std::string::npos)
+                cfg.injection.queue_capacity = parse_u32_config(val, "injection.queue_capacity");
+            else if (trimmed.find("allowed_apps:") != std::string::npos) {
+                // P2-12 manifest permission gate: comma-separated app
+                // identities (SO_PEERCRED cmdline basenames). Empty/missing
+                // = allow all (development default).
+                cfg.injection.allowed_apps.clear();
+                size_t pos = 0;
+                while (pos <= val.size()) {
+                    size_t comma = val.find(',', pos);
+                    std::string app = val.substr(pos, (comma == std::string::npos
+                                                        ? val.size() : comma) - pos);
+                    /* trim spaces around each entry */
+                    const size_t b = app.find_first_not_of(" \t");
+                    const size_t e = app.find_last_not_of(" \t");
+                    if (b != std::string::npos)
+                        cfg.injection.allowed_apps.push_back(app.substr(b, e - b + 1));
+                    if (comma == std::string::npos)
+                        break;
+                    pos = comma + 1;
+                }
+            }
         } else if (section == "ai_overlay") {
             if (trimmed.find("enabled:") != std::string::npos)
                 cfg.ai_overlay_enabled = (val == "true" || val == "1");
@@ -430,8 +702,18 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.ai_overlay_draw_landmarks = (val == "true" || val == "1");
             else if (trimmed.find("enable_face_blur:") != std::string::npos)
                 cfg.ai_overlay_enable_face_blur = (val == "true" || val == "1");
+            else if (trimmed.find("face_blur_block_size:") != std::string::npos)
+                cfg.ai_overlay_face_blur_block_size = parse_u32_config(val, "ai_overlay.face_blur_block_size");
             else if (trimmed.find("box_thickness:") != std::string::npos)
                 cfg.ai_overlay_box_thickness = parse_u32_config(val, "ai_overlay.box_thickness");
+            else if (trimmed.find("result_ttl_ms:") != std::string::npos)
+                cfg.ai_overlay_result_ttl_ms = parse_u32_config(val, "ai_overlay.result_ttl_ms");
+            else if (trimmed.find("strict_frame_lock:") != std::string::npos)
+                cfg.ai_overlay_strict_frame_lock = (val == "true" || val == "1");
+            else if (trimmed.find("strict_wait_cap_ms:") != std::string::npos)
+                cfg.ai_overlay_strict_wait_cap_ms = parse_u32_config(val, "ai_overlay.strict_wait_cap_ms");
+            else if (trimmed.find("legacy_auto_bind:") != std::string::npos)
+                cfg.ai_overlay_legacy_auto_bind = (val == "true" || val == "1");
             else if (trimmed.find("overlay_library:") != std::string::npos)
                 cfg.ai_overlay_lib = val;
             else if (trimmed.find("stream_map:") != std::string::npos && !val.empty()) {
@@ -445,6 +727,39 @@ static DaemonConfig load_config(const std::string& path) {
                         std::string v = trim(pair.substr(c + 1));
                         if (!k.empty() && !v.empty())
                             cfg.ai_overlay_stream_map[k] = v;
+                    }
+                }
+            } else if (trimmed.find("result_ttl_map:") != std::string::npos && !val.empty()) {
+                // Flat format: "dst1:ms1,dst2:ms2,..." — per-display-stream TTL
+                // overrides (keyed like stream_map values; 0 = derive, see
+                // resolve_result_ttl_ms).
+                std::istringstream ss(val);
+                std::string pair;
+                while (std::getline(ss, pair, ',')) {
+                    auto c = pair.find(':');
+                    if (c != std::string::npos) {
+                        std::string k = trim(pair.substr(0, c));
+                        std::string v = trim(pair.substr(c + 1));
+                        if (!k.empty() && !v.empty())
+                            cfg.ai_overlay_stream_result_ttls[k] =
+                                parse_u32_config(v, "ai_overlay.result_ttl_map");
+                    }
+                }
+            } else if (trimmed.find("bindings:") != std::string::npos && !val.empty()) {
+                // Flat format: "infer1:display1,infer2:display2,..." — same
+                // direction as stream_map. A bound infer stream's platform
+                // results draw on the display stream (the behavior-decoupling
+                // admission path); unbound platform events are dropped and
+                // counted. legacy_auto_bind admits everything (old behavior).
+                std::istringstream ss(val);
+                std::string pair;
+                while (std::getline(ss, pair, ',')) {
+                    auto c = pair.find(':');
+                    if (c != std::string::npos) {
+                        std::string k = trim(pair.substr(0, c));
+                        std::string v = trim(pair.substr(c + 1));
+                        if (!k.empty() && !v.empty())
+                            cfg.ai_overlay_bindings[k] = v;
                     }
                 }
             }
@@ -639,6 +954,8 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.light_sensor.sample_interval_ms = static_cast<int>(parse_u32_config(val, "light_sensor.sample_interval_ms", 60000));
             else if (trimmed.find("stable_samples:") != std::string::npos)
                 cfg.light_sensor.stable_samples = static_cast<int>(parse_u32_config(val, "light_sensor.stable_samples", 100));
+            else if (trimmed.find("min_hold_s:") != std::string::npos)
+                cfg.light_sensor.min_hold_ms = static_cast<int>(parse_u32_config(val, "light_sensor.min_hold_s", 3600)) * 1000;
             else if (trimmed.find("dark_mv:") != std::string::npos)
                 cfg.light_sensor.dark_mv = static_cast<int>(parse_u32_config(val, "light_sensor.dark_mv", 3300));
             else if (trimmed.find("bright_mv:") != std::string::npos)
@@ -651,6 +968,42 @@ static DaemonConfig load_config(const std::string& path) {
         } else if (section == "lens") {
             if (trimmed.find("fg2009:") == 0) {
                 lens_subsection = "fg2009";
+            } else if (trimmed.find("position_persistence:") != std::string::npos) {
+                cfg.lens_position_persistence = (val == "true" || val == "1");
+            } else if (trimmed.find("image_probe_") != std::string::npos) {
+                // lens: image_probe_* keys (image-sharpness fixed-lens probe).
+                // Matched before the fg2009 subsection branch: keys unique to
+                // this block must parse wherever they sit under lens:.
+                if (trimmed.find("image_probe_enabled:") != std::string::npos)
+                    cfg.lens_image_probe_enabled = (val == "true" || val == "1");
+                else if (trimmed.find("image_probe_steps:") != std::string::npos)
+                    cfg.lens_image_probe_steps = (int)parse_u32_config(val, "lens.image_probe_steps");
+                else if (trimmed.find("image_probe_frames:") != std::string::npos)
+                    cfg.lens_image_probe_frames = (int)parse_u32_config(val, "lens.image_probe_frames");
+                else if (trimmed.find("image_probe_settle_ms:") != std::string::npos)
+                    cfg.lens_image_probe_settle_ms = (int)parse_u32_config(val, "lens.image_probe_settle_ms");
+                else if (trimmed.find("image_probe_pps:") != std::string::npos)
+                    cfg.lens_image_probe_pps = (int)parse_u32_config(val, "lens.image_probe_pps", HAL_LENS_FG2009_MAX_PPS);
+                else if (trimmed.find("image_probe_ready_timeout_ms:") != std::string::npos)
+                    cfg.lens_image_probe_ready_timeout_ms = (int)parse_u32_config(val, "lens.image_probe_ready_timeout_ms");
+                else if (trimmed.find("image_probe_retries:") != std::string::npos)
+                    cfg.lens_image_probe_retries = (int)parse_u32_config(val, "lens.image_probe_retries");
+                else if (trimmed.find("image_probe_retry_interval_ms:") != std::string::npos)
+                    cfg.lens_image_probe_retry_interval_ms = (int)parse_u32_config(val, "lens.image_probe_retry_interval_ms");
+                else if (trimmed.find("self_init_enabled:") != std::string::npos)
+                    cfg.lens_self_init_enabled = (int)parse_u32_config(val, "lens.self_init_enabled");
+                else if (trimmed.find("image_probe_move_timeout_ms:") != std::string::npos)
+                    cfg.lens_image_probe_move_timeout_ms = (int)parse_u32_config(val, "lens.image_probe_move_timeout_ms");
+                else if (trimmed.find("image_probe_texture_floor:") != std::string::npos)
+                    cfg.lens_image_probe_texture_floor = parse_u32_config(val, "lens.image_probe_texture_floor");
+                else if (trimmed.find("image_probe_motor_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_motor_ratio = parse_float_config(val, "lens.image_probe_motor_ratio");
+                else if (trimmed.find("image_probe_flat_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_flat_ratio = parse_float_config(val, "lens.image_probe_flat_ratio");
+                else if (trimmed.find("image_probe_return_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_return_ratio = parse_float_config(val, "lens.image_probe_return_ratio");
+                else if (trimmed.find("image_probe_luma_guard_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_luma_guard_ratio = parse_float_config(val, "lens.image_probe_luma_guard_ratio");
             } else if (lens_subsection == "fg2009") {
                 if (trimmed.find("ram_steps:") != std::string::npos)
                     cfg.lens_fg2009.ram_steps = (int32_t)parse_u32_config(val, "lens.fg2009.ram_steps");
@@ -780,10 +1133,11 @@ int main(int argc, char** argv) {
     // Load configuration
     DaemonConfig config = load_config(config_path);
     setup_logging(config.log_level, config.log_file, config_path);
+    // Lens model first: the IR profile name substitution below must happen
+    // before the media-config validation resolves the effective name.
+    apply_lens_model_identity(config);
+    apply_lens_infrared_profile(config);
     select_product_media_config_for_infrared(config);
-    if (!apply_product_lens_model(config, config_path)) {
-        return 1;
-    }
 
     HAL_LOG_INFO("===================================");
     HAL_LOG_INFO("AIPC Camera Daemon v2.0.0");

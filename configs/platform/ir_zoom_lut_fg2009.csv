@@ -1,16 +1,21 @@
-# FG2009 IR zoom-follow LUT.
-# Ratio column spans this lens's optical range (1.0 .. 2.2416, 9 evenly
-# spaced rows); PWM columns are carried over verbatim from the AF0832 LUT
-# (near 100->0, far 0->100 crossover). Selected at runtime when
-# product.yaml lens.model == fg2009 and camera-daemon.yaml still points
-# infrared.lut_path at the AF0832 default.
+# FG2009 IR zoom-follow LUT (optics-based starting points, bench-tune).
+# Lens FOV H: 109.8deg @1.0 -> 46.2deg @2.2416; near LED 120deg beam,
+# far LED 30deg beam.
+# Rules: far stays 0 while its 30deg beam covers <35% of the frame width
+# (~z<=1.5) to avoid a center hotspot, then ramps superlinearly to full
+# power at max tele where the 30deg-vs-46.2deg mismatch is smallest and
+# the use case is long range. Near tapers from 100 down to a floor of 28:
+# it is the only source covering the full FOV at every zoom (far never
+# reaches the outer ~17% per side at tele).
+# Selected at runtime when product.yaml lens.model == fg2009 and
+# camera-daemon.yaml still points infrared.lut_path at the AF0832 default.
 zoom_ratio,near_pwm,far_pwm
 1.000,100,0
-1.165,85,0
-1.330,80,0
-1.495,80,5
-1.660,75,10
-1.826,55,25
-1.991,32,50
-2.156,12,80
-2.242,0,100
+1.165,100,0
+1.330,100,0
+1.495,95,0
+1.660,85,3
+1.826,70,10
+1.991,52,25
+2.156,40,55
+2.242,28,100

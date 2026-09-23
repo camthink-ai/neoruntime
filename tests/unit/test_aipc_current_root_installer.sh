@@ -76,6 +76,74 @@ cmp "$DATA/etc/sysctl.d/panic.conf" "$ROOTFS/etc/sysctl.d/panic.conf"
 cmp "$DATA/etc/security/seccomp-default.json" "$ROOTFS/etc/aipc/seccomp-default.json"
 grep -qx "$DATA/lib/hal" "$ROOTFS/etc/ld.so.conf.d/aipc.conf"
 
+# The OS bootstrap invokes the current-root installer on every boot. Existing
+# disabled units must stay disabled, and the stable platform target must not be
+# started because it Wants the entire runtime regardless of enable state.
+for name in aipc-firstboot.service aipc-autostart.service platform-api.service aipc-logrotate.timer; do
+    printf '[Unit]\nDescription=Test %s\n[Install]\nWantedBy=multi-user.target\n' "$name" >"$DATA/systemd/$name"
+done
+mkdir -p "$ROOTFS/etc/systemd/system"
+cp "$DATA/systemd/aipc-firstboot.service" "$ROOTFS/etc/systemd/system/aipc-firstboot.service"
+cp "$DATA/systemd/aipc-autostart.service" "$ROOTFS/etc/systemd/system/aipc-autostart.service"
+cp "$DATA/systemd/platform-api.service" "$ROOTFS/etc/systemd/system/platform-api.service"
+
+FAKE_BIN="$TMP/fake-bin"
+SYSTEMCTL_LOG="$TMP/systemctl.log"
+mkdir -p "$FAKE_BIN"
+cat >"$FAKE_BIN/systemctl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+if [ "$1" = "is-enabled" ]; then
+    case "$2" in
+        aipc-autostart.service|platform-api.service)
+            printf 'disabled\n'
+            exit 1
+            ;;
+        aipc-platform.target)
+            printf 'static\n'
+            exit 0
+            ;;
+        *)
+            printf 'enabled\n'
+            exit 0
+            ;;
+    esac
+fi
+exit 0
+EOF
+chmod 0755 "$FAKE_BIN/systemctl"
+
+SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+AIPC_INSTALL_ROOT="$DATA" \
+AIPC_ROOTFS_PREFIX="$ROOTFS" \
+AIPC_TEST_ACTIVATE_WITH_ROOTFS_PREFIX=1 \
+AIPC_SYSTEMCTL="$FAKE_BIN/systemctl" \
+AIPC_SYSCTL=/bin/true \
+AIPC_LDCONFIG=/bin/true \
+    "$INSTALLER" >"$TMP/activate.out"
+
+if grep -Eq '^enable (aipc-autostart|platform-api)\.service$' "$SYSTEMCTL_LOG"; then
+    echo "installer re-enabled an explicitly disabled unit" >&2
+    cat "$SYSTEMCTL_LOG" >&2
+    exit 1
+fi
+grep -qx 'enable aipc-logrotate.timer' "$SYSTEMCTL_LOG" || {
+    echo "installer did not enable a newly installed unit" >&2
+    cat "$SYSTEMCTL_LOG" >&2
+    exit 1
+}
+start_line="$(grep '^start --no-block ' "$SYSTEMCTL_LOG" || true)"
+if [[ "$start_line" == *aipc-autostart.service* || "$start_line" == *aipc-platform.target* ]]; then
+    echo "installer bypassed the persisted runtime disable state" >&2
+    cat "$SYSTEMCTL_LOG" >&2
+    exit 1
+fi
+grep -q 'not starting aipc-autostart.service (preserved disabled state)' "$TMP/activate.out" || {
+    echo "installer did not report the preserved autostart state" >&2
+    cat "$TMP/activate.out" >&2
+    exit 1
+}
+
 # A failed rootfs copy must propagate out of the installer. This specifically
 # guards the errexit contract used by the generic OS launcher.
 mkdir "$TMP/fail-bin"

@@ -58,7 +58,7 @@ Additional dependencies:
 | `aipc-nginx-gateway.service` | simple | Nginx app gateway + route sync (`aipc-nginx-app-route-sync.py --serve`); after `platform-api` and `app-manager` |
 | `aipc-os-updater.service` | oneshot | A/B OS upgrade installer (`/usr/libexec/aipc-os-updater install`); writes only the inactive copy |
 | `aipc-os-reboot.service` | oneshot | Reboot into the newly installed OS copy (`/usr/libexec/aipc-os-updater reboot`) |
-| `aipc-os-verify.service` | oneshot | Post-upgrade verification (`/usr/libexec/aipc-os-updater verify`); rolls back and reboots on failure |
+| `aipc-os-verify.service` | oneshot | Gated post-upgrade verification; `needs-verify` starts `aipc-autostart` only for a pending verify/rollback job, then `verify` rolls back and reboots on failure |
 | `aipc-platform.target` | target | Stable grouping handle for the application platform. `Wants=` healthmon, event-bus, camera-daemon, ai-runtime, device-control, device-discovery, platform-api, app-manager, nginx-gateway |
 
 ## Startup Order
@@ -82,11 +82,11 @@ app-manager.service (Wants ai-runtime, event-bus, containerd)
    |
 platform-api.service (After/Wants all app services)
    |
-aipc-autostart.service
-   |
-aipc-platform.target
-   |
-aipc-os-verify.service          # post-upgrade verification
+aipc-autostart.service          # normal platform boot, only while enabled
+
+aipc-os-verify.service          # always eligible at boot, but needs-verify gated
+   |                            # no unconditional Wants= on runtime units
+   `-- pending upgrade only --> restart aipc-autostart.service --> verify
 ```
 
 - `aipc-restore` runs before `network-pre.target` so network/SSH come up with the
@@ -162,9 +162,11 @@ aipc-cli system enable       # Enable auto-start on boot (incl. aipc-autostart)
 aipc-cli system disable      # Stop now + disable auto-start (incl. aipc-autostart)
 ```
 
-`disable` survives a reboot because it also disables `aipc-autostart.service`
-(the boot unit that re-enables the service set); a redeploy or an OS-upgrade
-verify boot re-enables the platform by design.
+`disable` survives an ordinary reboot because it disables
+`aipc-autostart.service`, `aipc-os-verify` does not unconditionally pull the
+runtime into the boot transaction, and firstboot does not enable individual
+runtime units. A redeploy or a genuinely pending OS-upgrade verify boot brings
+the platform back by design.
 
 ## Service File Locations
 

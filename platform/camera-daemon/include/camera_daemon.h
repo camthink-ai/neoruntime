@@ -21,9 +21,13 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 #include <memory>
 #include <atomic>
+#include <functional>
 #include <mutex>
+#include <optional>
+#include <condition_variable>
 #include <shared_mutex>
 #include <thread>
 #include <cstdint>
@@ -63,6 +67,10 @@ class EncodedPublisher;
 class AiOverlaySubscriber;
 class AudioService;
 class DpmWorker;
+class DspService;
+#include "dsp_service.h"
+class InjectionService;
+#include "injection_service.h"
 struct AudioCfg;
 
 #ifdef HAS_GRPC
@@ -154,11 +162,20 @@ struct DaemonConfig {
     std::string fd_pub_sock_path;
     uint32_t    fd_pub_max_clients;
     uint32_t    fd_pub_max_outstanding;
+    uint32_t    fd_pub_lease_ms;
 
     // Watchdog
     uint32_t    watchdog_scan_ms;
     uint32_t    watchdog_timeout_ms;
     uint32_t    watchdog_warn_ms;
+
+    // DSP offload service (P2: `dsp:` YAML section; defaults in dsp_service.h)
+    DspServiceConfig dsp;
+
+    // App frame injection (P0: `injection:` YAML section; defaults in
+    // injection_service.h). Master gate ships OFF — see the wiring TODOs
+    // in injection_service.cpp.
+    InjectionServiceConfig injection;
 
     // RTSP
     bool        rtsp_enabled;
@@ -177,11 +194,31 @@ struct DaemonConfig {
     bool        ai_overlay_draw_confidence = true;
     bool        ai_overlay_draw_landmarks = true;
     bool        ai_overlay_enable_face_blur = false;
+    uint32_t    ai_overlay_face_blur_block_size = 8;   // mosaic cell size (px); 0 = blur
     uint32_t    ai_overlay_box_thickness = 2;
     // Stream mapping: inference_stream_id → display_encoder_stream
     // e.g. "third" → "main" means results from stream_id="third" drawn on "main" encoder.
     // If empty, auto-generated from configured streams (all → first encoder stream).
     std::unordered_map<std::string, std::string> ai_overlay_stream_map;
+    // Behavior decoupling (output-isolation scope cut): platform result
+    // events ("ai-runtime"/"auto-infer" publishers) draw only when their
+    // infer stream is explicitly bound here (infer → display, same
+    // direction as stream_map) or the legacy switch is on. App events
+    // (SDK publish) are always admitted. Static yaml only — never an
+    // UpdateAiOverlay RPC knob.
+    bool        ai_overlay_legacy_auto_bind = false;
+    std::map<std::string, std::string> ai_overlay_bindings;
+    // Result validity window (ms). 0 = derive per stream: per-result ttl
+    // (event metadata) > stream override (ai_overlay_stream_result_ttls) >
+    // this global > round(2000/fps) from the stream config > 500ms fallback.
+    uint32_t    ai_overlay_result_ttl_ms = 0;
+    std::unordered_map<std::string, uint32_t> ai_overlay_stream_result_ttls;
+    // Strict frame-lock (P1-6): identity-fed display streams (stream_map
+    // D→D) wait — bounded — for the frame's own inference result at the
+    // bake site. Wait cap 0 = derive (2 frame periods, clamp [1,500] ms);
+    // expiry degrades to preview semantics with a rate-limited warning.
+    bool        ai_overlay_strict_frame_lock = false;
+    uint32_t    ai_overlay_strict_wait_cap_ms = 0;
 
     // Logging
     std::string log_level;
@@ -236,6 +273,47 @@ struct DaemonConfig {
     // Run one refinement one-shot right after the boot park lands on the
     // curve (the job queues immediately and waits for the lens to park).
     int lens_fg2009_af_boot_oneshot = 1;
+
+    // Image-sharpness probe (motorized vs fixed lens): when the iris probe
+    // files the unit under the no-iris group, a short focus jog observed
+    // through the ISP AF statistics decides whether a focus motor answered
+    // (statistics dip and return) or nothing is attached (statistics flat on
+    // a textured scene). Runs deferred after the lens parks and the boot
+    // autofocus pass completes; bench-tunable via lens.image_probe.* keys.
+    // An inconclusive verdict (slow MCU init, transient AF activity, low
+    // texture) retries with backoff instead of stranding the identity for
+    // the whole boot — the fg2009 default would leave motor controls live
+    // on a motorless lens.
+    int lens_image_probe_enabled = 1;
+    int lens_image_probe_steps = 250;       // focus jog, curve steps each way
+    int lens_image_probe_frames = 5;        // frames per measurement point
+    int lens_image_probe_settle_ms = 400;   // mechanical settle after a jog
+    int lens_image_probe_pps = 600;
+    int lens_image_probe_ready_timeout_ms = 300000;  // lens+AF+stats readiness
+    int lens_image_probe_move_timeout_ms = 15000;
+    int lens_image_probe_retries = 4;       // extra attempts when inconclusive
+    int lens_image_probe_retry_interval_ms = 60000;  // backoff between attempts
+
+    // Headless-boot lens self-init (lens.self_init_enabled). The FG2009
+    // bootstrap otherwise only runs when lens API traffic reaches
+    // device-control's ensureLensBootstrapped; on a boot nobody polls the
+    // lens stays uninitialized forever (overnight 2026-09-21 incident:
+    // fixed lens shipped motorized UI until the first page view). AF0832
+    // keeps its legacy lazy init — its boot behavior is unchanged.
+    int lens_self_init_enabled = 1;
+    uint32_t lens_image_probe_texture_floor = 3000;  // raw AF sum, bench-calibrated
+    float lens_image_probe_motor_ratio = 0.25f;  // dip depth that proves a motor
+    float lens_image_probe_flat_ratio = 0.08f;   // flat band (gate + stability)
+    float lens_image_probe_return_ratio = 0.15f; // return-to-baseline tolerance
+    float lens_image_probe_luma_guard_ratio = 0.20f; // AE-shift rejection band
+
+    // Lens position persistence: archive the last user-settled zoom/focus
+    // (event-driven — the recorder arms on issued motion and writes only
+    // after the motors settle and the position actually changed) and replay
+    // it at boot instead of the config-derived startup position, followed by
+    // one autofocus pass. Survives deploys: /data/aipc/etc/*.json is not
+    // rewritten by deploy.sh.
+    bool lens_position_persistence = true;
 
     AutofocusConfig autofocus;
     IlluminationConfig infrared;
@@ -304,8 +382,14 @@ public:
 
     /**
      * @brief Update transform configuration via HAL_MEDIA_OPS
+     *
+     * @param persisted_ok  optional out: true only when the applied config was
+     *   also durably mirrored (HAS_GRPC builds). False on every apply failure
+     *   and on a mirror-write failure — init uses this to decide whether the
+     *   lens hint may advance (avoiding a hint/mirror split-brain).
      */
-    bool set_transform_config(const aipc::camera::TransformConfig& config);
+    bool set_transform_config(const aipc::camera::TransformConfig& config,
+                              bool* persisted_ok = nullptr);
 
     /**
      * @brief Set a single scalar profile field at runtime (platform-owned config knob).
@@ -363,7 +447,10 @@ public:
      * @brief Update AI overlay configuration - hot reload
      */
     bool update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence,
-                                   uint32_t box_thickness);
+                                   uint32_t box_thickness,
+                                   std::optional<bool> enable_face_blur = {},
+                                   std::optional<bool> strict_frame_lock = {},
+                                   std::optional<uint32_t> strict_wait_cap_ms = {});
 
 #ifdef HAS_GRPC
     /**
@@ -422,11 +509,21 @@ public:
     // required. Both helpers live under #ifdef HAS_GRPC (same as the OSD/privacy
     // helpers); the persist call site inside set_transform_config carries its own
     // #ifdef guard.
-    void persist_transform_config(const aipc::camera::TransformConfig& req);
-    // load_transform_config: read the mirror at startup; returns false on
-    // missing (INFO), unparseable (WARNING + Clear), or identity (all fields at
-    // their defaults — nothing to reapply) — never aborts init.
-    bool load_transform_config(aipc::camera::TransformConfig* req);
+    // Persist the transform config WITH the lens it was written for in ONE
+    // atomic file (v2 wrapper {"lens_model", "transform"}), so transform and
+    // lens attribution can never be observed split. Returns false on
+    // serialize/write/rename failure so the caller knows nothing durable
+    // landed; a failure never aborts the already-applied HAL transform.
+    bool persist_transform_config(const aipc::camera::TransformConfig& req,
+                                  const std::string& lens_model);
+    // load_transform_config: read the mirror at startup; *lens_model receives
+    // the embedded v2 lens attribution ("" for v1/legacy mirrors → the caller
+    // falls back to the sidecar hint). Returns false on missing (INFO) or
+    // unparseable (WARNING + Clear) — never aborts init. An all-identity
+    // config still returns true: the media pipeline seeds image settings from
+    // the profile iq_settings (dewarp defaults to enabled), so the identity
+    // state must be replayed to actually hold.
+    bool load_transform_config(aipc::camera::TransformConfig* req, std::string* lens_model);
 
     // Scalar config-field persistence — best-effort disk mirror of the last
     // web-configured scalar profile knobs (frontend.hailort.use-hailort-service and
@@ -542,6 +639,10 @@ public:
     /** Access HAL loader for peripheral ops (env_ctrl, alarm, rs485). */
     HalLoader* hal_loader() const { return hal_loader_.get(); }
     AudioService* audio_service() const { return audio_service_.get(); }
+    /** App-facing DSP offload service (null when HAL lacks DSP/buffer ops). */
+    DspService* dsp_service() const { return dsp_service_.get(); }
+    /** App frame injection service (null when DSP registry is off). */
+    InjectionService* injection_service() const { return injection_service_.get(); }
 
 #ifdef HAS_GRPC
     /**
@@ -634,6 +735,18 @@ private:
     std::unique_ptr<OsdManager>     osd_mgr_;
     std::unique_ptr<EncoderManager> encoder_mgr_;
     std::unique_ptr<FdPublisher>    fd_pub_;
+    std::unique_ptr<DspService>     dsp_service_;
+    // Frame injection (PushFrame P0) — holds BufferPins against the DSP
+    // registry, so it must be destroyed BEFORE dsp_service_ (declared
+    // after it; members destruct in reverse order).
+    std::unique_ptr<InjectionService> injection_service_;
+    // Live per-stream encode dims, observed at the bake site and fed to
+    // InjectionService's best-effort stream_dims resolver (P2-12). The
+    // frame IS the authority — this cache just answers push-time
+    // geometry questions before the first frame of a restarted stream.
+    // shared_mutex: the frame path reads it every frame, pushes are rare.
+    mutable std::shared_mutex stream_dims_mu_;
+    std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> stream_dims_;
     std::shared_ptr<RtspServer>     rtsp_server_;
     std::unique_ptr<EncodedPublisher> encoded_pub_;
     std::unique_ptr<AiOverlaySubscriber> ai_overlay_;
@@ -670,6 +783,60 @@ private:
     std::unique_ptr<grpc::Server> grpc_server_;
     void start_grpc_server();
     void stop_grpc_server();
+
+    // Lens position persistence. The recorder is armed by the lens service's
+    // motion listener (never by init/bootstrap parking), waits for the motors
+    // to settle, and writes /data/aipc/etc/lens_position.json atomically only
+    // when the position changed. The FG2009 restore replaces the boot
+    // one-shot when a model-matching archive exists (AF0832 restores through
+    // the autofocus startup seed instead).
+    struct ArchivedLensPosition {
+        std::string model;
+        float zoom_ratio = 0.0f;
+        int32_t zoom_pos = 0;
+        int32_t focus_pos = 0;
+        int64_t saved_at = 0;  // epoch seconds
+        bool valid() const { return !model.empty(); }
+    };
+    ArchivedLensPosition load_archived_lens_position();
+    bool save_archived_lens_position(const ArchivedLensPosition& pos);
+    void start_lens_position_recorder();
+    void stop_lens_position_recorder();
+    void lens_position_recorder_loop();
+    ArchivedLensPosition lens_archive_cache_;  // guarded by lens_recorder_mu_
+    std::thread lens_recorder_thread_;
+    std::mutex lens_recorder_mu_;
+    std::condition_variable lens_recorder_cv_;
+    std::atomic<bool> lens_recorder_dirty_{false};
+    std::atomic<bool> lens_recorder_stop_{true};
+
+    void fg2009_restore_loop(ArchivedLensPosition pos);
+    std::thread fg2009_restore_thread_;
+    std::atomic<bool> fg2009_restore_stop_{true};
+    // True while the archived-position restore thread is between spawn and
+    // exit. The restore moves run outside any autofocus job, so the image
+    // probe waits on this flag before it starts measuring.
+    std::atomic<bool> fg2009_restore_active_{false};
+
+    // Stage-2 lens identity: the iris probe files the no-iris group as
+    // fg2009; this deferred probe separates a real motorized FG2009 from a
+    // fixed-focus lens (electrically identical) using the image sensor as
+    // the feedback channel. Runs once after the boot autofocus pass parks
+    // the lens; a FixedLens verdict marks the lens controller and every
+    // motor motion request is rejected from then on.
+    void lens_image_probe_loop();
+    std::thread lens_image_probe_thread_;
+    std::atomic<bool> lens_image_probe_stop_{true};
+
+    // Headless-boot lens self-init (FG2009): waits out a short grace period
+    // so an RPC trigger from device-control wins if lens traffic shows up,
+    // then runs the Init sequence in-process so the restore and image-probe
+    // threads have an initialized lens to wait on. Joined before the lens
+    // service is torn down (the hook below points into it).
+    void lens_boot_ensure_loop();
+    std::thread lens_boot_ensure_thread_;
+    std::atomic<bool> lens_boot_ensure_stop_{true};
+    std::function<int()> lens_ensure_bootstrapped_;  // bundle hook; valid while lens_hal_service_ lives
 #endif
 
     bool switch_profile_internal(const std::string& profile_name, bool restart_af,

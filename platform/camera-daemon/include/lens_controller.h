@@ -26,6 +26,13 @@ public:
     virtual void end_autofocus_operation() = 0;
     virtual bool autofocus_operation_active() const = 0;
 
+    // Fixed-lens identity (image-probe verdict): once marked, the unit is
+    // known to carry no zoom/focus motors and every motion request is
+    // rejected with HAL_ERR_NOT_SUPPORTED. Default no-op keeps tests and
+    // tools source-compatible (same contract as the observers below).
+    virtual void mark_fixed_lens() {}
+    virtual bool fixed_lens() const { return false; }
+
     virtual bool initialized() const = 0;
     virtual bool af0832_bootstrapped() const = 0;
     virtual int state_get(LensControllerState* state) = 0;
@@ -47,4 +54,11 @@ public:
     // keeps other builders (tests/tools) source-compatible. Called with the
     // lens mutex held: implementations must not call back into the controller.
     virtual void set_zoom_motion_observer(std::function<void(float)> /*obs*/) {}
+
+    // Position-recorder arming hook: fired on every successfully issued user
+    // motion (RPC handlers and the wait-methods above), including moves the
+    // autofocus controller makes through those methods. Never fired for
+    // init/bootstrap parking, so a restore archive cannot be clobbered by the
+    // boot park. Same contract as the observer: mutex held, no call-backs.
+    virtual void set_motion_listener(std::function<void()> /*listener*/) {}
 };

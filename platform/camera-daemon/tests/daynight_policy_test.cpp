@@ -70,5 +70,31 @@ int main() {
     assert(std::string(light_mode_name(LightMode::Day)) == "day");
     assert(std::string(light_mode_name(LightMode::Night)) == "night");
 
+    /* ---- anti-flap dwell: a confirmed switch inside min_hold_ms is Held ---- */
+    {
+        config.min_hold_ms = 15000;
+        state = DayNightPolicyState{};  // mode=Day, last_switch_ms=0
+        /* First switch (t=1000): allowed — no prior switch. */
+        assert(evaluate(state, make_sample(10), config, false, 1000) == LightSwitchDecision::None);
+        assert(evaluate(state, make_sample(10), config, false, 1005) == LightSwitchDecision::None);
+        assert(evaluate(state, make_sample(10), config, false, 1010) == LightSwitchDecision::ToNight);
+        assert(state.mode == LightMode::Night);
+        assert(state.last_switch_ms == 1010);
+        /* Opposite direction confirmed well inside the dwell -> suppressed. */
+        assert(evaluate(state, make_sample(90), config, false, 11000) == LightSwitchDecision::None);
+        assert(evaluate(state, make_sample(90), config, false, 11005) == LightSwitchDecision::None);
+        assert(evaluate(state, make_sample(90), config, false, 11010) == LightSwitchDecision::Held);
+        assert(state.mode == LightMode::Night);            // unchanged
+        /* Still confirmed on the first tick at/after the dwell expiry (1010+15000) -> fires. */
+        assert(evaluate(state, make_sample(90), config, false, 16100) == LightSwitchDecision::ToDay);
+        assert(state.mode == LightMode::Day);
+        assert(state.last_switch_ms == 16100);
+        /* Default now_ms=0 disables the dwell (legacy callers/tests). */
+        state = DayNightPolicyState{};
+        assert(evaluate(state, make_sample(10), config, false, 0) == LightSwitchDecision::None);
+        assert(evaluate(state, make_sample(10), config, false, 0) == LightSwitchDecision::None);
+        assert(evaluate(state, make_sample(10), config, false, 0) == LightSwitchDecision::ToNight);
+    }
+
     return 0;
 }

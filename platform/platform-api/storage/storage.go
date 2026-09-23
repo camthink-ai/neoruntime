@@ -12,9 +12,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
-
-	"aipc/platform/common/logger"
+	"time"
 )
 
 var (
@@ -26,8 +26,10 @@ var (
 
 // ModelStorage manages model binary files using Content Addressable Storage (CAS).
 type ModelStorage struct {
-	blobDir      string // directory for hash-named blobs
-	minFreeBytes uint64 // minimum free disk space to allow writes
+	blobDir       string     // directory for hash-named blobs
+	minFreeBytes  uint64     // minimum free disk space to allow writes
+	maxTotalBytes uint64     // cap on total blob bytes; 0 = uncapped
+	writeMu       sync.Mutex // serializes SaveWithHash admission through publish
 }
 
 // HEFInfo holds metadata extracted from a HEF file via hailortcli.
@@ -40,13 +42,16 @@ type HEFInfo struct {
 }
 
 // NewModelStorage creates a ModelStorage backed by the given blob directory.
-func NewModelStorage(blobDir string, minFreeBytes uint64) (*ModelStorage, error) {
+// minFreeBytes is the free-space floor every write must leave on the disk;
+// maxTotalBytes caps how much the blobs themselves may consume (0 = uncapped).
+func NewModelStorage(blobDir string, minFreeBytes, maxTotalBytes uint64) (*ModelStorage, error) {
 	if err := os.MkdirAll(blobDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create blob directory %s: %w", blobDir, err)
 	}
 	return &ModelStorage{
-		blobDir:      blobDir,
-		minFreeBytes: minFreeBytes,
+		blobDir:       blobDir,
+		minFreeBytes:  minFreeBytes,
+		maxTotalBytes: maxTotalBytes,
 	}, nil
 }
 
@@ -60,10 +65,42 @@ type SaveResult struct {
 
 // SaveWithHash streams the reader content to a temporary file, computes SHA256,
 // and atomically renames it to blobs/<hash><ext>. Returns dedup info.
-func (s *ModelStorage) SaveWithHash(r io.Reader, ext string) (*SaveResult, error) {
-	// Check disk quota before writing
-	if err := s.CheckQuota(0); err != nil {
+func (s *ModelStorage) SaveWithHash(r io.Reader, ext string, size int64) (*SaveResult, error) {
+	// Admission must be atomic with publishing: two concurrent uploads that
+	// each pass an unsynchronized quota check can both stream and rename
+	// their blob, overshooting maxTotalBytes (and the free-space floor)
+	// by however many raced. Serializing the check-through-rename section
+	// keeps the budget exact; model uploads are rare admin operations, so
+	// the coarse lock costs nothing in practice.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	// Check disk quota before writing, counting the claimed payload against
+	// the free-space floor. Uploads know their real size (multipart
+	// FileHeader.Size, package length), so a disk near minFreeBytes is refused
+	// up front instead of failing mid-rename. A negative size (caller never
+	// measured) degrades to the legacy floor-only check.
+	if size < 0 {
+		size = 0
+	}
+	if err := s.CheckQuota(uint64(size)); err != nil {
 		return nil, err
+	}
+
+	// Total-usage admission: the free-space floor alone lets the store grow
+	// until only the floor remains. A configured budget keeps the blob
+	// directory inside it. Checked before streaming with the claimed size —
+	// the hash is unknowable until the bytes are read, so a dedup re-upload
+	// against a full budget is refused too (conservative by design).
+	if s.maxTotalBytes > 0 {
+		usage, err := s.UsageBytes()
+		if err != nil {
+			return nil, fmt.Errorf("failed to measure model storage usage: %w", err)
+		}
+		if usage+uint64(size) > s.maxTotalBytes {
+			return nil, fmt.Errorf("model storage quota exceeded: blobs use %d bytes, this write needs %d more, budget is %d bytes",
+				usage, size, s.maxTotalBytes)
+		}
 	}
 
 	// Write to temp file while computing hash
@@ -137,16 +174,101 @@ func (s *ModelStorage) BlobPath(hash, ext string) string {
 	return filepath.Join(s.blobDir, hash+ext)
 }
 
-// CheckQuota verifies that the filesystem hosting blobDir has enough free space.
-func (s *ModelStorage) CheckQuota(additionalBytes uint64) error {
+// StoredBlob describes one hash-named blob file currently in the store.
+type StoredBlob struct {
+	Hash    string    // hex sha256 (the file name without extension)
+	Ext     string    // canonical extension, e.g. ".hef"
+	Size    int64     // file size in bytes
+	ModTime time.Time // file mtime — the sweep's age signal
+}
+
+// blobNameRE matches the hash-named files SaveWithHash produces; upload-*.tmp
+// staging files and anything else in the directory are not blobs.
+var blobNameRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+// ListBlobs enumerates the content-addressed blob files. Order unspecified.
+func (s *ModelStorage) ListBlobs() ([]StoredBlob, error) {
+	entries, err := os.ReadDir(s.blobDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list blob directory: %w", err)
+	}
+	var blobs []StoredBlob
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		hash := strings.TrimSuffix(e.Name(), ext)
+		if !blobNameRE.MatchString(hash) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		blobs = append(blobs, StoredBlob{Hash: hash, Ext: ext, Size: info.Size(), ModTime: info.ModTime()})
+	}
+	return blobs, nil
+}
+
+// RemoveStaleTempFiles deletes upload-*.tmp staging files older than maxAge —
+// the leftovers of uploads whose process died between CreateTemp and the
+// deferred cleanup. Returns how many were removed.
+func (s *ModelStorage) RemoveStaleTempFiles(maxAge time.Duration) int {
+	entries, err := os.ReadDir(s.blobDir)
+	if err != nil {
+		return 0
+	}
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "upload-") || !strings.HasSuffix(e.Name(), ".tmp") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if os.Remove(filepath.Join(s.blobDir, e.Name())) == nil {
+			removed++
+		}
+	}
+	return removed
+}
+
+// FreeBytes reports the free space available to unprivileged writes on the
+// filesystem hosting blobDir.
+func (s *ModelStorage) FreeBytes() (uint64, error) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(s.blobDir, &stat); err != nil {
-		return fmt.Errorf("failed to check disk space: %w", err)
+		return 0, fmt.Errorf("failed to check disk space: %w", err)
 	}
+	return stat.Bavail * uint64(stat.Bsize), nil
+}
 
-	freeBytes := stat.Bavail * uint64(stat.Bsize)
+// UsageBytes sums the sizes of the hash-named blobs — what the store consumes
+// of its budget. Staging temp files and foreign entries do not count.
+func (s *ModelStorage) UsageBytes() (uint64, error) {
+	blobs, err := s.ListBlobs()
+	if err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, b := range blobs {
+		if b.Size > 0 {
+			total += uint64(b.Size)
+		}
+	}
+	return total, nil
+}
+
+// CheckQuota verifies that the filesystem hosting blobDir has enough free space.
+func (s *ModelStorage) CheckQuota(additionalBytes uint64) error {
+	freeBytes, err := s.FreeBytes()
+	if err != nil {
+		return err
+	}
 	required := s.minFreeBytes + additionalBytes
-
 	if freeBytes < required {
 		return fmt.Errorf("insufficient disk space: %d bytes free, need at least %d bytes",
 			freeBytes, required)
@@ -157,11 +279,14 @@ func (s *ModelStorage) CheckQuota(additionalBytes uint64) error {
 // ValidateHEF runs hailortcli parse-hef on the given file and extracts metadata.
 // Returns an error if the file is not a valid HEF or doesn't target the expected hardware.
 func (s *ModelStorage) ValidateHEF(filePath string) (*HEFInfo, error) {
-	// Check if hailortcli is available
+	// A missing hailortcli is an explicit failure, not a marker-string
+	// success: callers stored the marker in vstream_info and could not
+	// tell "validated" from "silently unvalidated". On a properly
+	// provisioned device the tool ships with the Hailo runtime — its
+	// absence means the deployment is broken.
 	hailortcli, err := exec.LookPath("hailortcli")
 	if err != nil {
-		logger.Warn("hailortcli not found, skipping HEF validation")
-		return &HEFInfo{RawOutput: "validation skipped: hailortcli not available"}, nil
+		return nil, fmt.Errorf("hailortcli not found in PATH — HEF validation requires the Hailo runtime tooling: %w", err)
 	}
 
 	cmd := exec.Command(hailortcli, "parse-hef", filePath)

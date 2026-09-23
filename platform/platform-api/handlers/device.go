@@ -820,6 +820,7 @@ func (h *APIHandlers) GetLensStatus(c *gin.Context) {
 		"autofocus_enabled": resp.GetAutofocusEnabled(),
 		"lens_model":        resp.GetLensModel(),
 		"zoom_ratio":        resp.GetZoomRatio(),
+		"fixed_lens":        resp.GetFixedLens(),
 		"zoom_ratio_range": gin.H{
 			"min": resp.GetZoomRatioRange().GetMin(),
 			"max": resp.GetZoomRatioRange().GetMax(),

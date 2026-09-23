@@ -190,6 +190,27 @@ typedef struct {
     uint8_t reserved[7];
 } HalInferenceRuntimeConfig;
 
+/**
+ * On-chip NMS runtime parameters (HailoRT InferModel::set_nms_*).
+ *
+ * Only applied to output streams using HailoRT's on-chip NMS format
+ * (@c is_nms in the model info); other models ignore these fields.
+ * Zero / negative values select the platform default (score 0.4, IoU 0.6,
+ * per-class max 50, total max 100, no class filter) — matching the
+ * zero-initialized-config = unchanged-behavior convention.
+ *
+ * @note These take effect at session create time (HailoRT applies NMS
+ * parameters during configure()); they are not runtime-mutable on an
+ * already-created session.
+ */
+typedef struct {
+    float    score_threshold;        /* <=0 = default */
+    float    iou_threshold;          /* <=0 = default */
+    uint32_t max_proposals_per_class;/* 0 = default */
+    uint32_t max_proposals_total;    /* 0 = default */
+    uint32_t class_filter_mask[8];   /* 256-class bitmask; all-zero = no filter */
+} HalInferenceNmsConfig;
+
 /* ========== Inference Config ========== */
 typedef struct {
     char model_path[HAL_MAX_MODEL_PATH];
@@ -206,6 +227,8 @@ typedef struct {
     HalInferenceRuntime *runtime;
     /** Per-model scheduler parameters (effective only when runtime uses a non-NONE algorithm). */
     HalInferenceSchedulerConfig scheduler;
+    /** On-chip NMS parameters, applied to NMS-format outputs at configure time. */
+    HalInferenceNmsConfig nms;
 } HalInferenceConfig;
 
 /* ========== Inference performance (device + host) ========== */
@@ -226,6 +249,10 @@ typedef struct {
     int64_t ram_used_kib;
     /** DSP or secondary accelerator load, percent 0..100, or -1.0f if unknown / N/A. */
     float dsp_utilization;
+    /** SoC on-die temperature, sensor 0, degrees Celsius, or -1.0f if unknown. */
+    float soc_temp_c;
+    /** SoC on-die temperature, sensor 1, degrees Celsius, or -1.0f if unknown. */
+    float soc_temp_c1;
 } HalInferencePerfStats;
 
 /**
@@ -247,6 +274,47 @@ typedef void (*HalInferenceAsyncCallback)(HalTensor *outputs, int num_outputs, i
 
 /* ========== Inference Session (opaque handle) ========== */
 typedef struct HalInferenceSession HalInferenceSession;
+
+/* ========== DMA frame direct-bind contract (P0-2) ========== */
+
+/**
+ * @brief Multi-plane DMA-BUF frame descriptor for zero-copy NPU input binding.
+ *
+ * Device-adjudicated on rig (HailoRT 5.3.0, hailo15, 2026-09-15, tools/npu-bind-probe):
+ * - Dual-plane NV12 as two separate dmabufs -> Bindings::InferStream::set_pix_buffer()
+ *   with HAILO_PIX_BUFFER_MEMORY_TYPE_DMABUF: PASS, outputs byte-identical to CPU
+ *   set_buffer() baseline. (The header note "only USERPTR" is stale on this stack.)
+ * - Single compact NV12 dmabuf (Y+UV packed, w*h*3/2) -> set_dma_buffer(): PASS,
+ *   byte-identical, no prior dma_map_dmabuf() required.
+ * - Low-level InputStream::write_async(fd): configure() returns HAILO_NOT_IMPLEMENTED
+ *   on this stack — do not use.
+ *
+ * HailoRT 5.3.0 exposes NO per-plane offset/stride on these paths, therefore
+ * bind_dma_frame() REQUIRES: offset[i] == 0 for every plane, and stride[i] equal
+ * to the compact row pitch (width for both NV12 planes). Same-geometry frames
+ * with padding stride CANNOT be direct-bound and must be rejected — equal
+ * dimensions do not imply bindability.
+ *
+ * Shapes accepted for HAL_PIX_FMT_NV12:
+ * - dual-fd:   fd[0]=Y dmabuf (bytes_used[0]=w*h), fd[1]=UV dmabuf (bytes_used[1]=w*h/2)
+ * - single-fd: fd[0]=compact NV12 dmabuf (bytes_used[0]=w*h*3/2), fd[1] == -1
+ * Other formats/pad shapes: HAL_ERR_NOT_SUPPORTED (callers fall back to CPU paths).
+ */
+typedef struct HalDmaFrameDesc {
+    int32_t  fd[HAL_MAX_PLANES];       /* per-plane dma-buf fd, -1 = plane absent */
+    uint32_t offset[HAL_MAX_PLANES];   /* plane offset within its dmabuf — MUST be 0 */
+    uint32_t stride[HAL_MAX_PLANES];   /* row pitch incl. padding — MUST equal width */
+    uint32_t bytes_used[HAL_MAX_PLANES];
+    HalPixelFormat format;
+    uint32_t width, height;
+    uint8_t  borrowed;                 /* 1 = caller keeps fd ownership; HAL never closes */
+} HalDmaFrameDesc;
+
+/** probe_capability() ids — out receives 1 (supported) / 0 (not). */
+#define HAL_INFER_CAP_PIXBUF_DMABUF   1  /* set_pix_buffer DMABUF multi-plane (dual-fd NV12) */
+#define HAL_INFER_CAP_DMABUF_SINGLE   2  /* set_dma_buffer single compact NV12 fd */
+#define HAL_INFER_CAP_STREAM_ASYNC_FD 3  /* low-level InputStream::write_async(fd) — absent on HailoRT 5.3.0/hailo15 */
+
 
 /* ========== Inference Operations ========== */
 typedef struct HalInferenceOps {
@@ -281,7 +349,13 @@ typedef struct HalInferenceOps {
     int (*alloc_input)(HalInferenceSession *session, int input_idx, HalTensor *tensor);
 
     /**
-     * @brief Create input tensor from frame buffer (convenience function)
+     * @brief Create input tensor from frame buffer (RAW COPY — no preprocessing).
+     *
+     * Copies the frame planes verbatim into a flat uint8 tensor. The
+     * HalInferenceConfig::preprocess rules are NOT applied here; the caller is
+     * responsible for matching the model input geometry/format, or must use
+     * @ref tensor_from_frame_ex instead.
+     *
      * @param frame Input frame
      * @param tensor Output tensor
      * @return HAL_OK on success
@@ -313,10 +387,27 @@ typedef struct HalInferenceOps {
     /**
      * @brief Run inference asynchronously (non-blocking).
      *
-     * Caller must provide output tensor slots (same ownership rules as @c run). Input/output
-     * buffers must remain valid until @p callback is invoked.
+     * Caller must provide output tensor slots with the same ownership rules as
+     * @c run. The implementation may invoke @p callback inline, before this
+     * function returns.
      *
-     * @return HAL_OK if the job was queued, or an error code immediately.
+     * A HAL_OK return transfers exactly one completion obligation to the
+     * implementation: it must eventually invoke @p callback exactly once. A
+     * non-HAL_OK return transfers no future obligation; before returning, the
+     * implementation must ensure that any callback it already started, and all
+     * accesses to @p userdata, have fully finished. Implementations must contain
+     * provider and callback exceptions so none cross this C ABI boundary.
+     *
+     * Input/output buffers and @p userdata must remain valid until the callback
+     * fully returns, not merely until it is entered. The caller must externally
+     * serialize destroy() against entry into every operation on the same session;
+     * once destruction begins, no new session operation may start. destroy()
+     * waits for every accepted callback to fully return before releasing the
+     * session. A callback must not call destroy() on its own session; it must
+     * hand destruction off to another execution context after returning.
+     *
+     * @return HAL_OK if the job was accepted, or a HAL error after callback
+     *         quiescence.
      */
     int (*run_async)(HalInferenceSession *session,
                      const HalTensor *inputs, int num_inputs,
@@ -369,10 +460,116 @@ typedef struct HalInferenceOps {
      * @return Version string
      */
     const char* (*get_version)(void);
+
+    /**
+     * @brief Create input tensor from a frame, applying the session's
+     *        HalInferenceConfig::preprocess rules (resize / color conversion /
+     *        letterbox / normalize) to match the model's first input stream.
+     *
+     * Unlike @ref tensor_from_frame, this is session-aware: the target geometry
+     * and format come from the model input stream. Fast path with no copy
+     * overhead when the frame already matches the model input exactly.
+     *
+     * Supported source formats: NV12, RGB24, BGR24. Resized/converted staging
+     * targets packed RGB888/BGR888 model inputs; NV12-order model inputs are
+     * only served by the exact-match fast path.
+     *
+     * @param session Inference session (defines target input + preprocess rules).
+     * @param frame   Input frame (any of the supported formats, any geometry).
+     * @param tensor  Output tensor; uint8 unless preprocess.normalize is set
+     *                (then float32, (in/255 - mean)/std per channel; shape[0]
+     *                counts elements, byte_size counts bytes).
+     * @return HAL_OK on success, negative HalErrorCode on failure.
+     */
+    int (*tensor_from_frame_ex)(HalInferenceSession *session, const HalFrameBuffer *frame, HalTensor *tensor);
+
+    /**
+     * @brief Build a zero-copy input tensor from a DMA-BUF frame (P0-2).
+     *
+     * Validates the descriptor against the session's first input stream
+     * (exact NV12 geometry, compact layout — see @ref HalDmaFrameDesc) and
+     * returns a HalTensor with data == NULL and dma_fd = frame->fd[0]. Pass
+     * that tensor to run()/run_async() inputs; the platform re-binds the dma
+     * buffer per submit. The tensor does NOT own the fds (borrowed semantics);
+     * callers must keep the dmabufs alive until the run callback fires.
+     * Output tensors remain CPU memory — this contract never moves outputs.
+     *
+     * @return HAL_OK, or HAL_ERR_INVALID_ARG / HAL_ERR_INVALID_SIZE /
+     *         HAL_ERR_NOT_SUPPORTED (geometry mismatch or padded stride —
+     *         fall back to tensor_from_frame* CPU paths).
+     */
+    int (*bind_dma_frame)(HalInferenceSession *session, const HalDmaFrameDesc *frame, HalTensor *out);
+
+    /**
+     * @brief Static capability probe for the dma-bind paths (no session needed).
+     * @param cap_id one of HAL_INFER_CAP_* — out receives 1/0.
+     * @return HAL_OK, or HAL_ERR_INVALID_ARG / HAL_ERR_NOT_SUPPORTED.
+     */
+    int (*probe_capability)(uint32_t cap_id, int32_t *out);
 } HalInferenceOps;
 
 /* ========== Global Operations Table ========== */
 extern HalInferenceOps HAL_INFERENCE_OPS;
+
+/*
+ * ABI guard (2026-09-16, remediation for the mixed-deploy SIGILL):
+ * HalInferenceOps carries no in-struct size/version, so a consumer built
+ * against a newer header reads tail members (tensor_from_frame_ex,
+ * bind_dma_frame, probe_capability) past the end of an older provider's
+ * table and calls a garbage pointer. Providers export this SEPARATE symbol
+ * holding sizeof(HalInferenceOps); consumers dlsym it and require
+ * offsetof(HalInferenceOps, member) + sizeof(void*) before reading any
+ * member appended after get_version. A missing symbol means the provider
+ * predates the guard: treat every tail member as unavailable. Deliberately
+ * NOT a struct field — the member layout of already-shipped builds must
+ * stay byte-identical in both directions.
+ */
+extern const uint32_t HAL_INFERENCE_OPS_ABI_SIZE;
+
+/* 1 when the provider's table provably contains the member at member_offset
+ * (pass offsetof(HalInferenceOps, <member>)). abi_size may be NULL for
+ * pre-guard providers — that answers 0 for every offset. */
+static inline int hal_inference_ops_has(const uint32_t *abi_size,
+                                        size_t member_offset)
+{
+    return abi_size != 0 &&
+           *abi_size >= (uint32_t)(member_offset + sizeof(void *));
+}
+
+/* ========== On-chip NMS output decoding ========== */
+
+/**
+ * One detection decoded from an on-chip NMS output tensor.
+ * Coordinates are normalized [0..1] relative to the model input frame.
+ */
+typedef struct {
+    float y_min, x_min, y_max, x_max;   /* normalized [0..1] */
+    float score;                        /* confidence [0..1] */
+} HalNmsDetection;
+
+/**
+ * @brief Decode an on-chip NMS output tensor into detections.
+ *
+ * Raw run() outputs of streams whose HalModelTensorInfo::is_nms is set use the
+ * Hailo-15 NMS layout (measured on target, HailoRT 5.3.0):
+ *
+ *   [count : float32] [count x { y_min, x_min, y_max, x_max, score : float32 x5 }]
+ *
+ * The per-class variants repeat this block per class; this helper decodes the
+ * first (highest-priority) block, which on single-head detectors is the
+ * complete result. Coordinates are normalized to the model input frame.
+ *
+ * Platform-neutral pure decoding — works on any HAL build.
+ *
+ * @param t          Output tensor obtained from run() (is_nms stream).
+ * @param out        Caller array receiving decoded detections.
+ * @param max_count  Capacity of @p out; excess boxes are truncated.
+ * @param count_out  Receives the number of decoded boxes (<= max_count).
+ * @return HAL_OK on success, HAL_ERR_INVALID_ARG / HAL_ERR_INVALID_SIZE on
+ *         malformed input.
+ */
+int hal_inference_decode_nms(const HalTensor *t, HalNmsDetection *out,
+                             uint32_t max_count, uint32_t *count_out);
 
 /* ========== Helper Functions ========== */
 

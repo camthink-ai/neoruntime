@@ -98,6 +98,9 @@ export default function LightingControl() {
   // Open-loop lens: no autofocus stack, and the ratio-only goto endpoint is
   // the one it supports (the AF0832 ratio+distance goto is rejected on it).
   const isFg2009 = lensStatus?.lens_model === 'fg2009';
+  // Fixed lens: no motors — skip the zoom half of a preset so the IR PWM
+  // half still applies instead of the whole load failing.
+  const isFixedLens = lensStatus?.fixed_lens === true;
   const presets = presetData?.presets ?? [];
 
   const [nearLevel, setNearLevel] = useState(DEFAULT_LEVEL);
@@ -202,7 +205,9 @@ export default function LightingControl() {
 
   const handleLoadPreset = async (p: IrPreset) => {
     try {
-      if (isFg2009) {
+      if (isFixedLens) {
+        // No motors to move — apply just the lighting half of the preset.
+      } else if (isFg2009) {
         // Ratio-only goto lands focus on the INF tracking curve and the
         // daemon's post-zoom observer runs a one-shot AF automatically;
         // an explicit oneshot here would only double-run it.

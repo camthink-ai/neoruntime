@@ -37,6 +37,9 @@ export interface LensStatus {
   // Current optical zoom ratio (position model on fg2009, AF table on af0832)
   zoom_ratio?: number;
   zoom_ratio_range?: ZoomRatioRange;
+  // Image-probe verdict: this lens has no motors (manual fixed lens).
+  // Consumers hide motor controls instead of surfacing MCU errors.
+  fixed_lens?: boolean;
 }
 
 export interface AutofocusStatus {

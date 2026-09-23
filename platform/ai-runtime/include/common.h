@@ -61,23 +61,6 @@ inline int build_nv12_tensors(const ReceivedFrame& frame, HalTensor* inputs) {
     return num_inputs;
 }
 
-/// Build a single-plane tensor for CLIP / embedding models.
-/// Passes the DMA-BUF fd directly — HailoRT handles NV12→RGB conversion
-/// internally when the HEF model expects RGB input.
-inline int build_clip_tensor(const ReceivedFrame& frame, HalTensor* inputs) {
-    inputs[0] = {};
-    inputs[0].data      = nullptr;
-    inputs[0].dma_fd    = (frame.fd_group && !frame.fd_group->fds.empty())
-                          ? frame.fd_group->fds[0] : -1;
-    inputs[0].ndim      = 3;
-    inputs[0].shape[0]  = static_cast<int32_t>(frame.height);
-    inputs[0].shape[1]  = static_cast<int32_t>(frame.width);
-    inputs[0].shape[2]  = 1;
-    inputs[0].dtype     = HAL_DTYPE_UINT8;
-    inputs[0].byte_size = (frame.num_planes > 0) ? frame.sizes[0] : 0;
-    return 1;
-}
-
 /// Serialize HalPostprocessResult (C struct) to JSON string for Event Bus publishing.
 std::string post_result_to_json(const std::string& stream_id,
                                 const std::string& model_id,

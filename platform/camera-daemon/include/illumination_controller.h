@@ -67,8 +67,8 @@ struct IlluminationStatus {
     uint16_t light_mv = 0;               // raw photodiode milli-volts
     int32_t light_milli = 0;             // raw scaled value
     bool light_valid = false;
-    int night_enter = 28;
-    int day_enter = 82;
+    int night_enter = 25;
+    int day_enter = 80;
 };
 
 class IlluminationController {

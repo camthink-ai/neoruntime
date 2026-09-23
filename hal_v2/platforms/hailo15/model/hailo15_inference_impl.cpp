@@ -11,11 +11,13 @@
 #include "common/hal_buffer.h"
 #include "common/hal_hailo15_priv.hpp"
 #include "model/hal_inference.h"
+#include "platforms/hailo15/model/hailo15_async_provider_lifecycle.hpp"
 
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -25,10 +27,14 @@
 #include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <condition_variable>
+#include <exception>
+#include <new>
 
 #if defined(HAL_HAVE_HAILORT)
 #include "hailo/hailort.hpp"
 #include "hailo/hailort.h"
+#include "hailo/transform.hpp"
 #if defined(HAL_HAVE_HAILO_POSTPROCESS_TOOLS)
 #include <hailo_postprocess_tools/objects/hailo_objects.hpp>
 #include <hailo_postprocess_tools/objects/hailo_tensors.hpp>
@@ -74,14 +80,15 @@ struct Hailo15RuntimeHandle
     std::shared_ptr<hailort::VDevice> vdevice;
 };
 
-/** Per-job context for run_async(). Kept alive (held in pending_async and
- *  captured by the HailoRT completion callback) until the NPU reports done. */
-struct Hailo15InferAsyncCtx
+using Hailo15AsyncProviderLifecycle =
+    hal_v2::hailo15::Hailo15AsyncProviderLifecycle;
+
+/** Per-job application payload retained by the lifecycle completion closure. */
+struct Hailo15InferAsyncPayload
 {
     std::vector<HalTensor> outputs;
     HalInferenceAsyncCallback callback = nullptr;
     void *userdata = nullptr;
-    std::unique_ptr<hailort::AsyncInferJob> job;
 };
 
 struct Hailo15InferPriv
@@ -94,26 +101,45 @@ struct Hailo15InferPriv
     std::vector<std::string> input_names;
     std::vector<std::string> output_names;
     std::string hef_basename;  // e.g. "hailo_yolov8n_384_640" from model path
+    /** NMS tensor-name prefix derived from the selected backend_function (see
+     *  nms_tensor_prefix_for_function). Empty → fall back to hef_basename. */
+    std::string nms_name_prefix;
     HalInferenceConfig cfg{};
 
-    // Async inference bookkeeping (run_async). pending_async lets destroy()
-    // flush in-flight jobs before tearing the session down, and lets
-    // query_session_performance_stats report queue depth; fps_mtx /
-    // fps_window_* drive the measured throughput window.
+    // Async lifecycle serializes bind + provider submission, defers inline
+    // completion until submission has unwound, and drains callbacks on destroy.
+    // This protects the shared bindings that set_buffer() rewrites per request.
     std::atomic<uint64_t> total_inferences{0};
-    std::mutex async_mtx;
-    // Serializes bind() + run_async()/run() per session. p->bindings holds the
-    // MemoryViews that set_buffer() rewrites on every call; without this lock,
-    // concurrent workers serving the same session race on the output buffer
-    // pointers HailoRT snapshots at submit time, aliasing buffers so one job's
-    // completion frees an output buffer another job's NPU write is still in
-    // flight (heap-use-after-free under K>=4 concurrency).
-    std::mutex submit_mtx;
-    std::vector<std::shared_ptr<Hailo15InferAsyncCtx>> pending_async;
+    Hailo15AsyncProviderLifecycle async_lifecycle;
     std::mutex fps_mtx;
     uint64_t fps_window_start_ms = 0;
     uint32_t fps_window_count = 0;
+
+    // Cached host-side input transform (tensor_from_frame_ex). Keyed by
+    // (srcW, srcH, contentW, contentH); frames from one pipeline are a
+    // constant size, so the cache hit rate is ~100%.
+    std::mutex transform_mu;
+    std::unique_ptr<hailort::InputTransformContext> transform_ctx;
+    uint32_t transform_key[4]{0, 0, 0, 0};
 };
+
+static Hailo15InferPriv *hailo15_new_infer_priv() noexcept
+{
+    try
+    {
+        return new (std::nothrow) Hailo15InferPriv();
+    }
+    catch (const std::exception &e)
+    {
+        HAL_LOG_ERROR("hailo15_inference: session allocation failed: %s",
+                      e.what());
+    }
+    catch (...)
+    {
+        HAL_LOG_ERROR("hailo15_inference: session allocation failed");
+    }
+    return nullptr;
+}
 
 /**
  * Shared VDevice singleton for multi-model parallel inference.
@@ -124,9 +150,11 @@ struct Hailo15InferPriv
  *
  * Cross-process sharing: the VDevice is shared with camera-daemon's medialib
  * AI-ISP by joining its group_id (kSharedVDeviceGroupId = the medialib
- * hailort.device-id "device0") via hailort_server. A mismatched group makes the
- * server refuse ai-runtime's attach with HAILO_DEVICE_IN_USE(73) as soon as a
- * model loads while AI-ISP is active.
+ * hailort.device-id "device0") via hailort_server. A mismatched group makes
+ * the server refuse the attach outright (verified on-device 2026-09-15:
+ * HAILO_OUT_OF_PHYSICAL_DEVICES(74) at VDevice::create — "requested: 1,
+ * found: 0"; DEVICE_IN_USE(73) is the non-service direct-attach code), so
+ * any override must be a deliberate exclusive run.
  *
  * Cached for the process lifetime; only reset_shared_vdevice() clears it (on
  * the connection-lost recovery path). Each model holds a shared_ptr copy, so
@@ -135,38 +163,59 @@ struct Hailo15InferPriv
  */
 static std::mutex g_shared_vdevice_mu;
 static std::shared_ptr<hailort::VDevice> g_shared_vdevice;
+/** Group the singleton was created with (first-wins; sticky across resets so
+ *  a connection-lost rebuild keeps a deliberate override). Read under
+ *  g_shared_vdevice_mu. */
+static std::string g_shared_vdevice_group;
 
 // group_id shared with camera-daemon's medialib AI-ISP VDevice. Must equal the
-// medialib's hailort.device-id ("device0"); a mismatch makes hailort_server
-// refuse the second attach (HAILO_DEVICE_IN_USE 73) and breaks NPU coexistence.
+// medialib's hailort.device-id ("device0"); any other group makes hailort_server
+// refuse this attach (74/73, see above) and breaks NPU coexistence.
 static constexpr const char *kSharedVDeviceGroupId = "device0";
 
-static std::shared_ptr<hailort::VDevice> get_shared_vdevice()
+static std::shared_ptr<hailort::VDevice> get_shared_vdevice(const char *group_override = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_shared_vdevice_mu);
     if (g_shared_vdevice)
+    {
+        if (group_override && group_override[0]
+            && g_shared_vdevice_group != group_override)
+        {
+            // Process-wide singleton: first creation wins. A later caller asking
+            // for a different group gets the existing one — silently switching
+            // would split the scheduler or break the AI-ISP coexistence group.
+            HAL_LOG_WARNING("hailo15_inference: shared VDevice already on group '%s'; "
+                            "ignoring requested group '%s' (first-wins)",
+                            g_shared_vdevice_group.c_str(), group_override);
+        }
         return g_shared_vdevice;
+    }
 
     hailo_vdevice_params_t params = {};
     hailo_init_vdevice_params(&params);
 
     // Join the medialib AI-ISP's group so ai-runtime and AI-ISP share the single NPU
     // via hailort_server. The medialib opens its VDevice with group_id = its hailort.device-id
-    // ("device0"); the former default "aipc" made the server refuse the second attach with
-    // HAILO_DEVICE_IN_USE(73) -> OUT_OF_PHYSICAL_DEVICES(74) as soon as a model loaded while
-    // AI-ISP was active. Same group + multi_process_service lets HailoRT pipeline both
-    // consumers' network groups on the one physical device.
-    params.group_id = kSharedVDeviceGroupId;
+    // ("device0"); a different group (the former default "aipc" did) makes the server refuse
+    // the attach with HAILO_OUT_OF_PHYSICAL_DEVICES(74) while AI-ISP is active. Same group +
+    // multi_process_service lets HailoRT pipeline both consumers' network groups on the one
+    // physical device.
+    params.group_id = (group_override && group_override[0])
+                          ? group_override
+                          : (g_shared_vdevice_group.empty() ? kSharedVDeviceGroupId
+                                                            : g_shared_vdevice_group.c_str());
     params.multi_process_service = true;
     params.scheduling_algorithm = HAILO_SCHEDULING_ALGORITHM_ROUND_ROBIN;
 
     auto exp = hailort::VDevice::create(params);
     if (!exp)
     {
-        HAL_LOG_ERROR("hailo15_inference: shared VDevice create failed (status=%d)", (int)exp.status());
+        HAL_LOG_ERROR("hailo15_inference: shared VDevice create failed (group='%s', status=%d)",
+                      params.group_id, (int)exp.status());
         return nullptr;
     }
     g_shared_vdevice = exp.release();
+    g_shared_vdevice_group = params.group_id;
     HAL_LOG_INFO("hailo15_inference: created shared VDevice (group='%s', multi_process_service=1, scheduler=ROUND_ROBIN)",
                  params.group_id);
     return g_shared_vdevice;
@@ -204,6 +253,10 @@ static inline bool hailo15_vdevice_connection_lost(hailo_status st)
  * nothing cached, so callers can rate-limit logging.
  *
  * Returns true iff the singleton was actually reset.
+ *
+ * g_shared_vdevice_group deliberately survives the reset: a rebuild via
+ * get_shared_vdevice(nullptr) re-uses it, so a deliberate vdevice_group_id
+ * override stays in effect across hailort_server restarts.
  */
 static bool reset_shared_vdevice()
 {
@@ -264,7 +317,7 @@ static int hailo15_bind_inputs_outputs(Hailo15InferPriv *p, const HalTensor *inp
     {
         const auto &name = p->input_names[i];
         const HalTensor &in = inputs[i];
-        if (!in.data || in.byte_size == 0)
+        if (in.byte_size == 0)
             return HAL_ERR_INVALID_ARG;
         const size_t frame_size = p->infer_model->input(name)->get_frame_size();
         if (in.byte_size != frame_size)
@@ -273,11 +326,65 @@ static int hailo15_bind_inputs_outputs(Hailo15InferPriv *p, const HalTensor *inp
                           frame_size);
             return HAL_ERR_INVALID_SIZE;
         }
-        hailo_status st = p->bindings.input(name)->set_buffer(hailort::MemoryView(in.data, in.byte_size));
-        if (HAILO_SUCCESS != st)
+        auto *tp = static_cast<TensorPriv *>(in.priv);
+        const HalDmaFrameDesc *d = tp ? tp->dma_frame : nullptr;
+        if (d || in.dma_fd >= 0)
         {
-            HAL_LOG_ERROR("hailo15_inference: set input buffer failed (st=%d)", (int)st);
-            return HAL_ERR_RESULT;
+            /* DMA-bound input. Preferred route: the
+             * HalDmaFrameDesc from bind_dma_frame() / the tensor_from_frame
+             * dma fast path — it carries the per-plane layout. Fallback: a
+             * bare tensor->dma_fd over one compact buffer. In both cases the
+             * underlying memory must stay valid for the transfer lifetime
+             * (sync run returns after completion; async until the callback).
+             * The descriptor is re-applied on every submit under the lifecycle
+             * helper's serialized vendor-submission section. */
+            hailo_status st;
+            if (d)
+            {
+                if (d->fd[1] >= 0)
+                {
+                    /* dual-fd NV12: one dmabuf per plane (path A) */
+                    hailo_pix_buffer_t pb = {};
+                    pb.memory_type = HAILO_PIX_BUFFER_MEMORY_TYPE_DMABUF;
+                    pb.number_of_planes = 2;
+                    pb.planes[0].fd = d->fd[0];
+                    pb.planes[0].bytes_used = d->bytes_used[0];
+                    pb.planes[0].plane_size = d->bytes_used[0];
+                    pb.planes[1].fd = d->fd[1];
+                    pb.planes[1].bytes_used = d->bytes_used[1];
+                    pb.planes[1].plane_size = d->bytes_used[1];
+                    st = p->bindings.input(name)->set_pix_buffer(pb);
+                }
+                else
+                {
+                    /* single compact NV12 dmabuf (path B1) */
+                    st = p->bindings.input(name)->set_dma_buffer(
+                        hailo_dma_buffer_t{d->fd[0], (size_t)d->bytes_used[0]});
+                }
+            }
+            else if (in.dma_fd >= 0)
+            {
+                st = p->bindings.input(name)->set_dma_buffer(hailo_dma_buffer_t{in.dma_fd, in.byte_size});
+            }
+            else
+            {
+                return HAL_ERR_INVALID_ARG;
+            }
+            if (HAILO_SUCCESS != st)
+            {
+                HAL_LOG_ERROR("hailo15_inference: dma bind input[%zu] failed (st=%d, dma_fd=%d)", i, (int)st,
+                              in.dma_fd);
+                return HAL_ERR_RESULT;
+            }
+        }
+        else
+        {
+            hailo_status st = p->bindings.input(name)->set_buffer(hailort::MemoryView(in.data, in.byte_size));
+            if (HAILO_SUCCESS != st)
+            {
+                HAL_LOG_ERROR("hailo15_inference: set input buffer failed (st=%d)", (int)st);
+                return HAL_ERR_RESULT;
+            }
         }
     }
 
@@ -350,13 +457,18 @@ static void hailo15_attach_postprocess_roi(Hailo15InferPriv *p, HalTensor *outpu
         hailo_vstream_info_t vi{};
         std::memset(&vi, 0, sizeof(vi));
         const bool is_nms = stinfo.is_nms();
-        if (is_nms && !p->hef_basename.empty())
+        // Prefix priority: selected backend_function → HEF basename. The function
+        // prefix decouples tensor naming from file naming (app-bundled HEFs); the
+        // basename keeps platform-materialized and built-in models working.
+        const std::string &nms_prefix =
+            !p->nms_name_prefix.empty() ? p->nms_name_prefix : p->hef_basename;
+        if (is_nms && !nms_prefix.empty())
         {
-            // Replace network-group prefix with HEF filename for postprocess compat.
+            // Replace network-group prefix with the vendor-recognized basename.
             // e.g. "yolov8n/yolov8_nms_postprocess" → "hailo_yolov8n_384_640/yolov8_nms_postprocess"
             const auto slash_pos = name.find('/');
             if (slash_pos != std::string::npos)
-                std::snprintf(vi.name, sizeof(vi.name), "%s%s", p->hef_basename.c_str(), name.c_str() + slash_pos);
+                std::snprintf(vi.name, sizeof(vi.name), "%s%s", nms_prefix.c_str(), name.c_str() + slash_pos);
             else
                 std::snprintf(vi.name, sizeof(vi.name), "%s", name.c_str());
         }
@@ -396,24 +508,6 @@ static void hailo15_attach_postprocess_roi(Hailo15InferPriv *p, HalTensor *outpu
 #endif
 }
 
-/** Block until every in-flight async job for this session has completed.
- *  Called from destroy() so the completion callbacks (which capture p) never
- *  fire after the session is freed. */
-static void hailo15_wait_pending_async(Hailo15InferPriv *p)
-{
-    std::vector<std::shared_ptr<Hailo15InferAsyncCtx>> snapshot;
-    {
-        std::lock_guard<std::mutex> lock(p->async_mtx);
-        snapshot.swap(p->pending_async);
-    }
-    const uint32_t timeout_ms = p->cfg.timeout_ms ? p->cfg.timeout_ms : 10000;
-    for (auto &ctx : snapshot)
-    {
-        if (ctx->job)
-            ctx->job->wait(std::chrono::milliseconds(timeout_ms));
-    }
-    snapshot.clear();
-}
 #endif
 
 static inline bool str_has_json_object_prefix(const char *s)
@@ -448,6 +542,25 @@ static inline std::string extract_json_string_value_best_effort(const char *json
     if (!q)
         return default_value ? std::string(default_value) : std::string();
     return std::string(p, q);
+}
+
+/** The vendor YOLO postprocess plugin looks NMS output tensors up by name
+ *  "<prefix>/yolov8_nms_postprocess" where <prefix> is one of the HEF basenames
+ *  its functions were compiled for. Deriving the prefix from the selected
+ *  backend_function (forwarded in platform_config by ai-runtime) instead of the
+ *  file path decouples tensor naming from file naming: app-bundled HEFs live at
+ *  arbitrary paths whose basename never matches. Unknown/absent function →
+ *  empty string, and callers fall back to the HEF file basename (the
+ *  platform's materialized runtime copies keep that path valid). */
+static std::string nms_tensor_prefix_for_function(const std::string &backend_function)
+{
+    static const std::map<std::string, std::string> kFunctionToPrefix = {
+        {"hailo_yolov8n", "hailo_yolov8n_384_640"},
+        {"hailo_yolov8s", "hailo_yolov8s_384_640"},
+        {"hailo_yolov8m", "hailo_yolov8m_384_640"},
+    };
+    const auto it = kFunctionToPrefix.find(backend_function);
+    return it == kFunctionToPrefix.end() ? std::string() : it->second;
 }
 
 static inline void preprocess_defaults(HalPreprocessConfig *p)
@@ -623,6 +736,16 @@ static void fill_hal_tensor_info_from_stream(HalModelTensorInfo *slot, const hai
     }
 }
 
+/* Some HailoRT APIs return stream names with/without the network prefix;
+ * match either the full name or the basename suffix after the last '/'. */
+static const char *stream_name_suffix(const char *s)
+{
+    if (!s)
+        return "";
+    const char *last = std::strrchr(s, '/');
+    return last ? (last + 1) : s;
+}
+
 /**
  * Override spatial dims from HEF get_*_stream_infos() (matched by stream name).
  *
@@ -639,17 +762,12 @@ static void enrich_tensor_image_size_from_hef_stream_info(HalModelTensorInfo *sl
         is_input ? hef.get_input_stream_infos("") : hef.get_output_stream_infos("");
     if (!exp.has_value())
         return;
-    auto suffix = [](const char *s) -> const char * {
-        if (!s)
-            return "";
-        const char *last = std::strrchr(s, '/');
-        return last ? (last + 1) : s;
-    };
     for (const hailo_stream_info_t &si : exp.value())
     {
         // Some HailoRT APIs return stream names with/without the network prefix.
         // Match either full name or the basename suffix after the last '/'.
-        if (std::strcmp(si.name, slot->name) != 0 && std::strcmp(suffix(si.name), suffix(slot->name)) != 0)
+        if (std::strcmp(si.name, slot->name) != 0 &&
+            std::strcmp(stream_name_suffix(si.name), stream_name_suffix(slot->name)) != 0)
             continue;
         if (hailo_format_order_is_nms_shape_invalid(si.format.order))
             break;
@@ -822,12 +940,110 @@ static void reconcile_input_nv12_dims_from_byte_size(HalModelTensorInfo *slot)
         slot->shape[2] = static_cast<int32_t>(best_w);
     }
 }
+
+/**
+ * Pixel geometry for a model input exactly as get_model_info() reports it:
+ * InferStream fill + HEF hw_shape enrichment + byte-size NV12 reconciliation.
+ * Bind-side geometry validation must agree with this derivation — the raw
+ * InferStream shape and even the HEF stream-info shape pack NV12 inputs as
+ * H/2 x W x 3, so validating against either rejects every frame the
+ * reconciled metadata matched. Returns false when the input cannot be
+ * resolved to unambiguous NV12 pixel dims; the caller falls back to the raw
+ * InferStream shape.
+ */
+static bool reconciled_input_pixel_geometry(Hailo15InferPriv *p, const std::string &name,
+                                            uint32_t *w, uint32_t *h)
+{
+    if (!p || !w || !h)
+        return false;
+    auto input_exp = p->infer_model->input(name);
+    if (!input_exp.has_value())
+        return false;
+    HalModelTensorInfo slot{};
+    fill_hal_tensor_info_from_stream(&slot, input_exp.value(), false);
+    enrich_tensor_image_size_from_hef_stream_info(&slot, p->infer_model->hef(), true);
+    reconcile_input_nv12_dims_from_byte_size(&slot);
+    if (slot.is_nv12 == 0 || slot.ndim < 4 || slot.shape[1] <= 0 || slot.shape[2] <= 0)
+        return false;
+    *h = static_cast<uint32_t>(slot.shape[1]);
+    *w = static_cast<uint32_t>(slot.shape[2]);
+    return true;
+}
 #endif
 
 } // namespace
 
 extern "C" {
 
+// Apply on-chip NMS parameters from HalInferenceConfig to every NMS-format
+// output stream of the model. HailoRT applies these at configure() time, so
+// this must run before infer_model->configure(). Zero/negative fields keep
+// HailoRT defaults (callers get the old behavior with a zeroed config).
+static void apply_nms_params(hailort::InferModel &model, const HalInferenceConfig &cfg)
+{
+    if (cfg.nms.score_threshold <= 0.0f && cfg.nms.iou_threshold <= 0.0f &&
+        cfg.nms.max_proposals_per_class == 0U && cfg.nms.max_proposals_total == 0U)
+    {
+        bool any_mask = false;
+        for (uint32_t m : cfg.nms.class_filter_mask)
+        {
+            if (m != 0U)
+            {
+                any_mask = true;
+                break;
+            }
+        }
+        if (!any_mask)
+        {
+            return; /* fully default — nothing to do */
+        }
+    }
+    for (const auto &name : model.get_output_names())
+    {
+        auto out_exp = model.output(name);
+        if (!out_exp)
+        {
+            continue;
+        }
+        // Non-NMS streams reject get_nms_shape() with INVALID_OPERATION — skip them.
+        auto shape_exp = out_exp.value().get_nms_shape();
+        if (!shape_exp)
+        {
+            continue;
+        }
+        if (cfg.nms.score_threshold > 0.0f)
+        {
+            out_exp.value().set_nms_score_threshold(cfg.nms.score_threshold);
+        }
+        if (cfg.nms.iou_threshold > 0.0f)
+        {
+            out_exp.value().set_nms_iou_threshold(cfg.nms.iou_threshold);
+        }
+        if (cfg.nms.max_proposals_per_class > 0U)
+        {
+            out_exp.value().set_nms_max_proposals_per_class(cfg.nms.max_proposals_per_class);
+        }
+        if (cfg.nms.max_proposals_total > 0U)
+        {
+            out_exp.value().set_nms_max_proposals_total(cfg.nms.max_proposals_total);
+        }
+        std::vector<bool> mask;
+        bool any = false;
+        for (uint32_t word : cfg.nms.class_filter_mask)
+        {
+            for (uint32_t bit = 0; bit < 32U && mask.size() < 256U; ++bit)
+            {
+                const bool on = ((word >> bit) & 1U) != 0U;
+                any = any || on;
+                mask.push_back(on);
+            }
+        }
+        if (any)
+        {
+            out_exp.value().set_nms_classes_filter_mask(mask);
+        }
+    }
+}
 static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *config)
 {
     if (!config || config->model_path[0] == '\0')
@@ -838,7 +1054,7 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
     HAL_LOG_WARNING("hailo15_inference: built without HailoRT; returning NULL");
     return nullptr;
 #else
-    auto *p = new (std::nothrow) Hailo15InferPriv();
+    auto *p = hailo15_new_infer_priv();
     if (!p)
         return nullptr;
     p->cfg = *config;
@@ -855,9 +1071,11 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
     // device id: from platform_config JSON or default.
     const char *pcfg = config->platform_config;
     std::string device_id = "device0";
+    std::string backend_function;
     if (pcfg && str_has_json_object_prefix(pcfg))
     {
         device_id = extract_json_string_value_best_effort(pcfg, "device_id", "device0");
+        backend_function = extract_json_string_value_best_effort(pcfg, "backend_function", "");
     }
     // device_id + hef_basename are derived once and (re)applied to `p` in both the
     // primary path here and the no-latency-flag retry branch below, which deletes
@@ -875,10 +1093,23 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
             hef_basename.resize(dot);
     }
     p->hef_basename = hef_basename;
+    // NMS tensor naming prefers the selected backend_function over the file name.
+    p->nms_name_prefix = nms_tensor_prefix_for_function(backend_function);
 
     // Acquire shared VDevice — enables HailoRT ROUND_ROBIN scheduling across
     // all models so the NPU can pipeline inference for multiple network groups.
-    p->vdevice = get_shared_vdevice();
+    // An explicit runtime handle (from runtime_acquire(), possibly carrying a
+    // vdevice_group_id override) reuses the VDevice it was created with; the
+    // handle-less path joins the process singleton on the shared group.
+    if (config->runtime)
+    {
+        auto *runtime_handle = reinterpret_cast<Hailo15RuntimeHandle *>(config->runtime);
+        p->vdevice = runtime_handle->vdevice;
+    }
+    else
+    {
+        p->vdevice = get_shared_vdevice();
+    }
     if (!p->vdevice)
     {
         HAL_LOG_ERROR("hailo15_inference: failed to acquire shared VDevice");
@@ -941,10 +1172,41 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
         p->infer_model->set_batch_size(config->batch_size);
 
     // Enable HW latency measurement so get_hw_latency_measurement() works.
-    // Some models (e.g., older HEFs compiled with prior HailoRT versions) do not
-    // support this flag and will fail configure() with HAILO_INVALID_OPERATION.
-    // Fall back to configuring without the flag when that happens.
-    p->infer_model->set_hw_latency_measurement_flags(HAILO_LATENCY_MEASURE);
+    // HailoRT only supports HW latency measurement on networks with a single
+    // PHYSICAL input; anything else fails configure() with
+    // HAILO_INVALID_OPERATION plus a hailort_server error burst and costs a
+    // full delete/rebuild retry, so skip the flag up front for those
+    // (get_hw_latency* returns 0, same as the retry path below).
+    // Field evidence (on-device, 2026-09-04): an NV12 HEF is ONE InferModel input
+    // that the device splits into y/uv physical inputs, so counting inputs()
+    // alone misses it — also treat multi-plane YUV input orders as
+    // multi-input. Any other INVALID_OPERATION is still handled by the retry.
+    const auto &model_inputs = p->infer_model->inputs();
+    bool multi_physical_input = model_inputs.size() > 1;
+    for (const auto &in : model_inputs)
+    {
+        const hailo_format_order_t order = in.format().order;
+        if (order == HAILO_FORMAT_ORDER_NV12 || order == HAILO_FORMAT_ORDER_NV21 ||
+            order == HAILO_FORMAT_ORDER_I420 || order == HAILO_FORMAT_ORDER_HAILO_YYUV ||
+            order == HAILO_FORMAT_ORDER_HAILO_YYVU || order == HAILO_FORMAT_ORDER_HAILO_YYYYUV)
+        {
+            multi_physical_input = true;
+            break;
+        }
+    }
+    if (multi_physical_input)
+    {
+        HAL_LOG_INFO("hailo15_inference: model '%s' has multi-plane/multiple inputs "
+                     "(%zu stream(s)) — skipping HW latency measurement "
+                     "(single physical input only)",
+                     hef_basename.c_str(), model_inputs.size());
+    }
+    else
+    {
+        p->infer_model->set_hw_latency_measurement_flags(HAILO_LATENCY_MEASURE);
+    }
+
+    apply_nms_params(*p->infer_model, *config);
 
     // Default: keep model formats; tensor_from_frame() will align.
     auto configured_exp = p->infer_model->configure();
@@ -960,7 +1222,7 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
             // Drop the priv that already holds the broken infer_model and start fresh.
             delete p;
 
-            p = new (std::nothrow) Hailo15InferPriv();
+            p = hailo15_new_infer_priv();
             if (!p)
             {
                 HAL_LOG_ERROR("hailo15_inference: OOM retrying without latency flag");
@@ -972,6 +1234,7 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
             // would be empty and NMS/postprocess tensor-name mapping would break.
             p->device_id = device_id;
             p->hef_basename = hef_basename;
+            p->nms_name_prefix = nms_tensor_prefix_for_function(backend_function);
 
             p->vdevice = get_shared_vdevice();
             if (!p->vdevice)
@@ -992,6 +1255,7 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
             p->infer_model = infer_model_exp2.release();
             if (config->batch_size > 0)
                 p->infer_model->set_batch_size(config->batch_size);
+            apply_nms_params(*p->infer_model, *config);
 
             // Do NOT set latency measurement flag this time.
             auto configured_exp2 = p->infer_model->configure();
@@ -1046,9 +1310,14 @@ static void hailo15_infer_destroy(HalInferenceSession *session)
     (void)session;
 #else
     auto *p = reinterpret_cast<Hailo15InferPriv *>(session);
-    // Drain in-flight async jobs first: their completion callbacks capture p,
-    // so freeing the session underneath a pending job would use-after-free.
-    hailo15_wait_pending_async(p);
+    // Completion code captures p, so release it only after every accepted
+    // callback has returned. Destruction from one of those callbacks is rejected
+    // without aborting or self-deadlocking; the caller must retry externally.
+    if (!p->async_lifecycle.close_and_wait())
+    {
+        HAL_LOG_ERROR("hailo15_inference: destroy called from its own async callback; session remains alive");
+        return;
+    }
     delete p;
 #endif
 }
@@ -1182,6 +1451,65 @@ static int hailo15_infer_tensor_from_frame(const HalFrameBuffer *frame, HalTenso
     if (!frame || !tensor)
         return HAL_ERR_INVALID_ARG;
 
+    /* ---- P1-1 dma fast path: compact dual-plane NV12 with per-plane
+     * dmabufs binds straight to the NPU (zero CPU pixel copies). The
+     * vendor pool this HAL requests buffers from allocates exactly this
+     * layout (one dmabuf per plane, stride == width — see
+     * MediaLibraryBufferPool's 6-arg ctor delegating with
+     * bytes_per_line=width), so DPM's pre-resized model-geometry inputs
+     * take this path. Geometry-vs-model is still enforced at bind time
+     * (byte_size == frame_size check), so a mismatched frame fails
+     * cleanly exactly like the CPU path did. Anything off-contract
+     * (no fds, padded stride, non-NV12) falls through to memcpy staging. */
+    if (frame->format == HAL_PIX_FMT_NV12 &&
+        frame->num_planes >= 2 &&
+        frame->dma_fds[0] >= 0 && frame->dma_fds[1] >= 0 &&
+        frame->strides[0] == frame->width && frame->strides[1] == frame->width)
+    {
+        HalDmaFrameDesc desc{};
+        desc.fd[0] = frame->dma_fds[0];
+        desc.fd[1] = frame->dma_fds[1];
+        desc.fd[2] = -1; /* plane absent */
+        desc.offset[0] = 0;
+        desc.offset[1] = 0;
+        desc.stride[0] = frame->width;
+        desc.stride[1] = frame->width;
+        desc.bytes_used[0] = frame->width * frame->height;
+        desc.bytes_used[1] = frame->width * frame->height / 2;
+        desc.format = HAL_PIX_FMT_NV12;
+        desc.width = frame->width;
+        desc.height = frame->height;
+        desc.borrowed = 1; /* fds stay owned by the HalFrameBuffer */
+
+        auto *desc_copy = new (std::nothrow) HalDmaFrameDesc(desc);
+        auto *tp = new (std::nothrow) TensorPriv{};
+        if (!desc_copy || !tp)
+        {
+            delete desc_copy;
+            delete tp;
+            return HAL_ERR_NO_MEM;
+        }
+        tp->dma_frame = desc_copy;
+
+        static std::atomic<bool> s_dma_bind_logged{false};
+        if (!s_dma_bind_logged.exchange(true))
+        {
+            HAL_LOG_INFO("hailo15_inference: tensor_from_frame dma direct-bind engaged "
+                         "(%ux%u NV12 dual-fd, zero CPU copies)",
+                         (unsigned)frame->width, (unsigned)frame->height);
+        }
+
+        const uint32_t total = desc.bytes_used[0] + desc.bytes_used[1];
+        std::memset(tensor, 0, sizeof(*tensor));
+        tensor->dma_fd = frame->dma_fds[0]; /* data stays NULL: no CPU pixels */
+        tensor->ndim = 1;
+        tensor->shape[0] = (int32_t)total;
+        tensor->dtype = HAL_DTYPE_UINT8;
+        tensor->byte_size = total;
+        tensor->priv = tp;
+        return HAL_OK;
+    }
+
     uint32_t plane0_sz = 0;
     uint32_t plane1_sz = 0;
     switch (frame->format)
@@ -1232,6 +1560,501 @@ static int hailo15_infer_tensor_from_frame(const HalFrameBuffer *frame, HalTenso
     return HAL_OK;
 }
 
+/* Session-aware tensor_from_frame: applies HalInferenceConfig::preprocess
+ * (resize / color / letterbox / normalize) to match the model's first input
+ * stream, using HailoRT's host-side InputTransformContext.
+ *
+ * Fast path: frame geometry + format already match the model input and
+ * normalize is off -> verbatim copy (same as the legacy tensor_from_frame).
+ *
+ * Letterbox (KEEP_ASPECT) runs the transform at the aspect-preserving content
+ * size, then composes the result onto the padded destination canvas.
+ */
+static int hailo15_infer_tensor_from_frame_ex(HalInferenceSession *session,
+                                              const HalFrameBuffer *frame, HalTensor *tensor)
+{
+#if !defined(HAL_HAVE_HAILORT)
+    (void)session; (void)frame; (void)tensor;
+    return HAL_ERR_NOT_SUPPORTED;
+#else
+    auto *p = reinterpret_cast<Hailo15InferPriv *>(session);
+    if (!p || p->input_names.empty() || !frame || !tensor)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    const std::string &name = p->input_names[0];
+    auto in_exp = p->infer_model->input(name);
+    if (!in_exp.has_value())
+    {
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+    auto &st = in_exp.value();
+    const hailo_3d_image_shape_t dsh = st.shape();
+    const hailo_format_t dfm = st.format();
+    if (dsh.width == 0 || dsh.height == 0)
+    {
+        return HAL_ERR_INVALID_STATE;
+    }
+
+    /* Source validation (geometry mapping happens in the staging step). */
+    switch (frame->format)
+    {
+    case HAL_PIX_FMT_NV12:
+        if (frame->num_planes < 2 || !frame->planes[0] || !frame->planes[1])
+        {
+            return HAL_ERR_INVALID_ARG;
+        }
+        break;
+    case HAL_PIX_FMT_RGB24:
+    case HAL_PIX_FMT_BGR24:
+        if (frame->num_planes < 1 || !frame->planes[0])
+        {
+            return HAL_ERR_INVALID_ARG;
+        }
+        break;
+    default:
+        HAL_LOG_ERROR("hailo15_inference: tensor_from_frame_ex: unsupported source format %d",
+                      (int)frame->format);
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+
+    /* ---- Fast path 1: DMABUF frame + exact match -> zero-copy fd binding ----
+     * The tensor borrows the frame's dma-buf: no allocation, no memcpy. The
+     * caller must keep the frame alive until the inference completes (sync
+     * run() returns after completion; run_async until the callback fires).
+     * Single compact dmabuf only: a dual-fd NV12 frame (one dmabuf per plane,
+     * the vendor MediaLibraryBufferPool layout) must not bind here — dma_fds[0]
+     * covers only the Y plane while byte_size spans both, so the bare-fd bind
+     * would map the wrong extent. Those frames fall through to Fast path 2 ->
+     * tensor_from_frame, whose dma fast path builds the per-plane
+     * HalDmaFrameDesc and binds via set_pix_buffer instead. The row pitch must
+     * be tight as well: a padded stride cannot be re-expressed by one
+     * contiguous fd binding (stride 0 = derived = tight). */
+    const bool nv12_dual_fd = (frame->format == HAL_PIX_FMT_NV12 && frame->dma_fds[1] >= 0);
+    const bool stride_tight =
+        (frame->format == HAL_PIX_FMT_NV12)
+            ? ((frame->strides[0] == 0 || frame->strides[0] == frame->width) &&
+               (frame->num_planes < 2 || frame->strides[1] == 0 || frame->strides[1] == frame->width))
+            : (frame->strides[0] == 0 || frame->strides[0] == frame->width * 3);
+    const bool normalize = p->cfg.preprocess.normalize;
+    /* Exact-match test uses the reconciled geometry (see bind_dma_frame):
+     * the raw InferStream shape packs NV12 as H/2 x W x 3, so an
+     * exact-match DMABUF frame would otherwise fall through to the staged
+     * conversion path. */
+    uint32_t match_w = dsh.width;
+    uint32_t match_h = dsh.height;
+    {
+        uint32_t hw_w = 0, hw_h = 0;
+        if (reconciled_input_pixel_geometry(p, name, &hw_w, &hw_h))
+        {
+            match_w = hw_w;
+            match_h = hw_h;
+        }
+    }
+    if (frame->mem_type == HAL_MEM_DMABUF && frame->dma_fds[0] >= 0 && !nv12_dual_fd && stride_tight &&
+        frame->width == match_w && frame->height == match_h && !normalize &&
+        ((frame->format == HAL_PIX_FMT_NV12 && dfm.order == HAILO_FORMAT_ORDER_NV12) ||
+         (frame->format == HAL_PIX_FMT_RGB24 && dsh.features == 3 &&
+          (dfm.order == HAILO_FORMAT_ORDER_RGB888 || dfm.order == HAILO_FORMAT_ORDER_NHWC))))
+    {
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < frame->num_planes; ++i)
+        {
+            total += frame->sizes[i];
+        }
+        if (total != 0 && total == st.get_frame_size())
+        {
+            std::memset(tensor, 0, sizeof(*tensor));
+            tensor->data = static_cast<uint8_t *>(frame->planes[0]); /* CPU mapping, borrowed */
+            tensor->dma_fd = frame->dma_fds[0];
+            tensor->ndim = 1;
+            tensor->shape[0] = static_cast<int32_t>(total); /* uint8: elements == bytes */
+            tensor->dtype = HAL_DTYPE_UINT8;
+            tensor->byte_size = total;
+            std::snprintf(tensor->name, sizeof(tensor->name), "%s", name.c_str());
+            tensor->priv = new (std::nothrow) TensorPriv{std::shared_ptr<void>() /* borrowed, owns nothing */
+#if defined(HAL_HAVE_HAILO_POSTPROCESS_TOOLS)
+                                                         ,
+                                                         nullptr
+#endif
+            };
+            return tensor->priv ? HAL_OK : HAL_ERR_NO_MEM;
+        }
+    }
+
+    /* ---- Fast path 2: exact match -> verbatim copy ---- */
+    if (frame->width == dsh.width && frame->height == dsh.height && !normalize &&
+        ((frame->format == HAL_PIX_FMT_NV12 && dfm.order == HAILO_FORMAT_ORDER_NV12) ||
+         (frame->format == HAL_PIX_FMT_RGB24 && dfm.order == HAILO_FORMAT_ORDER_RGB888)))
+    {
+        return hailo15_infer_tensor_from_frame(frame, tensor);
+    }
+
+    /* ---- Target channel order ----
+     * An explicit preprocess.color request wins; otherwise stage RGB: this
+     * HailoRT stack exposes packed model inputs as RGB888/NHWC — there is no
+     * BGR order, so BGR output only happens on an explicit user request. */
+    const bool out_bgr = (p->cfg.preprocess.color == HAL_PREPROCESS_COLOR_NV12_TO_BGR ||
+                          p->cfg.preprocess.color == HAL_PREPROCESS_COLOR_RGB_TO_BGR);
+    /* Packed 3-channel interleaved model inputs only: NV12-order inputs are
+     * served by the exact-match fast path above and cannot be resized on the
+     * CPU staging path; planar (NHCW) or non-3-channel inputs are rejected.
+     * F8CR is the quantized packed 8-bit order vendor detection HEFs report
+     * (e.g. yolov5m_vehicles 1080p RGB): byte-compatible with the staged
+     * RGB888 buffer — the raw array path feeds those models the identical
+     * flat uint8 tensor. */
+    const bool packed_rgb_ok =
+        (dfm.order == HAILO_FORMAT_ORDER_RGB888 || dfm.order == HAILO_FORMAT_ORDER_NHWC ||
+         dfm.order == HAILO_FORMAT_ORDER_F8CR) &&
+        dsh.features == 3;
+    if (!packed_rgb_ok)
+    {
+        HAL_LOG_ERROR("hailo15_inference: tensor_from_frame_ex: model input order %d "
+                      "(features %u) only supported on the exact-match fast path",
+                      (int)dfm.order, (unsigned)dsh.features);
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+
+    /* ---- General path: stage the source as packed RGB888/BGR888 ----
+     * NV12 cannot be expressed by a packed 3-channel staging buffer, so
+     * convert it here on the CPU (BT.601 limited range) and resize on the
+     * CPU (bilinear). Production NV12-input models take the fast path above
+     * and skip this. Plane strides are honored: media/DMA buffers commonly
+     * carry row padding. */
+    const uint32_t w = frame->width, h = frame->height;
+    const size_t rgb_sz = (size_t)w * h * 3;
+    auto src_buf = alloc_aligned_shared(rgb_sz, 4096);
+    if (!src_buf)
+    {
+        return HAL_ERR_NO_MEM;
+    }
+    uint8_t *s = static_cast<uint8_t *>(src_buf.get());
+    const uint8_t *yp = static_cast<const uint8_t *>(frame->planes[0]);
+    if (frame->format == HAL_PIX_FMT_NV12)
+    {
+        const uint8_t *uvp = static_cast<const uint8_t *>(frame->planes[1]);
+        const uint32_t ys = frame->strides[0] ? frame->strides[0] : w;
+        const uint32_t uvs = frame->strides[1] ? frame->strides[1] : w;
+        for (uint32_t j = 0; j < h; ++j)
+        {
+            const size_t yrow = (size_t)j * ys;
+            const size_t uvrow = (size_t)(j / 2) * uvs;
+            for (uint32_t i = 0; i < w; ++i)
+            {
+                const int Y = yp[yrow + i];
+                const int U = (int)uvp[uvrow + (i & ~1u)] - 128;
+                const int V = (int)uvp[uvrow + (i & ~1u) + 1] - 128;
+                /* BT.601 limited range; the +128 rounding bias belongs inside
+                 * the division (adding it afterwards offsets every channel by
+                 * half-range: black would decode to 128, not 0). */
+                int R = ((Y - 16) * 298 + 409 * V + 128) / 256;
+                int G = ((Y - 16) * 298 - 100 * U - 208 * V + 128) / 256;
+                int B = ((Y - 16) * 298 + 516 * U + 128) / 256;
+                R = R < 0 ? 0 : (R > 255 ? 255 : R);
+                G = G < 0 ? 0 : (G > 255 ? 255 : G);
+                B = B < 0 ? 0 : (B > 255 ? 255 : B);
+                const size_t o = ((size_t)j * w + i) * 3;
+                if (out_bgr)
+                {
+                    s[o + 0] = (uint8_t)B;
+                    s[o + 1] = (uint8_t)G;
+                    s[o + 2] = (uint8_t)R;
+                }
+                else
+                {
+                    s[o + 0] = (uint8_t)R;
+                    s[o + 1] = (uint8_t)G;
+                    s[o + 2] = (uint8_t)B;
+                }
+            }
+        }
+    }
+    else if (frame->format == HAL_PIX_FMT_BGR24 || frame->format == HAL_PIX_FMT_RGB24)
+    {
+        const uint8_t *q = static_cast<const uint8_t *>(frame->planes[0]);
+        const uint32_t srs = frame->strides[0] ? frame->strides[0] : w * 3;
+        const bool swap = ((frame->format == HAL_PIX_FMT_BGR24) != out_bgr);
+        for (uint32_t j = 0; j < h; ++j)
+        {
+            const uint8_t *src_row = q + (size_t)j * srs;
+            uint8_t *dst_row = s + (size_t)j * w * 3;
+            if (swap)
+            {
+                for (uint32_t i = 0; i < w; ++i)
+                {
+                    dst_row[(size_t)i * 3 + 0] = src_row[(size_t)i * 3 + 2];
+                    dst_row[(size_t)i * 3 + 1] = src_row[(size_t)i * 3 + 1];
+                    dst_row[(size_t)i * 3 + 2] = src_row[(size_t)i * 3 + 0];
+                }
+            }
+            else
+            {
+                std::memcpy(dst_row, src_row, (size_t)w * 3);
+            }
+        }
+    }
+    else
+    {
+        std::memcpy(s, frame->planes[0], rgb_sz);
+    }
+
+    /* ---- Target content geometry (letterbox keeps the source aspect) ---- */
+    const uint32_t outW = dsh.width, outH = dsh.height;
+    uint32_t contW = outW, contH = outH;
+    if (p->cfg.preprocess.letterbox == HAL_PREPROCESS_LETTERBOX_KEEP_ASPECT)
+    {
+        const float scale = std::min((float)outW / (float)frame->width, (float)outH / (float)frame->height);
+        contW = (uint32_t)((float)frame->width * scale) & ~1u;
+        contH = (uint32_t)((float)frame->height * scale) & ~1u;
+        if (contW < 2) contW = 2;
+        if (contH < 2) contH = 2;
+        if (contW > outW) contW = outW;
+        if (contH > outH) contH = outH;
+    }
+
+    /* ---- CPU resize (bilinear) + letterbox canvas ----
+     * InputTransformContext proved unreliable for arbitrary rescales on this
+     * stack (identity-size color conversion works, true resizes fail with
+     * HAILO_INVALID_OPERATION), so the general path resizes on the CPU.
+     * Correctness-first: production NV12-input models take the zero-copy fast
+     * path above and never land here. */
+    auto dst_buf = alloc_aligned_shared((size_t)outW * outH * 3, 4096);
+    if (!dst_buf)
+    {
+        return HAL_ERR_NO_MEM;
+    }
+    uint8_t *final_data = static_cast<uint8_t *>(dst_buf.get());
+    size_t final_sz = (size_t)outW * outH * 3;
+    std::shared_ptr<void> canvas;
+    {
+        const uint32_t sw = frame->width, sh = frame->height;
+        const float fx = (float)contW / (float)sw;
+        const float fy = (float)contH / (float)sh;
+        const uint8_t pv = p->cfg.preprocess.pad_value;
+        const uint32_t off_x = ((outW - contW) / 2) & ~1u;
+        const uint32_t off_y = ((outH - contH) / 2) & ~1u;
+        std::memset(final_data, pv, final_sz);
+        for (uint32_t y = 0; y < contH; ++y)
+        {
+            const float sy = (y + 0.5f) / fy - 0.5f;
+            int y0 = (int)sy; if (y0 < 0) y0 = 0; if (y0 > (int)sh - 1) y0 = (int)sh - 1;
+            int y1 = y0 + 1; if (y1 > (int)sh - 1) y1 = (int)sh - 1;
+            float wy = sy - y0; if (wy < 0) wy = 0; if (wy > 1) wy = 1;
+            uint8_t *drow = final_data + ((size_t)(off_y + y) * outW + off_x) * 3;
+            const uint8_t *r0 = s + (size_t)y0 * sw * 3;
+            const uint8_t *r1 = s + (size_t)y1 * sw * 3;
+            for (uint32_t x = 0; x < contW; ++x)
+            {
+                const float sx = (x + 0.5f) / fx - 0.5f;
+                int x0 = (int)sx; if (x0 < 0) x0 = 0; if (x0 > (int)sw - 1) x0 = (int)sw - 1;
+                int x1 = x0 + 1; if (x1 > (int)sw - 1) x1 = (int)sw - 1;
+                float wx = sx - x0; if (wx < 0) wx = 0; if (wx > 1) wx = 1;
+                for (uint32_t c = 0; c < 3; ++c)
+                {
+                    const float v = (1 - wy) * ((1 - wx) * r0[(size_t)x0 * 3 + c] + wx * r0[(size_t)x1 * 3 + c]) +
+                                    wy * ((1 - wx) * r1[(size_t)x0 * 3 + c] + wx * r1[(size_t)x1 * 3 + c]);
+                    drow[(size_t)x * 3 + c] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+                }
+            }
+        }
+    }
+
+    /* ---- Normalize (uint8 -> float32 with per-channel mean/std) ---- */
+    HalDataType odtype = HAL_DTYPE_UINT8;
+    if (normalize && dfm.type == HAILO_FORMAT_TYPE_FLOAT32)
+    {
+        const size_t n = final_sz;
+        auto fbuf = alloc_aligned_shared(n * sizeof(float), 4096);
+        if (!fbuf)
+        {
+            return HAL_ERR_NO_MEM;
+        }
+        float *fo = static_cast<float *>(fbuf.get());
+        for (size_t i = 0; i < n; ++i)
+        {
+            const uint32_t c = (uint32_t)(i % 3);
+            const float mean = p->cfg.preprocess.mean[c];
+            const float sd = p->cfg.preprocess.std[c] != 0.0f ? p->cfg.preprocess.std[c] : 1.0f;
+            fo[i] = (((float)final_data[i] / 255.0f) - mean) / sd;
+        }
+        canvas = fbuf;
+        final_data = static_cast<uint8_t *>(fbuf.get());
+        final_sz = n * sizeof(float);
+        odtype = HAL_DTYPE_FLOAT32;
+    }
+    else if (normalize)
+    {
+        HAL_LOG_WARNING("hailo15_inference: preprocess.normalize requested but model input is not FLOAT32 - ignored");
+    }
+
+    std::memset(tensor, 0, sizeof(*tensor));
+    tensor->data = final_data;
+    tensor->dma_fd = -1;
+    tensor->ndim = 1;
+    /* shape counts elements; byte_size counts bytes (uint8: identical). */
+    const size_t elem_size = (odtype == HAL_DTYPE_FLOAT32) ? sizeof(float) : 1;
+    tensor->shape[0] = (int32_t)(final_sz / elem_size);
+    tensor->dtype = odtype;
+    tensor->byte_size = (uint32_t)final_sz;
+    std::snprintf(tensor->name, sizeof(tensor->name), "%s", name.c_str());
+    tensor->priv = new (std::nothrow) TensorPriv{canvas ? canvas : dst_buf
+#if defined(HAL_HAVE_HAILO_POSTPROCESS_TOOLS)
+                                                   ,
+                                                   nullptr
+#endif
+    };
+    if (!tensor->priv)
+    {
+        return HAL_ERR_NO_MEM;
+    }
+    return HAL_OK;
+#endif
+}
+
+/* ========== DMA frame direct-bind (P0-2, adjudicated by tools/npu-bind-probe
+ * on rig 2026-09-15: dual-fd set_pix_buffer(DMABUF) and single-compact-fd
+ * set_dma_buffer both PASS with byte-identical outputs) ========== */
+
+static int hailo15_infer_bind_dma_frame(HalInferenceSession *session, const HalDmaFrameDesc *frame, HalTensor *out)
+{
+    if (!session || !frame || !out)
+        return HAL_ERR_INVALID_ARG;
+
+    /* Layout validation is platform-independent. */
+    if (frame->format != HAL_PIX_FMT_NV12)
+        return HAL_ERR_NOT_SUPPORTED;
+    const uint32_t w = frame->width, h = frame->height;
+    if (w == 0 || h == 0 || w > (0xFFFFFFFFu / h))
+        return HAL_ERR_INVALID_ARG;
+    const uint64_t y_len64 = (uint64_t)w * h;
+    const uint64_t nv12_len64 = y_len64 + (y_len64 / 2);
+    if (nv12_len64 > 0xFFFFFFFFu)
+        return HAL_ERR_INVALID_ARG;
+    const uint32_t y_len = (uint32_t)y_len64;
+    const uint32_t uv_len = (uint32_t)(y_len64 / 2);
+
+    const bool dual = frame->fd[1] >= 0;
+    const uint32_t planes = dual ? 2u : 1u;
+    for (uint32_t i = 0; i < planes; i++)
+    {
+        /* HailoRT 5.3.0 has no per-plane offset/stride: compact layout only.
+         * Same geometry with padding stride is NOT bindable (尺寸相同≠可直绑). */
+        if (frame->fd[i] < 0 || frame->offset[i] != 0 || frame->stride[i] != w)
+            return HAL_ERR_NOT_SUPPORTED;
+    }
+    if (dual)
+    {
+        if (frame->bytes_used[0] != y_len || frame->bytes_used[1] != uv_len)
+            return HAL_ERR_INVALID_SIZE;
+    }
+    else
+    {
+        if (frame->bytes_used[0] != y_len + uv_len)
+            return HAL_ERR_INVALID_SIZE;
+    }
+
+#if !defined(HAL_HAVE_HAILORT)
+    (void)session;
+    (void)frame;
+    (void)out;
+    return HAL_ERR_NOT_SUPPORTED;
+#else
+    auto *p = reinterpret_cast<Hailo15InferPriv *>(session);
+    if (p->input_names.empty())
+        return HAL_ERR_INVALID_ARG;
+    const auto &name = p->input_names[0];
+    auto input_exp = p->infer_model->input(name);
+    if (!input_exp.has_value())
+        return HAL_ERR_NOT_SUPPORTED;
+    const auto &input = input_exp.value();
+    const hailo_3d_image_shape_t input_shape = input.shape();
+    const hailo_format_t input_format = input.format();
+    if (input_format.order != HAILO_FORMAT_ORDER_NV12)
+    {
+        HAL_LOG_ERROR("hailo15_inference: bind_dma_frame input '%s' is not NV12 (order=%d)",
+                      name.c_str(), static_cast<int>(input_format.order));
+        return HAL_ERR_NOT_SUPPORTED;
+    }
+    /* Validate against the reconciled geometry — the same derivation
+     * get_model_info() reports — not the raw InferStream shape, which packs
+     * NV12 as H/2 x W x 3 and would reject every reconciled-match frame. */
+    uint32_t exp_w = input_shape.width;
+    uint32_t exp_h = input_shape.height;
+    {
+        uint32_t hw_w = 0, hw_h = 0;
+        if (reconciled_input_pixel_geometry(p, name, &hw_w, &hw_h))
+        {
+            exp_w = hw_w;
+            exp_h = hw_h;
+        }
+    }
+    if (exp_w != w || exp_h != h)
+    {
+        HAL_LOG_ERROR("hailo15_inference: bind_dma_frame geometry mismatch "
+                      "(desc=%ux%u input '%s'=%ux%u)",
+                      w, h, name.c_str(), exp_w, exp_h);
+        return HAL_ERR_INVALID_SIZE;
+    }
+    const size_t frame_size = input.get_frame_size();
+    if (frame_size != static_cast<size_t>(nv12_len64))
+    {
+        HAL_LOG_ERROR("hailo15_inference: bind_dma_frame size mismatch "
+                      "(desc=%llu input '%s'=%zu)",
+                      static_cast<unsigned long long>(nv12_len64),
+                      name.c_str(), frame_size);
+        return HAL_ERR_INVALID_SIZE;
+    }
+
+    auto *desc_copy = new (std::nothrow) HalDmaFrameDesc(*frame);
+    if (!desc_copy)
+        return HAL_ERR_NO_MEM;
+    auto *tp = new (std::nothrow) TensorPriv{};
+    if (!tp)
+    {
+        delete desc_copy;
+        return HAL_ERR_NO_MEM;
+    }
+    tp->dma_frame = desc_copy;
+
+    std::memset(out, 0, sizeof(*out));
+    out->dma_fd = frame->fd[0]; /* data stays NULL: no CPU pixels on this path */
+    out->ndim = 1;
+    out->shape[0] = (int32_t)nv12_len64;
+    out->dtype = HAL_DTYPE_UINT8;
+    out->byte_size = (uint32_t)nv12_len64;
+    std::snprintf(out->name, sizeof(out->name), "%s", name.c_str());
+    out->priv = tp;
+    return HAL_OK;
+#endif
+}
+
+static int hailo15_infer_probe_capability(uint32_t cap_id, int32_t *out)
+{
+    if (!out)
+        return HAL_ERR_INVALID_ARG;
+#if !defined(HAL_HAVE_HAILORT)
+    (void)cap_id;
+    return HAL_ERR_NOT_SUPPORTED;
+#else
+    /* Static verdicts from the 2026-09-15 device adjudication; the live
+     * authority is tools/npu-bind-probe. */
+    switch (cap_id)
+    {
+    case HAL_INFER_CAP_PIXBUF_DMABUF:
+        *out = 1; /* set_pix_buffer DMABUF dual-plane: PASS, byte-identical */
+        return HAL_OK;
+    case HAL_INFER_CAP_DMABUF_SINGLE:
+        *out = 1; /* set_dma_buffer single compact fd: PASS, byte-identical */
+        return HAL_OK;
+    case HAL_INFER_CAP_STREAM_ASYNC_FD:
+        *out = 0; /* vdev->configure(): HAILO_NOT_IMPLEMENTED on this stack */
+        return HAL_OK;
+    default:
+        return HAL_ERR_INVALID_ARG;
+    }
+#endif
+}
+
 static int hailo15_infer_run(HalInferenceSession *session,
                              const HalTensor *inputs, int num_inputs,
                              HalTensor *outputs, int num_outputs)
@@ -1264,24 +2087,26 @@ static int hailo15_infer_run(HalInferenceSession *session,
     }
 
     std::unique_ptr<hailort::AsyncInferJob> job;
-    {
-        // Bind + submit must be atomic per session: p->bindings is shared state.
-        std::lock_guard<std::mutex> lk(p->submit_mtx);
-
+    const int submit_rc = p->async_lifecycle.serialize_vendor_submission([&]() -> int {
         const int bind_rc = hailo15_bind_inputs_outputs(p, inputs, outputs);
         if (bind_rc != HAL_OK)
             return bind_rc;
 
-        auto job_exp = p->configured.run_async(p->bindings, [](const hailort::AsyncInferCompletionInfo &) {});
+        auto job_exp = p->configured.run_async(
+            p->bindings, [](const hailort::AsyncInferCompletionInfo &) {});
         if (!job_exp)
         {
-            HAL_LOG_ERROR("hailo15_inference: run_async failed (status=%d)", (int)job_exp.status());
+            HAL_LOG_ERROR("hailo15_inference: run_async failed (status=%d)",
+                          static_cast<int>(job_exp.status()));
             if (hailo15_vdevice_connection_lost(job_exp.status()))
                 hailo15_notify_vdevice_lost(job_exp.status(), "run_async");
             return HAL_ERR_RESULT;
         }
         job = std::make_unique<hailort::AsyncInferJob>(job_exp.release());
-    }
+        return HAL_OK;
+    });
+    if (submit_rc != HAL_OK)
+        return submit_rc;
     hailo_status st = job->wait(std::chrono::milliseconds(p->cfg.timeout_ms ? p->cfg.timeout_ms : 10000));
     if (HAILO_SUCCESS != st)
     {
@@ -1298,17 +2123,17 @@ static int hailo15_infer_run(HalInferenceSession *session,
 }
 
 /**
- * Submit one inference without blocking. The caller's output buffers must stay
- * valid until the callback fires (HailoRT snapshots the MemoryView pointers at
- * submission time, the NPU writes them asynchronously). The completion ctx is
- * shared between pending_async (so destroy() can drain it) and the HailoRT
- * callback, which keeps it alive until the NPU reports done. */
+ * Submit one inference without blocking. The lifecycle helper serializes shared
+ * binding updates, atomically arbitrates callback ownership versus rejection,
+ * and retains the output snapshot and userdata through callback return.
+ */
 static int hailo15_infer_run_async(HalInferenceSession *session,
                                    const HalTensor *inputs, int num_inputs,
                                    HalTensor *outputs, int num_outputs,
                                    HalInferenceAsyncCallback callback, void *userdata)
 {
-    if (!session || !inputs || num_inputs <= 0 || !outputs || num_outputs <= 0 || !callback)
+    if (!session || !inputs || num_inputs <= 0 || !outputs ||
+        num_outputs <= 0 || !callback)
         return HAL_ERR_INVALID_ARG;
 
 #if !defined(HAL_HAVE_HAILORT)
@@ -1321,106 +2146,170 @@ static int hailo15_infer_run_async(HalInferenceSession *session,
     auto *p = reinterpret_cast<Hailo15InferPriv *>(session);
     const size_t want_in = p->input_names.size();
     const size_t want_out = p->output_names.size();
-    if (static_cast<size_t>(num_inputs) < want_in || static_cast<size_t>(num_outputs) < want_out)
+    if (static_cast<size_t>(num_inputs) < want_in ||
+        static_cast<size_t>(num_outputs) < want_out)
         return HAL_ERR_INSUFFICIENT_BUFFER;
 
-    auto ready = p->configured.wait_for_async_ready(std::chrono::milliseconds(p->cfg.timeout_ms ? p->cfg.timeout_ms : 1000));
-    if (HAILO_SUCCESS != ready)
+    std::shared_ptr<Hailo15InferAsyncPayload> payload;
+    try
     {
-        if (hailo15_vdevice_connection_lost(ready))
-            hailo15_notify_vdevice_lost(ready, "wait_for_async_ready");
-        return HAL_ERR_TIMEOUT;
+        payload = std::make_shared<Hailo15InferAsyncPayload>();
+        payload->callback = callback;
+        payload->userdata = userdata;
+    }
+    catch (const std::bad_alloc &)
+    {
+        return HAL_ERR_NO_MEM;
+    }
+    catch (...)
+    {
+        return HAL_ERR_RESULT;
     }
 
-    // Bind + submit must be atomic per session: p->bindings is shared state
-    // rewritten by set_buffer() on every call. Without this lock, concurrent
-    // workers serving the same session race on the output buffer pointers
-    // HailoRT snapshots at submit time, aliasing buffers so one job's
-    // completion frees an output buffer another job's NPU write is still in
-    // flight (heap-use-after-free under K>=4 concurrency). The completion
-    // callback (below) and destroy()'s drain only ever take async_mtx, never
-    // submit_mtx, so nesting is deadlock-free.
-    std::shared_ptr<Hailo15InferAsyncCtx> ctx;
-    {
-        std::lock_guard<std::mutex> lk(p->submit_mtx);
+    using Attempt = Hailo15AsyncProviderLifecycle::Attempt;
+    using Result = Hailo15AsyncProviderLifecycle::SubmissionResult;
+    const int rc = p->async_lifecycle.submit(
+        [p, inputs, outputs, payload, want_out](Attempt attempt) -> Result {
+            const auto ready_timeout = std::chrono::milliseconds(
+                p->cfg.timeout_ms ? p->cfg.timeout_ms : 1000);
+            const hailo_status ready =
+                p->configured.wait_for_async_ready(ready_timeout);
+            if (HAILO_SUCCESS != ready)
+            {
+                if (hailo15_vdevice_connection_lost(ready))
+                    hailo15_notify_vdevice_lost(
+                        ready, "wait_for_async_ready");
+                return Result::rejected(HAL_ERR_TIMEOUT);
+            }
 
-        const int bind_rc = hailo15_bind_inputs_outputs(p, inputs, outputs);
-        if (bind_rc != HAL_OK)
-            return bind_rc;
+            const int bind_rc =
+                hailo15_bind_inputs_outputs(p, inputs, outputs);
+            if (bind_rc != HAL_OK)
+                return Result::rejected(bind_rc);
 
-        // Snapshot the output tensors for the callback. ctx is held by both
-        // pending_async (so destroy() can flush it) and the HailoRT completion
-        // callback, keeping it — and the AsyncInferJob it owns — alive until
-        // the NPU reports done.
-        ctx = std::make_shared<Hailo15InferAsyncCtx>();
-        ctx->outputs.assign(outputs, outputs + want_out);
-        ctx->callback = callback;
-        ctx->userdata = userdata;
+            try
+            {
+                payload->outputs.assign(outputs, outputs + want_out);
+            }
+            catch (const std::bad_alloc &)
+            {
+                return Result::rejected(HAL_ERR_NO_MEM);
+            }
+            catch (...)
+            {
+                return Result::rejected(HAL_ERR_RESULT);
+            }
 
-        // Register ctx BEFORE submitting so a callback that fires before
-        // run_async returns still finds (and erases) it. Without this, a
-        // fast-completing job would strand ctx in pending_async and block
-        // destroy()'s drain.
-        {
-            std::lock_guard<std::mutex> lock(p->async_mtx);
-            p->pending_async.push_back(ctx);
-        }
+            auto job_exp = p->configured.run_async(
+                p->bindings,
+                [attempt](const hailort::AsyncInferCompletionInfo &info) noexcept {
+                    const int status = info.status == HAILO_SUCCESS
+                        ? HAL_OK
+                        : HAL_ERR_RESULT;
+                    attempt.complete(status);
+                });
+            if (!job_exp)
+            {
+                const hailo_status status = job_exp.status();
+                HAL_LOG_ERROR(
+                    "hailo15_inference: run_async failed (status=%d)",
+                    static_cast<int>(status));
+                if (hailo15_vdevice_connection_lost(status))
+                    hailo15_notify_vdevice_lost(status, "run_async");
+                return Result::rejected(HAL_ERR_RESULT);
+            }
 
-        auto job_exp = p->configured.run_async(
-            p->bindings,
-            [p, ctx, want_out](const hailort::AsyncInferCompletionInfo &info) {
-                const int status = (info.status == HAILO_SUCCESS) ? HAL_OK : HAL_ERR_RESULT;
-                if (status == HAL_OK)
+            // A successful Expected transfers the eventual callback obligation.
+            // Mark it before release/detach so any later exception still reports
+            // acceptance instead of allowing caller-side fallback.
+            attempt.mark_vendor_accepted();
+            auto job = job_exp.release();
+            job.detach();
+            return Result::accepted();
+        },
+        [p, payload, want_out](int status) noexcept {
+            if (status == HAL_OK)
+            {
+                try
                 {
                     hailo15_record_inference(p);
-                    hailo15_attach_postprocess_roi(p, ctx->outputs.data(), want_out);
+                    hailo15_attach_postprocess_roi(
+                        p, payload->outputs.data(), want_out);
                 }
+                catch (const std::exception &e)
                 {
-                    std::lock_guard<std::mutex> lock(p->async_mtx);
-                    auto &vec = p->pending_async;
-                    vec.erase(std::remove(vec.begin(), vec.end(), ctx), vec.end());
+                    status = HAL_ERR_RESULT;
+                    HAL_LOG_ERROR(
+                        "hailo15_inference: async completion processing threw: %s",
+                        e.what());
                 }
-                if (ctx->callback)
-                    ctx->callback(ctx->outputs.data(), static_cast<int>(want_out), status, ctx->userdata);
-            });
-        if (!job_exp)
-        {
-            HAL_LOG_ERROR("hailo15_inference: run_async failed (status=%d)", (int)job_exp.status());
-            if (hailo15_vdevice_connection_lost(job_exp.status()))
-                hailo15_notify_vdevice_lost(job_exp.status(), "run_async");
-            // Roll back the pre-registration above: no job was created, so no
-            // completion callback will ever fire to remove ctx.
-            std::lock_guard<std::mutex> lock(p->async_mtx);
-            p->pending_async.erase(std::remove(p->pending_async.begin(), p->pending_async.end(), ctx),
-                                   p->pending_async.end());
-            return HAL_ERR_RESULT;
-        }
-        ctx->job = std::make_unique<hailort::AsyncInferJob>(job_exp.release());
-    }
-    return HAL_OK;
+                catch (...)
+                {
+                    status = HAL_ERR_RESULT;
+                    HAL_LOG_ERROR(
+                        "hailo15_inference: async completion processing threw");
+                }
+            }
+
+            try
+            {
+                payload->callback(payload->outputs.data(),
+                                  static_cast<int>(want_out), status,
+                                  payload->userdata);
+            }
+            catch (const std::exception &e)
+            {
+                HAL_LOG_ERROR("hailo15_inference: async callback threw: %s",
+                              e.what());
+            }
+            catch (...)
+            {
+                HAL_LOG_ERROR("hailo15_inference: async callback threw");
+            }
+        });
+
+    if (rc != HAL_OK)
+        HAL_LOG_ERROR("hailo15_inference: async submission rejected (rc=%d)",
+                      rc);
+    return rc;
 #endif
 }
 
 /**
  * Acquire a handle to the shared NPU runtime. The HEAD design shares one
  * ROUND_ROBIN VDevice across every model session, so every acquired runtime
- * is backed by the same scheduler — the @p config is accepted for API
- * compatibility but the singleton's scheduling wins. */
+ * is backed by the same scheduler. A non-empty @p config->vdevice_group_id
+ * seeds the singleton's group at first creation (mirroring the GenAI
+ * implementation); the singleton is process-lifetime, so a later acquire
+ * asking for a different group keeps the existing one (WARN in
+ * get_shared_vdevice). algorithm / multi_process_service stay at the
+ * platform defaults (ROUND_ROBIN + hailort_server) — group is the one knob
+ * this honors, and it must match the medialib hailort.device-id unless the
+ * caller deliberately wants an exclusive run.
+ */
 static HalInferenceRuntime *hailo15_infer_runtime_acquire(const HalInferenceRuntimeConfig *config)
 {
 #if !defined(HAL_HAVE_HAILORT)
     (void)config;
     return nullptr;
 #else
-    (void)config;
-    auto vdev = get_shared_vdevice();
+    const char *group_override = nullptr;
+    if (config && config->vdevice_group_id[0] != '\0')
+        group_override = config->vdevice_group_id;
+    auto vdev = get_shared_vdevice(group_override);
     if (!vdev)
         return nullptr;
     auto *wrapper = new (std::nothrow) Hailo15RuntimeHandle();
     if (!wrapper)
         return nullptr;
     wrapper->vdevice = vdev;
-    HAL_LOG_INFO("hailo15_inference: runtime_acquire group=aipc algorithm=ROUND_ROBIN");
+    std::string group_str;
+    {
+        std::lock_guard<std::mutex> lock(g_shared_vdevice_mu);
+        group_str = g_shared_vdevice_group;
+    }
+    HAL_LOG_INFO("hailo15_inference: runtime_acquire group='%s' algorithm=ROUND_ROBIN multi_process_service=1",
+                 group_str.c_str());
     return reinterpret_cast<HalInferenceRuntime *>(wrapper);
 #endif
 }
@@ -1447,6 +2336,7 @@ static void hailo15_infer_free_tensor(HalTensor *tensor)
     if (tensor->priv)
     {
         auto *tp = static_cast<TensorPriv *>(tensor->priv);
+        delete tp->dma_frame; /* owned desc copy from bind_dma_frame() */
         delete tp;
     }
     std::memset(tensor, 0, sizeof(*tensor));
@@ -1490,10 +2380,8 @@ static int hailo15_infer_query_session_performance_stats(HalInferenceSession *se
     // GetStats report how many jobs are outstanding even when callers no
     // longer query stats per-inference.
     out->total_inferences = p->total_inferences.load(std::memory_order_relaxed);
-    {
-        std::lock_guard<std::mutex> lock(p->async_mtx);
-        out->pending_async_jobs = static_cast<uint32_t>(p->pending_async.size());
-    }
+    out->pending_async_jobs = static_cast<uint32_t>(
+        p->async_lifecycle.pending_count());
     auto q_exp = p->configured.get_async_queue_size();
     if (q_exp)
         out->async_queue_size = static_cast<uint32_t>(*q_exp);
@@ -1518,9 +2406,6 @@ static int hailo15_infer_query_system_performance_stats(const char *device_id, u
     (void)sampling_period_ms;
     return HAL_ERR_NOT_SUPPORTED;
 #else
-    const uint32_t period_ms = sampling_period_ms ? sampling_period_ms : 100U;
-    const std::chrono::milliseconds period(period_ms);
-
     // Helper to fill output from a hailo_performance_stats_t
     auto fill_output = [](const hailo_performance_stats_t &s, HalInferencePerfStats *o) {
         o->cpu_utilization = s.cpu_utilization;
@@ -1532,6 +2417,8 @@ static int hailo15_infer_query_system_performance_stats(const char *device_id, u
             : -1.0f;
     };
 
+    const uint32_t period_ms = sampling_period_ms ? sampling_period_ms : 100U;
+    const std::chrono::milliseconds period(period_ms);
     // HailoRT 5.3.0 IntegratedDevice returns real NNC counters even when
     // hailort_server is running in multi_process_service mode.
     auto dev_exp = (device_id && device_id[0])
@@ -1543,6 +2430,15 @@ static int hailo15_infer_query_system_performance_stats(const char *device_id, u
         auto stats_exp = dev->query_performance_stats(period);
         if (stats_exp) {
             fill_output(stats_exp.value(), out);
+            /* On-die temperature: optional diagnostic — a read failure must not
+             * fail the whole query (fields keep their "unknown" value). */
+            out->soc_temp_c = -1.0f;
+            out->soc_temp_c1 = -1.0f;
+            auto temp_exp = dev->get_chip_temperature();
+            if (temp_exp) {
+                out->soc_temp_c = temp_exp.value().ts0_temperature;
+                out->soc_temp_c1 = temp_exp.value().ts1_temperature;
+            }
             return HAL_OK;
         }
     }
@@ -1567,6 +2463,16 @@ HalInferenceOps HAL_INFERENCE_OPS = {
     .free_tensor = hailo15_infer_free_tensor,
     .query_system_performance_stats = hailo15_infer_query_system_performance_stats,
     .get_version = hailo15_infer_get_version,
+    /* M3 additions (appended at the table tail, after get_version) */
+    .tensor_from_frame_ex = hailo15_infer_tensor_from_frame_ex,
+    /* P0-2 additions (DMA direct-bind contract; NULL on platforms without it) */
+    .bind_dma_frame = hailo15_infer_bind_dma_frame,
+    .probe_capability = hailo15_infer_probe_capability,
 };
+
+/* ABI guard companion (see hal_inference.h): sizeof the table this build
+ * exports, so consumers refuse tail members an older table lacks instead of
+ * reading past its end (mixed-deploy SIGILL, two core dumps 2026-09-16). */
+const uint32_t HAL_INFERENCE_OPS_ABI_SIZE = (uint32_t)sizeof(HalInferenceOps);
 
 } // extern "C"

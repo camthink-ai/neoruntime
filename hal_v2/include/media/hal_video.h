@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include "../common/hal_common.h"
@@ -278,6 +279,38 @@ typedef struct {
      *         HAL_ERR_INVALID_ARG for bad pointers or invalid FROM_MEDIA context.
      */
     int (*get_sensor_module_info)(void *video_ctx, uint32_t sensor_index, HalVideoSensorModuleInfo *info);
+
+    /* ---------- multi-stage snapshot capture (M2 additions) ---------- */
+
+    /**
+     * @brief Capture one frame at an arbitrary pipeline stage (diagnostics).
+     *
+     * Stage names are pipeline-defined; typical Hailo stages include
+     * "pre_isp_raw" (16-bit raw, pre-ISP), "denoise", "post_isp", "dewarp",
+     * "multiresize_<stream_id>" and "encoder_<WxH>". Use
+     * @ref list_snapshot_stages to discover the exact set on the running
+     * pipeline.
+     *
+     * The capture is asynchronous: files are written by the pipeline threads
+     * into a timestamped directory under /tmp/medialib_snapshots/ shortly
+     * after the next frame passes the requested stage(s). This call only
+     * arms the request and returns immediately.
+     *
+     * @param video_ctx Video context (any type; the snapshot manager is global).
+     * @param stage     Stage name, or NULL / "" for all registered stages.
+     * @return 0 on success (request armed), negative HalErrorCode on failure.
+     */
+    int (*request_snapshot)(void *video_ctx, const char *stage);
+
+    /**
+     * @brief List the pipeline stages available for @ref request_snapshot.
+     *
+     * @param video_ctx Video context.
+     * @param buf       Receives a NUL-terminated, newline-separated stage list.
+     * @param buf_len   Size of buf; the list is truncated to fit.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*list_snapshot_stages)(void *video_ctx, char *buf, size_t buf_len);
 } HalVideoOps;
 
 /** Platform-specific video operations (resolved at link time). */

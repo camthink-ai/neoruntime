@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
 
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -21,6 +22,7 @@ import {
   Power,
   PowerOff,
   Loader2,
+  Pencil,
 } from 'lucide-react';
 
 import { Empty } from '@/components/ui/empty';
@@ -44,14 +46,21 @@ interface ModelData {
   used_by_apps?: string[];
   input_width?: number;
   input_height?: number;
+  /** provenance: "disk" = system preset, anything else = manually imported */
+  source?: string;
 }
 
 interface ModelListProps {
   models: ModelData[];
+  /** total before filtering — distinguishes "no models" from "no match" */
+  totalCount?: number;
+  onClearFilters?: () => void;
   onDelete: (modelId: string, modelName: string) => void;
   onLoad: (modelId: string) => void;
   onUnload: (modelId: string, modelName: string) => void;
-  loadingAction?: string | null;
+  onUpdate?: (model: ModelData) => void;
+  /** per-model busy predicate — index holds a Set so concurrent actions show. */
+  isActionLoading?: (modelId: string) => boolean;
 }
 
 const PAGE_SIZE = 10;
@@ -66,12 +75,22 @@ const formatLoadTime = (timestamp: number | undefined, t: any): string => {
   return `${Math.floor(diff / 86400)} ${t('sys.ai_models.time.days_ago', '天前')}`;
 };
 
+const formatFileSize = (bytes: number | undefined): string => {
+  if (!bytes) return '-';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};
+
 export default function ModelList({
   models,
+  totalCount,
+  onClearFilters,
   onDelete,
   onLoad,
   onUnload,
-  loadingAction,
+  onUpdate,
+  isActionLoading,
 }: ModelListProps) {
   const { t } = useTranslation();
   const [currentPage, setCurrentPage] = useState(1);
@@ -86,6 +105,7 @@ export default function ModelList({
     id: string;
     name: string;
   } | null>(null);
+  const [updateConfirm, setUpdateConfirm] = useState<ModelData | null>(null);
 
   const totalPages = Math.max(1, Math.ceil(models.length / PAGE_SIZE));
   const safePage = Math.min(currentPage, totalPages);
@@ -112,7 +132,7 @@ export default function ModelList({
   return (
     <>
       <div className="bg-card rounded-xl border border-border shadow-sm overflow-hidden">
-        <table className="w-full min-w-[900px] text-sm text-left">
+        <table className="w-full min-w-[1100px] text-sm text-left">
           <thead className="border-b border-border bg-background text-muted-foreground font-medium shadow-sm">
             <tr>
               <th className="px-6 py-4 font-medium">
@@ -123,6 +143,12 @@ export default function ModelList({
               </th>
               <th className="px-6 py-4 font-medium">
                 {t('sys.ai_models.table.status', '状态')}
+              </th>
+              <th className="px-6 py-4 font-medium">
+                {t('sys.ai_models.detail.input_size', '输入尺寸')}
+              </th>
+              <th className="px-6 py-4 font-medium">
+                {t('sys.ai_models.detail.file_size', '文件大小')}
               </th>
               <th className="px-6 py-4 font-medium">
                 {t('sys.ai_models.table.model_path', '路径')}
@@ -139,21 +165,42 @@ export default function ModelList({
             {pagedModels.length === 0 ? (
               <tr>
                 <td
-                  colSpan={6}
+                  colSpan={8}
                   className="px-6 py-12 text-center text-muted-foreground"
                 >
-                  <Empty
-                    description={t(
-                      'sys.ai_models.empty.installed',
-                      '暂无已安装的AI模型'
-                    )}
-                  />
+                  {models.length === 0 && (totalCount ?? 0) > 0 ? (
+                    <div className="flex flex-col items-center gap-3">
+                      <Empty
+                        description={t(
+                          'sys.ai_models.empty.no_match',
+                          '没有符合条件的模型'
+                        )}
+                      />
+                      {onClearFilters && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={onClearFilters}
+                        >
+                          {t('sys.ai_models.empty.clear_filters', '清除筛选')}
+                        </Button>
+                      )}
+                    </div>
+                  ) : (
+                    <Empty
+                      description={t(
+                        'sys.ai_models.empty.installed',
+                        '暂无已安装的AI模型'
+                      )}
+                    />
+                  )}
                 </td>
               </tr>
             ) : (
               pagedModels.map(model => {
                 const isLoaded = model.status === 'loaded';
-                const isLoading = loadingAction === model.model_id;
+                const isLoading = isActionLoading?.(model.model_id) ?? false;
                 const modelType = getModelTypeLabel(
                   model.model_type,
                   model.model_id,
@@ -195,6 +242,19 @@ export default function ModelList({
                             {model.variant}
                           </Badge>
                         )}
+                        <Badge
+                          variant="outline"
+                          className="text-xs max-w-[150px] truncate text-muted-foreground"
+                          title={
+                            model.source === 'disk'
+                              ? 'system preset'
+                              : 'manually imported'
+                          }
+                        >
+                          {model.source === 'disk'
+                            ? t('sys.ai_models.provenance.system')
+                            : t('sys.ai_models.provenance.manual')}
+                        </Badge>
                       </div>
                     </td>
                     <td className="px-6 py-4">
@@ -206,6 +266,14 @@ export default function ModelList({
                           ? t('sys.ai_models.status.loaded', '已加载')
                           : t('sys.ai_models.status.uploaded', '未加载')}
                       </Badge>
+                    </td>
+                    <td className="px-6 py-4 text-muted-foreground whitespace-nowrap">
+                      {model.input_width && model.input_height
+                        ? `${model.input_width}×${model.input_height}`
+                        : '-'}
+                    </td>
+                    <td className="px-6 py-4 text-muted-foreground whitespace-nowrap">
+                      {formatFileSize(model.file_size)}
                     </td>
                     <td className="px-6 py-4 min-w-0 max-w-[200px]">
                       {model.model_path ? (
@@ -277,6 +345,23 @@ export default function ModelList({
                         >
                           <Eye className="w-4 h-4" />
                         </Button>
+                        {onUpdate && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8 hover:text-primary"
+                            onClick={() => {
+                              if (appsCount > 0) {
+                                setUpdateConfirm(model);
+                              } else {
+                                onUpdate(model);
+                              }
+                            }}
+                            title={t('sys.ai_models.action.update', '更新')}
+                          >
+                            <Pencil className="w-4 h-4" />
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="icon"
@@ -304,7 +389,9 @@ export default function ModelList({
               {
                 start: models.length === 0 ? 0 : startIndex + 1,
                 end: Math.min(startIndex + PAGE_SIZE, models.length),
-                total: models.length,
+                // Unfiltered count — the filtered slice must not shrink the
+                // reported total when the user is searching.
+                total: totalCount ?? models.length,
               }
             )}
           </span>
@@ -352,7 +439,7 @@ export default function ModelList({
                   <span>
                     {t(
                       'sys.ai_models.message.delete_blocked',
-                      '该模型正在被以下应用引用，请先删除引用关系后再删除模型：'
+                      '该模型正在被以下应用引用（含未运行应用），请先删除引用关系后再删除模型：'
                     )}
                   </span>
                   <ul className="mt-2 space-y-1">
@@ -361,7 +448,15 @@ export default function ModelList({
                         key={app}
                         className="font-medium text-foreground text-sm"
                       >
-                        • {app}
+                        {/* Links jump to the apps page so the referencing
+                            app can be located and removed without hunting
+                            for its name by hand. */}
+                        <Link
+                          to="/apps"
+                          className="underline decoration-border underline-offset-2 transition-colors hover:text-primary hover:decoration-primary"
+                        >
+                          {app}
+                        </Link>
                       </li>
                     ))}
                   </ul>
@@ -426,11 +521,52 @@ export default function ModelList({
         </AlertDialogContent>
       </AlertDialog>
 
+      {/* Update Confirmation (model in use by apps) */}
+      <AlertDialog
+        open={!!updateConfirm}
+        onOpenChange={open => !open && setUpdateConfirm(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t('sys.ai_models.confirm.update_title', '确认更新')}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                'sys.ai_models.confirm.update_in_use',
+                '模型 "{{name}}" 正被 {{count}} 个应用使用，更新后相关应用可能受影响。确定继续？',
+                {
+                  name: updateConfirm?.name || updateConfirm?.model_id,
+                  count: updateConfirm?.used_by_apps?.length ?? 0,
+                }
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common.cancel', '取消')}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (updateConfirm) {
+                  onUpdate?.(updateConfirm);
+                  setUpdateConfirm(null);
+                }
+              }}
+            >
+              {t('sys.ai_models.action.update', '更新')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {/* Detail Dialog */}
       <ModelDetailDialog
         model={detailModel}
         open={!!detailModel}
         onOpenChange={open => !open && setDetailModel(null)}
+        onLoad={onLoad}
+        onUnload={onUnload}
+        onUpdateFile={onUpdate}
+        isActionLoading={isActionLoading}
       />
     </>
   );

@@ -93,8 +93,22 @@ public:
         zoom_motion_observer_ = std::move(obs);
     }
 
+    void set_motion_listener(std::function<void()> listener) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        motion_listener_ = std::move(listener);
+    }
+
     bool autofocus_operation_active() const override {
         return af_operation_active_.load();
+    }
+
+    void mark_fixed_lens() override {
+        fixed_lens_.store(true);
+        HAL_LOG_WARNING("LensHAL: fixed-lens identity applied — motor motion rejected");
+    }
+
+    bool fixed_lens() const override {
+        return fixed_lens_.load();
     }
 
     bool initialized() const override {
@@ -136,6 +150,7 @@ public:
     }
 
     int zoom_abs_wait(int pps, int32_t position, uint32_t timeout_ms) override {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         int ret = HAL_ERR_NOT_INITIALIZED;
         bool event_waited = false;
         {
@@ -153,6 +168,7 @@ public:
             } else if (initialized_ && sym_.zoom_abs) {
                 ret = sym_.zoom_abs(1, pps, position);
             }
+            if (ret == HAL_OK) notify_motion_locked();
         }
         if (ret != HAL_OK) return ret;
         if (event_waited && !fg2009_) return HAL_OK;
@@ -160,6 +176,7 @@ public:
     }
 
     int focus_abs_wait(int pps, int32_t position, uint32_t timeout_ms) override {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         int ret = HAL_ERR_NOT_INITIALIZED;
         bool event_waited = false;
         {
@@ -175,6 +192,7 @@ public:
             } else if (initialized_ && sym_.focus_abs) {
                 ret = sym_.focus_abs(1, pps, position);
             }
+            if (ret == HAL_OK) notify_motion_locked();
         }
         if (ret != HAL_OK) return ret;
         if (event_waited && !fg2009_) return HAL_OK;
@@ -203,9 +221,11 @@ public:
          * Do not hold mu_ while waiting. Cancellation must be able to acquire
          * it and send stop commands while a long dual-axis segment is active.
          */
-        return sync_abs(static_cast<uint16_t>(zoom_pps), zoom_position,
-                        static_cast<uint16_t>(focus_pps), focus_position,
-                        timeout_ms);
+        const int ret = sync_abs(static_cast<uint16_t>(zoom_pps), zoom_position,
+                                 static_cast<uint16_t>(focus_pps), focus_position,
+                                 timeout_ms);
+        if (ret == HAL_OK) notify_motion();
+        return ret;
     }
 
     int stop_all(uint32_t timeout_ms) override {
@@ -213,6 +233,7 @@ public:
             std::lock_guard<std::mutex> lock(mu_);
             if (sym_.zoom_stop) sym_.zoom_stop(1);
             if (sym_.focus_stop) sym_.focus_stop(1);
+            notify_motion_locked();
         }
         const bool zoom_ok = wait_motor_stopped(true, timeout_ms);
         const bool focus_ok = wait_motor_stopped(false, timeout_ms);
@@ -259,13 +280,21 @@ public:
             return grpc::Status::OK;
         }
 
+        init_locked(resp);
+        return grpc::Status::OK;
+    }
+
+    // Full init sequence shared by the Init RPC and the boot self-init
+    // hook: io_init → lens_init (one retry) → lens_config → per-model
+    // anchoring. Caller holds mu_.
+    int init_locked(aipc::lens::HalStatus* resp) {
         // io_init
         int ret = sym_.io_init(cfg_.serial_device.c_str(),
                                cfg_.baud_rate, cfg_.timeout_ms);
         if (ret != 0) {
             HAL_LOG_ERROR("LensHAL: io_init failed: %d", ret);
             fill_status(resp, ret, "io_init failed");
-            return grpc::Status::OK;
+            return ret;
         }
 
         // lens_init with retry (mirrors Go code)
@@ -278,7 +307,7 @@ public:
             if (ret != 0) {
                 HAL_LOG_ERROR("LensHAL: lens_init retry failed: %d", ret);
                 fill_status(resp, ret, "lens_init failed after retry");
-                return grpc::Status::OK;
+                return ret;
             }
         }
 
@@ -287,7 +316,7 @@ public:
         if (ret != 0) {
             HAL_LOG_ERROR("LensHAL: lens_config failed: %d", ret);
             fill_status(resp, ret, "lens_config failed");
-            return grpc::Status::OK;
+            return ret;
         }
 
         if (fg2009_) {
@@ -296,10 +325,10 @@ public:
             const int fret = finish_init_fg2009_locked();
             if (fret != HAL_OK) {
                 fill_status(resp, fret, "fg2009 init failed");
-                return grpc::Status::OK;
+                return fret;
             }
             fill_status(resp, 0, "ok");
-            return grpc::Status::OK;
+            return 0;
         }
 
         // Set limits
@@ -314,7 +343,24 @@ public:
         HAL_LOG_INFO("LensHAL: initialized (dev=%s baud=%u)",
                      cfg_.serial_device.c_str(), cfg_.baud_rate);
         fill_status(resp, 0, "ok");
-        return grpc::Status::OK;
+        return 0;
+    }
+
+    // Boot-time self-init for headless units. device-control only runs the
+    // init sequence when lens API traffic arrives (ensureLensBootstrapped),
+    // so a boot nobody polls would leave the lens uninitialized forever —
+    // the identity probe times out and a fixed lens ships motorized UI.
+    // Atomic with the RPC paths under mu_: whichever trigger wins the race,
+    // the other side's check makes it a no-op.
+    int EnsureBootstrapped() {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (initialized_) return HAL_OK;
+        if (!bridge_loaded_) return -1;
+        if (af_operation_active_.load()) return HAL_ERR_INVALID_STATE;
+        HAL_LOG_INFO("LensHAL: boot self-init (no RPC init observed)");
+        aipc::lens::HalStatus resp;
+        init_locked(&resp);
+        return resp.hal_code();
     }
 
     grpc::Status ReInit(grpc::ServerContext* /*ctx*/,
@@ -421,6 +467,9 @@ public:
         resp->set_focus_rz_done(raw.focus_rz_done != 0);
         resp->set_zoom_pos(raw.zoom_pos);
         resp->set_focus_pos(raw.focus_pos);
+        // Fixed-lens identity (set by the image probe ~40s after boot) rides
+        // along every state poll so consumers can hide motor controls.
+        resp->set_fixed_lens(fixed_lens_.load());
 
         if (fg2009_) {
             // MCU position counters carry no optical meaning on FG2009;
@@ -509,6 +558,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_run failed");
         return grpc::Status::OK;
@@ -532,6 +582,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_abs failed");
         return grpc::Status::OK;
@@ -543,6 +594,7 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "zoom_stop")) return grpc::Status::OK;
         int ret = sym_.zoom_stop(1);
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_stop failed");
         return grpc::Status::OK;
     }
@@ -558,6 +610,7 @@ public:
             return grpc::Status::OK;
         }
         int ret = sym_.zoom_rz(1);
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_rz failed");
         return grpc::Status::OK;
     }
@@ -616,6 +669,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_run failed");
         return grpc::Status::OK;
@@ -637,6 +691,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_abs failed");
         return grpc::Status::OK;
@@ -648,6 +703,7 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "focus_stop")) return grpc::Status::OK;
         int ret = sym_.focus_stop(1);
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_stop failed");
         return grpc::Status::OK;
     }
@@ -663,6 +719,7 @@ public:
             return grpc::Status::OK;
         }
         int ret = sym_.focus_rz(1);
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_rz failed");
         return grpc::Status::OK;
     }
@@ -781,6 +838,7 @@ public:
         if (reject_if_fg2009(resp, "af0832_force_reset_zero")) return grpc::Status::OK;
         ensure_af0832_created();
         int ret = sym_.af0832_force_reset_zero ? sym_.af0832_force_reset_zero() : -1;
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "af0832_force_reset_zero failed");
         return grpc::Status::OK;
     }
@@ -795,6 +853,7 @@ public:
         int ret = sym_.af0832_goto
                   ? sym_.af0832_goto(req->zoom_ratio(), req->focus_distance_m())
                   : -1;
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "af0832_goto failed");
         return grpc::Status::OK;
     }
@@ -915,6 +974,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_goto_ratio failed");
         return grpc::Status::OK;
@@ -933,6 +993,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_goto_level failed");
         return grpc::Status::OK;
@@ -950,6 +1011,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_move_rel failed");
         return grpc::Status::OK;
@@ -967,6 +1029,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_move_rel failed");
         return grpc::Status::OK;
@@ -992,6 +1055,7 @@ public:
         bool focus_ok = wait_motor_stopped(false, req->timeout_ms());
 
         bool ok = zoom_ok && focus_ok;
+        if (ok) notify_motion();
         fill_status(resp, ok ? 0 : -1, ok ? "ok" : "stop_and_wait timeout");
         return grpc::Status::OK;
     }
@@ -1000,6 +1064,7 @@ private:
     Config          cfg_;
     mutable std::mutex mu_;
     std::atomic<bool> af_operation_active_{false};
+    std::atomic<bool> fixed_lens_{false};
     void*           dl_handle_     = nullptr;
     BridgeSymbols   sym_{};
     bool            bridge_loaded_ = false;
@@ -1022,6 +1087,7 @@ private:
     // Fired after every issued FG2009 zoom move (new optical ratio, computed
     // from the model while mu_ is held — receivers must not call back).
     std::function<void(float)> zoom_motion_observer_;
+    std::function<void()> motion_listener_;
 
     /* ── dlopen / dlsym ─────────────────────────────────────────────── */
 
@@ -1302,6 +1368,7 @@ private:
      * fold the completed move into the model. Fire-and-forget like the
      * AF0832-era ZoomAbs RPC; completion via WaitZoomStopped. */
     int fg2009_zoom_abs_locked(uint32_t pps, int32_t target_curve) {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         if (!initialized_ || !fg2009_state_.anchored || !sym_.zoom_rel)
             return HAL_ERR_NOT_INITIALIZED;
         const int32_t delta =
@@ -1316,6 +1383,7 @@ private:
     }
 
     int fg2009_focus_abs_locked(uint32_t pps, int32_t target_curve) {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         if (!initialized_ || !fg2009_state_.anchored || !sym_.focus_rel)
             return HAL_ERR_NOT_INITIALIZED;
         const int32_t delta =
@@ -1333,6 +1401,7 @@ private:
      * by ZoomGotoRatio so focus rides the INF tracking curve atomically. */
     int fg2009_dual_abs_locked(uint32_t zoom_pps, int32_t target_zoom,
                                uint32_t focus_pps, int32_t target_focus) {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         if (!initialized_ || !fg2009_state_.anchored || !sym_.dual_rel)
             return HAL_ERR_NOT_INITIALIZED;
         const int32_t zdelta =
@@ -1361,8 +1430,28 @@ private:
         zoom_motion_observer_(ratio);
     }
 
+    /* Arms the daemon's lens-position recorder after a successfully issued
+     * motion. Idempotent and cheap (the listener only sets an atomic and
+     * kicks a condvar), so firing it from every motion path costs nothing
+     * while the lens is idle. Variant for call sites already holding mu_. */
+    void notify_motion_locked() {
+        if (motion_listener_) motion_listener_();
+    }
+
+    /* Lock-free-context variant: snapshots the listener under mu_, then runs
+     * it outside the lock. */
+    void notify_motion() {
+        std::function<void()> listener;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            listener = motion_listener_;
+        }
+        if (listener) listener();
+    }
+
     /* Physical relative jog, clamped so the model stays inside travel. */
     int fg2009_zoom_rel_locked(uint32_t pps, int32_t steps) {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         if (!initialized_ || !fg2009_state_.anchored || !sym_.zoom_rel)
             return HAL_ERR_NOT_INITIALIZED;
         const int32_t target = hal_lens_fg2009_clamp_zoom_curve(
@@ -1378,6 +1467,7 @@ private:
     }
 
     int fg2009_focus_rel_locked(uint32_t pps, int32_t steps) {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         if (!initialized_ || !fg2009_state_.anchored || !sym_.focus_rel)
             return HAL_ERR_NOT_INITIALIZED;
         const int32_t target = hal_lens_fg2009_clamp_focus_curve(
@@ -1554,6 +1644,9 @@ LensHalServiceBundle CreateLensHalService(const LensHalConfig& cfg) {
     LensHalServiceBundle bundle;
     auto service = std::make_unique<LensHalServiceImpl>(cfg);
     bundle.controller = service.get();
+    bundle.ensure_bootstrapped = [impl = service.get()] {
+        return impl->EnsureBootstrapped();
+    };
     bundle.service = std::move(service);
     return bundle;
 }

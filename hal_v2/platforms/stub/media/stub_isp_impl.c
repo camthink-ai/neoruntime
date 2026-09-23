@@ -159,7 +159,73 @@ static int stub_isp_get_af_measurement(void *video_ctx, HalIspAfMeasurement *mea
 
 static const char *stub_isp_get_version(void)
 {
-    return "HAL-ISP stub 2.1.0 (stateful)";
+    return "HAL-ISP stub 2.2.0 (stateful)";
+}
+
+/* ---- M2: WB / 3DNR / AE stats / HDR ratios (static simulation) ---- */
+
+static HalIspWbConfig g_stub_wb_cfg;
+
+static int stub_isp_set_wb_config(void *video_ctx, const HalIspWbConfig *config)
+{
+    (void)video_ctx;
+    if (!config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    g_stub_wb_cfg = *config;
+    return HAL_OK;
+}
+
+static int stub_isp_get_current_wb_config(void *video_ctx, HalIspWbConfig *config)
+{
+    (void)video_ctx;
+    if (!config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    *config = g_stub_wb_cfg;
+    return HAL_OK;
+}
+
+static int stub_isp_set_3dnr_config(void *video_ctx, const HalIspNr3dConfig *config)
+{
+    (void)video_ctx;
+    if (!config || config->strength < 0 || config->strength > 100)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    return HAL_OK;
+}
+
+static int stub_isp_get_ae_stats(void *video_ctx, HalIspAeStats *stats)
+{
+    (void)video_ctx;
+    if (!stats)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    memset(stats, 0, sizeof(*stats));
+    /* Simulated mid-grey scene: half the histogram mass around bin 128. */
+    stats->hist[128] = 1000;
+    stats->luma_valid = true;
+    for (int i = 0; i < HAL_ISP_AE_LUMA_GRID; ++i)
+    {
+        stats->luma[i] = 128;
+    }
+    stats->hist_valid = false;
+    return HAL_OK;
+}
+
+static int stub_isp_set_hdr_ratios(void *video_ctx, float ls_ratio, float vs_ratio)
+{
+    (void)video_ctx;
+    if (ls_ratio <= 1.0f || ls_ratio > 64.0f)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    (void)vs_ratio;
+    return HAL_OK;
 }
 
 /* ---- Ops table ---- */
@@ -177,4 +243,9 @@ HalIspOps HAL_ISP_OPS = {
     .wait_af_measurement        = stub_isp_wait_af_measurement,
     .get_af_measurement         = stub_isp_get_af_measurement,
     .get_version                = stub_isp_get_version,
+    .set_wb_config              = stub_isp_set_wb_config,
+    .get_current_wb_config      = stub_isp_get_current_wb_config,
+    .set_3dnr_config            = stub_isp_set_3dnr_config,
+    .get_ae_stats               = stub_isp_get_ae_stats,
+    .set_hdr_ratios             = stub_isp_set_hdr_ratios,
 };

@@ -11,8 +11,18 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <cstdint>
 
 namespace aipc::ai_runtime {
+
+struct AutoInferOutstandingWorkState {
+    std::mutex mu;
+    std::condition_variable cv;
+    size_t count = 0;
+};
 
 class AutoInfer {
 public:
@@ -28,14 +38,25 @@ public:
     bool start();
     void stop();
 
-private:
-    void pipeline_loop(const AutoInferPipeline& pipe);
+    /// True when a started pipeline exited unexpectedly after startup and the
+    /// runtime should shut down in a controlled, ordered fashion.
+    bool failed() const noexcept {
+        return pipeline_failed_.load(std::memory_order_acquire);
+    }
 
-    void publish_result(const std::string& stream_id,
-                        const std::string& model_id,
-                        uint64_t frame_seq,
-                        uint64_t timestamp_ns,
-                        const HalPostprocessResult& result);
+private:
+    enum class LifecycleState : uint8_t { Stopped, Starting, Running, Stopping };
+    struct PipelineFrameState;
+    struct PipelineRunState;
+
+    void pipeline_thread_main(
+        AutoInferPipeline pipe,
+        std::shared_ptr<PipelineRunState> run_state) noexcept;
+    void pipeline_loop(
+        const AutoInferPipeline& pipe,
+        const std::shared_ptr<PipelineRunState>& run_state,
+        bool& startup_succeeded);
+    void stop_locked(std::unique_lock<std::mutex>& lifecycle_lock);
 
     ModelManager*       model_mgr_;
     FdReceiver*         fd_receiver_;
@@ -45,8 +66,15 @@ private:
     PostprocessPool*    postprocess_pool_;
     const Config&       cfg_;
 
+    std::mutex lifecycle_mu_;
+    LifecycleState lifecycle_state_ = LifecycleState::Stopped;
     std::vector<std::thread> threads_;
+    std::mutex pipeline_states_mu_;
+    std::vector<std::weak_ptr<PipelineFrameState>> pipeline_states_;
+    std::shared_ptr<PipelineRunState> pipeline_run_state_;
+    std::shared_ptr<AutoInferOutstandingWorkState> outstanding_work_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> pipeline_failed_{false};
 };
 
 }  // namespace aipc::ai_runtime

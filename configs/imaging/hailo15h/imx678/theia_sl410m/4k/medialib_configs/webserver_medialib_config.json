@@ -2,7 +2,7 @@
   "version": "2.0.0",
   "metadata": {
     "architecture": "hailo15h",
-    "content_hash": "997c946efe888edd09100e20cb429a4a5e3c12e456f965291877dda4fa7fe19d",
+    "content_hash": "6b79336a88fac13d3dbf3c7e28af34ff2059bc84ac0a023384ba797b735a7680",
     "description": "",
     "generation_timestamp": "2026-05-18T06:03:51.089256+00:00"
   },
@@ -110,8 +110,12 @@
       "name": "AI_ISP_Gen3_LicensePlate"
     },
     {
-      "config_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/gst_example_IR/gst_example_IR_profile.json",
+      "config_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/AF_IR_profile.json",
       "name": "Infrared_Basic"
+    },
+    {
+      "config_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/gst_example_IR/gst_example_IR_profile.json",
+      "name": "Infrared_Basic_FG2009"
     }
   ]
 }

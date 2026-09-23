@@ -42,7 +42,8 @@ const char *light_mode_name(LightMode mode)
 }
 
 LightSwitchDecision evaluate(DayNightPolicyState &policy, const LightSample &sample,
-                             const LightSensorConfig &config, bool lens_op_active)
+                             const LightSensorConfig &config, bool lens_op_active,
+                             uint64_t now_ms)
 {
     policy.last = sample;
 
@@ -98,6 +99,15 @@ LightSwitchDecision evaluate(DayNightPolicyState &policy, const LightSample &sam
         return LightSwitchDecision::None;
     }
 
+    /* Anti-flap dwell: too soon after the last applied switch. Keep the
+     * confirmed accumulation (stable_count stays >= stable_samples) so the
+     * switch fires on the first tick after the dwell expires. */
+    if (policy.last_switch_ms != 0 && now_ms >= policy.last_switch_ms &&
+        now_ms - policy.last_switch_ms < static_cast<uint64_t>(std::max(0, config.min_hold_ms)))
+    {
+        return LightSwitchDecision::Held;
+    }
+
     /* Confirmed transition. */
     if (lens_op_active)
     {
@@ -110,5 +120,6 @@ LightSwitchDecision evaluate(DayNightPolicyState &policy, const LightSample &sam
     policy.mode = candidate;
     policy.stable_count = 0;
     policy.has_pending = false;
+    policy.last_switch_ms = now_ms != 0 ? now_ms : 1;
     return candidate == LightMode::Day ? LightSwitchDecision::ToDay : LightSwitchDecision::ToNight;
 }
