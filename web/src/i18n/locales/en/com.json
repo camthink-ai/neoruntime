@@ -281,7 +281,6 @@
     },
     "backup": {
       "title": "Backup & Migration",
-      "subtitle": "Back up, restore, or migrate device configuration.",
       "drop_hint": "Drag file here, or click to select",
       "exporting": "Exporting…",
       "file": "File",

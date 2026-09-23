@@ -238,9 +238,6 @@ export default function BackupMigrate() {
         <h1 className="text-2xl font-bold tracking-tight text-foreground">
           {t('maintenance.backup.title', '备份与迁移')}
         </h1>
-        <p className="mt-1.5 text-sm text-muted-foreground">
-          {t('maintenance.backup.subtitle', '备份、恢复或迁移设备配置。')}
-        </p>
 
         <div className="mt-6 grid gap-6 lg:grid-cols-2">
           {/* Media config (JSON) — low risk, no identity change, no disconnect. */}

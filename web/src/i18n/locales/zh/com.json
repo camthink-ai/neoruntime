@@ -281,7 +281,6 @@
     },
     "backup": {
       "title": "备份与迁移",
-      "subtitle": "备份、恢复或迁移设备配置。",
       "drop_hint": "将文件拖到此处，或点击选择",
       "exporting": "导出中…",
       "file": "文件",
