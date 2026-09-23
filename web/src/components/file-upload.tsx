@@ -9,6 +9,21 @@ import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 
+// Prefer human-facing extensions over MIME keys when the accept map carries
+// them ({ 'application/gzip': ['.tar.gz', '.tgz'] } → '.tar.gz, .tgz').
+function formatAcceptList(accept: Record<string, unknown>): string {
+  const extensions = [
+    ...new Set(
+      Object.values(accept)
+        .filter((v): v is string[] => Array.isArray(v))
+        .flat()
+    ),
+  ];
+  return extensions.length > 0
+    ? extensions.join(', ')
+    : Object.keys(accept).join(', ');
+}
+
 export interface FileUploadProps extends Omit<DropzoneOptions, 'onDrop'> {
   className?: string;
   /** 上传成功回调 */
@@ -230,7 +245,7 @@ export default function FileUpload({
                 {t('sys.file_management.supported_formats', '支持格式')}:{' '}
                 {typeof accept === 'string'
                   ? accept
-                  : Object.keys(accept).join(', ')}
+                  : formatAcceptList(accept)}
               </p>
             )}
             {maxSize && (

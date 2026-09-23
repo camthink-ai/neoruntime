@@ -281,16 +281,9 @@
     },
     "backup": {
       "title": "Backup & Migration",
-      "subtitle": "Export/import device configuration to replicate settings across same-model devices or perform a full clone.",
+      "subtitle": "Back up, restore, or migrate device configuration.",
       "drop_hint": "Drag file here, or click to select",
       "exporting": "Exporting…",
-      "meta": {
-        "format": "Format",
-        "size_limit": "Max size",
-        "restart": "Service restart",
-        "restart_config": "Camera service",
-        "restart_clone": "All services"
-      },
       "file": "File",
       "size": "Size",
       "schema": "Schema",
@@ -304,6 +297,10 @@
       "export_failed": "Export failed",
       "export": "Export backup",
       "import": "Import / restore",
+      "restore": "Restore clone",
+      "create_clone": "Create clone",
+      "import_config": "Import config",
+      "export_config": "Export config",
       "risk": {
         "low": "Low risk",
         "mid": "Medium risk",
@@ -311,10 +308,16 @@
       },
       "tier": {
         "config": {
-          "title": "Media config (JSON)",
-          "desc": "Camera image & media settings only (no overlay images)",
-          "effect1": "Replaces this device's camera image and media settings with the imported file's",
-          "effect2": "Camera service restarts (~10s); live view pauses briefly"
+          "title": "Media config",
+          "desc": "Export or import image and media configuration for quickly copying media settings.",
+          "includes": {
+            "image": "Image & ISP config",
+            "video": "Video encoding & streams",
+            "audio": "Audio config",
+            "lens": "Lens & infrared"
+          },
+          "effect1": "Replaces this device's media configuration (image, encoding, audio, lens, etc.) with the imported file's",
+          "effect2": "Camera and lens services restart; live view pauses briefly"
         },
         "bundle": {
           "title": "Media config bundle",
@@ -325,9 +328,15 @@
         },
         "clone": {
           "title": "Full device clone",
-          "desc": "Entire device configuration",
-          "effect1": "Replaces the entire device configuration (all settings) with the imported file's",
-          "effect2": "Regenerates the device identity certificate and restarts core services — the web UI will disconnect briefly, then reconnect automatically"
+          "desc": "Back up or restore this device's complete configuration.",
+          "includes": {
+            "device": "Device config",
+            "network": "Network config",
+            "runtime": "App & AI runtime config"
+          },
+          "excludes": "Excludes device identity, security credentials, and installed apps & AI models",
+          "effect1": "Replaces the device's entire configuration (device identity excluded) with the imported file's",
+          "effect2": "Restarts core services (including this console)"
         }
       },
       "identity": {
@@ -340,16 +349,14 @@
       },
       "importTiers": {
         "config": {
-          "title": "Import media config",
-          "desc": "Select a previously exported .json file"
+          "title": "Import media config"
         },
         "bundle": {
           "title": "Import media bundle",
           "desc": "Select a previously exported .tar.gz file"
         },
         "clone": {
-          "title": "Import device clone",
-          "desc": "Select a previously exported .tar.gz file"
+          "title": "Import device clone"
         }
       },
       "toast": {
@@ -361,12 +368,13 @@
         "import_clone": "Device clone imported"
       },
       "confirm_action": "Apply",
+      "confirm_ack": "I understand the impact and want to continue",
       "confirm_low_title": "Confirm import",
       "confirm_low_desc": "This replaces the camera image and media settings; the camera service restarts. This action cannot be undone.",
       "confirm_mid_title": "Confirm import",
       "confirm_mid_desc": "This overwrites the current media config and overlay images, then restarts the camera services. This action cannot be undone.",
       "confirm_high_title": "Confirm full-device clone",
-      "confirm_high_desc": "This replaces the target device's entire configuration and regenerates its identity certificate; account info (password, device name, apps, models) is preserved. This action cannot be undone."
+      "confirm_high_desc": "This replaces the target device's entire configuration; device identity, installed apps, and AI models are preserved. This action cannot be undone."
     }
   }
 }

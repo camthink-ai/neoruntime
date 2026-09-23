@@ -281,16 +281,9 @@
     },
     "backup": {
       "title": "备份与迁移",
-      "subtitle": "导出/导入设备配置，以在相同型号设备间复制设置或执行整机克隆。",
+      "subtitle": "备份、恢复或迁移设备配置。",
       "drop_hint": "将文件拖到此处，或点击选择",
       "exporting": "导出中…",
-      "meta": {
-        "format": "文件格式",
-        "size_limit": "大小上限",
-        "restart": "服务重启",
-        "restart_config": "相机服务",
-        "restart_clone": "全部服务"
-      },
       "file": "文件",
       "size": "大小",
       "schema": "结构",
@@ -304,6 +297,10 @@
       "export_failed": "导出失败",
       "export": "导出备份",
       "import": "导入恢复",
+      "restore": "恢复克隆",
+      "create_clone": "创建克隆",
+      "import_config": "导入配置",
+      "export_config": "导出配置",
       "risk": {
         "low": "低风险",
         "mid": "中风险",
@@ -311,10 +308,16 @@
       },
       "tier": {
         "config": {
-          "title": "媒体配置 (JSON)",
-          "desc": "仅相机图像与媒体设置（不含叠加图）",
-          "effect1": "用导入文件替换本机的相机图像与媒体设置",
-          "effect2": "相机服务将重启（约 10 秒），实时画面短暂中断"
+          "title": "媒体配置",
+          "desc": "导出或导入图像与媒体相关配置，适用于快速复制媒体设置。",
+          "includes": {
+            "image": "图像与 ISP 配置",
+            "video": "视频编码与流",
+            "audio": "音频配置",
+            "lens": "镜头与红外"
+          },
+          "effect1": "用导入文件替换本机的媒体配置（图像、编码、音频、镜头等）",
+          "effect2": "相机与镜头服务将重启，实时画面短暂中断"
         },
         "bundle": {
           "title": "媒体配置 Bundle",
@@ -325,9 +328,15 @@
         },
         "clone": {
           "title": "整机克隆",
-          "desc": "整机全部配置",
-          "effect1": "用导入文件替换整机的全部配置（所有设置）",
-          "effect2": "重新生成设备身份证书，并重启核心服务 —— 网页界面会短暂断开，随后自动重连"
+          "desc": "备份或恢复当前设备的完整配置。",
+          "includes": {
+            "device": "设备配置",
+            "network": "网络配置",
+            "runtime": "应用与 AI 运行配置"
+          },
+          "excludes": "不包含设备身份信息、安全凭证及已安装的应用与 AI 模型",
+          "effect1": "用导入文件替换整机的全部配置（设备身份除外）",
+          "effect2": "重启核心服务（含本控制台）"
         }
       },
       "identity": {
@@ -340,16 +349,14 @@
       },
       "importTiers": {
         "config": {
-          "title": "导入媒体配置",
-          "desc": "选择此前导出的 .json 文件"
+          "title": "导入媒体配置"
         },
         "bundle": {
           "title": "导入媒体 Bundle",
           "desc": "选择此前导出的 .tar.gz 文件"
         },
         "clone": {
-          "title": "导入整机克隆",
-          "desc": "选择此前导出的 .tar.gz 文件"
+          "title": "导入整机克隆"
         }
       },
       "toast": {
@@ -361,12 +368,13 @@
         "import_clone": "整机克隆已导入"
       },
       "confirm_action": "应用",
+      "confirm_ack": "我已了解上述影响，确认继续",
       "confirm_low_title": "确认导入",
       "confirm_low_desc": "此操作将替换相机图像与媒体设置，相机服务将重启。此操作无法撤销。",
       "confirm_mid_title": "确认导入",
       "confirm_mid_desc": "此操作将覆盖当前媒体配置和叠加图，并重启相机服务。此操作无法撤销。",
       "confirm_high_title": "确认整机克隆",
-      "confirm_high_desc": "此操作将替换目标设备的全部配置，并重新生成设备身份证书；账户信息（密码、设备名、应用、模型）予以保留。此操作无法撤销。"
+      "confirm_high_desc": "此操作将替换目标设备的全部配置（设备身份除外，已安装应用与 AI 模型保留）。此操作无法撤销。"
     }
   }
 }

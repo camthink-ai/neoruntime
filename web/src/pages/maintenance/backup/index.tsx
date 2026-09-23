@@ -1,12 +1,12 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
+  Check,
   Download,
-  FileJson,
+  Images,
   Info,
   Loader2,
   Server,
-  ShieldCheck,
   Upload,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -30,16 +30,16 @@ const CONFIG_MAX = 16 * 1024 * 1024;
 interface TierCardProps {
   icon: LucideIcon;
   title: string;
-  desc: string;
-  riskLabel: string;
-  /** Tailwind classes for the top accent bar, icon tile and risk pill. */
-  accentClass: string;
+  /** Tailwind classes for the icon tile. */
   iconClass: string;
-  riskClass: string;
-  /** Compact facts row (format / size limit / service restart). */
-  meta: { label: string; value: string }[];
-  /** Clone-only reassurance strip: items the target keeps through an import. */
-  preserved?: string[];
+  /** Body copy under the header, one paragraph per line. */
+  descLines: string[];
+  /** ✓ checklist: what the tier covers. */
+  includes?: string[];
+  /** Note under the checklist: what a backup excludes. */
+  excludesNote?: string;
+  importLabel: string;
+  exportLabel: string;
   exporting: boolean;
   onExport: () => void;
   onImport: () => void;
@@ -48,17 +48,17 @@ interface TierCardProps {
 // One export/import tier. Structure mirrors the risk semantics used inside
 // ImportFileTransferDialog: sky = low (config), destructive = high (clone).
 // The footer sits on mt-auto so both cards' action rows align regardless of
-// the optional preserved strip.
+// the optional checklist block. The import (risky) button leads, the export
+// (safe) one stays visually primary.
 function TierCard({
   icon: Icon,
   title,
-  desc,
-  riskLabel,
-  accentClass,
   iconClass,
-  riskClass,
-  meta,
-  preserved,
+  descLines,
+  includes,
+  excludesNote,
+  importLabel,
+  exportLabel,
   exporting,
   onExport,
   onImport,
@@ -66,66 +66,60 @@ function TierCard({
   const { t } = useTranslation();
 
   return (
-    <Card className="gap-0 overflow-hidden transition-shadow hover:shadow-md">
-      <div className={cn('h-1 shrink-0', accentClass)} />
+    <Card className="transition-shadow hover:shadow-md">
       <div className="flex flex-1 flex-col gap-5 p-6">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex items-center gap-3.5">
-            <div
-              className={cn(
-                'flex h-11 w-11 shrink-0 items-center justify-center rounded-xl',
-                iconClass
-              )}
-            >
-              <Icon className="h-5 w-5" />
-            </div>
-            <div>
-              <h2 className="text-base font-semibold text-foreground">
-                {title}
-              </h2>
-              <p className="mt-0.5 text-sm text-muted-foreground">{desc}</p>
-            </div>
-          </div>
-          <span
+        <div className="flex items-center gap-3.5">
+          <div
             className={cn(
-              'inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium',
-              riskClass
+              'flex h-11 w-11 shrink-0 items-center justify-center rounded-xl',
+              iconClass
             )}
           >
-            <span className="h-1.5 w-1.5 rounded-full bg-current" />
-            {riskLabel}
-          </span>
+            <Icon className="h-5 w-5" />
+          </div>
+          <h2 className="text-base font-semibold text-foreground">{title}</h2>
         </div>
 
-        <div className="grid grid-cols-3 gap-3 rounded-xl border border-border/60 bg-muted/30 px-4 py-3">
-          {meta.map(m => (
-            <div key={m.label} className="flex min-w-0 flex-col gap-0.5">
-              <span className="truncate text-xs text-muted-foreground">
-                {m.label}
-              </span>
-              <span className="truncate text-sm font-medium text-foreground">
-                {m.value}
-              </span>
-            </div>
+        <div className="flex flex-col gap-1">
+          {descLines.map(line => (
+            <p
+              key={line}
+              className="text-sm leading-relaxed text-muted-foreground"
+            >
+              {line}
+            </p>
           ))}
         </div>
 
-        {preserved && preserved.length > 0 && (
-          <div className="flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/[0.04] px-3 py-2.5">
-            <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              <span className="font-medium text-emerald-700 dark:text-emerald-400">
-                {t('maintenance.backup.identity_preserved', '目标机保留')}:
-              </span>{' '}
-              {preserved.join(' · ')}
-            </p>
+        {includes && includes.length > 0 && (
+          <ul className="flex flex-col gap-2">
+            {includes.map(item => (
+              <li
+                key={item}
+                className="flex items-center gap-2.5 text-sm text-foreground"
+              >
+                <Check className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                {item}
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {excludesNote && (
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Info className="h-3.5 w-3.5 shrink-0" />
+            {excludesNote}
           </div>
         )}
 
-        <div className="mt-auto flex gap-3 pt-1">
+        <div className="mt-auto flex justify-end gap-3 pt-1">
+          <Button variant="secondary" className="gap-2" onClick={onImport}>
+            <Upload className="h-4 w-4" />
+            {importLabel}
+          </Button>
           <Button
             variant="carbon"
-            className="flex-1 gap-2"
+            className="gap-2"
             onClick={onExport}
             disabled={exporting}
           >
@@ -136,15 +130,7 @@ function TierCard({
             )}
             {exporting
               ? t('maintenance.backup.exporting', '导出中…')
-              : t('common.export', '导出')}
-          </Button>
-          <Button
-            variant="secondary"
-            className="flex-1 gap-2"
-            onClick={onImport}
-          >
-            <Upload className="h-4 w-4" />
-            {t('common.import', '导入')}
+              : exportLabel}
           </Button>
         </div>
       </div>
@@ -188,26 +174,27 @@ export default function BackupMigrate() {
   };
 
   // Impact disclosure lives inside each import dialog (confirm step), not on
-  // the card surface — the card only carries the quick facts (meta row).
+  // the card surface. Wording follows the backend: media import restarts
+  // camera-daemon + device-control (media_config_io.go); clone import keeps
+  // the target's identity (clone.go) and restarts the config-consuming
+  // services. The UI-disconnect warning is shown once, in the dialog's
+  // dedicated high-risk banner — not repeated here.
   const configEffects = [
     t(
       'maintenance.backup.tier.config.effect1',
-      '用导入文件替换本机的相机图像与媒体设置'
+      '用导入文件替换本机的媒体配置（图像、编码、音频、镜头等）'
     ),
     t(
       'maintenance.backup.tier.config.effect2',
-      '相机服务将重启（约 10 秒），实时画面短暂中断'
+      '相机与镜头服务将重启，实时画面短暂中断'
     ),
   ];
   const cloneEffects = [
     t(
       'maintenance.backup.tier.clone.effect1',
-      '覆盖这台设备的几乎所有配置与运行状态'
+      '用导入文件替换整机的全部配置（设备身份除外）'
     ),
-    t(
-      'maintenance.backup.tier.clone.effect2',
-      '重新生成设备身份并重启多个服务（含本控制台，会短暂断开）'
-    ),
+    t('maintenance.backup.tier.clone.effect2', '重启核心服务（含本控制台）'),
   ];
   const identityPreserved = [
     t('maintenance.backup.identity.password', 'Admin password'),
@@ -218,33 +205,31 @@ export default function BackupMigrate() {
     t('maintenance.backup.identity.network', 'Network identity'),
   ];
 
-  const configMeta = [
-    {
-      label: t('maintenance.backup.meta.format', '文件格式'),
-      value: '.json',
-    },
-    {
-      label: t('maintenance.backup.meta.size_limit', '大小上限'),
-      value: `${CONFIG_MAX / (1024 * 1024)} MB`,
-    },
-    {
-      label: t('maintenance.backup.meta.restart', '服务重启'),
-      value: t('maintenance.backup.meta.restart_config', '相机服务'),
-    },
+  const configDesc = [
+    t(
+      'maintenance.backup.tier.config.desc',
+      '导出或导入图像与媒体相关配置，适用于快速复制媒体设置。'
+    ),
   ];
-  const cloneMeta = [
-    {
-      label: t('maintenance.backup.meta.format', '文件格式'),
-      value: '.tar.gz',
-    },
-    {
-      label: t('maintenance.backup.meta.size_limit', '大小上限'),
-      value: `${CLONE_MAX / (1024 * 1024)} MB`,
-    },
-    {
-      label: t('maintenance.backup.meta.restart', '服务重启'),
-      value: t('maintenance.backup.meta.restart_clone', '全部服务'),
-    },
+  const cloneDesc = [
+    t('maintenance.backup.tier.clone.desc', '备份或恢复当前设备的完整配置。'),
+  ];
+  // Checklist wording follows the backend payload (media_config_io.go):
+  // base YAML (encoders/audio/lens/autofocus/infrared) + image JSONs
+  // (isp/transform/privacy_mask/osd/profile).
+  const configIncludes = [
+    t('maintenance.backup.tier.config.includes.image', '图像与 ISP 配置'),
+    t('maintenance.backup.tier.config.includes.video', '视频编码与流'),
+    t('maintenance.backup.tier.config.includes.audio', '音频配置'),
+    t('maintenance.backup.tier.config.includes.lens', '镜头与红外'),
+  ];
+  // Clone scope per clone.go: the /data/aipc/etc tree + the 4 config DB
+  // tables. App/model registries (AppInstall/AIModel) are deliberately NOT
+  // cloned — only their runtime yaml configs ride along in the etc tree.
+  const cloneIncludes = [
+    t('maintenance.backup.tier.clone.includes.device', '设备配置'),
+    t('maintenance.backup.tier.clone.includes.network', '网络配置'),
+    t('maintenance.backup.tier.clone.includes.runtime', '应用与 AI 运行配置'),
   ];
 
   return (
@@ -254,26 +239,19 @@ export default function BackupMigrate() {
           {t('maintenance.backup.title', '备份与迁移')}
         </h1>
         <p className="mt-1.5 text-sm text-muted-foreground">
-          {t(
-            'maintenance.backup.subtitle',
-            '导出/导入设备配置，以在相同型号设备间复制设置或执行整机克隆。'
-          )}
+          {t('maintenance.backup.subtitle', '备份、恢复或迁移设备配置。')}
         </p>
 
         <div className="mt-6 grid gap-6 lg:grid-cols-2">
           {/* Media config (JSON) — low risk, no identity change, no disconnect. */}
           <TierCard
-            icon={FileJson}
-            title={t('maintenance.backup.tier.config.title', '媒体配置 (JSON)')}
-            desc={t(
-              'maintenance.backup.tier.config.desc',
-              '仅相机图像与媒体设置（不含叠加图）'
-            )}
-            riskLabel={t('maintenance.backup.risk.low', '低风险')}
-            accentClass="bg-gradient-to-r from-sky-500 to-sky-400"
+            icon={Images}
+            title={t('maintenance.backup.tier.config.title', '媒体配置')}
             iconClass="bg-sky-500/10 text-sky-600 dark:text-sky-400"
-            riskClass="bg-sky-500/10 text-sky-700 dark:text-sky-400"
-            meta={configMeta}
+            descLines={configDesc}
+            includes={configIncludes}
+            importLabel={t('maintenance.backup.import_config', '导入配置')}
+            exportLabel={t('maintenance.backup.export_config', '导出配置')}
             exporting={exportingConfig}
             onExport={runExportConfig}
             onImport={() => setConfigImportOpen(true)}
@@ -283,25 +261,19 @@ export default function BackupMigrate() {
           <TierCard
             icon={Server}
             title={t('maintenance.backup.tier.clone.title', '整机克隆')}
-            desc={t('maintenance.backup.tier.clone.desc', '整机全部配置')}
-            riskLabel={t('maintenance.backup.risk.high', '高风险')}
-            accentClass="bg-gradient-to-r from-destructive to-destructive/60"
             iconClass="bg-destructive/10 text-destructive"
-            riskClass="bg-destructive/10 text-destructive"
-            meta={cloneMeta}
-            preserved={identityPreserved}
+            descLines={cloneDesc}
+            includes={cloneIncludes}
+            excludesNote={t(
+              'maintenance.backup.tier.clone.excludes',
+              '不包含设备身份信息、安全凭证及已安装的应用与 AI 模型'
+            )}
+            importLabel={t('maintenance.backup.restore', '恢复克隆')}
+            exportLabel={t('maintenance.backup.create_clone', '创建克隆')}
             exporting={exportingClone}
             onExport={runExportClone}
             onImport={() => setCloneImportOpen(true)}
           />
-        </div>
-
-        <div className="mt-6 flex items-center gap-2 text-xs text-muted-foreground">
-          <Info className="h-3.5 w-3.5 shrink-0" />
-          {t(
-            'maintenance.backup.footnote',
-            '导入会覆盖本机配置并重启服务，请谨慎操作。'
-          )}
         </div>
       </div>
 
@@ -311,10 +283,6 @@ export default function BackupMigrate() {
         open={configImportOpen}
         onOpenChange={setConfigImportOpen}
         title={t('maintenance.backup.importTiers.config.title', '导入媒体配置')}
-        description={t(
-          'maintenance.backup.importTiers.config.desc',
-          '选择此前导出的 .json 文件'
-        )}
         accept={ACCEPT_JSON}
         maxSize={CONFIG_MAX}
         effects={configEffects}
@@ -334,10 +302,6 @@ export default function BackupMigrate() {
         open={cloneImportOpen}
         onOpenChange={setCloneImportOpen}
         title={t('maintenance.backup.importTiers.clone.title', '导入整机克隆')}
-        description={t(
-          'maintenance.backup.importTiers.clone.desc',
-          '选择之前导出的 .tar.gz 克隆文件'
-        )}
         accept={ACCEPT_GZIP}
         maxSize={CLONE_MAX}
         effects={cloneEffects}
