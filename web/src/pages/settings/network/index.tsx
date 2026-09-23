@@ -236,6 +236,9 @@ export default function NetworkPage() {
   return (
     <>
       <div className="p-6 md:p-12 space-y-6 max-w-4xl mx-auto">
+        <h1 className="text-2xl font-bold tracking-tight text-foreground">
+          {t('common.network')}
+        </h1>
         <Card className="p-6">
           {/* Header */}
           <div className="mb-4 w-2xl:mb-8 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
