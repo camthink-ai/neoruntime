@@ -35,6 +35,7 @@ import { Separator } from '@/components/ui/separator';
 import { getAppWebUrl } from '../lib/appWebUrl';
 import {
   networkModeLabelKey,
+  uniqueVideoStreamIds,
   videoStreamLabelKey,
 } from '../lib/permissionLabels';
 
@@ -87,8 +88,8 @@ function PermissionIcons({ permissions }: { permissions: AppPermissions }) {
   if (hasVideo) {
     items.push({
       icon: <Video className="w-3.5 h-3.5" />,
-      label: permissions
-        .video!.map(stream => {
+      label: uniqueVideoStreamIds(permissions.video!)
+        .map(stream => {
           const key = videoStreamLabelKey(stream);
           return key ? t(key) : stream;
         })

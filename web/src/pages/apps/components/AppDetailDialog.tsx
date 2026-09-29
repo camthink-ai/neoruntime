@@ -29,7 +29,7 @@ import {
   useAppPermissions,
 } from '@/hooks';
 import { getAppWebUrl } from '../lib/appWebUrl';
-import { videoStreamLabelKey } from '../lib/permissionLabels';
+import { uniqueVideoStreamIds, videoStreamLabelKey } from '../lib/permissionLabels';
 
 function PermissionsPanel({ permissions }: { permissions: AppPermissions }) {
   const { t } = useTranslation();
@@ -52,7 +52,9 @@ function PermissionsPanel({ permissions }: { permissions: AppPermissions }) {
     return key ? t(key) : stream;
   };
 
-  const videoLabels = (permissions.video ?? []).map(formatVideoStreamLabel);
+  const videoLabels = uniqueVideoStreamIds(permissions.video ?? []).map(
+    formatVideoStreamLabel
+  );
 
   const deviceLabels: string[] = [];
   if (permissions.device?.light) deviceLabels.push(t('sys.apps.perm.light', 'Light'));

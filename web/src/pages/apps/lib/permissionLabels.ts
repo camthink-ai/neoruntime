@@ -20,6 +20,29 @@ export function videoStreamLabelKey(stream: string) {
   return STREAM_LABEL_KEYS[stream as keyof typeof STREAM_LABEL_KEYS];
 }
 
+// ".raw" aliases collapse onto their bare id for dedup purposes.
+const CANONICAL_STREAM_IDS = {
+  'main.raw': 'main',
+  'sub.raw': 'sub',
+  'third.raw': 'third',
+} as const;
+
+// Manifests may grant a stream twice (bare id and ".raw" alias); dedupe for
+// display by canonical id, keeping first-seen order and the original string
+// so unknown ids still surface as-is.
+export function uniqueVideoStreamIds(streams: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const stream of streams) {
+    const canonical = CANONICAL_STREAM_IDS[stream as keyof typeof CANONICAL_STREAM_IDS] ?? stream;
+    if (!seen.has(canonical)) {
+      seen.add(canonical);
+      unique.push(stream);
+    }
+  }
+  return unique;
+}
+
 export function networkModeLabelKey(mode: string) {
   return NETWORK_MODE_LABEL_KEYS[mode as keyof typeof NETWORK_MODE_LABEL_KEYS];
 }

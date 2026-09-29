@@ -38,6 +38,7 @@ import { useAppStats } from '@/hooks';
 import type { AppTemplate, AppPermissions } from '@/services/types';
 import {
   networkModeLabelKey,
+  uniqueVideoStreamIds,
   videoStreamLabelKey,
 } from '../lib/permissionLabels';
 
@@ -52,7 +53,7 @@ function InlinePermissionIcons({
   if (permissions.video?.length) {
     items.push({
       icon: <Video className="w-3 h-3" />,
-      label: permissions.video
+      label: uniqueVideoStreamIds(permissions.video)
         .map(stream => {
           const key = videoStreamLabelKey(stream);
           return key ? t(key) : stream;
