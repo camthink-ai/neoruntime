@@ -29,6 +29,7 @@ import {
   useAppPermissions,
 } from '@/hooks';
 import { getAppWebUrl } from '../lib/appWebUrl';
+import { videoStreamLabelKey } from '../lib/permissionLabels';
 
 function PermissionsPanel({ permissions }: { permissions: AppPermissions }) {
   const { t } = useTranslation();
@@ -47,24 +48,16 @@ function PermissionsPanel({ permissions }: { permissions: AppPermissions }) {
   if (!hasVideo && !hasModels && !hasEvents && !hasDevice && !hasNetwork) return null;
 
   const formatVideoStreamLabel = (stream: string) => {
-    switch (stream) {
-      case 'main.raw':
-        return t('sys.media_settings.main_stream', 'Main Stream');
-      case 'sub.raw':
-        return t('sys.media_settings.sub_stream', 'Sub Stream');
-      case 'third.raw':
-        return t('sys.media_settings.third_stream', 'Third Stream');
-      default:
-        return stream;
-    }
+    const key = videoStreamLabelKey(stream);
+    return key ? t(key) : stream;
   };
 
   const videoLabels = (permissions.video ?? []).map(formatVideoStreamLabel);
 
   const deviceLabels: string[] = [];
   if (permissions.device?.light) deviceLabels.push(t('sys.apps.perm.light', 'Light'));
-  if (permissions.device?.ir_cut) deviceLabels.push('IR-Cut');
-  if (permissions.device?.ptz) deviceLabels.push('PTZ');
+  if (permissions.device?.ir_cut) deviceLabels.push(t('sys.apps.import.ir_cut', 'IR-Cut'));
+  if (permissions.device?.ptz) deviceLabels.push(t('sys.apps.import.ptz_control', 'PTZ'));
   if (permissions.device?.lens) deviceLabels.push(t('sys.apps.perm.lens', 'Lens'));
 
   return (

@@ -33,6 +33,10 @@ import { useAppStats } from '@/hooks';
 import type { AppTemplate, AppPermissions } from '@/services/types';
 import { Separator } from '@/components/ui/separator';
 import { getAppWebUrl } from '../lib/appWebUrl';
+import {
+  networkModeLabelKey,
+  videoStreamLabelKey,
+} from '../lib/permissionLabels';
 
 interface TemplateCardProps {
   app: AppTemplate;
@@ -83,7 +87,12 @@ function PermissionIcons({ permissions }: { permissions: AppPermissions }) {
   if (hasVideo) {
     items.push({
       icon: <Video className="w-3.5 h-3.5" />,
-      label: permissions.video!.join(', '),
+      label: permissions
+        .video!.map(stream => {
+          const key = videoStreamLabelKey(stream);
+          return key ? t(key) : stream;
+        })
+        .join(', '),
       color: 'text-blue-500',
     });
   }
@@ -105,10 +114,10 @@ function PermissionIcons({ permissions }: { permissions: AppPermissions }) {
     items.push({
       icon: <Lightbulb className="w-3.5 h-3.5" />,
       label: [
-        permissions.device?.light && 'Light',
-        permissions.device?.ir_cut && 'IR-Cut',
-        permissions.device?.ptz && 'PTZ',
-        permissions.device?.lens && 'Lens',
+        permissions.device?.light && t('sys.apps.perm.light', 'Light'),
+        permissions.device?.ir_cut && t('sys.apps.import.ir_cut', 'IR-Cut'),
+        permissions.device?.ptz && t('sys.apps.import.ptz_control', 'PTZ'),
+        permissions.device?.lens && t('sys.apps.perm.lens', 'Lens'),
       ]
         .filter(Boolean)
         .join(', '),
@@ -116,9 +125,10 @@ function PermissionIcons({ permissions }: { permissions: AppPermissions }) {
     });
   }
   if (hasNetwork) {
+    const modeKey = networkModeLabelKey(permissions.network!.mode!);
     items.push({
       icon: <Wifi className="w-3.5 h-3.5" />,
-      label: permissions.network!.mode!,
+      label: modeKey ? t(modeKey) : permissions.network!.mode!,
       color: 'text-teal-500',
     });
   }
