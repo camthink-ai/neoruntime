@@ -36,18 +36,28 @@ import {
 } from '@/components/ui/tooltip';
 import { useAppStats } from '@/hooks';
 import type { AppTemplate, AppPermissions } from '@/services/types';
+import {
+  networkModeLabelKey,
+  videoStreamLabelKey,
+} from '../lib/permissionLabels';
 
 function InlinePermissionIcons({
   permissions,
 }: {
   permissions?: AppPermissions;
 }) {
+  const { t } = useTranslation();
   if (!permissions) return null;
   const items: { icon: React.ReactNode; label: string; color: string }[] = [];
   if (permissions.video?.length) {
     items.push({
       icon: <Video className="w-3 h-3" />,
-      label: permissions.video.join(', '),
+      label: permissions.video
+        .map(stream => {
+          const key = videoStreamLabelKey(stream);
+          return key ? t(key) : stream;
+        })
+        .join(', '),
       color: 'text-blue-500',
     });
   }
@@ -64,7 +74,7 @@ function InlinePermissionIcons({
   ) {
     items.push({
       icon: <Radio className="w-3 h-3" />,
-      label: 'Events',
+      label: t('sys.apps.perm.events', 'Event Bus'),
       color: 'text-amber-500',
     });
   }
@@ -77,10 +87,10 @@ function InlinePermissionIcons({
     items.push({
       icon: <Lightbulb className="w-3 h-3" />,
       label: [
-        permissions.device?.light && 'Light',
-        permissions.device?.ir_cut && 'IR-Cut',
-        permissions.device?.ptz && 'PTZ',
-        permissions.device?.lens && 'Lens',
+        permissions.device?.light && t('sys.apps.perm.light', 'Light'),
+        permissions.device?.ir_cut && t('sys.apps.import.ir_cut', 'IR-Cut'),
+        permissions.device?.ptz && t('sys.apps.import.ptz_control', 'PTZ'),
+        permissions.device?.lens && t('sys.apps.perm.lens', 'Lens'),
       ]
         .filter(Boolean)
         .join(', '),
@@ -88,9 +98,10 @@ function InlinePermissionIcons({
     });
   }
   if (permissions.network?.mode) {
+    const modeKey = networkModeLabelKey(permissions.network.mode);
     items.push({
       icon: <Wifi className="w-3 h-3" />,
-      label: permissions.network.mode,
+      label: modeKey ? t(modeKey) : permissions.network.mode,
       color: 'text-teal-500',
     });
   }
