@@ -1,6 +1,11 @@
 // Raw permission identifiers (stream ids, network modes) → i18n keys.
 // Unknown values surface as-is at call sites rather than being guessed.
+// Stream ids are bare ("main"/"sub"/"third", per streamsApi); the ".raw"
+// aliases are kept for older permission payloads.
 const STREAM_LABEL_KEYS = {
+  main: 'sys.media_settings.main_stream',
+  sub: 'sys.media_settings.sub_stream',
+  third: 'sys.media_settings.third_stream',
   'main.raw': 'sys.media_settings.main_stream',
   'sub.raw': 'sys.media_settings.sub_stream',
   'third.raw': 'sys.media_settings.third_stream',
