@@ -70,7 +70,15 @@ function makeFaceTexture(label: string, bg: string) {
 }
 
 // ---- 四向倾角标（始终面向相机的文字精灵）----
-function makeDirLabel(text: string, color: string) {
+// key/fallback 供语言切换时重绘纹理；pos 为场景坐标（+X=前 / -X=后 / +Y=右 / -Y=左）
+const DIR_LABEL_DEFS = [
+  { key: 'sys.gyro.front', fallback: '前倾', pos: [2.3, 0, 0] },
+  { key: 'sys.gyro.back', fallback: '后倾', pos: [-2.3, 0, 0] },
+  { key: 'sys.gyro.right', fallback: '右倾', pos: [0, 2.3, 0] },
+  { key: 'sys.gyro.left', fallback: '左倾', pos: [0, -2.3, 0] },
+] as const;
+
+function drawDirLabelTexture(text: string, color: string) {
   const size = 256;
   const cvs = document.createElement('canvas');
   cvs.width = size;
@@ -83,7 +91,13 @@ function makeDirLabel(text: string, color: string) {
   ctx.fillText(text, size / 2, size / 2);
   const tex = new CanvasTexture(cvs);
   tex.colorSpace = SRGBColorSpace;
-  const sp = new Sprite(new SpriteMaterial({ map: tex, transparent: true }));
+  return tex;
+}
+
+function makeDirLabel(text: string, color: string) {
+  const sp = new Sprite(
+    new SpriteMaterial({ map: drawDirLabelTexture(text, color), transparent: true }),
+  );
   sp.scale.set(1.0, 0.5, 1);
   return sp;
 }
@@ -149,6 +163,14 @@ export default function GyroCalibrationCard() {
   const rollRef = useRef<HTMLSpanElement>(null);
   const statusTextRef = useRef<HTMLSpanElement>(null);
   const statusDotRef = useRef<HTMLSpanElement>(null);
+  // 初始化 effect 只跑一次，渲染循环里的文案（水平/未水平）经 tRef 取最新翻译
+  const tRef = useRef(t);
+  const dirLabelsRef = useRef<Sprite[]>([]);
+  const dirLabelColorRef = useRef('rgba(255,255,255,0.92)');
+
+  useEffect(() => {
+    tRef.current = t;
+  });
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -299,17 +321,14 @@ export default function GyroCalibrationCard() {
         ? `hsl(${cssFg})`
         : cssFg
       : 'rgba(255,255,255,0.92)';
-    const dirLabels = [
-      { text: t('sys.gyro.front', '前倾'), pos: [2.3, 0, 0] as const },
-      { text: t('sys.gyro.back', '后倾'), pos: [-2.3, 0, 0] as const },
-      { text: t('sys.gyro.right', '右倾'), pos: [0, 2.3, 0] as const },
-      { text: t('sys.gyro.left', '左倾'), pos: [0, -2.3, 0] as const },
-    ].map((d) => {
-      const sp = makeDirLabel(d.text, baseColor);
+    dirLabelColorRef.current = baseColor;
+    const dirLabels = DIR_LABEL_DEFS.map((d) => {
+      const sp = makeDirLabel(t(d.key, d.fallback), baseColor);
       sp.position.set(d.pos[0], d.pos[1], d.pos[2]);
       scene.add(sp);
       return sp;
     });
+    dirLabelsRef.current = dirLabels;
 
     // ---- 姿态接口（双角度，yaw 锁死）----
     // target 由数据源写入；current 每帧平滑插值，抑制抖动。
@@ -338,8 +357,8 @@ export default function GyroCalibrationCard() {
       if (rollRef.current) rollRef.current.textContent = signed(rollDeg);
       if (statusTextRef.current) {
         statusTextRef.current.textContent = level
-          ? t('sys.gyro.level', '水平')
-          : t('sys.gyro.tilted', '未水平');
+          ? tRef.current('sys.gyro.level', '水平')
+          : tRef.current('sys.gyro.tilted', '未水平');
       }
       if (statusDotRef.current) {
         statusDotRef.current.style.backgroundColor = level ? '#10b981' : '#f85149';
@@ -433,9 +452,22 @@ export default function GyroCalibrationCard() {
         sp.material.map?.dispose();
         sp.material.dispose();
       }
+      dirLabelsRef.current = [];
       renderer.dispose();
     };
   }, []);
+
+  // 语言切换后重绘四向倾角标纹理（精灵纹理在初始化 effect 中生成，不会随重渲染变化）
+  useEffect(() => {
+    DIR_LABEL_DEFS.forEach((d, i) => {
+      const sp = dirLabelsRef.current[i];
+      if (!sp) return;
+      const prev = sp.material.map;
+      sp.material.map = drawDirLabelTexture(t(d.key, d.fallback), dirLabelColorRef.current);
+      sp.material.needsUpdate = true;
+      prev?.dispose();
+    });
+  }, [t]);
 
   return (
     <div className="bg-card rounded-2xl p-5 shadow-sm border border-border h-full max-lg:max-h-80 flex flex-col overflow-hidden">

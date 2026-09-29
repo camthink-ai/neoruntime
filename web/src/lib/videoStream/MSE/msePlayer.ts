@@ -647,8 +647,10 @@ export default class H264Player {
             }
             this.spsNalu = newSps;
             const res = parseHevcSpsResolution(this.spsNalu);
-            this.spsWidth = res.width;
-            this.spsHeight = res.height;
+            if (res) {
+              this.spsWidth = res.width;
+              this.spsHeight = res.height;
+            }
           } else if (nalType === HEVC_NAL_PPS) {
             this.ppsNalu = new Uint8Array(nalData);
           }

@@ -1262,7 +1262,7 @@ export default function ImportAppDialog({
               {t('common.cancel')}
             </Button>
 
-            <div className="flex flex-1 items-center justify-end gap-2 sm:flex-none sm:gap-4">
+            <div className="flex flex-1 items-center justify-end gap-2 sm:ml-auto sm:flex-none sm:gap-4">
               <Button
                 variant="outline"
                 className="hidden text-muted-foreground hover:text-foreground sm:inline-flex"

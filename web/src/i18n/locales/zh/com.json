@@ -61,6 +61,7 @@
     "downloads": "下载量",
     "category": "分类",
     "close": "关闭",
+    "clear": "清除",
     "device_info": "设备信息",
     "password_disable": "设备密码关闭",
     "firmware_upgrade": "固件更新",

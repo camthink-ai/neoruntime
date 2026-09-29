@@ -17,8 +17,6 @@ export interface SourceModelFormProps {
   isParsing: boolean;
   /** null = idle; 0-99 = uploading; 100 = body sent, server parsing. */
   uploadProgress: number | null;
-  /** abort an in-flight upload/parse and return to the empty slot. */
-  onCancelUpload: () => void;
   disabled: boolean;
   parseResult: ModelParseResult | null;
   /** '' | 'nms' | 'feature_map' — derived by the shell. */
@@ -42,7 +40,6 @@ export default function SourceModelForm({
   onClear,
   isParsing,
   uploadProgress,
-  onCancelUpload,
   disabled,
   parseResult,
   outputFormat,
@@ -199,23 +196,6 @@ export default function SourceModelForm({
             )}
             hint={formatHint}
           />
-          {isParsing && (
-            <div className="flex items-center gap-3">
-              <p className="flex-1 animate-pulse text-sm text-muted-foreground">
-                {isUploading
-                  ? t('sys.ai_models.wizard.uploading', 'Uploading...')
-                  : t('sys.ai_models.wizard.parsing', 'Parsing model...')}
-              </p>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={onCancelUpload}
-              >
-                {t('common.cancel', 'Cancel')}
-              </Button>
-            </div>
-          )}
         </div>
       )}
     </div>

@@ -232,19 +232,20 @@ export default function ModelList({
                         </div>
                       </div>
                     </td>
-                    <td className="px-6 py-4">
-                      <div className="flex items-center gap-2">
-                        <span className="text-muted-foreground">
-                          {modelType}
-                        </span>
+                    <td className="px-6 py-4 min-w-0 max-w-[240px]">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <TruncateWithTooltip
+                          value={modelType}
+                          className="min-w-0 flex-1 text-muted-foreground"
+                        />
                         {model.variant && (
-                          <Badge variant="outline" className="text-xs">
+                          <Badge variant="outline" className="shrink-0 text-xs">
                             {model.variant}
                           </Badge>
                         )}
                         <Badge
                           variant="outline"
-                          className="text-xs max-w-[150px] truncate text-muted-foreground"
+                          className="max-w-[150px] shrink-0 truncate text-xs text-muted-foreground"
                           title={
                             model.source === 'disk'
                               ? 'system preset'
