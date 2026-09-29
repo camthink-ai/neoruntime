@@ -23,7 +23,6 @@ import {
 import {
   Eye,
   Trash2,
-  Plus,
   Power,
   PowerOff,
   Loader2,
@@ -62,7 +61,6 @@ interface ModelCardProps {
   onDelete: (modelId: string, modelName: string) => void;
   onLoad: (modelId: string) => void;
   onUnload: (modelId: string, modelName: string) => void;
-  onImportClick?: () => void;
   onUpdate?: (model: ModelData) => void;
   /** per-model busy predicate — index holds a Set so concurrent actions show. */
   isActionLoading?: (modelId: string) => boolean;
@@ -99,7 +97,6 @@ export default function ModelCard({
   onDelete,
   onLoad,
   onUnload,
-  onImportClick,
   onUpdate,
   isActionLoading,
 }: ModelCardProps) {
@@ -119,7 +116,6 @@ export default function ModelCard({
   const [updateConfirm, setUpdateConfirm] = useState<ModelData | null>(null);
 
   const isFilterNoMatch = models.length === 0 && (totalCount ?? 0) > 0;
-  const isNoModels = (totalCount ?? models.length) === 0;
 
   return (
     <>
@@ -144,7 +140,7 @@ export default function ModelCard({
 
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4">
         {/* Import card */}
-        <div
+        {/* <div
           className="flex flex-col items-center justify-center p-6 border-2 border-dashed border-border rounded-lg hover:border-primary hover:bg-primary/5 transition-all cursor-pointer min-h-[220px]"
           onClick={() => onImportClick?.()}
         >
@@ -165,7 +161,7 @@ export default function ModelCard({
               )}
             </p>
           )}
-        </div>
+        </div> */}
 
         {models.map(model => {
           const modelType = getModelType(model.model_type, model.model_id, t);

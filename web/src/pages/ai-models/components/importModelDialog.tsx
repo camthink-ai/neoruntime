@@ -406,17 +406,6 @@ export default function ImportModelDialog({
     );
   };
 
-  // Interrupt an in-flight upload/parse from the source screen: abort the
-  // HTTP request, drop the picked file, and stay on the screen for a retry.
-  const handleCancelUpload = () => {
-    uploadCancelRef.current = true;
-    abortRef.current?.abort();
-    abortRef.current = null;
-    setUploadProgress(null);
-    setFile(null);
-    setParseResult(null);
-  };
-
   const handleContinue = () => {
     setScreen('configure');
   };
@@ -695,7 +684,6 @@ export default function ImportModelDialog({
                 onClear={handleClearFile}
                 isParsing={parseMutation.isPending}
                 uploadProgress={uploadProgress}
-                onCancelUpload={handleCancelUpload}
                 disabled={isLoading}
                 parseResult={parseResult}
                 outputFormat={outputFormat}
@@ -721,9 +709,9 @@ export default function ImportModelDialog({
           />
         )}
 
-        <div className="flex flex-row items-center gap-2 border-t border-border bg-muted/20 px-4 py-3 sm:justify-between sm:px-6 sm:py-4">
+        <div className="flex flex-col gap-3 border-t border-border bg-muted/20 px-4 py-3 sm:flex-row sm:items-center sm:gap-3 sm:px-6 sm:py-4">
           {screen === 'source' ? (
-            <>
+            <div className="flex w-full items-center gap-2 sm:ml-auto sm:w-auto sm:gap-3">
               <Button
                 variant="outline"
                 onClick={handleCancel}
@@ -741,29 +729,14 @@ export default function ImportModelDialog({
                 {t('common.next', 'Next')}
                 <ArrowRight className="ml-2 h-4 w-4" />
               </Button>
-            </>
+            </div>
           ) : (
             <>
-              <Button
-                variant="outline"
-                onClick={handleBackToSource}
-                disabled={isLoading}
-                className="flex-1 sm:flex-none"
-              >
-                <ArrowLeft className="mr-2 h-4 w-4" />
-                {t('sys.ai_models.wizard.back_to_source', 'Back to Upload')}
-              </Button>
-              <Button
-                variant="ghost"
-                onClick={handleCancel}
-                disabled={isLoading}
-                className="hidden flex-1 sm:flex-none sm:inline-flex"
-              >
-                {t('common.cancel', 'Cancel')}
-              </Button>
+              {/* Mobile: checkbox gets its own row above the buttons;
+                  desktop: inline left of Cancel via order. */}
               {!isUpdate && (
                 <label
-                  className={`flex cursor-pointer select-none items-center gap-2 text-sm text-muted-foreground${
+                  className={`order-first flex w-full cursor-pointer select-none items-center gap-2 text-sm text-muted-foreground sm:order-2 sm:w-auto${
                     isLoading ? ' pointer-events-none opacity-50' : ''
                   }`}
                 >
@@ -780,14 +753,35 @@ export default function ImportModelDialog({
                   </span>
                 </label>
               )}
-              <Button
-                variant="carbon"
-                onClick={handleRegister}
-                disabled={isLoading}
-                className="flex-1 sm:flex-none"
-              >
-                {submitLabel}
-              </Button>
+              {/* Mobile: back + register share one row; desktop: the wrapper
+                  dissolves (display:contents) so all buttons sit in one line. */}
+              <div className="flex w-full items-center gap-2 sm:contents">
+                <Button
+                  variant="outline"
+                  onClick={handleBackToSource}
+                  disabled={isLoading}
+                  className="flex-1 sm:order-1 sm:mr-auto sm:flex-none"
+                >
+                  <ArrowLeft className="mr-2 h-4 w-4" />
+                  {t('sys.ai_models.wizard.back_to_source', 'Back to Upload')}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={handleCancel}
+                  disabled={isLoading}
+                  className="hidden sm:order-3 sm:inline-flex"
+                >
+                  {t('common.cancel', 'Cancel')}
+                </Button>
+                <Button
+                  variant="carbon"
+                  onClick={handleRegister}
+                  disabled={isLoading}
+                  className="flex-1 sm:order-4 sm:flex-none"
+                >
+                  {submitLabel}
+                </Button>
+              </div>
             </>
           )}
         </div>

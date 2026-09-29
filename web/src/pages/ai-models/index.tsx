@@ -61,7 +61,7 @@ export default function AIModels() {
   const { t } = useTranslation();
   const [viewMode, setViewMode] = useState<'card' | 'list'>('card');
   const [search, setSearch] = useState('');
-  const [typeFilter, setTypeFilter] = useState<ModelTypeKey | 'all'>('all');
+  const [typeFilter, setTypeFilter] = useState<Set<ModelTypeKey>>(() => new Set());
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [sortBy, setSortBy] = useState<SortBy>('default');
   const [importDialogOpen, setImportDialogOpen] = useState(false);
@@ -120,22 +120,23 @@ export default function AIModels() {
 
   const filteredModels = useMemo(() => {
     const keyword = search.trim().toLowerCase();
-    return sortedModels.filter(
-      (model: any) => (typeFilter === 'all'
-          || resolveModelType(model.model_type, model.model_id) === typeFilter)
+    return sortedModels.filter((model: any) => {
+      const typeKey = resolveModelType(model.model_type, model.model_id);
+      return (typeFilter.size === 0
+          || (typeKey !== null && typeFilter.has(typeKey)))
         && (statusFilter === 'all'
           || (statusFilter === 'loaded'
             ? model.status === 'loaded'
             : model.status !== 'loaded'))
-        && matchesKeyword(model, keyword)
-    );
+        && matchesKeyword(model, keyword);
+    });
   }, [sortedModels, search, typeFilter, statusFilter]);
 
-  const hasActiveFilters =    search.trim() !== '' || typeFilter !== 'all' || statusFilter !== 'all';
+  const hasActiveFilters = search.trim() !== '' || typeFilter.size > 0 || statusFilter !== 'all';
 
   const handleClearFilters = () => {
     setSearch('');
-    setTypeFilter('all');
+    setTypeFilter(new Set());
     setStatusFilter('all');
   };
 
@@ -255,19 +256,30 @@ export default function AIModels() {
     );
   }
 
-  const statusChips: { value: StatusFilter; label: string }[] = [
+  const statusOptions: { value: StatusFilter; label: string }[] = [
     { value: 'all', label: t('sys.ai_models.filter.all_status', '全部状态') },
     { value: 'loaded', label: t('sys.ai_models.status.loaded', '已加载') },
     { value: 'unloaded', label: t('sys.ai_models.status.uploaded', '未加载') },
   ];
 
-  const typeChips: { value: ModelTypeKey | 'all'; label: string }[] = [
-    { value: 'all', label: t('sys.ai_models.filter.all_types', '全部类型') },
-    ...availableTypes.map(key => ({
-      value: key,
-      label: t(`sys.ai_models.model_type.${key}`),
-    })),
-  ];
+  const typeChips: { value: ModelTypeKey; label: string }[] = availableTypes.map(key => ({
+    value: key,
+    label: t(`sys.ai_models.model_type.${key}`),
+  }));
+
+  /** Multi-select: type chips toggle independently; an empty selection
+   *  means "all types" and the 全部 chip resets to that state. */
+  const toggleTypeFilter = (key: ModelTypeKey) => {
+    setTypeFilter(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  };
 
   const renderChip = (active: boolean, label: string, onClick: () => void) => (
     <Button
@@ -319,6 +331,26 @@ export default function AIModels() {
           />
         </div>
 
+        {/* Status filter (coarsest cut) as a compact dropdown; the type
+            filter lives on the chip row below, one click per type. */}
+        {models.length > 0 && (
+          <Select
+            value={statusFilter}
+            onValueChange={value => setStatusFilter(value as StatusFilter)}
+          >
+            <SelectTrigger className="w-[130px] shrink-0">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {statusOptions.map(option => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+
         <Select
           value={sortBy}
           onValueChange={value => setSortBy(value as SortBy)}
@@ -361,13 +393,20 @@ export default function AIModels() {
         </div>
       </div>
 
-      {/* Filter chips — status first (coarsest cut), then type. Only the
-          types present in the data are offered. */}
+      {/* Type filter chips (multi-select) — only the types present in the
+          data are offered; the 全部 chip clears the selection. */}
       {models.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 mb-6">
-          {statusChips.map(chip => renderChip(statusFilter === chip.value, chip.label, () => setStatusFilter(chip.value)))}
-          <span className="mx-1 h-5 w-px bg-border" aria-hidden />
-          {typeChips.map(chip => renderChip(typeFilter === chip.value, chip.label, () => setTypeFilter(chip.value)))}
+          {renderChip(
+            typeFilter.size === 0,
+            t('sys.ai_models.filter.all_types', '全部类型'),
+            () => setTypeFilter(new Set())
+          )}
+          {typeChips.map(chip => renderChip(
+              typeFilter.has(chip.value),
+              chip.label,
+              () => toggleTypeFilter(chip.value)
+            ))}
           {hasActiveFilters && (
             <Button
               type="button"
@@ -392,7 +431,6 @@ export default function AIModels() {
             onDelete={handleDeleteModel}
             onLoad={handleLoadModel}
             onUnload={handleUnloadModel}
-            onImportClick={() => setImportDialogOpen(true)}
             onUpdate={handleOpenUpdateDialog}
             isActionLoading={id => loadingActions.has(id)}
           />

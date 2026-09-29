@@ -28,6 +28,13 @@ export const useModels = () => useQuery({
     // The list endpoint syncs against the runtime over gRPC (per-model N+1),
     // so serve the cache for a beat instead of refetching on every focus.
     staleTime: 30_000,
+    // A failed list (e.g. 500 while the runtime is down) must not be re-fired
+    // by every remount/window-focus/reconnect — the error screen's retry
+    // button is the way back. 5xx exponential retries are already disabled
+    // globally in main.tsx; once the error clears these resume on their own.
+    retryOnMount: false,
+    refetchOnWindowFocus: query => !query.state.error,
+    refetchOnReconnect: query => !query.state.error,
   });
 
 export const useModelInfo = (modelId: string) => useQuery({
