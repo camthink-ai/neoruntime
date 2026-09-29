@@ -18,15 +18,14 @@ const maxDescriptionSize = 2 << 20
 const SingleRecoveryMarker = "AIPC_LOCAL_RECOVERY_V1"
 
 type ValidationOptions struct {
-	ExpectedSHA256       string
-	ExpectedMachine      string
-	ExpectedProduct      string
-	ExpectedHW           string
-	ExpectedDevice       string
-	RequireBuildTime     bool
-	RequireAB            bool
-	RequireCompatibility bool
-	RequireSignature     bool
+	ExpectedSHA256   string
+	ExpectedMachine  string
+	ExpectedProduct  string
+	ExpectedHW       string
+	ExpectedDevice   string
+	RequireBuildTime bool
+	RequireAB        bool
+	RequireSignature bool
 }
 
 type ValidationResult struct {
@@ -49,8 +48,6 @@ type ValidationResult struct {
 	SingleRecoveryCapable   bool
 	MinRecoveryVersion      string
 	SecureBootKeyID         string
-	CompatLevel             int
-	DataSchema              int
 	Entries                 int
 	HasSignature            bool
 }
@@ -63,8 +60,6 @@ var (
 	deviceRE      = regexp.MustCompile(`(?m)\bFILESYSTEM_DEVICE\s*=\s*['"]([^'"]+)['"]`)
 	minRecoveryRE = regexp.MustCompile(`(?m)\bmin-recovery-version\s*=\s*"([^"]+)"`)
 	keyIDRE       = regexp.MustCompile(`(?m)\bsecure-boot-key-id\s*=\s*"([^"]+)"`)
-	compatLevelRE = regexp.MustCompile(`(?m)\baipc-compat-level\s*=\s*"([0-9]+)"`)
-	dataSchemaRE  = regexp.MustCompile(`(?m)\bdata-schema\s*=\s*"([0-9]+)"`)
 )
 
 func ValidatePackage(path string, opts ValidationOptions) (*ValidationResult, error) {
@@ -194,8 +189,6 @@ func ValidatePackage(path string, opts ValidationOptions) (*ValidationResult, er
 	result.SupportsAB = result.SupportsFullUpgrade || result.SupportsStandardUpgrade
 	result.MinRecoveryVersion = firstMatch(minRecoveryRE, description)
 	result.SecureBootKeyID = firstMatch(keyIDRE, description)
-	result.CompatLevel, _ = strconv.Atoi(firstMatch(compatLevelRE, description))
-	result.DataSchema, _ = strconv.Atoi(firstMatch(dataSchemaRE, description))
 	if result.Version == "" {
 		return nil, fmt.Errorf("sw-description does not contain a target version")
 	}
@@ -207,9 +200,6 @@ func ValidatePackage(path string, opts ValidationOptions) (*ValidationResult, er
 	}
 	if opts.RequireAB && !result.SupportsAB {
 		return nil, fmt.Errorf("sw-description does not define stable/copy-a")
-	}
-	if opts.RequireCompatibility && (result.CompatLevel <= 0 || result.DataSchema <= 0) {
-		return nil, fmt.Errorf("sw-description does not contain valid aipc-compat-level and data-schema")
 	}
 	if opts.RequireSignature && !result.HasSignature {
 		return nil, fmt.Errorf("package does not contain sw-description.sig")

@@ -24,6 +24,21 @@ bool HalMlLoader::load(const std::string& lib_path) {
         return false;
     }
 
+    // ABI guard: absent from HALs built before 2026-09-16 — members appended
+    // after get_version (tensor_from_frame_ex / bind_dma_frame /
+    // probe_capability) are then treated as unavailable so a mixed deploy
+    // falls back instead of calling past the end of the provider's table
+    // (the R1 SIGILL). Not fatal: the core table still works.
+    infer_ops_abi_size_ = static_cast<const uint32_t*>(
+        dlsym(dl_handle_, "HAL_INFERENCE_OPS_ABI_SIZE"));
+    if (!infer_ops_abi_size_) {
+        LOG_WARN("HAL_INFERENCE_OPS_ABI_SIZE not found in %s — HAL predates the "
+                 "ABI guard; tensor_from_frame_ex / bind_dma_frame / "
+                 "probe_capability disabled (deploy ai-runtime and HAL from "
+                 "the same build)",
+                 lib_path.c_str());
+    }
+
     // Resolve HAL_POSTPROCESS_OPS (optional)
     post_ops_ = static_cast<HalPostprocessOps*>(dlsym(dl_handle_, "HAL_POSTPROCESS_OPS"));
     if (post_ops_) {
@@ -71,6 +86,7 @@ bool HalMlLoader::load(const std::string& lib_path) {
 
 void HalMlLoader::unload() {
     infer_ops_ = nullptr;
+    infer_ops_abi_size_ = nullptr;
     post_ops_  = nullptr;
     draw_ops_  = nullptr;
     clip_text_enc_ops_ = nullptr;

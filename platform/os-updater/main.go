@@ -15,7 +15,7 @@ func main() {
 	machine := flag.String("machine", envOr("AIPC_OS_MACHINE", "hailo15-ne503"), "device machine")
 	flag.Parse()
 	if flag.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: aipc-os-updater [OPTIONS] install|reboot|verify|check-recovery|exchange-dirs OLD NEW")
+		fmt.Fprintln(os.Stderr, "usage: aipc-os-updater [OPTIONS] install|reboot|needs-verify|verify|check-recovery|exchange-dirs OLD NEW")
 		os.Exit(2)
 	}
 	runner := osupgrade.NewRunner(osupgrade.NewStore(*root))
@@ -25,6 +25,17 @@ func main() {
 		err = runner.Install()
 	case "reboot":
 		err = runner.Reboot()
+	case "needs-verify":
+		needed, checkErr := runner.NeedsVerification()
+		if checkErr != nil {
+			fmt.Fprintln(os.Stderr, checkErr)
+			// ExecCondition treats 255 as a real unit failure. Other non-zero
+			// values skip the service without marking it failed.
+			os.Exit(255)
+		}
+		if !needed {
+			os.Exit(1)
+		}
 	case "verify":
 		err = runner.Verify()
 	case "check-recovery":

@@ -139,7 +139,9 @@ export function ViewEditDialog({
                 size="icon-sm"
                 className="h-8 w-8"
                 onClick={toggleFullscreen}
-                title={isFullscreen ? '退出全屏' : '全屏'}
+                title={isFullscreen
+                  ? t('sys.file_management.exit_fullscreen', '退出全屏')
+                  : t('sys.file_management.fullscreen', '全屏')}
               >
                 {isFullscreen ? (
                   <Minimize2 className="h-4 w-4" />

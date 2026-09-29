@@ -23,7 +23,11 @@ void PostprocessPool::start() {
 }
 
 void PostprocessPool::stop() {
-    if (!running_.exchange(false)) return;
+    {
+        std::lock_guard lock(mu_);
+        if (!running_) return;
+        running_ = false;
+    }
 
     LOG_INFO("Stopping postprocess pool");
     cv_.notify_all();
@@ -34,18 +38,26 @@ void PostprocessPool::stop() {
     workers_.clear();
 }
 
-bool PostprocessPool::submit(Task& task) {
+bool PostprocessPool::submit(Task& task) noexcept {
     if (!running_) return false;
 
-    std::lock_guard lock(mu_);
-    if (static_cast<int>(tasks_.size()) >= queue_capacity_) {
-        LOG_WARN("Postprocess queue full (%d), falling back to sync",
-                 queue_capacity_);
-        return false;
+    try {
+        std::lock_guard lock(mu_);
+        if (!running_) return false;
+        if (static_cast<int>(tasks_.size()) >= queue_capacity_) {
+            LOG_WARN("Postprocess queue full (%d), falling back to sync",
+                     queue_capacity_);
+            return false;
+        }
+        tasks_.push(task);
+        cv_.notify_one();
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR("Postprocess queue submission failed: %s", e.what());
+    } catch (...) {
+        LOG_ERROR("Postprocess queue submission failed");
     }
-    tasks_.push(std::move(task));
-    cv_.notify_one();
-    return true;
+    return false;
 }
 
 int PostprocessPool::queue_depth() const {

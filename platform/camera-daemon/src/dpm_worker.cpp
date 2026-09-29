@@ -35,6 +35,8 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
+#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -364,6 +366,42 @@ int decode_plate_grid(const HalTensor* outs, uint32_t num_outputs,
     return static_cast<int>(kept.size());
 }
 
+// Comma-join label names for logs and skip reasons ("a,b,c").
+std::string join_csv(const std::vector<std::string>& v) {
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) out += ',';
+        out += v[i];
+    }
+    return out;
+}
+
+// Read the "labels" string array out of a Hailo postproc config JSON — the same
+// file the HAL reads via config_file, whose labels populate d.label. Returns
+// false (with a short reason) when the file is missing/unreadable, is not valid
+// JSON, or carries no non-empty labels array: for a keep-filtered detection
+// spec any of these means d.label stays empty and every detection would be
+// silently dropped by the keep_labels filter. Non-throwing: parse runs with
+// allow_exceptions=false and get<std::string>() is only called on elements that
+// passed is_string().
+bool read_postproc_labels(const std::string& path, std::vector<std::string>& out,
+                          std::string& err) {
+    out.clear();
+    if (path.empty()) { err = "no postproc JSON path configured"; return false; }
+    std::ifstream f(path);
+    if (!f) { err = "open failed"; return false; }
+    const nlohmann::json j =
+        nlohmann::json::parse(f, /*callback=*/nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded()) { err = "malformed JSON"; return false; }
+    const auto it = j.find("labels");
+    if (it == j.end() || !it->is_array()) { err = "no \"labels\" array"; return false; }
+    for (const auto& l : *it) {
+        if (l.is_string()) out.push_back(l.get<std::string>());
+    }
+    if (out.empty()) { err = "empty \"labels\" array"; return false; }
+    return true;
+}
+
 }  // namespace
 
 DpmWorker::DpmWorker() = default;
@@ -423,6 +461,12 @@ bool DpmWorker::init_sessions() {
     dsp_ops_ = cfg_.dsp_ops;
     fb_ops_ = cfg_.fb_ops;
 
+    // Init diagnostics for the caller: camera_daemon reverts the DPM toggle
+    // when specs were requested but none became effective (instead of arming
+    // a silent no-op worker).
+    requested_specs_ = cfg_.detectors.size();
+    skip_reasons_.clear();
+
     // DSP context (clean-frame → model-input resize, on the streaming thread).
     HalDspConfig dcfg{};
     dcfg.device_priority = 0;
@@ -430,10 +474,17 @@ bool DpmWorker::init_sessions() {
 
     // Graceful per-spec init: a missing/unsupported HEF is logged + skipped; the
     // worker still ships the models that DID load. start() succeeds even if every
-    // spec fails (idle mode) — DPM can be "armed" with no targets selected.
+    // spec fails (idle mode) — DPM can be "armed" with no targets selected. Every
+    // skip is recorded in skip_reasons_ so the caller can tell that apart from
+    // the valid empty-label idle and fail honestly (see detector_skip_reasons()).
     for (const auto& spec : cfg_.detectors) {
         DetectorSession ds;
         ds.spec = spec;
+
+        // Record why each requested spec did NOT ship (one entry per skip).
+        auto skip = [this, &spec](std::string reason) {
+            skip_reasons_.emplace_back(spec.name + ": " + std::move(reason));
+        };
 
         HalInferenceConfig icfg{};
         std::snprintf(icfg.model_path, sizeof(icfg.model_path), "%s",
@@ -450,6 +501,7 @@ bool DpmWorker::init_sessions() {
         if (!ds.session) {
             HAL_LOG_WARNING("DPM[%s]: HEF load failed (%s) — skipping model",
                             spec.name.c_str(), spec.hef.c_str());
+            skip("HEF load failed");
             continue;
         }
 
@@ -458,6 +510,7 @@ bool DpmWorker::init_sessions() {
             minfo.num_outputs == 0) {
             HAL_LOG_WARNING("DPM[%s]: get_model_info failed — skipping",
                             spec.name.c_str());
+            skip("get_model_info failed");
             infer_ops_->destroy(ds.session);
             continue;
         }
@@ -466,6 +519,7 @@ bool DpmWorker::init_sessions() {
         if (!model_input_info(infer_ops_, ds.session, ds.input_w, ds.input_h, ds.input_format)) {
             HAL_LOG_WARNING("DPM[%s]: input dims/format unknown — skipping",
                             spec.name.c_str());
+            skip("input dims/format unknown");
             infer_ops_->destroy(ds.session);
             continue;
         }
@@ -497,6 +551,7 @@ bool DpmWorker::init_sessions() {
             HAL_LOG_WARNING("DPM[%s]: input buffer alloc failed (rc=%d, %ux%u %s DMABUF) — skipping",
                             spec.name.c_str(), alloc_rc, ds.input_w, ds.input_h,
                             pixfmt_name(ds.input_format));
+            skip("input buffer alloc failed");
             for (int b = 0; b < 2; ++b) {
                 if (ds.input_fb[b]) { fb_ops_->release_frame_buffer(ds.input_fb[b]); ds.input_fb[b] = nullptr; }
             }
@@ -515,6 +570,7 @@ bool DpmWorker::init_sessions() {
             if ((ds.input_w & 1u) || (ds.input_h & 1u)) {
                 HAL_LOG_WARNING("DPM[%s]: RGB model with odd input dims %ux%u — NV12 staging needs even dims, skipping",
                                 spec.name.c_str(), ds.input_w, ds.input_h);
+                skip("RGB model with odd input dims (NV12 staging needs even dims)");
                 for (int b = 0; b < 2; ++b) {
                     if (ds.input_fb[b]) { fb_ops_->release_frame_buffer(ds.input_fb[b]); ds.input_fb[b] = nullptr; }
                 }
@@ -540,6 +596,7 @@ bool DpmWorker::init_sessions() {
             if (!salloc_ok) {
                 HAL_LOG_WARNING("DPM[%s]: NV12 staging buffer alloc failed (rc=%d, %ux%u) — skipping",
                                 spec.name.c_str(), salloc_rc, ds.input_w, ds.input_h);
+                skip("NV12 staging buffer alloc failed");
                 for (int b = 0; b < 2; ++b) {
                     if (ds.input_fb[b]) { fb_ops_->release_frame_buffer(ds.input_fb[b]); ds.input_fb[b] = nullptr; }
                     if (ds.staging_nv12[b]) { fb_ops_->release_frame_buffer(ds.staging_nv12[b]); ds.staging_nv12[b] = nullptr; }
@@ -591,10 +648,65 @@ bool DpmWorker::init_sessions() {
             pcfg.config.detection.config_file =
                 spec.post_json.empty() ? nullptr : spec.post_json.c_str();
         }
+
+        // Label-compatibility gate (2026-08 field incident): a visdrone 11-class
+        // HEF+JSON pair overwrote hailo_yolov8n_384_640.* in the shared models
+        // dir. The postproc loaded fine, but none of its labels
+        // ("pedestrian"/"car"/"bus"...) intersected keep_labels {vehicle,face}
+        // → every detection was silently dropped by the keep filter → the mask
+        // was forever empty while the UI toggle stayed ON. For a keep-filtered
+        // detection spec the postproc JSON labels MUST intersect keep_labels;
+        // otherwise the spec can never contribute a mask — refuse it here
+        // instead of loading it into a silent no-op.
+        if (!spec.is_seg && !spec.keep_labels.empty()) {
+            std::vector<std::string> post_labels;
+            std::string json_err;
+            if (!read_postproc_labels(spec.post_json, post_labels, json_err)) {
+                HAL_LOG_WARNING("DPM[%s]: postproc JSON unusable (%s: %s) — d.label "
+                                "would stay empty and keep_labels could never match; "
+                                "skipping model %s",
+                                spec.name.c_str(), spec.post_json.c_str(),
+                                json_err.c_str(), spec.hef.c_str());
+                skip("postproc JSON unusable (" + json_err + ")");
+                for (int b = 0; b < 2; ++b) {
+                    if (ds.input_fb[b]) { fb_ops_->release_frame_buffer(ds.input_fb[b]); ds.input_fb[b] = nullptr; }
+                    if (ds.staging_nv12[b]) { fb_ops_->release_frame_buffer(ds.staging_nv12[b]); ds.staging_nv12[b] = nullptr; }
+                }
+                infer_ops_->destroy(ds.session);
+                continue;
+            }
+            const std::string* hit = nullptr;
+            for (const auto& want : spec.keep_labels) {
+                if (std::find(post_labels.begin(), post_labels.end(), want) != post_labels.end()) {
+                    hit = &want;
+                    break;
+                }
+            }
+            if (!hit) {
+                HAL_LOG_WARNING("DPM[%s]: postproc labels (%s) do not intersect "
+                                "keep_labels (%s) — model %s can never mask the "
+                                "selected targets (wrong or overwritten model?); "
+                                "skipping",
+                                spec.name.c_str(), join_csv(post_labels).c_str(),
+                                join_csv(spec.keep_labels).c_str(), spec.hef.c_str());
+                skip("labels mismatch: postproc=[" + join_csv(post_labels) +
+                     "] keep=[" + join_csv(spec.keep_labels) + "]");
+                for (int b = 0; b < 2; ++b) {
+                    if (ds.input_fb[b]) { fb_ops_->release_frame_buffer(ds.input_fb[b]); ds.input_fb[b] = nullptr; }
+                    if (ds.staging_nv12[b]) { fb_ops_->release_frame_buffer(ds.staging_nv12[b]); ds.staging_nv12[b] = nullptr; }
+                }
+                infer_ops_->destroy(ds.session);
+                continue;
+            }
+            HAL_LOG_INFO("DPM[%s]: postproc labels intersect keep_labels at \"%s\"",
+                         spec.name.c_str(), hit->c_str());
+        }
+
         ds.post = post_ops_->create(&pcfg);
         if (!ds.post) {
             HAL_LOG_WARNING("DPM[%s]: postproc create failed — skipping",
                             spec.name.c_str());
+            skip("postproc create failed");
             for (int b = 0; b < 2; ++b) {
                 if (ds.input_fb[b]) { fb_ops_->release_frame_buffer(ds.input_fb[b]); ds.input_fb[b] = nullptr; }
                 if (ds.staging_nv12[b]) { fb_ops_->release_frame_buffer(ds.staging_nv12[b]); ds.staging_nv12[b] = nullptr; }
@@ -641,6 +753,9 @@ bool DpmWorker::init_sessions() {
     if (detectors_.empty()) {
         // Idle mode: DPM armed with no targets. Valid state — worker runs, no
         // inference, publishes no mask (get_latest() == nullptr → no bake).
+        // camera_daemon distinguishes this (requested_spec_count()==0, the
+        // empty-label case) from a requested-but-none-effective init via
+        // detector_skip_reasons() and reverts the toggle for the latter.
         HAL_LOG_INFO("DPM: idle mode (no detectors loaded) — worker runs, no inference");
     }
     return true;

@@ -136,7 +136,7 @@ Examples:
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("request failed: %w", err)
 		}
@@ -179,7 +179,7 @@ var logsDownloadCmd = &cobra.Command{
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("download failed: %w", err)
 		}

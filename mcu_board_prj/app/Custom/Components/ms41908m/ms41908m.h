@@ -17,11 +17,16 @@ extern "C" {
 #define MS41908M_CALC_INTCT_FROM_PPS(pps)       (MS41908M_OSCIN_FREQ / ((uint32_t)(pps) * 24UL))                        /* pps (micro steps/sec) to intct */
 #define MS41908M_CALC_INTCT_FROM_PSUM(psum)     (MS41908M_OSCIN_FREQ / ((uint32_t)(psum) * MS41908M_VD_FREQ * 24UL))    /* psum (micro steps) to intct */
 #define MS41908M_CALC_PSUM_FROM_INTCT(intct)    (MS41908M_OSCIN_FREQ / ((uint32_t)(intct) * MS41908M_VD_FREQ * 24UL))   /* intct to psum (micro steps) */
-/* PPS and micro steps limits */
-#define MS41908M_PPS_MIN                        (24UL)                      /* 24 micro steps/sec */
-#define MS41908M_PPS_MAX                        (4000UL)                    /* 4000 micro steps/sec */
-#define MS41908M_MSTEPS_MIN                     (1UL)                       /* 1 micro step */
-#define MS41908M_MSTEPS_MAX                     (65535UL)                   /* 65535 micro steps */
+/* Raw MS41908M motion-unit limits. These are not physical lens steps/second. */
+#define MS41908M_RAW_PPS_MIN                    (24UL)
+#define MS41908M_RAW_PPS_MAX                    (8000UL)
+#define MS41908M_RAW_PSUM_MIN                   (1UL)
+#define MS41908M_RAW_PSUM_MAX                   (65535UL)
+/* Source compatibility for existing low-level callers. */
+#define MS41908M_PPS_MIN                        MS41908M_RAW_PPS_MIN
+#define MS41908M_PPS_MAX                        MS41908M_RAW_PPS_MAX
+#define MS41908M_MSTEPS_MIN                     MS41908M_RAW_PSUM_MIN
+#define MS41908M_MSTEPS_MAX                     MS41908M_RAW_PSUM_MAX
 /* Reset zero configuration */
 #define MS41908M_RESET_FAST_PPS                 (1200UL)                        /* Fast exit from PI blocked (LOW) zone */
 #define MS41908M_RESET_SLOW_PPS                 (400UL)                         /* Slow re-approach until PI falling edge */
@@ -199,6 +204,7 @@ ms41908m_state_t ms41908m_get_zoom_state(void);         /* Zoom and focus may ru
 ms41908m_state_t ms41908m_get_focus_state(void);
 int ms41908m_get_zoom_position(void);       /* return the current position, if reset zero is not done or while running, return value is not guaranteed to be correct  */
 int ms41908m_get_focus_position(void);      /* return the current position, if reset zero is not done or while running, return value is not guaranteed to be correct */
+/* Low-level/raw motion APIs: pps and distance are MS41908M units, not physical lens steps. */
 int ms41908m_zoom_run(uint16_t pps, int32_t micro_steps);
 int ms41908m_focus_run(uint16_t pps, int32_t micro_steps);
 int ms41908m_zoom_run_to_position(uint16_t pps, int32_t position);   /* zero + if limits set (*_set_position_limit), target must be in [min,max] */

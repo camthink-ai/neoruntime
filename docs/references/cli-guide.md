@@ -21,6 +21,35 @@ subcommands only (media, process, logs, system, stream, files, event-log,
 monitor). The global flags above are `--output/-o`, `--verbose/-v`,
 `--app-manager`, and `--event-bus`.
 
+## Authentication (REST commands)
+
+**Local usage (default, or `--api http://localhost:8080` etc.): no token
+required.** When the `--api` target is a loopback address and the platform-api
+unix socket exists (default `/run/aipc/platform-api.sock`), the CLI transparently
+dials the socket instead of TCP. This face is authenticated by the socket file
+permission (0660, root + group), the same trust model as the platform's gRPC
+services. REST commands work out of the box on the device.
+
+To force TCP anyway (e.g. for testing the authenticated path), point
+`api.unix_socket` in the config file at a non-existent path.
+
+**Remote usage (`--api http://<device-ip>:8080`): Bearer token required.**
+Requests over TCP are rejected with 401 unless a valid token is provided. Put
+the token in the CLI config file:
+
+```yaml
+auth:
+  token: <token>        # value of auth.token_key from the device's
+                        # /data/aipc/etc/platform-api.yaml, or the AIPC_TOKEN_KEY
+                        # env var the service was started with
+```
+
+Notes:
+
+- The CLI config file lives at `$HOME/.aipc/config.yaml`. Beware: on the device
+  the root account's HOME is `/home/root`, not `/root`.
+- Local calls may still carry the configured token; the socket face ignores it.
+
 ---
 
 ## app — Application Management
@@ -104,7 +133,7 @@ aipc-cli device gpio write 21 1      # GPIO 21 output high
 ```bash
 aipc-cli stream list                                 # List streams
 aipc-cli stream info <stream-id>                     # Stream details
-aipc-cli stream url <stream-id> [--format rtsp|hls]  # Get stream URL
+aipc-cli stream url <stream-id> [--format ws|rtsp]   # Get stream URL
 ```
 
 ---
@@ -153,9 +182,14 @@ aipc-cli system status                               # Service status
 aipc-cli system start                                # Start all services
 aipc-cli system stop                                 # Stop all services
 aipc-cli system restart                              # Restart all services
-aipc-cli system enable                               # Enable auto-start on boot
-aipc-cli system disable                              # Disable auto-start
+aipc-cli system enable                               # Enable auto-start on boot (incl. aipc-autostart)
+aipc-cli system disable                              # Stop now + disable auto-start (incl. aipc-autostart)
 ```
+
+`disable` survives an ordinary reboot: it disables `aipc-autostart.service`,
+and the OS verifier only starts that unit when a non-terminal upgrade job
+actually needs post-boot verification. A redeploy or such an OS-upgrade verify
+boot brings the platform back by design.
 
 ---
 
@@ -261,4 +295,11 @@ grpc:
 output:
   format: table
   color: true
+api:
+  unix_socket: /run/aipc/platform-api.sock  # loopback REST calls dial this
+                                            # socket (token-free); point at a
+                                            # non-existent path to force TCP
+auth:
+  token: ""                                 # only needed for remote --api
+                                            # targets (TCP requires Bearer)
 ```

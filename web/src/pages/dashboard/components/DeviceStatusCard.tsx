@@ -1,9 +1,7 @@
 import { useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Activity, Timer, Thermometer } from 'lucide-react';
-import { monitorApi } from '@/services/api/system';
-import { useDeviceStatus } from '@/hooks/useDeviceControl';
+import { useMonitorSnapshot } from '@/services/dashboard';
 import { useDeviceClock } from '@/hooks/useDeviceClock';
 
 const TEMP_WARN_SOC = 80;
@@ -12,19 +10,12 @@ const TEMP_WARN_BOARD = 80;
 export default function DeviceStatusCard() {
   const { t } = useTranslation();
   const { systemTime, formattedClock } = useDeviceClock();
-  const { data: deviceStatus } = useDeviceStatus();
 
-  // Temperature snapshot (board)
-  const { data: snapshot } = useQuery({
-    queryKey: ['monitorSnapshot'],
-    queryFn: () => monitorApi.getSnapshot(),
-    staleTime: 2000,
-    refetchInterval: 5000,
-    retry: false,
-  });
+  // Temperature snapshot (cpu/board) — 由 useMonitorSnapshot 统一提供
+  const { data: snapshot } = useMonitorSnapshot();
 
-  const temps = snapshot?.data?.temperatures;
-  const socTemp = deviceStatus?.soc_temp_c;
+  const temps = snapshot?.temperatures;
+  const socTemp = temps?.cpu;
 
   const hasWarning =    (temps?.board ?? 0) >= TEMP_WARN_BOARD || (socTemp ?? 0) >= TEMP_WARN_SOC;
 

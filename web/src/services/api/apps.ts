@@ -41,8 +41,12 @@ export const appsApi = {
   // 获取异步安装进度
   getInstallProgress: (taskId: string) => request.get(`/api/v1/apps/install-progress/${taskId}`),
 
-  // 上传镜像文件
-  uploadImage: (file: File, onProgress?: (progress: number) => void) => {
+  // 上传镜像文件（signal：向导取消时中止请求，防止残留上传继续回调）
+  uploadImage: (
+    file: File,
+    onProgress?: (progress: number) => void,
+    signal?: AbortSignal
+  ) => {
     const formData = new FormData();
     formData.append('file', file); // 字段名必须是 'file'
 
@@ -50,6 +54,7 @@ export const appsApi = {
       headers: {
         'Content-Type': 'multipart/form-data',
       },
+      signal,
       onUploadProgress: progressEvent => {
         if (onProgress && progressEvent.total) {
           const percentCompleted = Math.round(
@@ -62,14 +67,57 @@ export const appsApi = {
   },
 
   // 上传 app.yaml 清单文件
-  uploadManifest: (file: File) => {
+  uploadManifest: (file: File, baseManifestPath?: string) => {
     const formData = new FormData();
     formData.append('file', file);
+    if (baseManifestPath) {
+      formData.append('base_manifest_path', baseManifestPath);
+    }
     return request.post('/api/v1/apps/upload-manifest', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
   },
 
+  // 上传 .neoapp 单文件应用包（tar.gz：app.yaml + image.tar），服务端解包，
+  // 响应同时携带 manifest 与 image 两半（path/image_path 等）
+  // （signal：向导取消时中止请求，防止残留上传继续回调）
+  uploadPackage: (
+    file: File,
+    onProgress?: (progress: number) => void,
+    signal?: AbortSignal
+  ) => {
+    const formData = new FormData();
+    formData.append('file', file); // 字段名必须是 'file'
+
+    return request.post('/api/v1/apps/upload-package', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+      signal,
+      onUploadProgress: progressEvent => {
+        if (onProgress && progressEvent.total) {
+          const percentCompleted = Math.round(
+            (progressEvent.loaded * 100) / progressEvent.total
+          );
+          onProgress(percentCompleted);
+        }
+      },
+    });
+  },
+
   // 从已上传的清单+镜像安装应用（异步，返回 task_id）
-  installPackage: (data: { manifest_path: string; image_path?: string }) => request.post('/api/v1/apps/install-package', data),
+  installPackage: (data: {
+    manifest_path: string;
+    image_path?: string;
+    force?: boolean;
+  }) => request.post('/api/v1/apps/install-package', data),
+
+  // 放弃尚未交给安装任务的 request-private staging
+  abandonStaging: (paths: string[]) => request.post('/api/v1/apps/staging/abandon', { paths }),
+
+  // 字段级修改已上传的清单（保注释/未知字段，白名单路径 → JSON 值）
+  patchManifest: (data: {
+    manifest_path: string;
+    fields: Record<string, unknown>;
+  }) => request.patch('/api/v1/apps/manifest', data),
 };

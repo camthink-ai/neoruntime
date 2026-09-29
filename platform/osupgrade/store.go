@@ -86,9 +86,8 @@ type Job struct {
 	RecoveryVersion             string                  `json:"recovery_version,omitempty"`
 	SecureBootKeyID             string                  `json:"secure_boot_key_id,omitempty"`
 	AppVersion                  string                  `json:"app_version,omitempty"`
-	CompatLevel                 int                     `json:"compat_level,omitempty"`
-	DataSchema                  int                     `json:"data_schema,omitempty"`
 	CompatibilityValid          bool                    `json:"compatibility_valid"`
+	CompatibilityWarning        string                  `json:"compatibility_warning,omitempty"`
 	RollbackSupported           bool                    `json:"rollback_supported"`
 	ServiceInterruptionRequired bool                    `json:"service_interruption_required"`
 	DowngradeAllowed            bool                    `json:"downgrade_allowed"`

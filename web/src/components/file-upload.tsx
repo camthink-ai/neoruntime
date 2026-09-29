@@ -9,6 +9,21 @@ import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 
+// Prefer human-facing extensions over MIME keys when the accept map carries
+// them ({ 'application/gzip': ['.tar.gz', '.tgz'] } → '.tar.gz, .tgz').
+function formatAcceptList(accept: Record<string, unknown>): string {
+  const extensions = [
+    ...new Set(
+      Object.values(accept)
+        .filter((v): v is string[] => Array.isArray(v))
+        .flat()
+    ),
+  ];
+  return extensions.length > 0
+    ? extensions.join(', ')
+    : Object.keys(accept).join(', ');
+}
+
 export interface FileUploadProps extends Omit<DropzoneOptions, 'onDrop'> {
   className?: string;
   /** 上传成功回调 */
@@ -67,10 +82,15 @@ export default function FileUpload({
         const error = rejectedFiles[0].errors[0];
         if (error.code === 'file-too-large') {
           toast.error(
-            `文件过大，最大允许 ${maxSize ? `${(maxSize / 1024 / 1024).toFixed(1)}MB` : '未限制'}`
+            t('sys.file_upload.file_too_large', {
+              limit: maxSize
+                ? `${(maxSize / 1024 / 1024).toFixed(1)}MB`
+                : t('sys.file_upload.no_limit', '未限制'),
+              defaultValue: '文件过大，最大允许 {{limit}}',
+            })
           );
         } else if (error.code === 'file-invalid-type') {
-          toast.error('文件类型不支持');
+          toast.error(t('sys.file_upload.file_type_unsupported', '文件类型不支持'));
         } else {
           toast.error(error.message);
         }
@@ -96,7 +116,7 @@ export default function FileUpload({
         }
       }
     },
-    [single, onChange, onUpload, maxSize]
+    [single, onChange, onUpload, maxSize, t]
   );
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -180,7 +200,7 @@ export default function FileUpload({
                   <div className="flex items-center gap-3 flex-1 min-w-0">
                     <File className="w-5 h-5 text-muted-foreground shrink-0" />
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-foreground truncate">
+                      <p className="text-sm font-medium text-foreground break-all">
                         {file.name}
                       </p>
                       <p className="text-xs text-muted-foreground">
@@ -213,24 +233,28 @@ export default function FileUpload({
           /* 空状态 */
           <>
             <UploadCloud className="w-12 h-12 mb-3 text-muted-foreground" />
-            <p className="text-muted-foreground mb-1">
+            <p className="text-muted-foreground mb-1 text-center break-words">
               {placeholder
                 || t(
                   'sys.file_upload.placeholder',
                   'Drag files here, or click to select'
                 )}
             </p>
-            {hint && <p className="text-sm text-muted-foreground">{hint}</p>}
+            {hint && (
+              <p className="text-sm text-muted-foreground text-center break-words">
+                {hint}
+              </p>
+            )}
             {accept && (
-              <p className="text-xs text-muted-foreground mt-2">
+              <p className="mt-2 text-xs text-muted-foreground text-center break-all">
                 {t('sys.file_management.supported_formats', '支持格式')}:{' '}
                 {typeof accept === 'string'
                   ? accept
-                  : Object.keys(accept).join(', ')}
+                  : formatAcceptList(accept)}
               </p>
             )}
             {maxSize && (
-              <p className="text-xs text-muted-foreground">
+              <p className="text-xs text-muted-foreground text-center break-words">
                 {t('common.max_file_size', {
                   size: `${(maxSize / 1024 / 1024).toFixed(1)}MB`,
                   defaultValue: '最大文件大小: {{size}}',
@@ -253,10 +277,11 @@ interface FileUploadButtonProps extends Omit<FileUploadProps, 'children'> {
 }
 
 export function FileUploadButton({
-  buttonText = '选择文件',
+  buttonText,
   buttonClassName,
   ...props
 }: FileUploadButtonProps) {
+  const { t } = useTranslation();
   return (
     <FileUpload {...props}>
       <button
@@ -266,7 +291,7 @@ export function FileUploadButton({
           buttonClassName
         )}
       >
-        {buttonText}
+        {buttonText || t('sys.file_upload.select_file', '选择文件')}
       </button>
     </FileUpload>
   );
@@ -280,6 +305,7 @@ interface ImageUploadProps extends FileUploadProps {
 }
 
 export function ImageUpload({ previewUrl, ...props }: ImageUploadProps) {
+  const { t } = useTranslation();
   const [preview, setPreview] = useState<string | null>(previewUrl || null);
 
   const handleChange = (files: File[]) => {
@@ -312,9 +338,11 @@ export function ImageUpload({ previewUrl, ...props }: ImageUploadProps) {
         ) : (
           <>
             <UploadCloud className="w-12 h-12 mb-3 text-muted-foreground" />
-            <p className="text-muted-foreground mb-1">点击或拖拽上传图片</p>
+            <p className="text-muted-foreground mb-1">
+              {t('sys.file_upload.upload_image_hint', '点击或拖拽上传图片')}
+            </p>
             <p className="text-sm text-muted-foreground">
-              支持 PNG, JPG, GIF, WebP
+              {t('sys.file_upload.image_formats_hint', '支持 PNG, JPG, GIF, WebP')}
             </p>
           </>
         )}

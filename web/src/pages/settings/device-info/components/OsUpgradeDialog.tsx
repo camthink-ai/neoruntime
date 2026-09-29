@@ -220,26 +220,31 @@ export function OsUpgradeDialog({ open, onOpenChange }: OsUpgradeDialogProps) {
 
   // Always query the active job — used both on open (to echo any staged
   // package) and after a failed upload/validate (to sync the backend state).
-  const refresh = useCallback(async (silent = true) => {
-    try {
-      const resp: any = await systemApi.osUpgradeStatus(undefined, silent);
-      const st: OSUpgradeStatus | undefined = resp?.data;
-      if (st) {
-        if (st.status === 'success') {
-          cleanupTerminalPackage(st.job_id || '');
-          resetPackageState();
-          return;
+  const refresh = useCallback(
+    async (silent = true) => {
+      try {
+        const resp: any = await systemApi.osUpgradeStatus(undefined, silent);
+        const st: OSUpgradeStatus | undefined = resp?.data;
+        if (st) {
+          if (st.status === 'success') {
+            cleanupTerminalPackage(st.job_id || '');
+            resetPackageState();
+            return;
+          }
+          setStatus(st);
+          setJobId(st.job_id || '');
+          if (st.status === 'ready') {
+            setSelectedUpdateMode(
+              current => current || getDefaultUpdateMode(st)
+            );
+          }
         }
-        setStatus(st);
-        setJobId(st.job_id || '');
-        if (st.status === 'ready') {
-          setSelectedUpdateMode(current => current || getDefaultUpdateMode(st));
-        }
+      } catch {
+        // Device unreachable / no active job — leave the current status.
       }
-    } catch {
-      // Device unreachable / no active job — leave the current status.
-    }
-  }, [cleanupTerminalPackage, resetPackageState]);
+    },
+    [cleanupTerminalPackage, resetPackageState]
+  );
 
   useEffect(() => {
     if (open) {
@@ -584,11 +589,19 @@ export function OsUpgradeDialog({ open, onOpenChange }: OsUpgradeDialogProps) {
         advancedMode ? undefined : 'standard',
         advancedMode ? selectedUpdateMode : undefined
       );
-    } catch {
+    } catch (err) {
       releaseNetworkErrorSuppress();
-      setMaskErrorMessage(
-        t('sys.device_info.os_upgrade_install_failed', '启动升级失败，请重试')
-      );
+      const detail: string = (err as any)?.data?.error?.detail || '';
+      const message = /app firmware upgrade is in progress/i.test(detail)
+        ? t(
+            'sys.device_info.os_upgrade_blocked_app_ota',
+            '应用固件升级正在进行中，OS 安装被拒绝；请等待应用升级完成或失败后再试'
+          )
+        : t(
+            'sys.device_info.os_upgrade_install_failed',
+            '启动升级失败，请重试'
+          );
+      setMaskErrorMessage(message);
       setMaskPhase('error');
       return;
     }
@@ -888,6 +901,33 @@ export function OsUpgradeDialog({ open, onOpenChange }: OsUpgradeDialogProps) {
                 )}
               </div>
             )}
+
+            {displayFile
+              && packageReady
+              && status.compatibility_valid === false && (
+                <div className="flex items-start space-x-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
+                  <ShieldAlert className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                  <div className="flex-1 space-y-1">
+                    <span className="block text-sm font-medium leading-tight">
+                      {t(
+                        'sys.device_info.os_upgrade_app_incompatible_title',
+                        '当前应用与此 OS 包不兼容'
+                      )}
+                    </span>
+                    {status.compatibility_warning && (
+                      <span className="block text-xs text-muted-foreground">
+                        {status.compatibility_warning}
+                      </span>
+                    )}
+                    <span className="block text-xs text-muted-foreground">
+                      {t(
+                        'sys.device_info.os_upgrade_app_incompatible_desc',
+                        'OS 升级不受应用兼容性限制；升级完成后请安装支持该 OS 范围的应用包，期间应用服务将保持停止，platform-api 救援通道仍可用'
+                      )}
+                    </span>
+                  </div>
+                </div>
+              )}
 
             {displayFile && packageReady && (
               <div className="flex items-start space-x-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,6 +16,25 @@ import (
 	"aipc/platform/common/logger"
 	"github.com/gin-gonic/gin"
 )
+
+// localTrustKey marks requests that arrived over the local unix socket face.
+// The value is injected server-side only (see WithLocalTrust); TCP clients
+// cannot forge it, which is what makes the middleware exemption safe.
+type localTrustKey struct{}
+
+// WithLocalTrust marks a request context as arriving from the local unix
+// socket listener, which shares the platform gRPC trust model: socket file
+// permissions (root + group, 0660) already gate who can connect.
+func WithLocalTrust(ctx context.Context) context.Context {
+	return context.WithValue(ctx, localTrustKey{}, true)
+}
+
+// IsLocalSocket reports whether the request context carries the local unix
+// socket trust mark.
+func IsLocalSocket(ctx context.Context) bool {
+	trusted, _ := ctx.Value(localTrustKey{}).(bool)
+	return trusted
+}
 
 // TokenValidator validates authentication tokens
 type TokenValidator struct {
@@ -173,6 +193,13 @@ func Middleware(validator *TokenValidator) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// If auth is disabled, allow all requests
 		if !validator.enabled {
+			c.Next()
+			return
+		}
+
+		// Requests on the local unix socket face share the gRPC services'
+		// trust model: the socket file permission already gates access.
+		if IsLocalSocket(c.Request.Context()) {
 			c.Next()
 			return
 		}

@@ -63,16 +63,40 @@ func (h *MediaHandlers) SetEventLogger(logger *eventLoggerPkg.Logger) {
 	h.eventLogger = logger
 }
 
-// projectMediaConfig persists the marshaled camera-daemon.yaml through the
-// Config Controller when available (atomic write + read-back verify +
-// auto-restore + revision/audit), falling back to a direct os.WriteFile when
-// the Manager is nil or the apply fails. yamlStr is the full YAML the handler
-// already produced via yaml.Marshal of its config map — passing it verbatim
-// avoids a YAML→JSON→YAML round-trip that would drift integer formatting.
-// The actor is the HTTP user for entry-point callers and "" for the internal
-// fire-and-forget helpers (which are invoked from goroutines where the gin
-// context is unsafe to capture).
+// projectMediaConfig persists the marshaled camera-daemon.yaml. It is the single
+// write chokepoint for every per-field media edit (SetConfig and the stream
+// hot-reload / RTSP / AI-overlay / add / remove / toggle helpers), all of which
+// hold h.configMu while calling it.
+//
+// It first takes configApplyMu — the shared apply lock that also guards the
+// multi-file media/bundle import (applyImportedMediaConfig) and the device-clone
+// file apply (applyTree). That serialization is what stops a clone restore from
+// overwriting /data/aipc/etc mid-edit while a media write is in flight (or vice
+// versa) — the P0 race. Lock order is configMu → configApplyMu (media edits) and
+// configApplyMu alone (clone); the two never form a cycle.
+//
+// Callers that ALREADY hold configApplyMu (only applyImportedMediaConfig) must
+// call projectMediaConfigLocked instead to avoid reentrant self-deadlock —
+// sync.Mutex is not reentrant.
+//
+// Persist itself routes through the Config Controller when available (atomic
+// write + read-back verify + auto-restore + revision/audit), falling back to a
+// direct os.WriteFile when the Manager is nil or the apply fails. yamlStr is the
+// full YAML the handler already produced via yaml.Marshal of its config map —
+// passing it verbatim avoids a YAML→JSON→YAML round-trip that would drift
+// integer formatting. The actor is the HTTP user for entry-point callers and ""
+// for the internal fire-and-forget helpers (which are invoked from goroutines
+// where the gin context is unsafe to capture).
 func (h *MediaHandlers) projectMediaConfig(ctx context.Context, actor, yamlStr string) error {
+	configApplyMu.Lock()
+	defer configApplyMu.Unlock()
+	return h.projectMediaConfigLocked(ctx, actor, yamlStr)
+}
+
+// projectMediaConfigLocked is projectMediaConfig without the configApplyMu lock.
+// Precondition: the caller already holds configApplyMu. See projectMediaConfig
+// for the full contract and why this split exists.
+func (h *MediaHandlers) projectMediaConfigLocked(ctx context.Context, actor, yamlStr string) error {
 	if h.configMgr != nil {
 		if _, _, err := h.configMgr.Apply(ctx, "media", "config", yamlStr, actor); err != nil {
 			logger.Warn("media manager apply failed, falling back to direct write: %v", err)
@@ -157,6 +181,10 @@ func deepMerge(dst, src map[string]interface{}) {
 }
 
 func (h *MediaHandlers) GetConfig(c *gin.Context) {
+	// Dynamic config: never let the browser serve a stale copy. Without this,
+	// an out-of-band change (e.g. ONVIF SetVideoEncoderConfiguration) is invisible
+	// until a hard refresh — F5 reuses the heuristically-cached JSON.
+	c.Header("Cache-Control", "no-store")
 	data, err := os.ReadFile(h.configPath)
 	if err != nil {
 		Resp(c).FailMsg(CodeCameraError, "Failed to read config: "+err.Error())
@@ -1248,11 +1276,12 @@ func (h *MediaHandlers) SetRtspEnabled(c *gin.Context) {
 // writeAiOverlayConfig persists AI overlay settings to camera-daemon.yaml so
 // they survive a daemon restart. The proto field names differ from the yaml
 // keys (show_label→draw_labels, show_confidence→draw_confidence,
-// line_thickness→box_thickness); the remaining yaml-only keys
-// (event_bus_endpoint, topic_prefix, draw_landmarks, enable_face_blur,
-// stream_map) are preserved by the read-modify-write of the whole map. Called
-// only after the gRPC hot-reload succeeds.
-func (h *MediaHandlers) writeAiOverlayConfig(ctx context.Context, actor string, enabled bool, showLabel, showConfidence bool, lineThickness uint32) {
+// line_thickness→box_thickness); enable_face_blur is written only when the
+// request carries it, so pre-upgrade callers keep the stored value. The
+// remaining yaml-only keys (event_bus_endpoint, topic_prefix, draw_landmarks,
+// face_blur_block_size, stream_map) are preserved by the read-modify-write of
+// the whole map. Called only after the gRPC hot-reload succeeds.
+func (h *MediaHandlers) writeAiOverlayConfig(ctx context.Context, actor string, enabled bool, showLabel, showConfidence bool, lineThickness uint32, enableFaceBlur *bool) {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
 
@@ -1274,6 +1303,9 @@ func (h *MediaHandlers) writeAiOverlayConfig(ctx context.Context, actor string, 
 	overlay["draw_labels"] = showLabel
 	overlay["draw_confidence"] = showConfidence
 	overlay["box_thickness"] = int(lineThickness)
+	if enableFaceBlur != nil {
+		overlay["enable_face_blur"] = *enableFaceBlur
+	}
 
 	outData, err := marshalMediaConfig(config)
 	if err != nil {
@@ -1294,6 +1326,9 @@ func (h *MediaHandlers) UpdateAiOverlay(c *gin.Context) {
 		ShowLabel      bool   `json:"show_label"`
 		ShowConfidence bool   `json:"show_confidence"`
 		LineThickness  uint32 `json:"line_thickness"`
+		// Optional: mosaic detections labeled "face". nil keeps the current
+		// daemon-side setting (proto3 optional → pointer field).
+		EnableFaceBlur *bool `json:"enable_face_blur"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1310,6 +1345,7 @@ func (h *MediaHandlers) UpdateAiOverlay(c *gin.Context) {
 		ShowLabel:      req.ShowLabel,
 		ShowConfidence: req.ShowConfidence,
 		LineThickness:  req.LineThickness,
+		EnableFaceBlur: req.EnableFaceBlur,
 	})
 
 	if err != nil {
@@ -1324,12 +1360,13 @@ func (h *MediaHandlers) UpdateAiOverlay(c *gin.Context) {
 
 	// Persist so overlay settings survive a daemon restart.
 	h.writeAiOverlayConfig(context.Background(), getUsernameFromContext(c),
-		req.Enabled, req.ShowLabel, req.ShowConfidence, req.LineThickness)
+		req.Enabled, req.ShowLabel, req.ShowConfidence, req.LineThickness, req.EnableFaceBlur)
 
 	if h.eventLogger != nil {
 		h.eventLogger.LogWithCodeAsync("media.ai_overlay.changed", eventLoggerPkg.MessageParams{"enabled": req.Enabled,
-			"show_label":      req.ShowLabel,
-			"show_confidence": req.ShowConfidence}, getUsernameFromContext(c))
+			"show_label":       req.ShowLabel,
+			"show_confidence":  req.ShowConfidence,
+			"enable_face_blur": req.EnableFaceBlur}, getUsernameFromContext(c))
 	}
 
 	Resp(c).OK(gin.H{"message": "AI overlay config updated successfully"})
@@ -2064,6 +2101,10 @@ func (h *MediaHandlers) ReconfigurePipeline(c *gin.Context) {
 // Falls back to config-derived status if the daemon has not implemented the RPC yet.
 // GET /api/v1/media/status
 func (h *MediaHandlers) GetStreamStatus(c *gin.Context) {
+	// Runtime state: never cache. F5 must always hit the network so an
+	// out-of-band change (ONVIF Set, web save from another tab) is visible
+	// without a hard refresh.
+	c.Header("Cache-Control", "no-store")
 	// Always read YAML config first to get full stream list (including disabled)
 	allParams, _ := h.readAllEncoderParams()
 	yamlMap := make(map[string]streamEncoderParams)
@@ -2179,57 +2220,132 @@ func extractEncodersFromFile(path string) []encoderParams {
 // writeAppliedStreamsToConfig writes all applied encoder params back to the YAML config file
 // in a single read-modify-write cycle to avoid concurrent goroutine races.
 func (h *MediaHandlers) writeAppliedStreamsToConfig(streams []*camerapb.PipelineStreamConfig) {
+	// Hold configMu across the whole read-modify-write. Every sibling YAML
+	// writer (addStreamToConfig, setStreamEnabledInConfig, ...) holds it and
+	// projectMediaConfig's doc requires callers to hold it; without the lock,
+	// an AddStream appending between our ReadFile and the whole-list replace
+	// below would be silently erased (reverse zombie: live at HAL, missing at
+	// next boot).
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+
 	data, err := os.ReadFile(h.configPath)
 	if err != nil {
+		logger.Warn("media: applied-streams persist skipped: read config: %v", err)
 		return
 	}
 
 	var config map[string]interface{}
 	if err := yaml.Unmarshal(data, &config); err != nil {
+		logger.Warn("media: applied-streams persist skipped: parse config: %v", err)
 		return
 	}
 
+	// Materialize the list when the YAML has encoders: null/absent so a
+	// reconfigure that ADDS streams to such a degraded config still persists
+	// them (same materialization addStreamToConfig performs).
 	encoders, ok := config["encoders"].([]interface{})
 	if !ok {
+		encoders = []interface{}{}
+	}
+	config["encoders"] = encoders
+
+	// AppliedStreams is the authoritative post-reconfigure layout, so rebuild
+	// the encoder list from it: update existing entries, ADD entries the YAML
+	// lacks (update-only left a reconfigure-added stream forever missing from
+	// the YAML), and DROP entries the pipeline no longer has (a removed stream
+	// otherwise resurrects at next boot as a zombie encoder). The HTTP layer
+	// requires 1-4 streams and nil AppliedStreams routes to the YAML-reload
+	// fallback at the caller, so an empty slice is never a legitimate
+	// "drop all" — guard rather than persist an empty list.
+	if len(streams) == 0 {
 		return
 	}
-
-	for _, s := range streams {
-		for _, item := range encoders {
-			m, ok := item.(map[string]interface{})
-			if !ok {
-				continue
+	oldEntries := make(map[string]map[string]interface{}, len(encoders))
+	for _, item := range encoders {
+		if m, ok := item.(map[string]interface{}); ok {
+			if n := getFieldString(m, "stream_name"); n != "" {
+				oldEntries[n] = m
 			}
-			if getFieldString(m, "stream_name") != s.StreamId {
-				continue
-			}
-			if s.EncoderWidth > 0 {
-				m["width"] = s.EncoderWidth
-			}
-			if s.EncoderHeight > 0 {
-				m["height"] = s.EncoderHeight
-			}
-			if s.Codec != "" {
-				m["codec"] = s.Codec
-			}
-			if s.EncoderBitrate > 0 {
-				m["bitrate"] = s.EncoderBitrate
-			}
-			if s.EncoderFramerate > 0 {
-				m["fps"] = s.EncoderFramerate
-			}
-			if s.EncoderGop > 0 {
-				m["gop"] = s.EncoderGop
-			}
-			break
 		}
 	}
+	seen := make(map[string]bool, len(streams))
+	nextEncoders := make([]interface{}, 0, len(streams))
+	for _, s := range streams {
+		if s.GetStreamId() == "" || seen[s.GetStreamId()] {
+			continue
+		}
+		seen[s.GetStreamId()] = true
+		var m map[string]interface{}
+		if old, ok := oldEntries[s.GetStreamId()]; ok {
+			m = old
+		} else {
+			m = map[string]interface{}{"enabled": true}
+		}
+		// Applied dims come from live codec contexts, which report the rotated
+		// geometry while a portrait transform is active; persist the canonical
+		// landscape pair (same guard as writeStreamToConfig: only canonicalize
+		// a complete pair — swapping a partial (0,H) echo would write width=H
+		// and leave a stale height behind).
+		w, ht := s.GetEncoderWidth(), s.GetEncoderHeight()
+		if w > 0 && ht > 0 {
+			w, ht = canonicalEncoderDims(w, ht)
+		}
+		if w > 0 {
+			m["width"] = int(w)
+		}
+		if ht > 0 {
+			m["height"] = int(ht)
+		}
+		if s.GetCodec() != "" {
+			m["codec"] = s.GetCodec()
+		}
+		if s.GetEncoderBitrate() > 0 {
+			m["bitrate"] = int(s.GetEncoderBitrate())
+		}
+		if s.GetEncoderFramerate() > 0 {
+			m["fps"] = int(s.GetEncoderFramerate())
+		}
+		if s.GetEncoderGop() > 0 {
+			m["gop"] = int(s.GetEncoderGop())
+		}
+		m["stream_name"] = s.GetStreamId()
+		nextEncoders = append(nextEncoders, m)
+	}
+	// Retain deliberately-disabled stubs: DisableStream keeps an enabled:false
+	// entry (params preserved) precisely so EnableStream can re-create the
+	// encoder later, and such streams never appear in AppliedStreams (no live
+	// codec context echoes them). Dropping them on absence would break the
+	// disable→reconfigure→enable round-trip. Only an EXPLICIT enabled:false is
+	// a stub, though: the YAML convention treats an absent key as enabled
+	// (boot discovery creates those encoders), so entries without the key are
+	// droppable zombies like any other enabled entry missing from the applied
+	// layout — otherwise a legacy no-key entry could never be removed.
+	for _, item := range encoders {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		n := getFieldString(m, "stream_name")
+		if n == "" || seen[n] {
+			continue
+		}
+		if enabledRaw, present := m["enabled"]; present {
+			if enabled, _ := enabledRaw.(bool); !enabled {
+				nextEncoders = append(nextEncoders, m)
+			}
+		}
+	}
+	config["encoders"] = nextEncoders
 
 	outData, err := marshalMediaConfig(config)
 	if err != nil {
+		logger.Warn("media: applied-streams persist failed: marshal: %v", err)
 		return
 	}
-	_ = h.projectMediaConfig(context.Background(), "", string(outData))
+	if err := h.projectMediaConfig(context.Background(), "", string(outData)); err != nil {
+		logger.Warn("media: applied-streams persist failed: %v", err)
+	}
 }
 
 // canonicalEncoderDims returns the landscape (sensor-native) width/height for an
@@ -2781,14 +2897,17 @@ func (h *MediaHandlers) DisableStream(c *gin.Context) {
 			break
 		}
 	}
-	if !found {
-		Resp(c).FailMsg(CodeNotFound, "Stream not found in config: "+streamName)
-		return
-	}
+	// A stream missing from YAML is NOT proof it is absent at runtime: a
+	// reconfigure-persist can drop the YAML entry while HAL still streams the
+	// stream (a later profile switch rebuilt the pipeline from the on-disk
+	// profile file that still authors it).  The daemon probes HAL directly and
+	// force-removes such a zombie, so forward the RemoveStream and let it
+	// decide; its "Stream not found" reply maps back to 404 below, keeping the
+	// old contract for genuinely absent streams.
 
 	// Check if the stream is actually running via gRPC.
 	running := h.getRunningStreamParams(streamName)
-	if running == nil {
+	if found && running == nil {
 		Resp(c).OK(gin.H{"message": "Stream is already disabled", "stream": streamName})
 		return
 	}
@@ -2806,15 +2925,23 @@ func (h *MediaHandlers) DisableStream(c *gin.Context) {
 		return
 	}
 	if !resp.Success {
+		// Preserve the 404 contract for genuinely absent streams now that the
+		// YAML-missing case is forwarded instead of rejected locally.
+		if strings.HasPrefix(resp.Message, "Stream not found") {
+			Resp(c).FailMsg(CodeNotFound, resp.Message)
+			return
+		}
 		Resp(c).FailMsg(CodeCameraError, resp.Message)
 		return
 	}
 
 	// Persist disabled state (keep all params!) and reload in-memory stream list
-	h.setStreamEnabledInConfig(streamName, false)
-	if h.streamReloader != nil {
-		h.streamReloader.RestartH264Stream(streamName)
-		h.streamReloader.ReloadStreams(h.configPath)
+	if found {
+		h.setStreamEnabledInConfig(streamName, false)
+		if h.streamReloader != nil {
+			h.streamReloader.RestartH264Stream(streamName)
+			h.streamReloader.ReloadStreams(h.configPath)
+		}
 	}
 
 	if h.eventLogger != nil {

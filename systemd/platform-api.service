@@ -24,7 +24,11 @@ Environment=AIPC_CURRENT_ROOT_UNITS=/data/aipc/systemd
 Environment=AIPC_OS_REQUIRE_SIGNATURE=false
 Environment=AIPC_OS_REQUIRE_BUILD_TIME=true
 ExecStartPre=/bin/mkdir -p /data/aipc/logs /run/aipc /data/aipc/etc/ssl
-ExecStartPre=/bin/sh -c 'if [ -x /usr/libexec/aipc-compat-check ]; then exec /usr/libexec/aipc-compat-check; else echo "aipc-compat-check not installed yet; skip pre-start guard" >&2; fi'
+# platform-api is the rescue channel after an unconditional OS upgrade: it must
+# start even when the restored app is outside the new OS's supported range, so
+# the compat check runs warn-only here (incompatible app units stay held down
+# by their own hard-gate ExecStartPre). See docs/os-upgrade.md.
+ExecStartPre=/bin/sh -c 'if [ -x /usr/libexec/aipc-compat-check ]; then exec /usr/libexec/aipc-compat-check --warn-only; else echo "aipc-compat-check not installed yet; skip pre-start guard" >&2; fi'
 ExecStart=/usr/bin/platform-api -config /data/aipc/etc/platform-api.yaml
 Restart=always
 RestartSec=5

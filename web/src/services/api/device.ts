@@ -7,6 +7,11 @@ export interface LensAxisLimit {
   max_pos: number;
 }
 
+export interface ZoomRatioRange {
+  min: number;
+  max: number;
+}
+
 export const MotorState = {
   NoCfg: 0,
   Stopped: 1,
@@ -27,6 +32,14 @@ export interface LensStatus {
   autofocus_enabled: boolean;
   zoom_limit: LensAxisLimit;
   focus_limit: LensAxisLimit;
+  // Factory-fitted lens identity (empty on old backends → treat as af0832)
+  lens_model?: string;
+  // Current optical zoom ratio (position model on fg2009, AF table on af0832)
+  zoom_ratio?: number;
+  zoom_ratio_range?: ZoomRatioRange;
+  // Image-probe verdict: this lens has no motors (manual fixed lens).
+  // Consumers hide motor controls instead of surfacing MCU errors.
+  fixed_lens?: boolean;
 }
 
 export interface AutofocusStatus {
@@ -69,6 +82,42 @@ export interface DeviceStatus {
 }
 
 export type IrCutMode = 'day' | 'night';
+export type ImagingMode = 'day' | 'infrared';
+export type DayNightMode = 'auto' | 'day' | 'infrared'; // operator-selected mode (3-button)
+
+export interface InfraredStatus {
+  success: boolean;
+  message: string;
+  mode: ImagingMode;
+  transition: 'idle' | 'switching' | 'failed';
+  output_source: 'off' | 'automatic' | 'manual' | 'zoom_follow';
+  auto_follow: boolean;
+  follow_active: boolean;
+  manual_override: boolean;
+  degraded: boolean;
+  requested_near_pwm: number;
+  requested_far_pwm: number;
+  applied_near_pwm: number;
+  applied_far_pwm: number;
+  zoom_ratio: number;
+  active_profile: string;
+  // Day/night auto (light-sensor) policy
+  selected_mode: DayNightMode;
+  light_percent: number;
+  light_mv: number;
+  light_milli: number;
+  light_valid: boolean;
+  night_enter: number;
+  day_enter: number;
+}
+
+/** IR preset = snapshot of (zoom position + near/far IR intensity) for one-click recall. */
+export interface IrPreset {
+  name: string;
+  zoom_ratio: number;
+  near_pwm: number;
+  far_pwm: number;
+}
 
 // ── API ───────────────────────────────────────────────────────────────
 
@@ -79,7 +128,20 @@ export const deviceApi = {
 
   setIrLed: (level: number) => request.post('/api/v1/device/ir-led', { level }),
 
-  setIrCut: (mode: IrCutMode) => request.post('/api/v1/device/ir-cut', { mode }),
+  setIrCut: (mode: IrCutMode) => request.put('/api/v1/device/imaging-mode', {
+    mode: mode === 'night' ? 'infrared' : 'day',
+  }),
+  setImagingMode: (mode: DayNightMode) => request.put('/api/v1/device/imaging-mode', { mode }),
+  getInfraredStatus: () => request.get('/api/v1/device/infrared/status', { silent: true }),
+  setInfraredSettings: (settings: { auto_follow?: boolean; near_pwm?: number; far_pwm?: number; night_enter?: number; day_enter?: number }) => request.put('/api/v1/device/infrared/settings', settings),
+  clearInfraredManual: () => request.delete('/api/v1/device/infrared/manual'),
+
+  // IR preset save/load (zoom + IR intensity snapshot), persisted on the device.
+  listIrPresets: () => request.get('/api/v1/device/ir-presets', { silent: true }),
+  saveIrPreset: (preset: IrPreset) => request.put('/api/v1/device/ir-presets', preset),
+  deleteIrPreset: (name: string) => request.delete(`/api/v1/device/ir-presets/${encodeURIComponent(name)}`),
+  // Move zoom motor to a ratio (used to restore a preset's zoom position).
+  lensGoto: (zoomRatio: number, focusDistanceM = 0) => request.post('/api/v1/device/lens/goto', { zoom_ratio: zoomRatio, focus_distance_m: focusDistanceM }),
 
   controlZoom: (speed: number) => request.post('/api/v1/device/zoom', { speed }),
 
@@ -90,6 +152,9 @@ export const deviceApi = {
   oneshotAutofocus: () => request.post('/api/v1/device/lens/oneshot-af'),
 
   startZoomFollow: (ratio: number) => request.post('/api/v1/device/lens/zoom-follow', { ratio }),
+
+  // Open-loop zoom positioning (fg2009): goto an optical ratio directly.
+  gotoZoomRatio: (zoomRatio: number) => request.post('/api/v1/device/lens/goto-ratio', { zoom_ratio: zoomRatio }),
 
   getAutofocusStatus: () => request.get('/api/v1/device/lens/af/status', { silent: true }),
 

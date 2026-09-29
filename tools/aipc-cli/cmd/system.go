@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os/exec"
@@ -12,9 +13,9 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
 
+	inferencepb "aipc/platform/ai-runtime/proto"
 	devicepb "aipc/platform/device-control/proto"
 	eventpb "aipc/platform/event-bus/proto"
-	inferencepb "aipc/platform/ai-runtime/proto"
 	"aipc/tools/aipc-cli/pkg/output"
 )
 
@@ -41,7 +42,7 @@ var systemInfoCmd = &cobra.Command{
 
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err == nil {
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := apiHTTPClient.Do(req)
 			if err == nil && resp.StatusCode == http.StatusOK {
 				defer resp.Body.Close()
 				var info map[string]interface{}
@@ -98,7 +99,7 @@ var systemStatsCmd = &cobra.Command{
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("failed to get stats: %w", err)
 		}
@@ -209,11 +210,12 @@ var systemHealthCmd = &cobra.Command{
 			}
 		}
 
-		// Check platform-api (HTTP)
-		url := systemAPIBase + "/health"
+		// Check platform-api (HTTP). The server exposes its health endpoint at
+		// /api/v1/system/health (no auth); there is no bare /health route.
+		url := systemAPIBase + "/api/v1/system/health"
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		cancel()
 		if err != nil || resp.StatusCode != http.StatusOK {
 			results["platform-api"] = "unreachable"
@@ -265,13 +267,32 @@ func init() {
 
 // ============ service management ============
 
+// aipcServices mirrors SERVICES in scripts/aipc-autostart.sh (dependency
+// order; stop reverses it). system_test.go fails the build when the two
+// lists drift, so `system stop/disable` always covers the full boot set.
 var aipcServices = []string{
+	"aipc-healthmon",
 	"event-bus",
-	"app-manager",
-	"ai-runtime",
 	"camera-daemon",
+	"ai-runtime",
 	"device-control",
+	"device-discovery",
 	"platform-api",
+	"app-manager",
+	"aipc-nginx-gateway",
+}
+
+// aipc-autostart re-runs `systemctl enable` + `start` for aipcServices on
+// every boot, so `system disable` must disable it too or the next reboot
+// silently undoes the command. A redeploy (or the OS-upgrade verify boot)
+// re-enables it by design: that is the recovery path, not a bug.
+const aipcAutostartUnit = "aipc-autostart.service"
+
+// unitInstalled reports whether the unit exists at all (systemctl cat loads
+// it from any search path). The CLI skips absent units instead of failing so
+// it keeps working on installs that predate some of the services.
+func unitInstalled(svc string) bool {
+	return exec.Command("systemctl", "cat", svc+".service").Run() == nil
 }
 
 var serviceStartCmd = &cobra.Command{
@@ -328,7 +349,7 @@ var serviceStatusCmd = &cobra.Command{
 }
 
 func manageServices(action string) error {
-	services := aipcServices
+	services := append([]string(nil), aipcServices...)
 	// Stop in reverse order
 	if action == "stop" {
 		for i, j := 0, len(services)-1; i < j; i, j = i+1, j-1 {
@@ -336,14 +357,27 @@ func manageServices(action string) error {
 		}
 	}
 
+	var result error
 	for _, svc := range services {
+		if !unitInstalled(svc) {
+			printer.Printf("  %-18s %s\n", svc+":", printer.FormatStatus("not installed"))
+			continue
+		}
 		cmd := exec.Command("systemctl", action, svc+".service")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			printer.Printf("  %-18s %s (%s)\n", svc+":", printer.FormatStatus("failed"), strings.TrimSpace(string(out)))
-			return fmt.Errorf("%s %s failed: %s", action, svc, strings.TrimSpace(string(out)))
+			serviceErr := fmt.Errorf("%s %s failed: %s", action, svc, strings.TrimSpace(string(out)))
+			if action != "stop" {
+				return serviceErr
+			}
+			result = errors.Join(result, serviceErr)
+			continue
 		}
 		printer.Printf("  %-18s %s\n", svc+":", printer.FormatStatus("ok"))
+	}
+	if result != nil {
+		return result
 	}
 	printer.Success("\nAll services %sed", action)
 	return nil
@@ -352,12 +386,18 @@ func manageServices(action string) error {
 var serviceEnableCmd = &cobra.Command{
 	Use:   "enable",
 	Short: "Enable and start all AIPC services",
-	Long:  `Enable all AIPC services for auto-start on boot and start them immediately.`,
+	Long: `Enable all AIPC services for auto-start on boot and start them immediately.
+
+Also re-enables aipc-autostart.service, the boot unit that keeps the
+service set enabled across reboots.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		printer.Println("Enabling and starting AIPC services...")
 		printer.Println("────────────────────────────────────")
 		// Enable auto-start
 		if err := enableDisableServices("enable"); err != nil {
+			return err
+		}
+		if err := setAutostart("enable", false); err != nil {
 			return err
 		}
 		// Start services now (dependency order)
@@ -368,26 +408,51 @@ var serviceEnableCmd = &cobra.Command{
 var serviceDisableCmd = &cobra.Command{
 	Use:   "disable",
 	Short: "Stop and disable all AIPC services",
-	Long:  `Stop all running AIPC services and disable them from starting on boot.`,
+	Long: `Stop all running AIPC services and disable them from starting on boot.
+
+Also disables aipc-autostart.service, which would otherwise re-enable the
+whole service set at the next reboot. A redeploy or an OS-upgrade verify
+boot re-enables the platform by design (that is the recovery path).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		printer.Println("Stopping and disabling AIPC services...")
 		printer.Println("────────────────────────────────────")
+		var result error
+		// Quiesce the boot controller first so it cannot race with the
+		// following stop/disable operations and requeue runtime units.
+		if err := setAutostart("disable", true); err != nil {
+			printer.Error("Warning: failed to disable boot auto-start: %v", err)
+			result = errors.Join(result, err)
+		}
 		// Stop running services first (reverse dependency order)
 		if err := manageServices("stop"); err != nil {
 			printer.Error("Warning: some services failed to stop: %v", err)
+			result = errors.Join(result, err)
 		}
 		// Then disable auto-start
-		return enableDisableServices("disable")
+		if err := enableDisableServices("disable"); err != nil {
+			result = errors.Join(result, err)
+		}
+		return result
 	},
 }
 
 func enableDisableServices(action string) error {
+	var result error
 	for _, svc := range aipcServices {
+		if !unitInstalled(svc) {
+			printer.Printf("  %-18s %s\n", svc+":", printer.FormatStatus("not installed"))
+			continue
+		}
 		cmd := exec.Command("systemctl", action, svc+".service")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			printer.Printf("  %-18s %s (%s)\n", svc+":", printer.FormatStatus("failed"), strings.TrimSpace(string(out)))
-			return fmt.Errorf("%s %s failed: %s", action, svc, strings.TrimSpace(string(out)))
+			serviceErr := fmt.Errorf("%s %s failed: %s", action, svc, strings.TrimSpace(string(out)))
+			if action != "disable" {
+				return serviceErr
+			}
+			result = errors.Join(result, serviceErr)
+			continue
 		}
 		label := "enabled"
 		if action == "disable" {
@@ -395,7 +460,28 @@ func enableDisableServices(action string) error {
 		}
 		printer.Printf("  %-18s %s\n", svc+":", printer.FormatStatus(label))
 	}
-	printer.Success("\nAll services %sd", action)
+	if result != nil {
+		return result
+	}
+	printer.Success("\nAll runtime services %sd", action)
+	return nil
+}
+
+func setAutostart(action string, now bool) error {
+	if unitInstalled(strings.TrimSuffix(aipcAutostartUnit, ".service")) {
+		args := []string{action}
+		if now {
+			args = append(args, "--now")
+		}
+		args = append(args, aipcAutostartUnit)
+		cmd := exec.Command("systemctl", args...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			printer.Printf("  %-18s %s (%s)\n", aipcAutostartUnit+":", printer.FormatStatus("failed"), strings.TrimSpace(string(out)))
+			return fmt.Errorf("%s %s failed: %s", action, aipcAutostartUnit, strings.TrimSpace(string(out)))
+		}
+		printer.Printf("  %-18s %s\n", aipcAutostartUnit+":", printer.FormatStatus("(boot auto-start)"))
+	}
 	return nil
 }
 

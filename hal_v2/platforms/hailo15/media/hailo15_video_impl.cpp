@@ -17,6 +17,7 @@
 #include <hailo/media_library/frontend.hpp>
 #include <hailo/media_library/media_library.hpp>
 #include <hailo/media_library/sensor_registry.hpp>
+#include <hailo/media_library/snapshot.hpp>
 
 #include <cstdio>
 #include <cstring>
@@ -846,7 +847,52 @@ static int hailo15_video_release_frame(void *video_ctx, HalFrameBuffer *frame)
 
 static const char *hailo15_video_get_version(void)
 {
-    return "Hailo15 HAL-VIDEO 2.0.0";
+    return "Hailo15 HAL-VIDEO 2.1.0";
+}
+
+/* ---- M2: multi-stage snapshot capture ---- */
+
+static int hailo15_video_request_snapshot(void *video_ctx, const char *stage)
+{
+    (void)video_ctx;
+    SnapshotManager &sm = SnapshotManager::get_instance();
+    sm.enable_snapshot(true);
+    std::set<std::string> stages;
+    if (stage && stage[0] != '\0')
+    {
+        stages.insert(std::string(stage));
+    }
+    /* Empty set = all registered stages (see SnapshotManager::request_snapshot). */
+    const uint32_t seq = sm.request_snapshot(1U, stages, 1U);
+    if (seq == 0U)
+    {
+        /* 0 = manager disabled or no matching stage. Distinguish via the stage list. */
+        std::string all = sm.list_available_stages();
+        if (stage && stage[0] != '\0' && all.find(stage) == std::string::npos)
+        {
+            HAL_LOG_ERROR("hailo15_video_request_snapshot: unknown stage '%s' (available: %s)", stage, all.c_str());
+            return HAL_ERR_NOT_FOUND;
+        }
+        return HAL_ERR_INVALID_STATE;
+    }
+    return HAL_OK;
+}
+
+static int hailo15_video_list_snapshot_stages(void *video_ctx, char *buf, size_t buf_len)
+{
+    (void)video_ctx;
+    if (!buf || buf_len == 0)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    buf[0] = '\0';
+    std::string all = SnapshotManager::get_instance().list_available_stages();
+    if (all.size() >= buf_len)
+    {
+        all.resize(buf_len - 1);
+    }
+    std::memcpy(buf, all.c_str(), all.size() + 1);
+    return HAL_OK;
 }
 
 static int hailo15_video_get_sensor_module_info(void *video_ctx, uint32_t sensor_index, HalVideoSensorModuleInfo *info)
@@ -935,6 +981,8 @@ HalVideoOps HAL_VIDEO_OPS = {
     .release_frame = hailo15_video_release_frame,
     .get_version = hailo15_video_get_version,
     .get_sensor_module_info = hailo15_video_get_sensor_module_info,
+    .request_snapshot = hailo15_video_request_snapshot,
+    .list_snapshot_stages = hailo15_video_list_snapshot_stages,
 };
 
 } // extern "C"

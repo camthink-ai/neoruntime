@@ -70,6 +70,11 @@ const longTimeTaskMap: Record<string, number> = {
   '/api/v1/apps': 300000, // 5 min — install
   '/api/v1/debug-logs/export': 300000,
   '/api/v1/device/lens/reset-zero': 40000, // 40s — lens calibration
+  '/api/v1/media/config/import-bundle': 60000, // 1 min — bundle import
+  '/api/v1/media/config/bundle': 120000, // 2 min — bundle export (~25MB)
+  '/api/v1/system/clone/import': 120000, // 2 min — clone import + identity regen
+  '/api/v1/system/clone/export': 120000, // 2 min — clone export
+  '/api/v1/storage/format': 300000, // 5 min — synchronous mkfs on SD/eMMC; nginx caps /api/v1/ at 300s too
 };
 
 const debouncedTimeoutError = debounce(
@@ -93,6 +98,7 @@ const NETWORK_ERROR_SUPPRESS_URL_PATTERNS = [
   '/api/v1/system/restart',
   '/api/v1/system/ota/',
   '/api/v1/system/os-upgrade/',
+  '/api/v1/system/clone/import', // platform-api self-restarts after clone apply
 ];
 
 /** Suppress global request side effects during device restart / upgrade windows. */
@@ -235,6 +241,11 @@ request.interceptors.response.use(
     return response;
   },
   error => {
+    // AbortController-driven cancellation is caller-initiated; reject
+    // silently instead of surfacing it as a network-error toast.
+    if (axios.isCancel(error)) {
+      return Promise.reject(error);
+    }
     if (!error.response) {
       const config = error.config as
         | { url?: string; silent?: boolean }

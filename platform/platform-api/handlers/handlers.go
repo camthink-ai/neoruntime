@@ -51,6 +51,14 @@ type APIHandlers struct {
 	rsaPriv        *rsa.PrivateKey // decrypts frontend-encrypted passwords; nil -> plaintext fallback
 	rsaPubPEM      string          // served verbatim by GetPublicKey
 	eventLogger    *eventLoggerPkg.Logger
+
+	// blobRefMu makes blob-reference admission atomic with the orphan
+	// sweep: a handler proving a CAS blob exists and then committing a row
+	// that references it (Register/Update/Upload) re-asserts existence and
+	// commits under this lock, while sweepOrphanBlobs recounts references
+	// and deletes under it — closing the window where an aged staged or
+	// deduped blob is collected between the two.
+	blobRefMu sync.Mutex
 }
 
 // NewAPIHandlers creates a new API handlers instance
@@ -159,7 +167,7 @@ func (h *APIHandlers) GetSystemStats(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		aiStats, err := client.GetStats(ctx, &inferencepb.Empty{})
+		aiStats, err := client.GetStats(ctx, &inferencepb.GetStatsRequest{})
 		if err == nil {
 			stats["services"].(map[string]interface{})["ai-runtime"] = aiStats
 		}

@@ -167,6 +167,171 @@ func (h *APIHandlers) SetIrCut(c *gin.Context) {
 	Resp(c).OK(resp)
 }
 
+func (h *APIHandlers) SetImagingMode(c *gin.Context) {
+	var req struct {
+		Mode string `json:"mode" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
+		return
+	}
+	req.Mode = strings.ToLower(req.Mode)
+	if req.Mode != "day" && req.Mode != "infrared" && req.Mode != "auto" {
+		Resp(c).FailMsg(CodeInvalidRequest, "Mode must be 'auto', 'day' or 'infrared'")
+		return
+	}
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := client.SetImagingMode(ctx, &devicepb.ImagingModeRequest{Mode: req.Mode})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	if !resp.GetSuccess() {
+		message := resp.GetMessage()
+		if message == "" {
+			message = "Imaging mode switch failed"
+		}
+		Resp(c).FailMsg(CodeDeviceError, message)
+		return
+	}
+	Resp(c).OK(resp)
+}
+
+func (h *APIHandlers) GetInfraredStatus(c *gin.Context) {
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.GetInfraredStatus(ctx, &devicepb.Empty{})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
+func (h *APIHandlers) SetInfraredSettings(c *gin.Context) {
+	var req struct {
+		AutoFollow *bool   `json:"auto_follow"`
+		NearPWM    *uint32 `json:"near_pwm"`
+		FarPWM     *uint32 `json:"far_pwm"`
+		NightEnter *int    `json:"night_enter"`
+		DayEnter   *int    `json:"day_enter"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
+		return
+	}
+	if (req.NearPWM != nil && *req.NearPWM > 100) || (req.FarPWM != nil && *req.FarPWM > 100) {
+		Resp(c).FailMsg(CodeInvalidRequest, "PWM must be between 0 and 100")
+		return
+	}
+	// Light-sensor thresholds (validated only when at least one is provided)
+	if req.NightEnter != nil || req.DayEnter != nil {
+		ne, de := 0, 100
+		if req.NightEnter != nil {
+			ne = *req.NightEnter
+		}
+		if req.DayEnter != nil {
+			de = *req.DayEnter
+		}
+		if ne < 0 || ne > 100 || de < 0 || de > 100 || ne >= de {
+			Resp(c).FailMsg(CodeInvalidRequest, "thresholds must be 0..100 and night_enter < day_enter")
+			return
+		}
+	}
+	pbReq := &devicepb.InfraredSettingsRequest{
+		AutoFollow: req.AutoFollow, NearPwm: req.NearPWM, FarPwm: req.FarPWM,
+	}
+	if req.NightEnter != nil {
+		v := int32(*req.NightEnter)
+		pbReq.NightEnter = &v
+	}
+	if req.DayEnter != nil {
+		v := int32(*req.DayEnter)
+		pbReq.DayEnter = &v
+	}
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.SetInfraredSettings(ctx, pbReq)
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
+func (h *APIHandlers) ClearInfraredManual(c *gin.Context) {
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.ClearInfraredManual(ctx, &devicepb.Empty{})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
+func (h *APIHandlers) ListIrPresets(c *gin.Context) {
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.ListIrPresets(ctx, &devicepb.Empty{})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
+func (h *APIHandlers) SaveIrPreset(c *gin.Context) {
+	var req struct {
+		Name      string  `json:"name" binding:"required"`
+		ZoomRatio float32 `json:"zoom_ratio"`
+		NearPWM   uint32  `json:"near_pwm"`
+		FarPWM    uint32  `json:"far_pwm"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
+		return
+	}
+	if req.ZoomRatio < 1.0 || req.ZoomRatio > 2.88 || req.NearPWM > 100 || req.FarPWM > 100 {
+		Resp(c).FailMsg(CodeInvalidRequest, "zoom_ratio must be 1.0-2.88 and pwm 0-100")
+		return
+	}
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.SaveIrPreset(ctx, &devicepb.IrPreset{
+		Name: req.Name, ZoomRatio: req.ZoomRatio, NearPwm: req.NearPWM, FarPwm: req.FarPWM,
+	})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
+func (h *APIHandlers) DeleteIrPreset(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		Resp(c).FailMsg(CodeInvalidRequest, "missing preset name")
+		return
+	}
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.DeleteIrPreset(ctx, &devicepb.DeleteIrPresetRequest{Name: name})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	Resp(c).OK(resp)
+}
+
 func (h *APIHandlers) ControlPTZ(c *gin.Context) {
 	if h.grpcClients.DeviceControl == nil {
 		Resp(c).FailMsg(CodeServiceUnavailable, "Device Control not available")
@@ -424,6 +589,36 @@ func (h *APIHandlers) StartZoomFollow(c *gin.Context) {
 	Resp(c).OK(gin.H{"accepted": true, "job_id": resp.GetJobId(), "message": resp.GetMessage()})
 }
 
+// LensGotoZoomRatio moves the FG2009 open-loop zoom to an optical ratio.
+func (h *APIHandlers) LensGotoZoomRatio(c *gin.Context) {
+	if h.grpcClients.DeviceControl == nil {
+		Resp(c).FailMsg(CodeServiceUnavailable, "Device Control not available")
+		return
+	}
+	var req struct {
+		ZoomRatio float32 `json:"zoom_ratio" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.ZoomRatio < 1.0 {
+		Resp(c).FailMsg(CodeInvalidRequest, "zoom_ratio must be >= 1.0")
+		return
+	}
+	client := devicepb.NewDeviceControlClient(h.grpcClients.DeviceControl)
+	// Full open-loop travel takes several seconds; mirror the other
+	// blocking lens moves with a generous deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	resp, err := client.LensGotoZoomRatio(ctx, &devicepb.ZoomRatioRequest{ZoomRatio: req.ZoomRatio})
+	if err != nil {
+		Resp(c).FailMsg(CodeDeviceError, err.Error())
+		return
+	}
+	if !resp.GetSuccess() {
+		Resp(c).FailMsg(CodeDeviceError, resp.GetMessage())
+		return
+	}
+	Resp(c).OK(gin.H{"success": true, "message": resp.GetMessage()})
+}
+
 func (h *APIHandlers) GetAutofocusStatus(c *gin.Context) {
 	if h.grpcClients.DeviceControl == nil {
 		Resp(c).FailMsg(CodeServiceUnavailable, "Device Control not available")
@@ -623,6 +818,13 @@ func (h *APIHandlers) GetLensStatus(c *gin.Context) {
 		"focus_pos":         resp.GetFocusPos(),
 		"iris_adc":          resp.GetIrisAdc(),
 		"autofocus_enabled": resp.GetAutofocusEnabled(),
+		"lens_model":        resp.GetLensModel(),
+		"zoom_ratio":        resp.GetZoomRatio(),
+		"fixed_lens":        resp.GetFixedLens(),
+		"zoom_ratio_range": gin.H{
+			"min": resp.GetZoomRatioRange().GetMin(),
+			"max": resp.GetZoomRatioRange().GetMax(),
+		},
 		"zoom_limit": gin.H{
 			"min_pos": resp.GetZoomLimit().GetMinPos(),
 			"max_pos": resp.GetZoomLimit().GetMaxPos(),

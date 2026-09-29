@@ -1,9 +1,8 @@
 [Unit]
 Description=Verify AIPC after an OS A/B upgrade
-After=aipc-autostart.service aipc-platform.target
-Wants=aipc-autostart.service aipc-platform.target
+Wants=aipc-firstboot.service
+After=aipc-firstboot.service
 RequiresMountsFor=/data
-ConditionPathExists=/data/aipc-os-upgrade/active-job
 
 [Service]
 Type=oneshot
@@ -15,6 +14,14 @@ Environment=AIPC_BACKUP_ROOT=/data/backups/aipc-os-upgrade
 Environment=AIPC_APP_MANIFEST=/data/aipc/app-manifest.json
 Environment=AIPC_DATA_SCHEMA_FILE=/data/aipc-data/schema-version
 Environment=AIPC_OS_COMPATIBILITY_FILE=/etc/aipc-os-release
+# Do not express the runtime as a Wants= dependency here. systemd pulls unit
+# dependencies into the boot transaction before evaluating conditions, which
+# would undo `aipc-cli system disable` even when no upgrade needs verification.
+ExecCondition=/usr/libexec/aipc-os-updater needs-verify
+# An actual verify boot deliberately restores the platform so health checking
+# and the remote recovery channel are available. restart also executes the
+# oneshot if it was left active from an in-place current-root activation.
+ExecStartPre=/usr/bin/systemctl restart aipc-autostart.service
 ExecStart=/usr/libexec/aipc-os-updater verify
 StandardOutput=journal+console
 StandardError=journal+console

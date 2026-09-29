@@ -1,8 +1,19 @@
 #include "inference_scheduler.h"
 #include "log.h"
+#include <algorithm>
 #include <cstring>
+#include <exception>
 
 namespace aipc::ai_runtime {
+
+void WorkerCallbackState::release_owner() noexcept {
+    if (owners.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    auto* completion_scheduler = scheduler;
+    const bool tracked = tracker_active;
+    delete this;
+    if (tracked && completion_scheduler)
+        completion_scheduler->complete_external_async();
+}
 
 InferenceScheduler::InferenceScheduler(ModelManager* model_mgr,
                                        SessionManager* session_mgr,
@@ -30,7 +41,11 @@ void InferenceScheduler::start() {
 }
 
 void InferenceScheduler::stop() {
-    if (!running_.exchange(false)) return;
+    {
+        std::lock_guard lock(mu_);
+        if (!running_) return;
+        running_ = false;
+    }
 
     LOG_INFO("Stopping inference scheduler");
     cv_.notify_all();
@@ -68,6 +83,9 @@ int InferenceScheduler::drain_async(int timeout_ms) {
              async_in_flight_.load(), timeout_ms);
 
     std::unique_lock<std::mutex> lk(async_drain_mu_);
+#ifdef AIPC_AI_RUNTIME_TESTING
+    if (async_drain_wait_hook_for_test_) async_drain_wait_hook_for_test_();
+#endif
     async_drain_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
         [this] { return async_in_flight_.load() <= 0; });
 
@@ -87,10 +105,21 @@ void InferenceScheduler::notify_async_complete() {
     async_drain_cv_.notify_all();
 }
 
+void InferenceScheduler::begin_external_async() {
+    async_in_flight_.fetch_add(1);
+}
+
+void InferenceScheduler::complete_external_async() {
+    notify_async_complete();
+}
+
 bool InferenceScheduler::submit(std::unique_ptr<InferRequest> req) {
-    if (!running_) return false;
+#ifdef AIPC_AI_RUNTIME_TESTING
+    if (submit_prelock_hook_for_test_) submit_prelock_hook_for_test_();
+#endif
 
     std::lock_guard lock(mu_);
+    if (!running_) return false;
     if (total_queued_ >= queue_capacity_) {
         LOG_WARN("Inference queue full (%d), dropping request", queue_capacity_);
         return false;
@@ -135,42 +164,74 @@ void InferenceScheduler::handle_completion(
     (void)model_id; (void)session_id; (void)owns_outputs;
 }
 
-void InferenceScheduler::on_hw_complete(HalTensor* outputs, int num_outputs,
-                                          int status, void* userdata) {
-    auto* st = static_cast<WorkerCallbackState*>(userdata);
-    if (!st) return;
+void InferenceScheduler::on_hw_complete(HalTensor* /*outputs*/,
+                                        int num_outputs, int status,
+                                        void* userdata) {
+    auto* state = static_cast<WorkerCallbackState*>(userdata);
+    if (!state) return;
+
+    state->callback_status = status;
+    state->callback_num_outputs =
+        std::max(0, std::min(num_outputs, state->max_outputs));
+    const auto action = state->gate.on_callback();
+    if (action == AsyncCallbackAction::CompleteHere)
+        complete_async(state);
+}
+
+void InferenceScheduler::complete_async(
+    WorkerCallbackState* state) noexcept {
+    struct CallbackOwnerGuard {
+        WorkerCallbackState* state;
+        ~CallbackOwnerGuard() noexcept { state->release_owner(); }
+    } callback_owner{state};
 
     auto infer_time = std::chrono::duration_cast<Microseconds>(
-        SteadyClock::now() - st->infer_start);
+        SteadyClock::now() - state->infer_start);
+    HalTensor* outputs = state->output_slots.get();
+    const int num_outputs = state->callback_num_outputs;
 
     // Stats are recorded by the on_complete callback (or the caller), not
     // here — recording in both places would double-count QPS/latency.
-
-    // Deliver result to the on_complete callback
-    if (st->req->on_complete) {
-        st->req->on_complete(status, outputs, num_outputs,
-                             infer_time.count(), st->queue_time_us,
-                             true);  // model was acquired by worker
+    bool callback_failed = false;
+    if (state->req->on_complete) {
+        try {
+            state->req->on_complete(
+                state->callback_status, outputs, num_outputs,
+                infer_time.count(), state->queue_time_us,
+                true);  // model was acquired by worker
+        } catch (const std::exception& e) {
+            callback_failed = true;
+            LOG_ERROR("Inference completion callback threw: %s", e.what());
+        } catch (...) {
+            callback_failed = true;
+            LOG_ERROR("Inference completion callback threw");
+        }
     }
 
-    // If on_complete did not take ownership of outputs, clean up here
-    if (!st->req->owns_outputs) {
-        st->mgr->free_outputs(outputs, num_outputs);
-        st->mgr->release_model(st->req->model_id);
+    if (!state->req->owns_outputs) {
+        try {
+            state->mgr->free_outputs(outputs, state->max_outputs);
+        } catch (...) {
+            LOG_ERROR("Inference output cleanup threw");
+        }
+        try {
+            state->mgr->release_model(state->req->model_id);
+        } catch (...) {
+            LOG_ERROR("Inference model release threw");
+        }
+    } else if (callback_failed) {
+        // Ownership may already have moved into an asynchronous postprocess
+        // task. Reclaiming it here would risk a double-free and use-after-free;
+        // owning callbacks therefore provide their own no-throw RAII cleanup.
+        LOG_ERROR("Owning inference callback failed after possible transfer; "
+                  "scheduler cannot safely reclaim outputs");
     }
 
-    // Free the heap-allocated output slot array that worker_loop passed to
-    // run_async. Do not delete the callback's `outputs` pointer: Hailo15 passes
-    // a shallow-copy vector owned by the HAL async context.
-    delete[] st->outputs;
-
-    // Decrement async in-flight counter and notify drain.
-    InferenceScheduler* sched = st->scheduler;
-    delete st;  // releases the unique_ptr<InferRequest>
-
-    if (sched) {
-        sched->notify_async_complete();
-    }
+    // Application completion and cleanup run only after run_async() returned.
+    // The HAL callback's shallow-copy vector is not retained; output_slots is
+    // caller-owned storage and survives until both intrusive owners retire.
+    // Async tracking is retired by the final owner only after deleting state,
+    // including InferRequest::resource_holder and output slot storage.
 }
 
 void InferenceScheduler::worker_loop(int worker_id) {
@@ -246,9 +307,15 @@ void InferenceScheduler::worker_loop(int worker_id) {
         auto snap = model_mgr_->acquire_model_snapshot(req->model_id);
         if (!snap) {
             if (req->on_complete) {
-                req->on_complete(-1, nullptr, 0, 0,
-                                 static_cast<uint64_t>(queue_time.count()),
-                                 false);  // model not acquired
+                try {
+                    req->on_complete(-1, nullptr, 0, 0,
+                                     static_cast<uint64_t>(queue_time.count()),
+                                     false);  // model not acquired
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Inference completion callback threw: %s", e.what());
+                } catch (...) {
+                    LOG_ERROR("Inference completion callback threw");
+                }
             }
             continue;
         }
@@ -259,37 +326,64 @@ void InferenceScheduler::worker_loop(int worker_id) {
 
         // ── Async path (preferred): submit run_async, return immediately ──
         if (model_mgr_->has_async()) {
-            // Heap-allocate outputs: the worker loop continues after
-            // submission, so stack-allocated outputs would be overwritten
-            // before the HAL callback fires.
-            auto* outputs = new HalTensor[HAL_MAX_TENSORS]();
+            WorkerCallbackState* cb_state = nullptr;
+            int async_rc = HAL_ERROR;
 
-            auto* cb_state = new WorkerCallbackState{
-                this, model_mgr_, session_mgr_, std::move(req),
-                outputs, max_outputs, infer_start,
-                static_cast<uint64_t>(queue_time.count()), session
-            };
+            try {
+                auto setup_state = std::make_unique<WorkerCallbackState>();
+                setup_state->scheduler = this;
+                setup_state->mgr = model_mgr_;
+                setup_state->smgr = session_mgr_;
+                setup_state->output_slots =
+                    std::make_unique<HalTensor[]>(HAL_MAX_TENSORS);
+                setup_state->max_outputs = max_outputs;
+                setup_state->infer_start = infer_start;
+                setup_state->queue_time_us =
+                    static_cast<uint64_t>(queue_time.count());
+                setup_state->session = session;
+                setup_state->req = std::move(req);
+                cb_state = setup_state.release();
 
-            async_in_flight_.fetch_add(1);
-            int rc = model_mgr_->run_async(snap->infer_session,
-                                           cb_state->req->inputs,
-                                           cb_state->req->num_inputs,
-                                           outputs, max_outputs,
-                                           &InferenceScheduler::on_hw_complete,
-                                           cb_state);
-            if (rc == 0) {
-                // Submitted — worker is free to process the next request.
-                // on_hw_complete will fire from a HAL completion thread.
-                continue;
+                async_in_flight_.fetch_add(1);
+                cb_state->tracker_active = true;
+                async_rc = model_mgr_->run_async(
+                    snap->infer_session,
+                    cb_state->req->inputs,
+                    cb_state->req->num_inputs,
+                    cb_state->output_slots.get(), max_outputs,
+                    &InferenceScheduler::on_hw_complete, cb_state);
+            } catch (const std::exception& e) {
+                LOG_ERROR("Async inference submission threw: %s", e.what());
+            } catch (...) {
+                LOG_ERROR("Async inference submission threw");
             }
 
-            // Submission failed: fall through to sync path.
-            // Reconstruct req from cb_state for the sync handler.
-            async_in_flight_.fetch_sub(1);  // undo the increment
-            req = std::move(cb_state->req);
-            delete[] outputs;
-            delete cb_state;
-            // Fall through to sync infer below
+            if (cb_state) {
+                const auto action =
+                    cb_state->gate.on_return(async_rc == HAL_OK);
+                if (action == AsyncReturnAction::AwaitCallback) {
+                    cb_state->release_owner();  // submitter owner
+                    continue;
+                }
+                if (action == AsyncReturnAction::CompleteHere) {
+                    complete_async(cb_state);
+                    cb_state->release_owner();  // submitter owner
+                    continue;
+                }
+
+                req = std::move(cb_state->req);
+                try {
+                    // A rejected backend may have allocated output backing
+                    // storage before queue submission failed.
+                    model_mgr_->free_outputs(
+                        cb_state->output_slots.get(), max_outputs);
+                } catch (...) {
+                    LOG_ERROR("Async inference rollback cleanup threw");
+                }
+                cb_state->release_owner();  // unused callback owner
+                cb_state->release_owner();  // submitter owner
+            }
+            // Fall through to synchronous inference with the restored request.
         }
 
         // ── Sync path (fallback or HAL without async) ──
@@ -308,17 +402,30 @@ void InferenceScheduler::worker_loop(int worker_id) {
                     static_cast<uint64_t>(infer_time.count()));
             }
 
-            // Deliver result
+            bool callback_failed = false;
             if (req->on_complete) {
-                req->on_complete(rc, outputs, max_outputs,
-                                 infer_time.count(), queue_time.count(),
-                                 true);  // model was acquired
+                try {
+                    req->on_complete(rc, outputs, max_outputs,
+                                     infer_time.count(), queue_time.count(),
+                                     true);  // model was acquired
+                } catch (const std::exception& e) {
+                    callback_failed = true;
+                    LOG_ERROR("Inference completion callback threw: %s", e.what());
+                } catch (...) {
+                    callback_failed = true;
+                    LOG_ERROR("Inference completion callback threw");
+                }
             }
 
-            // Cleanup
             if (!req->owns_outputs) {
                 model_mgr_->free_outputs(outputs, max_outputs);
                 model_mgr_->release_model(req->model_id);
+            } else if (callback_failed) {
+                // Ownership may already have moved into an asynchronous
+                // postprocess task. Owning callbacks must contain exceptions
+                // and complete their own cleanup before returning.
+                LOG_ERROR("Owning inference callback failed after possible "
+                          "transfer; scheduler cannot safely reclaim outputs");
             }
         }
 

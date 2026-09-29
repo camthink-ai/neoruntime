@@ -2,11 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "aipc/platform/event-bus/proto"
 )
@@ -482,6 +488,209 @@ func TestWildcardSubscriberDelivery(t *testing.T) {
 
 	if received != len(topics) {
 		t.Errorf("Expected %d events, received %d", len(topics), received)
+	}
+}
+
+// ===================== GetTopicInfo / GetTopicStats =====================
+
+func TestGetTopicInfo(t *testing.T) {
+	server := newTestServer(100)
+	ctx := context.Background()
+
+	server.subMutex.Lock()
+	server.subscribers["app/events"] = []*Subscriber{
+		{ID: "s1", Topic: "app/events", EventCh: make(chan *pb.Event, 1), QuitCh: make(chan struct{})},
+		{ID: "s2", Topic: "app/events", EventCh: make(chan *pb.Event, 1), QuitCh: make(chan struct{})},
+	}
+	server.subMutex.Unlock()
+
+	// Publish twice so the stats-only path (published, no subscriber at
+	// publish time) also gets covered by this server instance.
+	for range 2 {
+		server.Publish(ctx, &pb.PublishRequest{
+			Event: &pb.Event{Topic: "stats/only", Payload: []byte(`{}`)},
+		})
+	}
+
+	tests := []struct {
+		name         string
+		topic        string
+		wantErr      codes.Code
+		wantSubs     uint32
+		wantMessages uint64
+	}{
+		{name: "topic with subscribers and messages", topic: "app/events", wantSubs: 2},
+		{name: "stats only topic (no subscribers)", topic: "stats/only", wantMessages: 2},
+		{name: "unknown topic", topic: "nope", wantErr: codes.NotFound},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := server.GetTopicInfo(ctx, &pb.TopicInfo{Topic: tc.topic})
+			if tc.wantErr != codes.OK {
+				if status.Code(err) != tc.wantErr {
+					t.Fatalf("GetTopicInfo(%q) error = %v, want %v", tc.topic, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetTopicInfo(%q) failed: %v", tc.topic, err)
+			}
+			if info.Topic != tc.topic {
+				t.Errorf("Topic = %q, want %q", info.Topic, tc.topic)
+			}
+			if info.SubscriberCount != tc.wantSubs {
+				t.Errorf("SubscriberCount = %d, want %d", info.SubscriberCount, tc.wantSubs)
+			}
+			if info.TotalMessages != tc.wantMessages {
+				t.Errorf("TotalMessages = %d, want %d", info.TotalMessages, tc.wantMessages)
+			}
+			if tc.wantMessages > 0 && info.LastMessageTs == 0 {
+				t.Error("LastMessageTs not set after publish")
+			}
+		})
+	}
+}
+
+func TestGetTopicStats(t *testing.T) {
+	server := newTestServer(100)
+	ctx := context.Background()
+
+	sub := &Subscriber{
+		ID:      "s1",
+		Topic:   "test/events",
+		EventCh: make(chan *pb.Event, 10),
+		QuitCh:  make(chan struct{}),
+	}
+	server.subMutex.Lock()
+	server.subscribers["test/events"] = []*Subscriber{sub}
+	server.subscribers["quiet/topic"] = []*Subscriber{
+		{ID: "s2", Topic: "quiet/topic", EventCh: make(chan *pb.Event, 1), QuitCh: make(chan struct{})},
+	}
+	server.subMutex.Unlock()
+
+	for i := range 2 {
+		server.Publish(ctx, &pb.PublishRequest{
+			Event: &pb.Event{Topic: "test/events", Payload: []byte(fmt.Sprintf(`{"n":%d}`, i))},
+		})
+	}
+
+	// Active topic: 2 published, 2 delivered to the one subscriber.
+	stats, err := server.GetTopicStats(ctx, &pb.TopicInfo{Topic: "test/events"})
+	if err != nil {
+		t.Fatalf("GetTopicStats failed: %v", err)
+	}
+	if stats.Topic != "test/events" {
+		t.Errorf("Topic = %q, want test/events", stats.Topic)
+	}
+	if stats.PublishedCount != 2 {
+		t.Errorf("PublishedCount = %d, want 2", stats.PublishedCount)
+	}
+	if stats.DeliveredCount != 2 {
+		t.Errorf("DeliveredCount = %d, want 2", stats.DeliveredCount)
+	}
+	if stats.DroppedCount != 0 {
+		t.Errorf("DroppedCount = %d, want 0", stats.DroppedCount)
+	}
+
+	// Subscribed but never published: zero counters, no error.
+	stats, err = server.GetTopicStats(ctx, &pb.TopicInfo{Topic: "quiet/topic"})
+	if err != nil {
+		t.Fatalf("GetTopicStats(quiet) failed: %v", err)
+	}
+	if stats.PublishedCount != 0 || stats.DeliveredCount != 0 {
+		t.Errorf("quiet/topic counters not zero: %+v", stats)
+	}
+
+	// Unknown topic: NotFound.
+	if _, err := server.GetTopicStats(ctx, &pb.TopicInfo{Topic: "nope"}); status.Code(err) != codes.NotFound {
+		t.Errorf("GetTopicStats(unknown) error = %v, want NotFound", err)
+	}
+}
+
+// ===================== PublishBatch =====================
+
+// batchStream fakes the client-streaming server for PublishBatch. The
+// embedded grpc.ServerStream is never invoked by the handler under test.
+type batchStream struct {
+	grpc.ServerStream
+	reqs    []*pb.PublishRequest
+	idx     int
+	resp    *pb.Status
+	recvErr error // returned after reqs is exhausted (overrides io.EOF)
+}
+
+func (b *batchStream) Recv() (*pb.PublishRequest, error) {
+	if b.idx >= len(b.reqs) {
+		if b.recvErr != nil {
+			return nil, b.recvErr
+		}
+		return nil, io.EOF
+	}
+	req := b.reqs[b.idx]
+	b.idx++
+	return req, nil
+}
+
+func (b *batchStream) SendAndClose(st *pb.Status) error {
+	b.resp = st
+	return nil
+}
+
+func TestPublishBatchAllSucceed(t *testing.T) {
+	server := newTestServer(100)
+
+	sub := &Subscriber{
+		ID:      "s1",
+		Topic:   "batch/events",
+		EventCh: make(chan *pb.Event, 10),
+		QuitCh:  make(chan struct{}),
+	}
+	server.subMutex.Lock()
+	server.subscribers["batch/events"] = []*Subscriber{sub}
+	server.subMutex.Unlock()
+
+	stream := &batchStream{reqs: []*pb.PublishRequest{
+		{Event: &pb.Event{Topic: "batch/events", Payload: []byte(`{"n":1}`)}},
+		{Event: &pb.Event{Topic: "batch/events", Payload: []byte(`{"n":2}`)}},
+		{Event: &pb.Event{Topic: "batch/events", Payload: []byte(`{"n":3}`)}},
+	}}
+	if err := server.PublishBatch(stream); err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+	if !stream.resp.Success {
+		t.Fatalf("Status.Success = false, message = %q", stream.resp.Message)
+	}
+	if got := len(sub.EventCh); got != 3 {
+		t.Errorf("subscriber received %d events, want 3", got)
+	}
+}
+
+func TestPublishBatchNilEventCountsAsFailed(t *testing.T) {
+	server := newTestServer(100)
+
+	stream := &batchStream{reqs: []*pb.PublishRequest{
+		{Event: &pb.Event{Topic: "batch/events", Payload: []byte(`{}`)}},
+		{Event: nil},
+	}}
+	if err := server.PublishBatch(stream); err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+	if stream.resp.Success {
+		t.Error("Status.Success = true, want false when a nil event is in the batch")
+	}
+}
+
+func TestPublishBatchRecvError(t *testing.T) {
+	server := newTestServer(100)
+	sentinel := errors.New("stream broken")
+
+	stream := &batchStream{recvErr: sentinel}
+	err := server.PublishBatch(stream)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("PublishBatch error = %v, want %v", err, sentinel)
+	}
+	if stream.resp != nil {
+		t.Error("SendAndClose should not be called on recv error")
 	}
 }
 

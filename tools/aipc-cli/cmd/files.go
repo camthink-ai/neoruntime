@@ -106,7 +106,7 @@ var filesGetCmd = &cobra.Command{
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("request failed: %w", err)
 		}
@@ -149,7 +149,7 @@ var filesPutCmd = &cobra.Command{
 		}
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("request failed: %w", err)
 		}
@@ -201,7 +201,7 @@ var filesUploadCmd = &cobra.Command{
 		}
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("upload failed: %w", err)
 		}
@@ -239,7 +239,7 @@ var filesDownloadCmd = &cobra.Command{
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("download failed: %w", err)
 		}
@@ -286,7 +286,7 @@ var filesDeleteCmd = &cobra.Command{
 		}
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("request failed: %w", err)
 		}
@@ -322,7 +322,7 @@ var filesMkdirCmd = &cobra.Command{
 		}
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("request failed: %w", err)
 		}
@@ -357,7 +357,7 @@ var filesRenameCmd = &cobra.Command{
 		}
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("request failed: %w", err)
 		}

@@ -17,6 +17,7 @@
 
 #include <hailo/media_library/encoder_config_types.hpp>
 #include <hailo/media_library/media_library_api_types.hpp>
+#include <hailo/media_library/snapshot.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -810,6 +811,11 @@ int build_contexts(Hailo15MediaPriv *priv, HalMediaContext *hm)
     const config_profile_t &prof = prof_exp.value();
     refresh_ids_from_profile(priv, prof);
 
+    /* Everything below mutates the shared ctx lists / by_stream maps: publish
+     * under ctx_list_mu so concurrent get_codec_names() snapshots never see a
+     * half-built or freed list. get_current_profile() above stays OUTSIDE the
+     * lock (MediaLibrary call — ctx_list_mu must never nest with ML). */
+    std::lock_guard<std::mutex> ctx_guard(priv->ctx_list_mu);
     free(hm->video_ctx_list);
     free(hm->codec_ctx_list);
     hm->video_ctx_list = nullptr;
@@ -894,6 +900,10 @@ int build_contexts(Hailo15MediaPriv *priv, HalMediaContext *hm)
 
 void destroy_contexts(Hailo15MediaPriv *priv, HalMediaContext *hm)
 {
+    /* Free under ctx_list_mu so a concurrent get_codec_names() snapshot either
+     * sees the complete old list or none of it — never a freed entry. Leaf
+     * lock: nothing else is taken while held (pure free()s + map clears). */
+    std::lock_guard<std::mutex> ctx_guard(priv->ctx_list_mu);
     if (hm->video_ctx_list)
     {
         for (uint32_t i = 0; i < hm->video_ctx_list_count; i++)
@@ -937,6 +947,87 @@ void refresh_osd_layout_from_profile(Hailo15MediaPriv *priv, const config_profil
     }
 }
 
+/**
+ * Stop accepting new frontend bridge callbacks and wait for the ones already
+ * running to drain (same protocol as hailo15_media_stop / reinit_media_library_on_stream_change,
+ * which keep their own inline copies of this sequence).  Every teardown that is
+ * about to disconnect bridges, erase multi_resize pads or destroy MediaLibrary
+ * objects must drain first: a GStreamer dataflow straggler still inside
+ * MediaLibraryFrontend::on_new_sample -> HAL bridge lambda while the objects it
+ * touches are destroyed is the SIGSEGV family seen on portrait rotation
+ * (pthread_mutex_lock in a dead frontend) and the std::out_of_range abort in
+ * MediaLibraryMultiResize::handle_frame after pad-map erasure.
+ *
+ * Returns HAL_OK once no bridge callback is running or can newly enter, and the
+ * caller may proceed with disconnect/teardown.  On timeout returns
+ * HAL_ERR_TIMEOUT with quiescing already cleared — callers must fail loud and
+ * NOT proceed with teardown (their pipeline is still intact and streaming).
+ *
+ * NOTE: the quiesce flag is a plain bool, not a counter.  Concurrent HAL
+ * teardown ops (e.g. rotation racing a profile switch) could interleave; the
+ * daemon serializes the REST-triggered layout ops, so this is the same
+ * exposure those ops already had.
+ */
+static int quiesce_and_drain_frontend_callbacks(Hailo15MediaPriv *p, const char *tag)
+{
+    uint32_t inflight_at_quiesce = 0;
+    {
+        std::lock_guard<std::mutex> lock(p->callback_lifecycle_mu);
+        p->callbacks_quiescing = true;
+        inflight_at_quiesce = p->frontend_callbacks_inflight;
+    }
+    HAL_LOG_INFO("hailo15_media: %s: quiescing frontend callbacks (inflight=%u)",
+                 tag ? tag : "teardown", inflight_at_quiesce);
+
+    constexpr auto callback_drain_timeout = std::chrono::seconds(3);
+    std::unique_lock<std::mutex> lock(p->callback_lifecycle_mu);
+    if (!p->callback_lifecycle_cv.wait_for(
+            lock, callback_drain_timeout,
+            [&] { return p->frontend_callbacks_inflight == 0; }))
+    {
+        const uint32_t inflight = p->frontend_callbacks_inflight;
+        p->callbacks_quiescing = false;
+        HAL_LOG_ERROR("hailo15_media: %s: frontend callback drain timed out after %llds (inflight=%u)",
+                      tag ? tag : "teardown",
+                      static_cast<long long>(callback_drain_timeout.count()), inflight);
+        return HAL_ERR_TIMEOUT;
+    }
+    HAL_LOG_INFO("hailo15_media: %s: frontend callbacks drained", tag ? tag : "teardown");
+    return HAL_OK;
+}
+
+/**
+ * RAII un-quiesce for callers of quiesce_and_drain_frontend_callbacks inside a
+ * larger reconfig function: engage() drains and remembers success; the
+ * destructor re-allows bridge callbacks on EVERY exit path (success, HAL
+ * failure, reconnect-after-failure) so a drained op can never leave the flag
+ * stuck and silently drop all future frames.
+ */
+class MlCallbackQuiesceScope
+{
+public:
+    explicit MlCallbackQuiesceScope(Hailo15MediaPriv &p) : p_(p) {}
+    ~MlCallbackQuiesceScope()
+    {
+        if (engaged_)
+        {
+            std::lock_guard<std::mutex> lock(p_.callback_lifecycle_mu);
+            p_.callbacks_quiescing = false;
+        }
+    }
+    /* Drains; on success marks the scope engaged.  Returns the drain result. */
+    int engage(const char *tag)
+    {
+        const int rc = quiesce_and_drain_frontend_callbacks(&p_, tag);
+        engaged_ = (rc == HAL_OK);
+        return rc;
+    }
+
+private:
+    Hailo15MediaPriv &p_;
+    bool engaged_{false};
+};
+
 int apply_profile_override_and_refresh(HalMediaContext *hm, Hailo15MediaPriv *priv, const config_profile_t &target_profile,
                                        const char *tag)
 {
@@ -961,7 +1052,7 @@ int apply_profile_override_and_refresh(HalMediaContext *hm, Hailo15MediaPriv *pr
     // treats a VCEnc rejection (error -3, e.g. a height not aligned to 8) as
     // non-fatal — it logs the failure but keeps consuming buffers with the OLD
     // layout while still reporting MEDIA_LIBRARY_SUCCESS. The encoder is then
-    // silently stuck on stale dimensions (observed on 93.72: stream labelled
+    // silently stuck on stale dimensions (observed on a field device: stream labelled
     // 960x540 while emitting ~921600-byte = 1280x720 packets, ~5 SLOW-dispatch
     // warnings/sec, 78% CPU). There is no reliable post-override readback of
     // the encoder's *actual* hardware geometry (m_encoders exposes config
@@ -971,6 +1062,16 @@ int apply_profile_override_and_refresh(HalMediaContext *hm, Hailo15MediaPriv *pr
     // applied at encoder creation and a VCEnc rejection fails start_pipeline()
     // and propagates to the caller. This covers all callers of this shared
     // helper; reconfigure_pipeline() also pre-gates (see ~line 5392).
+    // Drain in-flight bridge callbacks for the WHOLE reconfig window, including
+    // the early full-reinit reroutes below.  Every reroute disconnects the bridge
+    // subscriptions before reinit tears the pipeline down; disconnecting while a
+    // GStreamer dataflow straggler is still inside on_new_sample lets it run on
+    // freed callback closures (the recursive_mutex SIGSEGV family observed on
+    // concurrent RemoveStream/reconfigure).  engage() fails loud — on drain
+    // timeout nothing has been torn down yet, so we can return with the
+    // pipeline intact instead of crashing.
+    MlCallbackQuiesceScope quiesce_scope(*priv);
+
     if (prev_prof.has_value() && encoder_input_layout_changed(prev_prof.value(), target_profile))
     {
         HAL_LOG_INFO("hailo15_media: %s: encoder input layout changed; routing to full ML reinit "
@@ -978,7 +1079,18 @@ int apply_profile_override_and_refresh(HalMediaContext *hm, Hailo15MediaPriv *pr
                      tag ? tag : "profile_update");
         if (had_bridge)
         {
-            disconnect_ml_bridge_callbacks(priv);
+            const int drained = quiesce_scope.engage(tag ? tag : "profile_update");
+            if (drained != HAL_OK)
+            {
+                HAL_LOG_ERROR("hailo15_media: %s: callback drain failed before layout-reroute "
+                              "teardown; aborting with pipeline intact",
+                              tag ? tag : "profile_update");
+                return drained;
+            }
+            /* Bridge disconnect happens INSIDE reinit_media_library(), after
+             * stop_pipeline() has quelled the dataflow — unsubscribing here
+             * (pipeline still running) would erase frontend map entries a
+             * straggler on_new_sample still .at()s (std::out_of_range abort). */
         }
         return reinit_media_library_on_layout_change(hm, priv, target_profile, tag);
     }
@@ -997,37 +1109,89 @@ int apply_profile_override_and_refresh(HalMediaContext *hm, Hailo15MediaPriv *pr
     }
 
     const bool pipeline_running = priv->media_lib->get_pipeline_state() == media_library_pipeline_state_t::PIPELINE_STATE_RUNNING;
-    const bool adding_stream = disconnect_before && prev_prof.has_value() &&
+    // Count-based, not gated on disconnect_before: the bridges can be
+    // unregistered while the pipeline is still RUNNING (e.g. a previous op
+    // disconnected them mid-flight), and that state must still take the full
+    // reinit instead of falling through to the in-place set_override path
+    // that races live dataflow pads.
+    const bool adding_stream = prev_prof.has_value() &&
         target_profile.encoded_output_streams.size() > prev_prof.value().encoded_output_streams.size();
+    const bool removing_stream = prev_prof.has_value() &&
+        target_profile.encoded_output_streams.size() < prev_prof.value().encoded_output_streams.size();
 
     // When ADDING streams to a running pipeline, do a full ML destroy+recreate instead
     // of in-place set_override_parameters.  The multi_resize DSP pipeline does not
     // properly handle dynamic addition of output streams — pads get created but the
     // DSP doesn't produce output for the new stream after a remove→add cycle.
-    if (adding_stream && pipeline_running)
+    //
+    // REMOVAL takes the same full reinit: the in-place path erases the stream's
+    // multi_resize pad from libgstmedialib's unordered_map while a GStreamer
+    // dataflow straggler can still be inside MediaLibraryMultiResize::handle_frame
+    // pushing to that pad — a ~25%-reproducible std::out_of_range abort observed
+    // on RemoveStream.  The destroy+recreate path drains bridge callbacks and
+    // rebuilds every pad under a stopped pipeline instead of erasing live ones.
+    if ((adding_stream || removing_stream) && pipeline_running)
     {
         // Disconnect bridges before destroying ML (reinit will destroy the ML object).
+        // Drain FIRST: unsubscribe frees the vendor frontend closures while a
+        // dataflow straggler can still be executing one.
         if (disconnect_before)
         {
-            disconnect_ml_bridge_callbacks(priv);
-            HAL_LOG_INFO("hailo15_media: %s: unsubscribed HAL bridges before full ML reinit",
-                         tag ? tag : "profile_update");
+            const int drained = quiesce_scope.engage(tag ? tag : "profile_update");
+            if (drained != HAL_OK)
+            {
+                HAL_LOG_ERROR("hailo15_media: %s: callback drain failed before %s-stream teardown; "
+                              "aborting with pipeline intact",
+                              tag ? tag : "profile_update", adding_stream ? "add" : "remove");
+                return drained;
+            }
+            /* No early unsubscribe: reinit_media_library() owns the
+             * stop-first-then-disconnect sequence; disconnecting on the still
+             * running pipeline here is the straggler .at() race (E03 crash). */
         }
-        HAL_LOG_INFO("hailo15_media: %s: adding stream to running pipeline, full ML reinit",
-                     tag ? tag : "profile_update");
+        HAL_LOG_INFO("hailo15_media: %s: %s stream on running pipeline, full ML reinit",
+                     tag ? tag : "profile_update", adding_stream ? "adding" : "removing");
         return reinit_media_library_on_layout_change(hm, priv, target_profile, tag);
     }
 
-    // For stream REMOVAL: stop the pipeline BEFORE disconnecting bridges.
-    // If we disconnect first while the pipeline is still running, the GStreamer
-    // streaming thread may still be in on_new_sample → HAL bridge lambda, leading
-    // to SIGSEGV when it accesses the now-destroyed callback data.
+    // The scope declared above covers the pre_stop branch and the post-override
+    // HAL recycle at the tail — both tear the pipeline down while a streaming
+    // thread could still be in on_new_sample.
+
+    // For stream REMOVAL from a stopped pipeline (pipeline_running==false — no
+    // dataflow threads to race): stop the pipeline BEFORE disconnecting bridges
+    // would be a no-op, so only the drain matters.  For a same-count layout
+    // change (e.g. resolution change) the pipeline is still RUNNING here:
+    // drain FIRST (while encoders still consume, so callbacks blocked in
+    // add_buffer() can complete — same ordering as the reinit path), then stop,
+    // then disconnect.  Disconnecting before the drain with the pipeline live
+    // lets a straggler run on_new_sample into destroyed callback data.
     const bool pre_stop = disconnect_before && pipeline_running && !adding_stream;
     if (pre_stop)
     {
-        HAL_LOG_INFO("hailo15_media: %s: pre-stopping pipeline before disconnect + set_override_parameters",
+        HAL_LOG_INFO("hailo15_media: %s: draining frontend callbacks, then pre-stopping pipeline "
+                     "before disconnect + set_override_parameters",
                      tag ? tag : "profile_update");
-        priv->media_lib->stop_pipeline();
+        const int drained = quiesce_scope.engage(tag ? tag : "profile_update");
+        if (drained != HAL_OK)
+        {
+            // Fail loud: teardown with a stuck callback would crash (the very
+            // abort/SIGSEGV family this drain exists to prevent).  Nothing has
+            // been torn down yet — the pipeline is still running intact.
+            return drained;
+        }
+        const media_library_return stop_r = priv->media_lib->stop_pipeline();
+        if (stop_r != MEDIA_LIBRARY_SUCCESS)
+        {
+            /* Stop failed: the pipeline may still be RUNNING, and unsubscribing
+             * a running pipeline reopens the erase-while-.at() straggler window
+             * this ordering exists to close. Nothing is torn down yet (bridges
+             * still subscribed, encoders intact); the quiesce scope clears on
+             * return and streaming continues on the old layout. */
+            HAL_LOG_ERROR("hailo15_media: %s: pre-stop failed (%d) — aborting teardown with bridges attached",
+                          tag ? tag : "profile_update", static_cast<int>(stop_r));
+            return hailo15_ml_err(stop_r);
+        }
     }
     if (disconnect_before)
     {
@@ -1115,12 +1279,6 @@ int apply_profile_override_and_refresh(HalMediaContext *hm, Hailo15MediaPriv *pr
 
     if (had_bridge)
     {
-        disconnect_ml_bridge_callbacks(priv);
-        {
-            std::lock_guard<std::recursive_mutex> lock(priv->mutex);
-            priv->callbacks_registered = false;
-        }
-
         if (hal_recycle_stop_start)
         {
             HAL_LOG_INFO("hailo15_media: %s: HAL recycle after layout change (stop/start)", tag ? tag : "profile_update");
@@ -1145,6 +1303,16 @@ int apply_profile_override_and_refresh(HalMediaContext *hm, Hailo15MediaPriv *pr
                 }
                 return hailo15_ml_err(sr);
             }
+        }
+
+        /* Stop-first when recycling above (same straggler rationale as
+         * reinit_media_library).  The no-recycle branch disconnects on a
+         * pipeline set_override_parameters() just reconfigured in place —
+         * known narrow residual window, unchanged from prior behavior. */
+        disconnect_ml_bridge_callbacks(priv);
+        {
+            std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+            priv->callbacks_registered = false;
         }
 
         const int ce = connect_encoders(priv);
@@ -2037,8 +2205,17 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
     using json = nlohmann::json;
     json cfg = json::parse(stored_json);
 
-    std::string prof_name = target_profile.name;
-    if (prof_name.empty() && cfg.contains("default_profile"))
+    std::string prof_name;
+    if (!target_profile.name.empty())
+    {
+        /* A layout reinit is also used while switching profiles.  Select the
+         * requested target profile instead of the previous JSON default. */
+        prof_name = target_profile.name;
+        cfg["default_profile"] = prof_name;
+        HAL_LOG_INFO("hailo15_media: patch_json: selecting target profile '%s'",
+                     prof_name.c_str());
+    }
+    else if (cfg.contains("default_profile"))
         prof_name = cfg["default_profile"].get<std::string>();
     if (!prof_name.empty())
         cfg["default_profile"] = prof_name;
@@ -2149,6 +2326,47 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
         }
     }
 
+    /* --- Patch motion_detection (target profile wins; includes the analysis
+     * stream binding that stock profiles leave empty, without which the
+     * medialib motion module silently skips detection). from_json reads
+     * resolution.stream_id even though stock profiles omit it. --- */
+    {
+        const motion_detection_config_t &md = target_profile.application_settings.motion_detection;
+        const char *sens = "MEDIUM";
+        switch (md.sensitivity_level)
+        {
+        case LOWEST:  sens = "LOWEST";  break;
+        case LOW:     sens = "LOW";     break;
+        case HIGH:    sens = "HIGH";    break;
+        case HIGHEST: sens = "HIGHEST"; break;
+        default:      sens = "MEDIUM";  break;
+        }
+        json mdj = {
+            {"enabled", md.enabled},
+            /* NOTE: resolution.stream_id is intentionally NOT serialized — the
+             * config schema (additionalProperties:false) rejects it, and the
+             * official profiles never populate it either (every stock config
+             * ships motion_detection disabled; the medialib module therefore
+             * never runs: output_frames lookup uses the empty stream_id).
+             * The HAL runs its own frame-difference detector in the frontend
+             * bridge instead — see subscribe_motion. */
+            {"resolution",
+             {{"width", md.resolution.dimensions.destination_width},
+              {"height", md.resolution.dimensions.destination_height},
+              {"framerate", md.resolution.framerate}}},
+            {"roi",
+             {{"x", md.roi.x}, {"y", md.roi.y}, {"width", md.roi.width}, {"height", md.roi.height}}},
+            {"sensitivity_level", sens},
+            {"threshold", md.threshold},
+            {"buffer_pool_size", md.buffer_pool_size},
+        };
+        if (md.resolution.pool_max_buffers != 0)
+        {
+            mdj["resolution"]["pool_max_buffers"] = md.resolution.pool_max_buffers;
+        }
+        (*app_obj)["motion_detection"] = std::move(mdj);
+    }
+
     /* --- Patch encoded_output_streams --- */
     if (active_prof->contains("encoded_output_streams") &&
         (*active_prof)["encoded_output_streams"].is_array())
@@ -2252,6 +2470,24 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
                                                     (enc.output_stream.codec == CODEC_TYPE_HEVC)
                                                         ? "CODEC_TYPE_HEVC" : "CODEC_TYPE_H264";
                                             }
+                                            /* Rate parameters from the target profile: without this
+                                             * the cloned entry keeps the TEMPLATE's rate control — an
+                                             * added sub stream inherited main's 8Mbps/gop-30 and the
+                                             * add request's bitrate/gop never reached the rebuilt
+                                             * pipeline (encoder ran at the wrong rate until the next
+                                             * full reconfigure). Same JSON shape the encoder_override
+                                             * pass writes (rate_control.bitrate.target_bitrate /
+                                             * rate_control.intra_pic_rate). */
+                                            if (enc.rate_control.bitrate.target_bitrate > 0)
+                                            {
+                                                he["rate_control"]["bitrate"]["target_bitrate"] =
+                                                    enc.rate_control.bitrate.target_bitrate;
+                                            }
+                                            if (enc.rate_control.intra_pic_rate > 0)
+                                            {
+                                                he["rate_control"]["intra_pic_rate"] =
+                                                    enc.rate_control.intra_pic_rate;
+                                            }
                                         }
 
                                         /* Write to /tmp/ — the template directory (e.g. /usr/bin/profile/)
@@ -2303,7 +2539,74 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
                                                     (enc.output_stream.codec == CODEC_TYPE_HEVC) ? "CODEC_TYPE_HEVC" : "CODEC_TYPE_H264";
                                             }
                                         }
+                                        /* Rate parameters from the target profile — see the file-path
+                                         * variant above for why the template's rate control must be
+                                         * overwritten here as well. */
+                                        if (enc.rate_control.bitrate.target_bitrate > 0)
+                                        {
+                                            he["rate_control"]["bitrate"]["target_bitrate"] =
+                                                enc.rate_control.bitrate.target_bitrate;
+                                        }
+                                        if (enc.rate_control.intra_pic_rate > 0)
+                                        {
+                                            he["rate_control"]["intra_pic_rate"] =
+                                                enc.rate_control.intra_pic_rate;
+                                        }
                                     }
+                                }
+                            }
+                        }
+                        else if constexpr (std::is_same_v<T, jpeg_encoder_config_t>)
+                        {
+                            /* JPEG encoder: no hailo_encoder template applies. Build a fresh
+                             * JPEG config (input_stream + jpeg_encoder{n_threads,quality}),
+                             * borrowing version/metadata from the donor template file so the
+                             * architecture check passes; content_hash is recomputed. */
+                            if (new_entry.contains("encoding") && new_entry["encoding"].is_string())
+                            {
+                                std::string tmpl_path = new_entry["encoding"].get<std::string>();
+                                std::ifstream ef(tmpl_path);
+                                if (ef.is_open())
+                                {
+                                    json enc_cfg;
+                                    ef >> enc_cfg;
+                                    ef.close();
+                                    enc_cfg["encoding"] = {
+                                        {"input_stream",
+                                         {{"format", enc.input_stream.format},
+                                          {"framerate", enc.input_stream.framerate},
+                                          {"height", enc.input_stream.height},
+                                          {"width", enc.input_stream.width}}},
+                                        {"jpeg_encoder",
+                                         {{"n_threads", enc.n_threads}, {"quality", enc.quality}}}};
+                                    if (enc_cfg.contains("metadata") && enc_cfg["metadata"].is_object())
+                                    {
+                                        auto enc_hash = compute_medialib_content_hash(enc_cfg);
+                                        if (enc_hash)
+                                        {
+                                            enc_cfg["metadata"]["content_hash"] = *enc_hash;
+                                        }
+                                    }
+                                    std::string new_path = std::string("/tmp/encoder_inject_") + tid + ".json";
+                                    std::ofstream of(new_path);
+                                    if (of.is_open())
+                                    {
+                                        of << enc_cfg.dump(4);
+                                        of.close();
+                                        new_entry["encoding"] = new_path;
+                                        HAL_LOG_INFO("hailo15_media: patch_json: wrote JPEG encoder config '%s' for '%s'",
+                                                     new_path.c_str(), tid.c_str());
+                                    }
+                                    else
+                                    {
+                                        HAL_LOG_ERROR("hailo15_media: patch_json: FAILED to write JPEG encoder config '%s'",
+                                                      new_path.c_str());
+                                    }
+                                }
+                                else
+                                {
+                                    HAL_LOG_ERROR("hailo15_media: patch_json: FAILED to open template encoder config '%s' (jpeg)",
+                                                  tmpl_path.c_str());
                                 }
                             }
                         }
@@ -2353,6 +2656,49 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
     return cfg.dump(2);
 }
 
+/* Snapshot each profile's authored iq_settings.grayscale.enabled. Must run
+ * exactly once, at FIRST init: only there is no runtime override applied yet,
+ * so get_profile() still returns the values parsed from the immutable
+ * configuration. (Profiles in the stock webserver config are name+config_file
+ * stubs — iq_settings live in per-profile files — so the values are read
+ * through the SDK rather than re-parsed from the config json. This also stays
+ * correct for custom config_path/config_json and non-default IR profiles
+ * configured in camera-daemon.) */
+static void snapshot_authored_grayscale(Hailo15MediaPriv *priv)
+{
+    priv->authored_profile_grayscale.clear();
+    for (const std::string &name : priv->profile_names)
+    {
+        auto exp = priv->media_lib->get_profile(name);
+        if (!exp.has_value())
+        {
+            HAL_LOG_WARNING("hailo15_media: snapshot_authored_grayscale: get_profile('%s') failed",
+                            name.c_str());
+            continue;
+        }
+        priv->authored_profile_grayscale[name] = exp.value().iq_settings.grayscale.enabled;
+    }
+}
+
+/* The live profile's iq_settings.grayscale.enabled is not a safe source for
+ * "is this profile monochrome by design": set_override_parameters() ->
+ * ConfigManager::set_profile() replaces the stored profile_by_name entry with
+ * the toggled values, so after a single gray=1 toggle the live value stays
+ * true until reboot re-parses the JSON (the grayscale ratchet). Consult the
+ * init-time snapshot instead (see snapshot_authored_grayscale). Unknown
+ * profile names fall back to color with a warning. */
+static bool profile_authored_grayscale(Hailo15MediaPriv *priv, const std::string &profile_name)
+{
+    const auto it = priv->authored_profile_grayscale.find(profile_name);
+    if (it == priv->authored_profile_grayscale.end())
+    {
+        HAL_LOG_WARNING("hailo15_media: no authored grayscale snapshot for '%s' - assuming color",
+                        profile_name.c_str());
+        return false;
+    }
+    return it->second;
+}
+
 /**
  * Full MediaLibrary teardown + reinit for stream layout changes (add/remove).
  * Patches the stored config JSON to match the target stream layout, then
@@ -2364,12 +2710,23 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
 
 extern "C" {
 
+/* Forward declaration — defined near rotation_full_reinit(), which shares it. */
+static std::string patch_rotation_in_profile_files(const std::string &config_json,
+                                                   rotation_angle_t angle);
+
 static int hailo15_media_init(const HalMediaConfig *config, void **media_ctx_return)
 {
     if (!config || !media_ctx_return)
     {
         return HAL_ERR_INVALID_ARG;
     }
+
+    /* Enable the medialib snapshot manager BEFORE pipeline components are
+     * created: stages (pre_isp_raw / multiresize_<id> / encoder_<WxH> ...)
+     * register themselves during component construction, so a later enable
+     * leaves request_snapshot() with an empty stage set. File output only
+     * happens when a snapshot is actually requested. */
+    SnapshotManager::get_instance().enable_snapshot(true);
 
     std::string json;
     std::string effective_path; /* non-empty when config was loaded from a file path */
@@ -2458,6 +2815,24 @@ static int hailo15_media_init(const HalMediaConfig *config, void **media_ctx_ret
         fix_encoder_dimension_mismatches(json);
     }
 
+    /* Bake the caller-requested rotation into the initial medialib build.
+     * Rotation is the only image field whose later change forces a medialib
+     * pipeline restart (stream_restart_required() in the vendor lib), and that
+     * internal stop→reconfigure→start can wedge the DSP rotation buffers (see
+     * dynamic_change_image_config). Patching the rotation into the profile
+     * files BEFORE initialize() means the pipeline is CREATED rotated, so the
+     * caller's post-init transform replay is rotation-wise a no-op — no
+     * restart, no wedge, no slow full reinit at boot. Other image fields
+     * (flip/dewarp/gray/dis/eis) do not trigger restarts and are applied by
+     * the normal dynamic_change_image_config() path after init. */
+    if (config->image_config.rotation_angle != HAL_ROTATION_ANGLE_0)
+    {
+        HAL_LOG_INFO("hailo15_media: init: baking rotation=%d into initial pipeline build",
+                     static_cast<int>(config->image_config.rotation_angle));
+        json = patch_rotation_in_profile_files(
+            json, static_cast<rotation_angle_t>(config->image_config.rotation_angle));
+    }
+
     /* Re-sync stored_config_json now that encoder overrides / dimension fixes have
      * been applied to `json`. Otherwise stored_config_json diverges from the live
      * pipeline: it would hold the raw loaded config (e.g. a 4k module config) while
@@ -2516,7 +2891,16 @@ static int hailo15_media_init(const HalMediaConfig *config, void **media_ctx_ret
         }
     }
 
-    const media_library_return ini = priv->media_lib->initialize(json, hal_backup_path);
+    /* should_restore_backup=false: `json` is the authoritative boot config the
+     * daemon built from its YAML (encoder overrides and rotation are already
+     * baked in above). With restore=true, MediaLibrary::initialize() prefers
+     * {backup}/medialib_config.json unconditionally on success — a stale backup
+     * (e.g. one frozen weeks ago with a 3-encoder layout) then boots a pipeline
+     * the YAML no longer describes, resurrecting deleted streams as zombie
+     * encoders after reboot. Mirrors rotation_full_reinit, which deliberately
+     * passes false for the same reason. The backup folder stays registered for
+     * explicit backup_profiles() calls. */
+    const media_library_return ini = priv->media_lib->initialize(json, false);
     if (ini != MEDIA_LIBRARY_SUCCESS)
     {
         delete priv;
@@ -2586,6 +2970,10 @@ static int hailo15_media_init(const HalMediaConfig *config, void **media_ctx_ret
     }
 
     hailo15_parse_profile_names_from_config_json(json, &priv->profile_names);
+    /* First init only: capture each profile's authored grayscale before any runtime
+     * override can replace the stored entries (see snapshot_authored_grayscale).
+     * The snapshot lives in priv and survives later media_lib reinits unchanged. */
+    snapshot_authored_grayscale(priv);
 
     auto *hm = static_cast<HalMediaContext *>(calloc(1, sizeof(HalMediaContext)));
     if (!hm)
@@ -2631,6 +3019,13 @@ static int hailo15_media_init(const HalMediaConfig *config, void **media_ctx_ret
             const auto &iq = prof_exp.value().iq_settings;
             hm->config.image_config.dewarp = iq.dewarp.enabled;
             hm->config.image_config.grayscale = iq.grayscale.enabled;
+            /* Rotation too — the profile may carry a rotation baked at init
+             * (image_config above) or authored in the config JSON. Reporting
+             * it keeps get_current_config() truthful and lets callers detect
+             * "already rotated" instead of issuing a redundant rotation
+             * change (which would take the slow full-reinit path). */
+            hm->config.image_config.rotation_angle = static_cast<HalRotationAngle>(
+                prof_exp.value().application_settings.rotation.effective_value());
         }
     }
 
@@ -2781,20 +3176,18 @@ static int hailo15_media_stop(void *media_ctx)
     HAL_LOG_INFO("hailo15_media: stop: frontend callbacks drained");
 
     /*
-     * No frontend bridge callback can now be running or newly enter. Drop the
-     * subscriptions before GStreamer teardown without holding priv->mutex.
+     * Stop the pipeline BEFORE dropping the frontend subscriptions: our drain
+     * above only covers OUR bridge lambdas, while MediaLibraryFrontend's
+     * on_new_sample can still be in flight on a streaming thread and
+     * .at()s the very entries unsubscribe_all_from_frontend() erases
+     * (std::out_of_range abort family).  A bridge lambda entered during the
+     * stop drops at FrontendCallbackGuard and never reaches add_buffer(), so
+     * the historical flush<->add_buffer deadlock cannot form.
      */
     bool had_bridge = false;
     {
         std::lock_guard<std::recursive_mutex> lock(priv->mutex);
         had_bridge = priv->callbacks_registered;
-    }
-    if (had_bridge)
-    {
-        HAL_LOG_INFO("hailo15_media: stop: disconnect_ml_bridge_callbacks before stop_pipeline()");
-        disconnect_ml_bridge_callbacks(priv);
-        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
-        priv->callbacks_registered = false;
     }
 
     /*
@@ -2804,6 +3197,15 @@ static int hailo15_media_stop(void *media_ctx)
     HAL_LOG_INFO("hailo15_media: stop: calling stop_pipeline() ...");
     const media_library_return r = priv->media_lib->stop_pipeline();
     HAL_LOG_INFO("hailo15_media: stop: stop_pipeline() returned %d", static_cast<int>(r));
+
+    if (r == MEDIA_LIBRARY_SUCCESS && had_bridge)
+    {
+        /* Dataflow is down — unsubscribing cannot race on_new_sample lookups. */
+        HAL_LOG_INFO("hailo15_media: stop: disconnect_ml_bridge_callbacks after stop_pipeline()");
+        disconnect_ml_bridge_callbacks(priv);
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->callbacks_registered = false;
+    }
 
     if (r != MEDIA_LIBRARY_SUCCESS && had_bridge)
     {
@@ -2907,6 +3309,12 @@ static int hailo15_media_switch_profile(void *media_ctx, const char *profile_nam
     /* Same rule as stop: set_profile may stop/restart the pipeline; must not hold priv->mutex across it. */
     const bool had_bridge = priv->callbacks_registered;
 
+    /* Covers every teardown point below (pre-set_profile disconnect, pre_stop,
+     * post-set_profile recycle): engages the callback drain at the first one
+     * reached and re-allows callbacks on every exit — including the
+     * failure-restore paths that reconnect bridges and restart the pipeline. */
+    MlCallbackQuiesceScope quiesce_scope(*priv);
+
     std::optional<config_profile_t> prev_prof;
     {
         auto prev_exp = priv->media_lib->get_current_profile();
@@ -2938,8 +3346,36 @@ static int hailo15_media_switch_profile(void *media_ctx, const char *profile_nam
         }
         if (disconnect_before)
         {
+            /* Cross-layout: set_profile() will tear the pipeline down while it
+             * is still RUNNING.  Drain first — a dataflow straggler inside
+             * on_new_sample while ML restarts internally is the same SIGSEGV
+             * family fixed for rotation_full_reinit.  Stop the pipeline BEFORE
+             * unsubscribing (mirrors pre_stop below): unsubscribing on a
+             * running pipeline erases frontend entries a straggler on_new_sample
+             * still .at()s (std::out_of_range abort). */
+            const int drained = quiesce_scope.engage("switch_profile");
+            if (drained != HAL_OK)
+            {
+                return drained;
+            }
+            const media_library_return stop_r = priv->media_lib->stop_pipeline();
+            if (stop_r != MEDIA_LIBRARY_SUCCESS)
+            {
+                /* Stop failed: the pipeline may still be RUNNING — unsubscribing
+                 * now would erase frontend entries a straggler on_new_sample
+                 * still .at()s (the exact SIGABRT family this stop-first order
+                 * exists to close). Nothing is torn down yet: bridges stay
+                 * subscribed, profile unchanged, the quiesce scope clears on
+                 * return and the old profile keeps streaming. Fail loud — the
+                 * switch can be retried (same policy as the reinit stop-failure
+                 * handler). */
+                HAL_LOG_ERROR("hailo15_media: switch_profile: pre-stop failed (%d) — aborting switch with "
+                              "bridges attached, old profile keeps streaming",
+                              static_cast<int>(stop_r));
+                return hailo15_ml_err(stop_r);
+            }
             disconnect_ml_bridge_callbacks(priv);
-            HAL_LOG_INFO("hailo15_media: switch_profile: unsubscribed HAL bridges before set_profile (layout differs)");
+            HAL_LOG_INFO("hailo15_media: switch_profile: pre-stopped, unsubscribed HAL bridges (layout differs)");
         }
         else
         {
@@ -2962,10 +3398,29 @@ static int hailo15_media_switch_profile(void *media_ctx, const char *profile_nam
     if (pre_stop)
     {
         HAL_LOG_INFO(
-            "hailo15_media: switch_profile(%s): pre-stopping pipeline before set_profile "
+            "hailo15_media: switch_profile(%s): draining callbacks + pre-stopping pipeline before set_profile "
             "(same-layout FAST_TOGGLE accumulation avoidance)",
             profile_name);
-        priv->media_lib->stop_pipeline();
+        /* Drain while the pipeline is still consuming (same ordering as the
+         * reinit path): callbacks blocked in encoder add_buffer() can finish
+         * before stop_pipeline() freezes the consumers. */
+        const int drained = quiesce_scope.engage("switch_profile_pre_stop");
+        if (drained != HAL_OK)
+        {
+            return drained;
+        }
+        const media_library_return stop_r = priv->media_lib->stop_pipeline();
+        if (stop_r != MEDIA_LIBRARY_SUCCESS)
+        {
+            /* Same fail-loud policy as the cross-layout branch above: stop
+             * failed, the pipeline may still be RUNNING, and unsubscribing a
+             * running pipeline is the straggler .at() abort window. Bridges
+             * stay attached and the old profile keeps streaming; retryable. */
+            HAL_LOG_ERROR("hailo15_media: switch_profile(%s): pre-stop failed (%d) — aborting switch with "
+                          "bridges attached, old profile keeps streaming",
+                          profile_name, static_cast<int>(stop_r));
+            return hailo15_ml_err(stop_r);
+        }
         disconnect_ml_bridge_callbacks(priv);
         HAL_LOG_INFO("hailo15_media: switch_profile(%s): unsubscribed HAL bridges after pre-stop", profile_name);
     }
@@ -3025,6 +3480,16 @@ static int hailo15_media_switch_profile(void *media_ctx, const char *profile_nam
         }
         else if (had_bridge && disconnect_before)
         {
+            /* Cross-layout failure path: we pre-stopped the pipeline and
+             * unsubscribed the bridges BEFORE set_profile, so restoring
+             * requires a restart too — reconnecting alone would leave the
+             * pipeline STOPPED (black screen) with callbacks_registered
+             * stale-false, desyncing every later switch/rollback decision.
+             * Mirrors the pre_stop restore above and
+             * apply_profile_override_and_refresh's failure handling. */
+            HAL_LOG_INFO("hailo15_media: switch_profile(%s): restoring pipeline after cross-layout set_profile "
+                         "failure",
+                         profile_name);
             const int ce = connect_encoders(priv);
             if (ce != HAL_OK)
             {
@@ -3034,6 +3499,16 @@ static int hailo15_media_switch_profile(void *media_ctx, const char *profile_nam
             if (cf != HAL_OK)
             {
                 return cf;
+            }
+            {
+                std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+                priv->callbacks_registered = true;
+            }
+            media_library_return st = priv->media_lib->start_pipeline();
+            if (st != MEDIA_LIBRARY_SUCCESS)
+            {
+                HAL_LOG_WARNING("hailo15_media: switch_profile: cross-layout restore start_pipeline failed (%d)",
+                                static_cast<int>(st));
             }
         }
         return hailo15_ml_err(r);
@@ -3102,14 +3577,19 @@ static int hailo15_media_switch_profile(void *media_ctx, const char *profile_nam
 
     if (had_bridge)
     {
-        disconnect_ml_bridge_callbacks(priv);
-        {
-            std::lock_guard<std::recursive_mutex> lock(priv->mutex);
-            priv->callbacks_registered = false;
-        }
-
         if (hal_recycle_stop_start)
         {
+            /* force_recycle on a same-layout switch is the one path that
+             * reaches this teardown WITHOUT an earlier drain (no pre-set_profile
+             * disconnect/pre_stop happened).  Drain before the stop_pipeline +
+             * disconnect below destroy a pipeline a live straggler callback
+             * may still be pushing into.  Cross-layout paths re-engage here
+             * too — with bridges already disconnected the drain is instant. */
+            const int drained = quiesce_scope.engage("switch_profile_recycle");
+            if (drained != HAL_OK)
+            {
+                return drained;
+            }
             HAL_LOG_INFO(
                 "hailo15_media: switch_profile(%s): %s — HAL recycle (stop_pipeline, bridges, start_pipeline)",
                 profile_name,
@@ -3136,7 +3616,16 @@ static int hailo15_media_switch_profile(void *media_ctx, const char *profile_nam
                 return hailo15_ml_err(sr);
             }
         }
-        else if (ml_did_full_restart)
+
+        /* Stop-first (straggler rationale as reinit_media_library): unsubscribe
+         * only after the recycle above stopped the dataflow. */
+        disconnect_ml_bridge_callbacks(priv);
+        {
+            std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+            priv->callbacks_registered = false;
+        }
+
+        if (ml_did_full_restart)
         {
             HAL_LOG_INFO(
                 "hailo15_media: switch_profile(%s): ML already full-restarted pipeline — HAL reconnects bridges only "
@@ -3149,7 +3638,7 @@ static int hailo15_media_switch_profile(void *media_ctx, const char *profile_nam
                 "hailo15_media: switch_profile(%s): pre-stopped before set_profile — reconnect bridges + start_pipeline",
                 profile_name);
         }
-        else
+        else if (!hal_recycle_stop_start)
         {
             HAL_LOG_INFO(
                 "hailo15_media: switch_profile(%s): same layout as webserver path — reconnect bridges only (no HAL "
@@ -3220,6 +3709,39 @@ static int hailo15_media_get_codec_list(void *media_ctx, void **codec_list, uint
     }
     *codec_list_count = hm->codec_ctx_list_count;
     *codec_list = hm->codec_ctx_list;
+    return HAL_OK;
+}
+
+static int hailo15_media_get_codec_names(void *media_ctx, char (*names_out)[HAL_CODEC_NAME_MAX],
+                                         uint32_t max_names, uint32_t *count_out)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    auto *hm = static_cast<HalMediaContext *>(media_ctx);
+    if (!priv || !hm || !names_out || !count_out || max_names == 0)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    *count_out = 0;
+    /* Snapshot under ctx_list_mu: destroy_contexts()/build_contexts() mutate
+     * the list under the same leaf lock, so every name copied here belongs to
+     * a context that stays alive until this call returns. Callers that cannot
+     * hold the daemon-side serialization locks (zombie probe vs concurrent
+     * profile switch / rotation rebuild) must use this instead of dereferencing
+     * get_codec_list() pointers, which a rebuild can free mid-read. */
+    std::lock_guard<std::mutex> ctx_guard(priv->ctx_list_mu);
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < hm->codec_ctx_list_count && n < max_names; i++)
+    {
+        auto *cc = static_cast<HalCodecContext *>(hm->codec_ctx_list[i]);
+        if (!cc)
+        {
+            continue;
+        }
+        std::strncpy(names_out[n], cc->codec_name, HAL_CODEC_NAME_MAX - 1);
+        names_out[n][HAL_CODEC_NAME_MAX - 1] = '\0';
+        n++;
+    }
+    *count_out = n;
     return HAL_OK;
 }
 
@@ -3448,6 +3970,32 @@ static int hailo15_media_add_codec_stream(void *media_ctx, const HalMediaAddCode
                 return kv.second;
             }
         }
+        /* No JPEG stream in this profile (defaults carry only H.264/H.265): synthesize
+         * a JPEG template from any existing encoder's input geometry. The JPEG schema
+         * only requires input_stream + n_threads[1..4] + quality[0..100]; the caller
+         * overwrites width/height/framerate/quality afterwards. Without any encoder
+         * at all there is no geometry donor — keep the error then. */
+        if (want_jpeg)
+        {
+            for (const auto &kv : p.encoded_output_streams)
+            {
+                input_config_t in{};
+                std::visit([&](auto &enc) { in = enc.input_stream; }, kv.second.encoding);
+                if (in.width == 0U || in.height == 0U)
+                {
+                    continue;
+                }
+                config_encoded_output_stream_t tmpl{};
+                tmpl.osd = config_stream_osd_t{};
+                tmpl.masking = privacy_mask_config_t{};
+                jpeg_encoder_config_t je{};
+                je.input_stream = in;
+                je.n_threads = 1;
+                je.quality = 85;
+                tmpl.encoding = je;
+                return tmpl;
+            }
+        }
         return std::nullopt;
     };
 
@@ -3568,6 +4116,32 @@ static int hailo15_media_add_streams_batch(void *media_ctx, const HalMediaAddCod
             if (is_jpeg == want_jpeg)
             {
                 return kv.second;
+            }
+        }
+        /* No JPEG stream in this profile (defaults carry only H.264/H.265): synthesize
+         * a JPEG template from any existing encoder's input geometry. The JPEG schema
+         * only requires input_stream + n_threads[1..4] + quality[0..100]; the caller
+         * overwrites width/height/framerate/quality afterwards. Without any encoder
+         * at all there is no geometry donor — keep the error then. */
+        if (want_jpeg)
+        {
+            for (const auto &kv : p.encoded_output_streams)
+            {
+                input_config_t in{};
+                std::visit([&](auto &enc) { in = enc.input_stream; }, kv.second.encoding);
+                if (in.width == 0U || in.height == 0U)
+                {
+                    continue;
+                }
+                config_encoded_output_stream_t tmpl{};
+                tmpl.osd = config_stream_osd_t{};
+                tmpl.masking = privacy_mask_config_t{};
+                jpeg_encoder_config_t je{};
+                je.input_stream = in;
+                je.n_threads = 1;
+                je.quality = 85;
+                tmpl.encoding = je;
+                return tmpl;
             }
         }
         return std::nullopt;
@@ -4084,6 +4658,143 @@ static std::string patch_config_json_for_rotation(
  * The pipeline starts directly in the rotated configuration, avoiding any stop→restart
  * buffer reallocation.
  */
+/* Patch the rotation into every profile file referenced by a medialib config
+ * JSON (profiles[].config_file → application_settings, whether string-referenced
+ * or inline), recomputing the medialib content hashes so the edited files stay
+ * valid. String-referenced application_settings are redirected to a patched
+ * copy under /tmp; inline objects and profile files are patched in place.
+ *
+ * Shared by rotation_full_reinit() (runtime rotation change) and
+ * hailo15_media_init() (baking the persisted rotation into the initial build)
+ * — both need the pipeline to be CREATED with the rotation already in the
+ * profile files, because changing rotation on a built pipeline goes through
+ * medialib's internal stop→reconfigure→start(), which is the wedge path
+ * (see dynamic_change_image_config).
+ *
+ * The main config JSON itself is only canonically re-dumped; all edits land in
+ * the referenced profile files. Returns the (re-dumped) config JSON. */
+static std::string patch_rotation_in_profile_files(const std::string &config_json,
+                                                   rotation_angle_t angle)
+{
+    using json = nlohmann::json;
+    std::string patched_json = config_json;
+    json cfg;
+    try { cfg = json::parse(patched_json); } catch (...) {}
+
+    if (cfg.is_discarded() || !cfg.contains("profiles") || !cfg["profiles"].is_array())
+    {
+        return patched_json;
+    }
+
+    /* Helper: patch application_settings content. Do NOT swap
+     * application_input_streams resolutions — multi_resize's
+     * get_output_resolution_by_index() already swaps dimensions when rotation
+     * is 90/270. Swapping here too causes a double-swap that negates the
+     * rotation. */
+    auto patch_app_settings = [&](json &app_obj) {
+        if (!app_obj.contains("rotation")) app_obj["rotation"] = json::object();
+        app_obj["rotation"]["enabled"] = (angle != ROTATION_ANGLE_0);
+        {
+            const char *angle_str = "ROTATION_ANGLE_0";
+            switch (angle) {
+                case ROTATION_ANGLE_90:  angle_str = "ROTATION_ANGLE_90"; break;
+                case ROTATION_ANGLE_180: angle_str = "ROTATION_ANGLE_180"; break;
+                case ROTATION_ANGLE_270: angle_str = "ROTATION_ANGLE_270"; break;
+                default: break;
+            }
+            app_obj["rotation"]["angle"] = angle_str;
+        }
+    };
+
+    for (auto &prof : cfg["profiles"])
+    {
+        if (!prof.contains("config_file") || !prof["config_file"].is_string())
+            continue;
+        std::string pf_path = prof["config_file"].get<std::string>();
+        std::ifstream pf(pf_path);
+        if (!pf.is_open()) continue;
+        json pf_data;
+        try { pf >> pf_data; } catch (...) { pf.close(); continue; }
+        pf.close();
+
+        bool changed = false;
+        if (pf_data.contains("application_settings"))
+        {
+            if (pf_data["application_settings"].is_string())
+            {
+                std::string as_path = pf_data["application_settings"].get<std::string>();
+                std::ifstream asf(as_path);
+                if (asf.is_open())
+                {
+                    json as_data;
+                    try { asf >> as_data; } catch (...) { asf.close(); continue; }
+                    asf.close();
+                    patch_app_settings(as_data);
+                    if (as_data.contains("metadata") && as_data["metadata"].is_object())
+                    {
+                        auto h = compute_medialib_content_hash(as_data);
+                        if (h) as_data["metadata"]["content_hash"] = *h;
+                    }
+                    std::string basename = pf_path;
+                    auto slash = basename.rfind('/');
+                    if (slash != std::string::npos) basename = basename.substr(slash + 1);
+                    auto dot = basename.rfind('.');
+                    if (dot != std::string::npos) basename = basename.substr(0, dot);
+                    std::string tmp_as = "/tmp/app_settings_rot_" + basename + ".json";
+                    std::ofstream of(tmp_as);
+                    if (of.is_open())
+                    {
+                        of << as_data.dump(4);
+                        of.close();
+                        pf_data["application_settings"] = tmp_as;
+                        changed = true;
+                    }
+                    else
+                    {
+                        HAL_LOG_WARNING("hailo15_media: patch_rotation_in_profile_files: "
+                                        "cannot write %s (rotation not baked for this profile)",
+                                        tmp_as.c_str());
+                    }
+                }
+            }
+            else if (pf_data["application_settings"].is_object())
+            {
+                patch_app_settings(pf_data["application_settings"]);
+                if (pf_data["application_settings"].contains("metadata") &&
+                    pf_data["application_settings"]["metadata"].is_object())
+                {
+                    auto h = compute_medialib_content_hash(pf_data["application_settings"]);
+                    if (h) pf_data["application_settings"]["metadata"]["content_hash"] = *h;
+                }
+                changed = true;
+            }
+        }
+        if (changed)
+        {
+            if (pf_data.contains("metadata") && pf_data["metadata"].is_object())
+            {
+                auto h = compute_medialib_content_hash(pf_data);
+                if (h) pf_data["metadata"]["content_hash"] = *h;
+            }
+            std::ofstream of(pf_path);
+            if (of.is_open())
+            {
+                of << pf_data.dump(4);
+                of.close();
+                HAL_LOG_INFO("hailo15_media: patch_rotation_in_profile_files: patched profile %s (rotation only, no encoder swap)",
+                             pf_path.c_str());
+            }
+            else
+            {
+                HAL_LOG_WARNING("hailo15_media: patch_rotation_in_profile_files: "
+                                "cannot write profile %s (rotation not baked)",
+                                pf_path.c_str());
+            }
+        }
+    }
+    return cfg.dump(4);
+}
+
 static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15MediaPriv *priv,
                                 const HalMediaImageConfig *cfg)
 {
@@ -4092,6 +4803,22 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
 
     HAL_LOG_INFO("hailo15_media: rotation_full_reinit: angle=%d, to_portrait=%d",
                  static_cast<int>(angle), to_portrait);
+
+    /* 0. Remember the profile that was active BEFORE teardown. initialize() (step 6)
+     *    boots the fresh medialib with the config's default profile (Daylight_Basic);
+     *    without an explicit restore the pipeline keeps serving the default after a
+     *    rotation, which visibly breaks non-default modes — IR being the worst case:
+     *    color pipeline + IR-cut removed + IR illumination on -> purple image
+     *    (reproduced on 93.214, 2026-09-29). Captured here because the old media_lib
+     *    is destroyed at step 4. */
+    std::string resume_profile;
+    {
+        auto prof_exp = priv->media_lib->get_current_profile();
+        if (prof_exp.has_value())
+        {
+            resume_profile = prof_exp.value().name;
+        }
+    }
 
     /* 1. Reuse stored_config_json as-is. It is authoritative — synced to the running
      *    config at init (after encoder overrides) and after every page change
@@ -4108,120 +4835,61 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
      * The encoder input_stream dimensions must remain UN-rotated so that the
      * appsrc caps match the DSP output format.  Only Pass B is needed:
      * set rotation enabled/angle and swap application_input_streams resolutions. */
+    patched_json = patch_rotation_in_profile_files(patched_json, angle);
+
+    /* 2b. Drain bridge callbacks BEFORE any teardown.  The SIGSEGV observed on
+     * portrait switches crashed inside MediaLibraryFrontend::on_new_sample →
+     * HAL bridge lambda → pthread_mutex_lock while step 4's shutdown()/reset()
+     * destroyed the frontend under the still-running callback: this function
+     * used to disconnect bridges and immediately destroy MediaLibrary without
+     * waiting for the callbacks already inside the vendor dataflow path to
+     * return.  The scope re-allows callbacks on every exit of this function. */
+    MlCallbackQuiesceScope quiesce_scope(*priv);
     {
-        using json = nlohmann::json;
-        json cfg;
-        try { cfg = json::parse(patched_json); } catch (...) {}
-
-        if (!cfg.is_discarded() && cfg.contains("profiles") && cfg["profiles"].is_array())
+        const int drained = quiesce_scope.engage("rotation_reinit");
+        if (drained != HAL_OK)
         {
-            /* Helper: patch application_settings content */
-            auto patch_app_settings = [&](json &app_obj) {
-                if (!app_obj.contains("rotation")) app_obj["rotation"] = json::object();
-                app_obj["rotation"]["enabled"] = (angle != ROTATION_ANGLE_0);
-                {
-                    const char *angle_str = "ROTATION_ANGLE_0";
-                    switch (angle) {
-                        case ROTATION_ANGLE_90:  angle_str = "ROTATION_ANGLE_90"; break;
-                        case ROTATION_ANGLE_180: angle_str = "ROTATION_ANGLE_180"; break;
-                        case ROTATION_ANGLE_270: angle_str = "ROTATION_ANGLE_270"; break;
-                        default: break;
-                    }
-                    app_obj["rotation"]["angle"] = angle_str;
-                }
-                /* Do NOT swap application_input_streams resolutions here.
-                 * multi_resize's get_output_resolution_by_index() already
-                 * swaps dimensions when rotation is 90/270. Swapping here
-                 * too causes a double-swap that negates the rotation. */
-            };
-
-            for (auto &prof : cfg["profiles"])
-            {
-                if (!prof.contains("config_file") || !prof["config_file"].is_string())
-                    continue;
-                std::string pf_path = prof["config_file"].get<std::string>();
-                std::ifstream pf(pf_path);
-                if (!pf.is_open()) continue;
-                json pf_data;
-                try { pf >> pf_data; } catch (...) { pf.close(); continue; }
-                pf.close();
-
-                bool changed = false;
-                if (pf_data.contains("application_settings"))
-                {
-                    if (pf_data["application_settings"].is_string())
-                    {
-                        std::string as_path = pf_data["application_settings"].get<std::string>();
-                        std::ifstream asf(as_path);
-                        if (asf.is_open())
-                        {
-                            json as_data;
-                            try { asf >> as_data; } catch (...) { asf.close(); continue; }
-                            asf.close();
-                            patch_app_settings(as_data);
-                            if (as_data.contains("metadata") && as_data["metadata"].is_object())
-                            {
-                                auto h = compute_medialib_content_hash(as_data);
-                                if (h) as_data["metadata"]["content_hash"] = *h;
-                            }
-                            std::string basename = pf_path;
-                            auto slash = basename.rfind('/');
-                            if (slash != std::string::npos) basename = basename.substr(slash + 1);
-                            auto dot = basename.rfind('.');
-                            if (dot != std::string::npos) basename = basename.substr(0, dot);
-                            std::string tmp_as = "/tmp/app_settings_rot_" + basename + ".json";
-                            std::ofstream of(tmp_as);
-                            if (of.is_open())
-                            {
-                                of << as_data.dump(4);
-                                of.close();
-                                pf_data["application_settings"] = tmp_as;
-                                changed = true;
-                            }
-                        }
-                    }
-                    else if (pf_data["application_settings"].is_object())
-                    {
-                        patch_app_settings(pf_data["application_settings"]);
-                        if (pf_data["application_settings"].contains("metadata") &&
-                            pf_data["application_settings"]["metadata"].is_object())
-                        {
-                            auto h = compute_medialib_content_hash(pf_data["application_settings"]);
-                            if (h) pf_data["application_settings"]["metadata"]["content_hash"] = *h;
-                        }
-                        changed = true;
-                    }
-                }
-                if (changed)
-                {
-                    if (pf_data.contains("metadata") && pf_data["metadata"].is_object())
-                    {
-                        auto h = compute_medialib_content_hash(pf_data);
-                        if (h) pf_data["metadata"]["content_hash"] = *h;
-                    }
-                    std::ofstream of(pf_path);
-                    if (of.is_open())
-                    {
-                        of << pf_data.dump(4);
-                        of.close();
-                        HAL_LOG_INFO("hailo15_media: rotation_reinit: patched profile %s (rotation only, no encoder swap)",
-                                     pf_path.c_str());
-                    }
-                }
-            }
-            patched_json = cfg.dump(4);
+            /* Fail loud, nothing torn down yet — the pipeline keeps streaming
+             * on the old rotation instead of crashing the daemon. */
+            return drained;
         }
     }
 
-    /* 3. Disconnect bridge callbacks from old medialib objects. */
-    disconnect_ml_bridge_callbacks(priv);
-
-    /* 4. Full shutdown — releases ALL medialib DMA buffers (ISP, DSP, encoder). */
+    /* 3. Stop the pipeline BEFORE unsubscribing the bridges (same straggler
+     * rationale as reinit_media_library): the drain above only proves OUR
+     * lambdas exited — a vendor on_new_sample still in flight on a streaming
+     * thread .at()s the very frontend entries unsubscribe_all_from_frontend()
+     * erases, and the erase-while-running window aborts the daemon
+     * (std::out_of_range SIGABRT, observed on Infrared_Basic_FG2009 rotation
+     * storms).  A bridge lambda entered during the stop drops at
+     * FrontendCallbackGuard and never reaches add_buffer(), so stopping with
+     * subscriptions attached cannot re-form the flush<->add_buffer deadlock. */
     HAL_LOG_INFO("hailo15_media: rotation_full_reinit: shutting down medialib");
     using Clock = std::chrono::steady_clock;
     auto rr_t0 = Clock::now();
-    (void)priv->media_lib->stop_pipeline();
+    const media_library_return stop_r = priv->media_lib->stop_pipeline();
     auto rr_t1 = Clock::now();
+    if (stop_r != MEDIA_LIBRARY_SUCCESS)
+    {
+        /* Stop failed: the pipeline may still be RUNNING. Unsubscribing now
+         * reopens the straggler .at() window, and shutdown()/reset() would
+         * destroy the MediaLibrary under a callback still in flight. Fail
+         * loud and keep streaming on the old rotation (same policy as the
+         * drain failure above); the transform change can be retried. */
+        HAL_LOG_ERROR("hailo15_media: rotation_full_reinit: stop_pipeline failed (%d) — aborting reinit, "
+                      "bridges attached, old rotation kept",
+                      static_cast<int>(stop_r));
+        return hailo15_ml_err(stop_r);
+    }
+    disconnect_ml_bridge_callbacks(priv);
+    {
+        /* Keep the flag honest across the teardown (mirrors reinit): every
+         * failure path below returns without reconnecting, so a stale true
+         * would make later switch/apply decisions skip bridge re-registration
+         * on a MediaLibrary that no longer has any (review M2). */
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->callbacks_registered = false;
+    }
     (void)priv->media_lib->shutdown();
     auto rr_t2 = Clock::now();
     priv->media_lib.reset();
@@ -4281,6 +4949,51 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
     /* 8. Update profile names list. */
     hailo15_parse_profile_names_from_config_json(patched_json, &priv->profile_names);
 
+    /* 8b. Restore the pre-rotation active profile (see step 0). Safe point: the pipeline
+     *     is NOT running yet (started at step 14) and no HAL bridges are connected
+     *     (step 15), so set_profile() here configures a fresh instance — none of the
+     *     pre-stop/disconnect dance switch_profile() needs for a RUNNING pipeline, and
+     *     no FAST_TOGGLE accumulation on a live FE stream. Restoring BEFORE
+     *     build_contexts (step 9) means the HAL contexts, the OSD refresh (step 10) and
+     *     the extras pass (step 13) all build against the restored profile — including
+     *     profile_authored_grayscale(), which must see the authored-monochrome name.
+     *     Failure (e.g. PROFILE_IS_RESTRICTED under thermal gating) degrades to the
+     *     default profile instead of failing the rotation. */
+    if (!resume_profile.empty())
+    {
+        auto cur_exp = priv->media_lib->get_current_profile();
+        const std::string cur_name = cur_exp.has_value() ? cur_exp.value().name : std::string();
+        const bool known =
+            std::find(priv->profile_names.begin(), priv->profile_names.end(), resume_profile) !=
+            priv->profile_names.end();
+        if (cur_name == resume_profile)
+        {
+            HAL_LOG_INFO("hailo15_media: rotation_full_reinit: active profile '%s' preserved",
+                         resume_profile.c_str());
+        }
+        else if (!known)
+        {
+            HAL_LOG_WARNING("hailo15_media: rotation_full_reinit: previous profile '%s' not in config "
+                            "- staying on default '%s'",
+                            resume_profile.c_str(), cur_name.c_str());
+        }
+        else
+        {
+            media_library_return r = priv->media_lib->set_profile(resume_profile);
+            if (r == MEDIA_LIBRARY_SUCCESS)
+            {
+                HAL_LOG_INFO("hailo15_media: rotation_full_reinit: restored active profile '%s' (default was '%s')",
+                             resume_profile.c_str(), cur_name.c_str());
+            }
+            else
+            {
+                HAL_LOG_WARNING("hailo15_media: rotation_full_reinit: set_profile('%s') failed (%d) "
+                                "- staying on default '%s'",
+                                resume_profile.c_str(), static_cast<int>(r), cur_name.c_str());
+            }
+        }
+    }
+
     /* 9. Rebuild HAL video/codec contexts for the new medialib. */
     destroy_contexts(priv, hm);
     int br = build_contexts(priv, hm);
@@ -4331,7 +5044,16 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
             p.iq_settings.dewarp.enabled = cfg->dewarp;
             p.stabilizer_settings.dis.enabled = cfg->dis;
             p.stabilizer_settings.eis.enabled = cfg->eis;
-            p.iq_settings.grayscale.enabled = cfg->grayscale;
+            /* Profile-intrinsic grayscale (IR monochrome) must survive a full reinit:
+             * the toggle may only add grayscale, never remove it (see dynamic_change_image_config). */
+            const bool intrinsic_gray = profile_authored_grayscale(priv, p.name);
+            if (intrinsic_gray && !cfg->grayscale)
+            {
+                HAL_LOG_INFO("hailo15_media: grayscale toggle-off ignored - '%s' is authored "
+                             "monochrome",
+                             p.name.c_str());
+            }
+            p.iq_settings.grayscale.enabled = cfg->grayscale || intrinsic_gray;
 
             /* Recalculate OSD for new dimensions. */
             HalRotationAngle new_rot = cfg->rotation_angle;
@@ -4384,6 +5106,13 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
         {
             HAL_LOG_WARNING("hailo15_media: rotation_full_reinit: connect_frontend failed (%d)", cf);
         }
+        if (ce == HAL_OK && cf == HAL_OK)
+        {
+            /* Complement of the callbacks_registered=false at teardown: the
+             * flag now tracks reality on the success path too (review M2). */
+            std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+            priv->callbacks_registered = true;
+        }
     }
 
     HAL_LOG_INFO("hailo15_media: rotation_full_reinit: complete");
@@ -4398,6 +5127,12 @@ static int hailo15_media_dynamic_change_image_config(void *media_ctx, const HalM
     {
         return HAL_ERR_INVALID_ARG;
     }
+    /* Digital zoom magnification: medialib DIGITAL_ZOOM_MODE_MAGNIFICATION supports up to 31x. */
+    if (cfg->digital_zoom && (cfg->digital_zoom_value < 1 || cfg->digital_zoom_value > 31))
+    {
+        HAL_LOG_ERROR("hailo15_media: digital_zoom_value %d out of range [1..31]", cfg->digital_zoom_value);
+        return HAL_ERR_INVALID_ARG;
+    }
 
     auto prof_exp = priv->media_lib->get_current_profile();
     if (!prof_exp)
@@ -4406,108 +5141,34 @@ static int hailo15_media_dynamic_change_image_config(void *media_ctx, const HalM
     }
     config_profile_t p = prof_exp.value();
 
-    const bool prev_portrait = is_portrait_rotation(p.application_settings.rotation.effective_value());
-    const bool new_portrait = is_portrait_rotation(static_cast<rotation_angle_t>(cfg->rotation_angle));
+    /* Any real rotation change must take rotation_full_reinit. The light
+     * set_override_parameters() path below makes medialib internally
+     * stop→reconfigure→start() the pipeline, and that internal restart can
+     * silently wedge the multi_resize / DSP output buffer pool: set_override
+     * returns SUCCESS while buffers stop circulating, add_buffer() on the FE
+     * output is rejected and encoders starve → /media black with no signal.
+     * Originally reproduced with a dense DSP stack on dimension-swap rotations
+     * (93.213 — the former dense_dsp_stack / >4096 guards, now subsumed), and
+     * with a bare 180° rotation on medialib v1.12.x (93.214, 2026-09-28: every
+     * boot re-applied persisted rot=180 through this path and wedged, with and
+     * without dewarp/DIS/EIS). rotation_full_reinit bakes the rotation into
+     * the profile files and rebuilds the medialib from a clean state — the
+     * same known-good path the BUFFER_ALLOCATION_ERROR fallback below already
+     * uses. Cost: a few seconds of rebuild for a rare, user-initiated
+     * orientation change; every other image field (flip/dewarp/gray/dis/eis)
+     * still takes the fast in-place path because medialib does not restart
+     * the pipeline for those. */
+    if (p.application_settings.rotation.effective_value() !=
+        static_cast<rotation_angle_t>(cfg->rotation_angle))
+    {
+        HAL_LOG_INFO("hailo15_media: rotation change (%d -> %d): using rotation_full_reinit",
+                     static_cast<int>(p.application_settings.rotation.effective_value()),
+                     static_cast<int>(cfg->rotation_angle));
+        return rotation_full_reinit(media_ctx, hm, priv, cfg);
+    }
 
     p.application_settings.rotation.enabled = (cfg->rotation_angle != HAL_ROTATION_ANGLE_0);
     p.application_settings.rotation.angle = static_cast<rotation_angle_t>(cfg->rotation_angle);
-
-    /* Swap encoder width/height when transitioning between landscape and portrait.
-     * This matches the Hailo rotation_example pattern — medialib's internal
-     * update_encoder_streams_for_rotation() will see that the dimensions already
-     * match the target orientation and skip its own swap, preventing a double-swap.
-     *
-     * For large resolutions (any dimension > 2688), the normal set_override_parameters()
-     * path often fails due to CMA DMA buffer fragmentation — the medialib pipeline restart
-     * (stop→start) doesn't release enough CMA for the larger rotated buffer pools.
-     * In that case we fall back to a full medialib shutdown/reinitialize cycle which
-     * releases ALL DMA resources before allocating the rotated pipeline from a clean state. */
-    if (prev_portrait != new_portrait)
-    {
-        HAL_LOG_INFO("hailo15_media: rotation transition (prev_portrait=%d, new_portrait=%d), swapping dimensions",
-                     prev_portrait, new_portrait);
-
-        /* Detect large encoders, or a dense DSP transform stack, that need the
-         * full-reinit path. A dimension-swap rotation (we are inside the
-         * prev_portrait != new_portrait branch) layered on top of dewarp + (DIS
-         * or EIS) wedges the in-place set_override_parameters path: the light
-         * medialib stop->restart does not fully tear down the DSP dewarp/DIS/EIS
-         * stages, so they desync with the new geometry -> the FE output callback's
-         * add_buffer() is rejected -> encoder starvation -> /media black screen
-         * (reproduced on 93.213). rotation_full_reinit rebuilds all DSP stages
-         * from a clean medialib and avoids the wedge. Rotation alone (no DSP) is
-         * unaffected and still takes the fast in-place path below. */
-        const bool dense_dsp_stack = (cfg->dewarp && (cfg->dis || cfg->eis));
-        bool needs_full_reinit = dense_dsp_stack;
-        for (auto &kv : p.encoded_output_streams)
-        {
-            uint32_t w = 0, h = 0;
-            std::visit([&](auto &enc) { w = enc.input_stream.width; h = enc.input_stream.height; },
-                       kv.second.encoding);
-            auto pd = priv->encoder_patched_dims.find(kv.first);
-            if (pd != priv->encoder_patched_dims.end())
-            {
-                w = pd->second.first;
-                h = pd->second.second;
-            }
-            // 4K (3840x2160) rotation uses the fast in-place set_override_parameters
-            // path. Verified on 93.72 (2026-08-05): no OOM, no resolution regression.
-            // If a future resolution exceeds 4096, or CMA fragments and the in-place
-            // restart OOMs, the BUFFER_ALLOCATION_ERROR fallback below still recovers
-            // via rotation_full_reinit. Keep 4096 (not the old 2688) so 4K stays fast.
-            if (w > 4096 || h > 4096)
-            {
-                needs_full_reinit = true;
-                break;
-            }
-        }
-
-        if (needs_full_reinit)
-        {
-            return rotation_full_reinit(media_ctx, hm, priv, cfg);
-        }
-
-        for (auto &kv : p.encoded_output_streams)
-        {
-            auto pd = priv->encoder_patched_dims.find(kv.first);
-            if (pd != priv->encoder_patched_dims.end())
-            {
-                uint32_t cw = 0, ch = 0;
-                std::visit([&](auto &enc) { cw = enc.input_stream.width; ch = enc.input_stream.height; },
-                           kv.second.encoding);
-                if (cw != pd->second.first || ch != pd->second.second)
-                {
-                    HAL_LOG_INFO("hailo15_media: rotation: correcting encoder '%s' from profile %ux%u to patched %ux%u",
-                                 kv.first.c_str(), cw, ch, pd->second.first, pd->second.second);
-                    std::visit([&](auto &enc) {
-                        enc.input_stream.width = pd->second.first;
-                        enc.input_stream.height = pd->second.second;
-                    }, kv.second.encoding);
-                }
-            }
-
-            std::visit([](auto &enc) { std::swap(enc.input_stream.width, enc.input_stream.height); },
-                       kv.second.encoding);
-        }
-
-        for (auto &res : p.application_settings.application_input_streams.resolutions)
-        {
-            auto pd = priv->encoder_patched_dims.find(res.stream_id);
-            if (pd != priv->encoder_patched_dims.end())
-            {
-                if (res.dimensions.destination_width != pd->second.first ||
-                    res.dimensions.destination_height != pd->second.second)
-                {
-                    HAL_LOG_INFO("hailo15_media: rotation: correcting app_stream '%s' from %ux%u to %ux%u",
-                                 res.stream_id.c_str(),
-                                 res.dimensions.destination_width, res.dimensions.destination_height,
-                                 pd->second.first, pd->second.second);
-                    res.dimensions.destination_width = pd->second.first;
-                    res.dimensions.destination_height = pd->second.second;
-                }
-            }
-        }
-    }
 
     p.application_settings.flip.enabled = (cfg->flip_direction != HAL_FLIP_DIRECTION_NONE);
     p.application_settings.flip.direction = static_cast<flip_direction_t>(cfg->flip_direction);
@@ -4523,7 +5184,24 @@ static int hailo15_media_dynamic_change_image_config(void *media_ctx, const HalM
     p.iq_settings.dewarp.enabled = cfg->dewarp;
     p.stabilizer_settings.dis.enabled = cfg->dis;
     p.stabilizer_settings.eis.enabled = cfg->eis;
-    p.iq_settings.grayscale.enabled = cfg->grayscale;
+    /* A profile authored monochrome (the Infrared family) must keep
+     * grayscale ON; the transform toggle may only ADD grayscale, never disable an
+     * authored one. Otherwise flipping / resolution-switching in IR mode
+     * clobbers the B&W output into a purple color cast (IR-cut at night + IR LEDs +
+     * AWB on a color path). NOTE: the live profile value must not be OR-ed here —
+     * set_override_parameters() writes toggled values back into the stored profile,
+     * so after one gray=1 toggle the live value stays true until reboot and the
+     * toggle can never turn grayscale off again (the grayscale ratchet). The
+     * init-time authored snapshot (profile_authored_grayscale) is the only
+     * contamination-free source. */
+    const bool intrinsic_gray = profile_authored_grayscale(priv, p.name);
+    if (intrinsic_gray && !cfg->grayscale)
+    {
+        HAL_LOG_INFO("hailo15_media: grayscale toggle-off ignored - '%s' is authored "
+                     "monochrome",
+                     p.name.c_str());
+    }
+    p.iq_settings.grayscale.enabled = cfg->grayscale || intrinsic_gray;
 
     if (cfg->privacy_mask && !cfg->digital_zoom)
     {
@@ -4741,7 +5419,7 @@ static int hailo15_media_get_encoder_auto_feed_for_stream(void *media_ctx, const
 
 static std::string hailo15_generate_pipeline_config_json(
     const std::string &stored_json, const HalPipelineReconfig *reconfig,
-    const std::string &active_profile_name);
+    const std::string &active_profile_name, bool prune_absent_streams = false);
 static int reinit_media_library_on_stream_change(HalMediaContext *hm,
                                                   Hailo15MediaPriv *priv,
                                                   const std::string &new_config_json,
@@ -4883,7 +5561,14 @@ static int hailo15_media_override_stream_params(void *media_ctx, const HalStream
             HAL_LOG_ERROR("hailo15_media: override_stream_params: failed to generate new config JSON");
             return HAL_ERROR;
         }
-        int rc = reinit_media_library_on_stream_change(static_cast<HalMediaContext *>(media_ctx), priv, new_json);
+        // skip_encoder_overrides=true: generate_config already wrote the requested
+        // dimensions into new_json (encoder files at the existing-stream file-path
+        // branch + application_input_streams). Re-applying priv->encoder_overrides_json
+        // (the static YAML/init override) here would REVERT the caller's requested
+        // resolution/codec — e.g. a 4K->1080p ReconfigureEncoder (ONVIF
+        // SetVideoEncoderConfiguration) was silently forced back to 4K. Mirrors
+        // reconfigure_pipeline (the web-UI path), which passes true for the same reason.
+        int rc = reinit_media_library_on_stream_change(static_cast<HalMediaContext *>(media_ctx), priv, new_json, true);
         if (rc == HAL_OK)
         {
             HAL_LOG_INFO("hailo15_media: override_stream_params: reinit success (%u streams)", batch->stream_count);
@@ -4911,15 +5596,25 @@ static int hailo15_media_override_stream_params(void *media_ctx, const HalStream
 static std::string hailo15_generate_pipeline_config_json(
     const std::string &stored_json,
     const HalPipelineReconfig *reconfig,
-    const std::string &active_profile_name)
+    const std::string &active_profile_name,
+    bool prune_absent_streams)
 {
     using json = nlohmann::json;
 
     json cfg = json::parse(stored_json);
 
-    /* Preserve the runtime profile across full MediaLibrary reinit. */
-    std::string prof_name = active_profile_name;
-    if (prof_name.empty() && cfg.contains("default_profile"))
+    /* Preserve the profile that is active in MediaLibrary.  The stored JSON
+     * commonly declares a daytime default, which would otherwise replace an
+     * active infrared profile during a full stream-layout reinitialization. */
+    std::string prof_name;
+    if (!active_profile_name.empty())
+    {
+        prof_name = active_profile_name;
+        cfg["default_profile"] = prof_name;
+        HAL_LOG_INFO("hailo15_media: generate_config: preserving active profile '%s'",
+                     prof_name.c_str());
+    }
+    else if (cfg.contains("default_profile"))
     {
         prof_name = cfg["default_profile"].get<std::string>();
     }
@@ -5002,9 +5697,24 @@ static std::string hailo15_generate_pipeline_config_json(
                     {
                         if (r.contains("stream_id") && r["stream_id"] == sid)
                         {
+                            /* Width/height here are the application resolutions (the
+                             * frontend scaler destination) and must track the ENCODER
+                             * dims, falling back to the input dims only when no encoder
+                             * dims were provided. Writing the raw input dims poisons
+                             * stored_config_json AND the on-disk application_settings
+                             * file with the sensor resolution for scaled streams (e.g.
+                             * third 640x384 → 3840x2160). The running pipeline keeps
+                             * encoding at the correct dims, but the next full reinit
+                             * that runs fix_encoder_dimension_mismatches() without
+                             * encoder overrides (rotation_full_reinit) reads these
+                             * poisoned resolutions as "expected" and forces every
+                             * scaled encoder to the input resolution on the wire —
+                             * while the daemon still reports the encoder dims. */
+                            const uint32_t dst_w = (sc.encoder_width > 0U) ? sc.encoder_width : sc.input_width;
+                            const uint32_t dst_h = (sc.encoder_height > 0U) ? sc.encoder_height : sc.input_height;
                             if (sc.input_framerate > 0)  r["framerate"] = sc.input_framerate;
-                            if (sc.input_width > 0)       r["width"]     = sc.input_width;
-                            if (sc.input_height > 0)      r["height"]    = sc.input_height;
+                            if (dst_w > 0)                r["width"]     = dst_w;
+                            if (dst_h > 0)                r["height"]    = dst_h;
                             break;
                         }
                     }
@@ -5111,7 +5821,13 @@ static std::string hailo15_generate_pipeline_config_json(
                 auto &inp = (*enc_root)["input_stream"];
                 if (sc.encoder_width > 0)  inp["width"] = sc.encoder_width;
                 if (sc.encoder_height > 0) inp["height"] = sc.encoder_height;
-                if (sc.input_framerate > 0) inp["framerate"] = sc.input_framerate;
+                /* The encoder file's framerate is the ENCODED rate; input_framerate
+                 * is the frontend rate. They differ for scaled streams (third
+                 * 640x384 encodes @15 from a 30fps frontend) — writing the frontend
+                 * rate here runs the encoder at the wrong speed. */
+                const uint32_t injected_fps =
+                    (sc.encoder_framerate > 0U) ? sc.encoder_framerate : sc.input_framerate;
+                if (injected_fps > 0) inp["framerate"] = injected_fps;
 
                 /* Patch codec, bitrate, gop */
                 std::string codec_type = (std::string(sc.codec) == "h265" || std::string(sc.codec) == "HEVC")
@@ -5240,11 +5956,16 @@ static std::string hailo15_generate_pipeline_config_json(
                     {
                         auto &enc_obj = enc_cfg["encoding"];
 
-                        /* input_stream: framerate, width, height */
+                        /* input_stream: framerate, width, height. The encoder file's
+                         * framerate is the ENCODED rate; input_framerate is the
+                         * frontend rate (they differ for scaled streams, e.g.
+                         * third 640x384 @15 from a 30fps frontend). */
                         if (enc_obj.contains("input_stream"))
                         {
                             auto &inp = enc_obj["input_stream"];
-                            if (sc.input_framerate > 0)  inp["framerate"] = sc.input_framerate;
+                            const uint32_t patched_fps =
+                                (sc.encoder_framerate > 0U) ? sc.encoder_framerate : sc.input_framerate;
+                            if (patched_fps > 0)          inp["framerate"] = patched_fps;
                             if (sc.encoder_width > 0)     inp["width"]     = sc.encoder_width;
                             if (sc.encoder_height > 0)    inp["height"]    = sc.encoder_height;
                         }
@@ -5321,6 +6042,35 @@ static std::string hailo15_generate_pipeline_config_json(
                     HAL_LOG_WARNING("hailo15_media: generate_config: cannot open encoder file '%s'",
                                     enc_path.c_str());
                 }
+            }
+        }
+
+        /* --- Prune streams absent from the reconfig (full-layout reconfigure only) ---
+         * Historically this function only patched existing entries and injected
+         * missing ones: encoders absent from the reconfig survived every
+         * reconfigure, so a shrink (e.g. dropping 'sink1') rebuilt the pipeline
+         * with the old encoder still present. Mirrors the removal semantics of
+         * patch_json_stream_layout so the full-reinit path can actually shrink. */
+        if (prune_absent_streams)
+        {
+            std::set<std::string> requested_ids;
+            for (uint32_t i = 0; i < reconfig->stream_count; i++)
+            {
+                requested_ids.insert(std::string(reconfig->streams[i].stream_id));
+            }
+            for (auto it = eos_array.begin(); it != eos_array.end(); )
+            {
+                bool keep = false;
+                if (it->contains("stream_id") && (*it)["stream_id"].is_string())
+                {
+                    keep = requested_ids.count((*it)["stream_id"].get<std::string>()) > 0;
+                    if (!keep)
+                    {
+                        HAL_LOG_INFO("hailo15_media: generate_config: removing stream '%s' (absent from reconfig)",
+                                     (*it)["stream_id"].get<std::string>().c_str());
+                    }
+                }
+                it = keep ? it + 1 : eos_array.erase(it);
             }
         }
     }
@@ -5449,6 +6199,16 @@ static std::string hailo15_generate_pipeline_config_json(
         std::string pname = orig_path;
         auto slash = pname.rfind('/');
         if (slash != std::string::npos) pname = pname.substr(slash + 1);
+        /* The patched config_file is written back into stored state, so the
+         * NEXT reconfigure derives from this temp name and would compound the
+         * prefix (observed: profile_reconfig_x15 -> NAME_MAX overflow -> the
+         * temp write fails and medialib silently reuses a stale /tmp profile).
+         * Strip any previously compounded prefixes to keep the name stable. */
+        static constexpr const char *RECONFIG_PREFIX = "profile_reconfig_";
+        while (pname.rfind(RECONFIG_PREFIX, 0) == 0)
+        {
+            pname = pname.substr(strlen(RECONFIG_PREFIX));
+        }
         std::string tmp_prof = std::string("/tmp/profile_reconfig_") + pname;
         std::ofstream pof(tmp_prof);
         if (pof.is_open())
@@ -5537,16 +6297,17 @@ static int reinit_media_library_on_stream_change(HalMediaContext *hm,
     HAL_LOG_INFO("hailo15_media: reinit: frontend callbacks drained");
     HAL_LOG_INFO("[TIMING] reinit: drain_callbacks=%lldms", stage_ms());
 
-    // No bridge callback can now be running or newly enter MediaLibrary.
-    if (priv->callbacks_registered)
-    {
-        disconnect_ml_bridge_callbacks(priv);
-        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
-        priv->callbacks_registered = false;
-    }
-    HAL_LOG_INFO("hailo15_media: reinit: bridges disconnected");
-
-    // Stop only after the callback/auto-feed path is fully quiescent.
+    /* Stop the pipeline BEFORE unsubscribing the frontend bridges.  The drain
+     * above only proves OUR bridge lambdas exited: MediaLibraryFrontend's own
+     * on_new_sample can still be in flight on a GStreamer streaming thread,
+     * and unsubscribe_all_from_frontend() erases the very map entries
+     * on_new_sample .at()s — erasing while the pipeline still runs let a
+     * straggler throw std::out_of_range -> SIGABRT (RemoveStream ∥
+     * ReconfigurePipeline race, 1-in-~15 rounds).  Stopping first is
+     * deadlock-safe because a bridge lambda entered during the stop drops at
+     * FrontendCallbackGuard (callbacks_quiescing) and never reaches
+     * add_buffer() — the historical flush<->add_buffer deadlock the old
+     * disconnect-first order guarded against cannot form anymore. */
     if (priv->media_lib)
     {
         HAL_LOG_INFO("hailo15_media: reinit: stop_pipeline ...");
@@ -5569,6 +6330,16 @@ static int reinit_media_library_on_stream_change(HalMediaContext *hm,
             return hailo15_ml_err(stop_result);
         }
     }
+
+    /* Dataflow is down: no streaming thread can be inside on_new_sample
+     * anymore, so unsubscribing cannot race its map lookups. */
+    if (priv->callbacks_registered)
+    {
+        disconnect_ml_bridge_callbacks(priv);
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->callbacks_registered = false;
+    }
+    HAL_LOG_INFO("hailo15_media: reinit: bridges disconnected");
 
     HAL_LOG_INFO("[TIMING] reinit: stop_pipeline=%lldms (incl disconnect_bridges)", stage_ms());
 
@@ -5623,8 +6394,15 @@ static int reinit_media_library_on_stream_change(HalMediaContext *hm,
         }
     }
 
-    // Initialize with new config
-    const media_library_return ini = new_ml->initialize(fixed_config, !priv->medialib_default_backup_folder.empty());
+    // Initialize with new config. should_restore_backup=false: the config
+    // passed here was authoritatively built for THIS layout change
+    // (patch_json_stream_layout / generate_config already removed and added
+    // encoders as requested). With restore=true, MediaLibrary::initialize()
+    // prefers the on-disk backup unconditionally on success — a stale backup
+    // layout then silently replaced this config, re-adding encoders the caller
+    // had just removed (remove/reconfigure shrinks were no-ops at the
+    // MediaLibrary level while still returning HAL_OK).
+    const media_library_return ini = new_ml->initialize(fixed_config, false);
     if (ini != MEDIA_LIBRARY_SUCCESS)
     {
         HAL_LOG_ERROR("hailo15_media: reinit: initialize failed (%d)", static_cast<int>(ini));
@@ -5741,17 +6519,18 @@ static int reinit_media_library_on_stream_change(HalMediaContext *hm,
     return HAL_OK;
 }
 
-/* True iff the prev->new profile change touches only resolution/framerate (frontend
- * dims + encoder input w/h/fps) — i.e. every encoder's codec type, bitrate and GOP are
+/* True iff the prev->new profile change touches nothing but encoder input
+ * framerate — codec type, bitrate, GOP and input width/height are all
  * unchanged, and no stream was added or removed.
  *
  * Used to decide whether reconfigure_pipeline can take the light
- * set_override_parameters() path. Because that path modifies res/fps only, it is
- * correct only when codec/bitrate/gop already match. The reconfig request always
- * carries the full encoder state, so this is a prev-vs-new delta check, not a
- * field-presence check. */
-static bool reconfigure_is_res_fps_only(const config_profile_t &prev_p,
-                                        const config_profile_t &new_p)
+ * set_override_parameters() path, which is only ever eligible for a STOPPED
+ * pipeline (see reconfigure_pipeline: set_override on a running pipeline
+ * races live GStreamer dataflow threads). The reconfig request always
+ * carries the full encoder state, so this is a prev-vs-new delta check, not
+ * a field-presence check. */
+static bool reconfigure_is_fps_only(const config_profile_t &prev_p,
+                                    const config_profile_t &new_p)
 {
     auto prev_map = prev_p.to_encoder_config_map();
     auto new_map = new_p.to_encoder_config_map();
@@ -5764,6 +6543,19 @@ static bool reconfigure_is_res_fps_only(const config_profile_t &prev_p,
                 {
                     return {c.rate_control.bitrate.target_bitrate,
                             c.rate_control.intra_pic_rate};
+                }
+                return {0, 0};
+            },
+            cfg);
+    };
+
+    auto dims_of = [](const encoder_config_t &cfg) -> std::pair<uint32_t, uint32_t> {
+        return std::visit(
+            [](const auto &c) -> std::pair<uint32_t, uint32_t> {
+                using T = std::decay_t<decltype(c)>;
+                if constexpr (std::is_same_v<T, hailo_encoder_config_t>)
+                {
+                    return {c.input_stream.width, c.input_stream.height};
                 }
                 return {0, 0};
             },
@@ -5785,6 +6577,17 @@ static bool reconfigure_is_res_fps_only(const config_profile_t &prev_p,
         {
             return false; /* bitrate or gop changed */
         }
+        if (dims_of(pit->second) != dims_of(entry.second))
+        {
+            /* Resolution deltas take the full reinit: the in-place frontend
+             * override rebuilds the sensor/scaler topology while GStreamer
+             * streaming threads may still be live (the recursive_mutex
+             * SIGSEGV family — observed on a field device when a
+             * retune-level set_override_parameters raced a straggler). Only
+             * framerate-only changes stay eligible, and even those only on a
+             * stopped pipeline (see reconfigure_pipeline). */
+            return false; /* width or height changed */
+        }
     }
     for (const auto &entry : prev_map)
     {
@@ -5796,17 +6599,19 @@ static bool reconfigure_is_res_fps_only(const config_profile_t &prev_p,
     return true;
 }
 
-/* Apply a resolution/framerate-only reconfigure through the light in-place
+/* Apply a framerate-only reconfigure through the light in-place
  * set_override_parameters() path, bypassing the ~4s full MediaLibrary destroy/recreate.
+ * ONLY eligible for a STOPPED pipeline — the caller enforces this; on a running
+ * pipeline every reconfigure takes the full reinit (racing dataflow threads).
  *
  * apply_frontend_stream_override() suspends encoder feeding across
  * set_override_parameters(), which mitigates the VCEnc -3 stride stall that
  * encoder_input_layout_changed() otherwise guards against with a full reinit — so a
- * geometry-only change can be applied without the heavy recreate.
+ * framerate-only change can be applied without the heavy recreate.
  *
- * Eligibility is reconfigure_is_res_fps_only(prev_p, p): the delta must be resolution
- * and/or framerate only. codec / bitrate / gop deltas are not applied here (the light
- * path fetches the live profile and would drop them) and must take the heavy reinit.
+ * Eligibility is reconfigure_is_fps_only(prev_p, p): the delta must be
+ * framerate only. codec / bitrate / gop / resolution deltas are not applied
+ * here and must take the heavy reinit.
  *
  * Returns HAL_OK with attempted=false when ineligible (caller takes the heavy path),
  * HAL_OK with attempted=true on success, or non-OK with attempted=true on an apply
@@ -5820,7 +6625,7 @@ static int try_light_reconfigure(HalMediaContext *hm, Hailo15MediaPriv *priv,
                                  const HalPipelineReconfig *reconfig, bool &attempted)
 {
     attempted = false;
-    if (!reconfigure_is_res_fps_only(prev_p, p))
+    if (!reconfigure_is_fps_only(prev_p, p))
     {
         return HAL_OK; /* codec/bitrate/gop changed — caller takes the heavy path */
     }
@@ -5831,9 +6636,17 @@ static int try_light_reconfigure(HalMediaContext *hm, Hailo15MediaPriv *priv,
     {
         const HalPipelineStreamConfig &sc = reconfig->streams[i];
         const std::string sid(sc.stream_id);
-        const uint32_t w = (sc.input_width > 0U) ? sc.input_width : sc.encoder_width;
-        const uint32_t h = (sc.input_height > 0U) ? sc.input_height : sc.encoder_height;
-        const uint32_t f = (sc.input_framerate > 0U) ? sc.input_framerate : sc.encoder_framerate;
+        /* apply_frontend_stream_override drives BOTH the frontend resolution and
+         * the encoder input dimensions with one value (it syncs them 1:1).  The
+         * reconfigure payload carries input_* (frontend) and encoder_* (encoded
+         * output) separately; preferring input_* here forced every encoder to
+         * the input geometry (all streams encoding 3840x2160 instead of
+         * 1280x720/640x384).  Encoder dims win when present — they are what the
+         * wire carries; input_* only applies when the caller set no encoder
+         * geometry. */
+        const uint32_t w = (sc.encoder_width > 0U) ? sc.encoder_width : sc.input_width;
+        const uint32_t h = (sc.encoder_height > 0U) ? sc.encoder_height : sc.input_height;
+        const uint32_t f = (sc.encoder_framerate > 0U) ? sc.encoder_framerate : sc.input_framerate;
         std::optional<std::pair<uint32_t, uint32_t>> res = std::nullopt;
         if (w > 0U && h > 0U)
         {
@@ -5919,10 +6732,23 @@ static int hailo15_media_reconfigure_pipeline(void *media_ctx, const HalPipeline
             {
                 if (res.stream_id == sid)
                 {
-                    if (sc.input_width > 0)
-                        res.dimensions.destination_width = sc.input_width;
-                    if (sc.input_height > 0)
-                        res.dimensions.destination_height = sc.input_height;
+                    /* Destination must track the ENCODER dims, falling back to the
+                     * input dims only when no encoder dims were provided. medialib's
+                     * model is destination == encoder input dims (one scale point at
+                     * the frontend scaler — apply_frontend_stream_override enforces
+                     * the same pairing on the light path). Writing the raw input dims
+                     * here leaves encoder < destination in the running profile; the
+                     * next full reinit WITHOUT encoder overrides (rotation_full_reinit)
+                     * runs fix_encoder_dimension_mismatches(), which forces the
+                     * encoder to the application resolution — silently upgrading a
+                     * scaled stream (e.g. third 640x384) to the 4K input resolution
+                     * on the wire, while the daemon still reports the encoder dims. */
+                    const uint32_t dst_w = (sc.encoder_width > 0U) ? sc.encoder_width : sc.input_width;
+                    const uint32_t dst_h = (sc.encoder_height > 0U) ? sc.encoder_height : sc.input_height;
+                    if (dst_w > 0)
+                        res.dimensions.destination_width = dst_w;
+                    if (dst_h > 0)
+                        res.dimensions.destination_height = dst_h;
                     if (sc.input_framerate > 0)
                         res.framerate = sc.input_framerate;
                     break;
@@ -5970,20 +6796,48 @@ static int hailo15_media_reconfigure_pipeline(void *media_ctx, const HalPipeline
 
     HAL_LOG_INFO("hailo15_media: reconfigure_pipeline: applying %u stream overrides", reconfig->stream_count);
 
-    // Encoder dimensions and framerate define VCEnc preprocessing and DSP buffer
-    // layouts. The in-place override path can retain stale stride/pool state, so
-    // destroy and recreate MediaLibrary whenever that layout changes.
-    const bool full_reinit_required =
+    /* set_override_parameters() on a RUNNING pipeline is unsound: it mutates
+     * encoder/scaler/pool state in place while GStreamer dataflow threads are
+     * live. Two crash families died in pthread_mutex_lock on freed memory
+     * inside this window — the frontend bridge recursive_mutex (on_new_sample
+     * straggler) and, per a field-device core dump captured 2026-09-29, the
+     * queue src-pad tasks themselves (queuesink0/queuesink2 faulting on a
+     * freed shared object, libc pthread_mutex_lock+0x14). A reconfigure of a
+     * running pipeline therefore ALWAYS takes the full destroy+recreate,
+     * which drains bridge callbacks and rebuilds every pad under a stopped
+     * pipeline. The in-place path stays eligible only for a STOPPED pipeline
+     * (no dataflow threads to race) — full_reinit_required is forced true
+     * whenever the pipeline is running. */
+    const bool pipeline_running = priv->media_lib->get_pipeline_state() ==
+        media_library_pipeline_state_t::PIPELINE_STATE_RUNNING;
+    const bool full_reinit_required = pipeline_running ||
         ml_stream_restart_required(prev_p, p) || encoder_input_layout_changed(prev_p, p);
     if (full_reinit_required)
     {
-        /* Resolution/framerate-only changes take the light set_override_parameters()
-         * path (encoder feed-suspend mitigates the VCEnc -3 stride stall this full
-         * reinit otherwise guards against), bypassing the ~4s MediaLibrary
-         * destroy/recreate. codec/bitrate/gop deltas are not eligible and take the
-         * heavy path; any apply failure falls back to the heavy reinit below. */
+        /* The light set_override_parameters() path is eligible only when the
+         * pipeline is STOPPED (see full_reinit_required above) and the stream
+         * set is unchanged; any light failure falls back to the heavy reinit
+         * below. */
+        /* Layout add/remove: the in-place profile `p` was derived from the live
+         * pipeline, so streams absent from (or missing in) the reconfig leave the
+         * encoder set unchanged in p — the light path can only retune existing
+         * streams, never add or remove encoders. When the requested sink set
+         * differs from the live one, force the full reinit below, whose
+         * generate_config(prune=true) converges the encoder set both ways. */
+        std::set<std::string> requested_ids, live_ids;
+        for (uint32_t i = 0; i < reconfig->stream_count; i++)
+        {
+            requested_ids.insert(std::string(reconfig->streams[i].stream_id));
+        }
+        for (const auto &kv : p.encoded_output_streams)
+        {
+            live_ids.insert(kv.first);
+        }
+        const bool same_stream_set = (requested_ids == live_ids);
         bool light_attempted = false;
-        const int light_rc = try_light_reconfigure(hm, priv, prev_p, p, reconfig, light_attempted);
+        const int light_rc = (same_stream_set && !pipeline_running)
+                                 ? try_light_reconfigure(hm, priv, prev_p, p, reconfig, light_attempted)
+                                 : HAL_OK; /* running pipeline or encoder set change — heavy path below */
         if (light_attempted && light_rc == HAL_OK)
         {
             HAL_LOG_INFO("hailo15_media: reconfigure_pipeline: light-path success (%u streams)", reconfig->stream_count);
@@ -5991,7 +6845,9 @@ static int hailo15_media_reconfigure_pipeline(void *media_ctx, const HalPipeline
         }
         HAL_LOG_INFO("hailo15_media: reconfigure_pipeline: stream buffer layout change detected, full reinit%s",
                      light_attempted ? " (light-path fallback)" : "");
-        std::string new_json = hailo15_generate_pipeline_config_json(priv->stored_config_json, reconfig, p.name);
+        /* prune_absent_streams=true: reconfigure_pipeline's payload is the FULL
+         * target layout — encoders absent from it must be removed, not retained. */
+        std::string new_json = hailo15_generate_pipeline_config_json(priv->stored_config_json, reconfig, p.name, true);
         if (new_json.empty())
         {
             HAL_LOG_ERROR("hailo15_media: reconfigure_pipeline: failed to generate new config JSON");
@@ -6014,9 +6870,220 @@ static int hailo15_media_reconfigure_pipeline(void *media_ctx, const HalPipeline
     return rc;
 }
 
+static HalThrottlingState to_hal_throttling_state(media_library_throttling_state_t st)
+{
+    switch (st)
+    {
+    case media_library_throttling_state_t::THROTTLING_STATE_FULL_PERFORMANCE:
+        return HAL_THROTTLING_FULL_PERFORMANCE;
+    case media_library_throttling_state_t::THROTTLING_STATE_COOLING:
+        return HAL_THROTTLING_COOLING;
+    case media_library_throttling_state_t::THROTTLING_STATE_S0:
+        return HAL_THROTTLING_S0;
+    case media_library_throttling_state_t::THROTTLING_STATE_S1:
+        return HAL_THROTTLING_S1;
+    case media_library_throttling_state_t::THROTTLING_STATE_S2:
+        return HAL_THROTTLING_S2;
+    case media_library_throttling_state_t::THROTTLING_STATE_S3:
+        return HAL_THROTTLING_S3;
+    case media_library_throttling_state_t::THROTTLING_STATE_S4:
+        return HAL_THROTTLING_S4;
+    case media_library_throttling_state_t::THROTTLING_STATE_UNINITIALIZED:
+    default:
+        return HAL_THROTTLING_UNINITIALIZED;
+    }
+}
+
+static int hailo15_media_subscribe_throttling(void *media_ctx, HalThrottlingCallback callback, void *userdata)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !priv->media_lib || !callback)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    HalMediaContext *hm = static_cast<HalMediaContext *>(media_ctx);
+    {
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->throttling_cb = callback;
+        priv->throttling_cb_user = userdata;
+    }
+    /* Only one subscriber is supported by medialib; a re-subscribe replaces. */
+    media_library_return r = priv->media_lib->subscribe_to_throttling_state_change(
+        [priv, hm](media_library_throttling_state_t st) {
+            HalThrottlingCallback cb = nullptr;
+            void *ud = nullptr;
+            {
+                std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+                cb = priv->throttling_cb;
+                ud = priv->throttling_cb_user;
+            }
+            if (!cb)
+            {
+                return;
+            }
+            /* Profile name is best-effort; medialib's throttling event carries state only. */
+            cb(hm, to_hal_throttling_state(st), "", ud);
+        });
+    if (r != MEDIA_LIBRARY_SUCCESS)
+    {
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->throttling_cb = nullptr;
+        priv->throttling_cb_user = nullptr;
+        return hailo15_ml_err(r);
+    }
+    return HAL_OK;
+}
+
+static int hailo15_media_unsubscribe_throttling(void *media_ctx)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !priv->media_lib)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    media_library_return r = priv->media_lib->unsubscribe_from_throttling_state_change();
+    {
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->throttling_cb = nullptr;
+        priv->throttling_cb_user = nullptr;
+    }
+    return hailo15_ml_err(r);
+}
+
+static int hailo15_media_get_throttling_state(void *media_ctx, HalThrottlingState *state_out)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !priv->media_lib || !state_out)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    auto st_exp = priv->media_lib->get_throttling_state();
+    if (!st_exp)
+    {
+        return hailo15_ml_err(st_exp.error());
+    }
+    *state_out = to_hal_throttling_state(st_exp.value());
+    return HAL_OK;
+}
+
+/* ---- M2: motion detection ----
+ * Motion configuration lives entirely in the HAL frame-difference engine's
+ * private state. It is deliberately NOT written into the medialib profile:
+ * the vendor module cannot run on this stack (stock profiles ship it disabled
+ * and its analysis stream_id is never populated — filling it breaks the
+ * frontend), and enabling it there only wakes a broken module that logs
+ * "Invalid motion_detection ROI size" every frame. */
+
+static int hailo15_media_set_motion_config(void *media_ctx, const HalMotionConfig *config)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !priv->media_lib || !config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (config->threshold < 0.0f || config->threshold > 1.0f)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (config->sensitivity < HAL_MOTION_SENSITIVITY_LOWEST ||
+        config->sensitivity > HAL_MOTION_SENSITIVITY_HIGHEST)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (config->roi_x < 0 || config->roi_y < 0 || config->roi_w < 0 || config->roi_h < 0)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->motion_engine_enabled = config->enabled;
+        priv->motion_threshold = config->threshold;
+        /* sensitivity LOWEST(0)..HIGHEST(4) -> per-pixel delta 40..8 */
+        priv->motion_diff_level = 40 - (config->sensitivity * 8);
+        /* Analysis ROI (pixels on the motion analysis stream); all-zero = full
+         * frame. Applied by the frame-difference engine, which only compares
+         * blocks intersecting the ROI. */
+        priv->motion_roi_x = config->roi_x > 0 ? static_cast<uint32_t>(config->roi_x) : 0;
+        priv->motion_roi_y = config->roi_y > 0 ? static_cast<uint32_t>(config->roi_y) : 0;
+        priv->motion_roi_w = config->roi_w > 0 ? static_cast<uint32_t>(config->roi_w) : 0;
+        priv->motion_roi_h = config->roi_h > 0 ? static_cast<uint32_t>(config->roi_h) : 0;
+        priv->motion_last_state = false; /* re-arm transition detection */
+        if (priv->motion_analysis_sid.empty() && !priv->frontend_stream_ids.empty())
+        {
+            /* pick the smallest output stream as the analysis source */
+            uint64_t best = UINT64_MAX;
+            for (const auto &sid : priv->frontend_stream_ids)
+            {
+                const auto vs = priv->video_by_stream.find(sid);
+                uint64_t area = UINT64_MAX;
+                if (vs != priv->video_by_stream.end())
+                {
+                    area = static_cast<uint64_t>(vs->second->config.width) * vs->second->config.height;
+                }
+                if (area > 0 && area < best)
+                {
+                    best = area;
+                    priv->motion_analysis_sid = sid;
+                }
+            }
+        }
+        priv->motion_prev_grid.clear();
+    }
+    return HAL_OK;
+}
+
+static int hailo15_media_get_motion_config(void *media_ctx, HalMotionConfig *config)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+    config->enabled = priv->motion_engine_enabled;
+    config->roi_x = static_cast<int32_t>(priv->motion_roi_x);
+    config->roi_y = static_cast<int32_t>(priv->motion_roi_y);
+    config->roi_w = static_cast<int32_t>(priv->motion_roi_w);
+    config->roi_h = static_cast<int32_t>(priv->motion_roi_h);
+    /* inverse of: sensitivity LOWEST(0)..HIGHEST(4) -> per-pixel delta 40..8 */
+    const int sens = (40 - priv->motion_diff_level) / 8;
+    config->sensitivity = static_cast<HalMotionSensitivity>(
+        sens < HAL_MOTION_SENSITIVITY_LOWEST ? HAL_MOTION_SENSITIVITY_LOWEST
+        : sens > HAL_MOTION_SENSITIVITY_HIGHEST ? HAL_MOTION_SENSITIVITY_HIGHEST : sens);
+    config->threshold = priv->motion_threshold;
+    return HAL_OK;
+}
+
+static int hailo15_media_subscribe_motion(void *media_ctx, HalMotionCallback callback, void *userdata)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv || !callback)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+    priv->motion_cb = callback;
+    priv->motion_cb_user = userdata;
+    priv->motion_last_state = false;
+    return HAL_OK;
+}
+
+static int hailo15_media_unsubscribe_motion(void *media_ctx)
+{
+    auto *priv = hailo15_media_priv_from_hal(media_ctx);
+    if (!priv)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+    priv->motion_cb = nullptr;
+    priv->motion_cb_user = nullptr;
+    return HAL_OK;
+}
+
 static const char *hailo15_media_get_version(void)
 {
-    return "Hailo15 HAL-MEDIA 2.0.0";
+    return "Hailo15 HAL-MEDIA 2.2.0";
 }
 
 /* --------------------------------------------------------------------
@@ -6276,9 +7343,144 @@ HalMediaOps HAL_MEDIA_OPS = {
     .reconfigure_pipeline = hailo15_media_reconfigure_pipeline,
     .get_version = hailo15_media_get_version,
     .attach_frame_analytics = hailo15_media_attach_frame_analytics,
+    .subscribe_throttling = hailo15_media_subscribe_throttling,
+    .unsubscribe_throttling = hailo15_media_unsubscribe_throttling,
+    .get_throttling_state = hailo15_media_get_throttling_state,
+    .set_motion_config = hailo15_media_set_motion_config,
+    .get_motion_config = hailo15_media_get_motion_config,
+    .subscribe_motion = hailo15_media_subscribe_motion,
+    .unsubscribe_motion = hailo15_media_unsubscribe_motion,
+    .get_codec_names = hailo15_media_get_codec_names,
 };
 
 } // extern "C"
+
+/*
+ * Keep priv->encoder_overrides_json in sync with the target stream layout.
+ *
+ * apply_encoder_overrides() runs during EVERY MediaLibrary reinit and treats
+ * the overrides list as the authoritative stream set: Pass 0 strips profile
+ * streams missing from it, Pass 2 re-injects entries the profile lacks.  That
+ * list is authored once at HAL init from the daemon config and was never
+ * updated on add/remove_stream — so after a REMOVE the next reinit
+ * resurrected the removed stream from the stale override (and stripped a
+ * just-added stream).  HAL layout stayed frozen while the daemon config
+ * churned around it: the "zombie sub" and crossed-dims defects.  Re-sync
+ * here so overrides describe exactly the target layout before patch_json
+ * builds the new config.  Injected entries carry dims/framerate only; codec/
+ * bitrate/gop stay absent so apply_encoder_overrides' >0/.empty() guards
+ * keep the template encoder defaults.
+ */
+static void sync_encoder_overrides_with_layout(Hailo15MediaPriv *priv, const config_profile_t &target)
+{
+    using json = nlohmann::json;
+    if (priv->encoder_overrides_json.empty())
+    {
+        return;
+    }
+    json ov = json::parse(priv->encoder_overrides_json, nullptr, false);
+    if (ov.is_discarded() || !ov.is_array())
+    {
+        return;
+    }
+
+    std::set<std::string> target_ids;
+    for (const auto &kv : target.encoded_output_streams)
+    {
+        target_ids.insert(kv.first);
+    }
+
+    bool changed = false;
+    /* Drop entries for streams the target layout no longer has. */
+    for (auto it = ov.begin(); it != ov.end();)
+    {
+        const std::string sid = it->value("stream_id", "");
+        if (!sid.empty() && target_ids.find(sid) == target_ids.end())
+        {
+            HAL_LOG_INFO("hailo15_media: encoder_override sync: dropping stale entry '%s'",
+                         sid.c_str());
+            it = ov.erase(it);
+            changed = true;
+            continue;
+        }
+        ++it;
+    }
+
+    /* Add entries for target streams missing from overrides, using the
+     * target's destination resolution so Pass 2 injects them with the
+     * requested geometry. */
+    for (const auto &sid : target_ids)
+    {
+        bool have = false;
+        for (const auto &e : ov)
+        {
+            if (e.value("stream_id", "") == sid)
+            {
+                have = true;
+                break;
+            }
+        }
+        if (have)
+        {
+            continue;
+        }
+        const output_resolution_t *res = nullptr;
+        for (const auto &r : target.application_settings.application_input_streams.resolutions)
+        {
+            if (r.stream_id == sid)
+            {
+                res = &r;
+                break;
+            }
+        }
+        if (!res || res->dimensions.destination_width == 0 || res->dimensions.destination_height == 0)
+        {
+            continue;
+        }
+        json entry;
+        entry["stream_id"] = sid;
+        entry["width"] = res->dimensions.destination_width;
+        entry["height"] = res->dimensions.destination_height;
+        entry["framerate"] = res->framerate;
+        /* Carry the target's rate/codec too. A dims-only entry leaves the
+         * stream's bitrate/gop unprotected on every later reinit that goes
+         * through the inject path (the stored JSON may still lack the stream),
+         * so an added sub stream would revert to the template encoder's rate
+         * (e.g. main's 8Mbps) until a full reconfigure. The encoder_override
+         * passes map bitrate→target_bitrate and gop→intra_pic_rate. */
+        {
+            const auto enc_it = target.encoded_output_streams.find(sid);
+            if (enc_it != target.encoded_output_streams.end())
+            {
+                std::visit([&entry](const auto &e) {
+                    using T = std::decay_t<decltype(e)>;
+                    if constexpr (std::is_same_v<T, hailo_encoder_config_t>)
+                    {
+                        if (e.rate_control.bitrate.target_bitrate > 0)
+                        {
+                            entry["bitrate"] = e.rate_control.bitrate.target_bitrate;
+                        }
+                        if (e.rate_control.intra_pic_rate > 0)
+                        {
+                            entry["gop"] = e.rate_control.intra_pic_rate;
+                        }
+                        entry["codec"] = (e.output_stream.codec == CODEC_TYPE_HEVC) ? "h265" : "h264";
+                    }
+                }, enc_it->second.encoding);
+            }
+        }
+        ov.push_back(entry);
+        HAL_LOG_INFO("hailo15_media: encoder_override sync: added entry '%s' %ux%u@%u",
+                     sid.c_str(), res->dimensions.destination_width,
+                     res->dimensions.destination_height, res->framerate);
+        changed = true;
+    }
+
+    if (changed)
+    {
+        priv->encoder_overrides_json = ov.dump();
+    }
+}
 
 static int reinit_media_library_on_layout_change(HalMediaContext *hm,
                                                    Hailo15MediaPriv *priv,
@@ -6286,6 +7488,10 @@ static int reinit_media_library_on_layout_change(HalMediaContext *hm,
                                                    const char *tag)
 {
     HAL_LOG_INFO("hailo15_media: reinit_layout [%s]: full destroy+recreate for stream layout change", tag ? tag : "?");
+
+    /* Overrides must describe the TARGET layout before patch_json + reinit
+     * apply them, or apply_encoder_overrides undoes the layout change. */
+    sync_encoder_overrides_with_layout(priv, target_profile);
 
     std::string patched_json = patch_json_stream_layout(priv->stored_config_json, target_profile);
     if (patched_json.empty())

@@ -8,11 +8,13 @@
 #include "fd_receiver.h"
 #include "event_bus_client.h"
 #include "grpc_service.h"
+#include "dsp_client.h"
 #include "auto_infer.h"
 
 #include <grpcpp/grpcpp.h>
 
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <atomic>
 #include <thread>
@@ -111,13 +113,18 @@ int main(int argc, char* argv[]) {
     // ── Preload models ───────────────────────────────────────────────────────
     for (auto& pm : cfg.preload_models) {
         LOG_INFO("Preloading model: %s -> %s (type=%s)", pm.id.c_str(), pm.path.c_str(), pm.type.c_str());
-        int rc = model_mgr.register_model(pm.id, pm.path);
+        // Register the same decoding identity the gRPC path carries. This
+        // keeps config-preloaded entries compatible with an identical later
+        // co-owner registration while rejecting a same-id/path request that
+        // would rewire their postprocess session to a different type/config.
+        int rc = model_mgr.register_model(pm.id, pm.path, "<system>", false,
+                                          pm.postprocess_json, pm.type);
         if (rc < 0) {
             LOG_WARN("Failed to preload model %s: %d", pm.id.c_str(), rc);
             continue;
         }
         if (!pm.type.empty() && model_mgr.has_post_ops()) {
-            model_mgr.init_post_process(pm.id, pm.type);
+            model_mgr.init_post_process(pm.id, pm.type, pm.postprocess_json);
         }
         if (!pm.postprocess_json.empty() && model_mgr.has_post_ops()) {
             model_mgr.update_postprocess_config(pm.id, pm.postprocess_json);
@@ -128,6 +135,13 @@ int main(int argc, char* argv[]) {
     // ── FD Receiver (zero-copy DMA-BUF from camera-daemon) ───────────────────
     FdReceiver fd_receiver(cfg.fd_socket_path);
 
+    // ── Stream DSP preprocess: camera.sock buffer plane + camera-control
+    // gRPC job plane. Process-lifetime singleton: its UDS connection owns every
+    // DSP buffer id this runtime allocates/imports (disconnect cleanup is the
+    // safety net), and late StreamPreprocessPool leases may outlive a stream.
+    DspClient dsp_client(cfg.fd_socket_path,
+                         cfg.stream_preprocess_job_endpoint);
+
     // ── Event Bus client ─────────────────────────────────────────────────────
     EventBusClient event_bus;
     if (cfg.event_bus_enabled && !cfg.event_bus_endpoint.empty()) {
@@ -136,10 +150,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Resolves Tensor.buffer_id inference inputs against camera-daemon's DSP
+    // buffer registry (same UDS). Lazily connects on first use.
+    BufferLookupClient buffer_lookup(cfg.fd_socket_path);
+
     // ── gRPC server ──────────────────────────────────────────────────────────
     AIRuntimeServiceImpl service(cfg, &model_mgr, &session_mgr,
-                                 &scheduler, &fd_receiver, &event_bus,
-                                 &postprocess_pool,
+                                 &scheduler, &fd_receiver, &buffer_lookup, &event_bus,
+                                 &postprocess_pool, &dsp_client,
                                  hal_loader.clip_text_enc_ops(),
                                  hal_loader.genai_ops());
 
@@ -180,8 +198,53 @@ int main(int argc, char* argv[]) {
     // ── Auto-inference pipelines ─────────────────────────────────────────────
     AutoInfer auto_infer(&model_mgr, &fd_receiver, &event_bus, &scheduler,
                           &session_mgr, &postprocess_pool, cfg);
-    if (cfg.auto_infer_enabled) {
-        auto_infer.start();
+    // Declared before the AutoInfer startup check so the ordered-shutdown
+    // helper below can join it on every exit path; assigned once Wait() starts.
+    std::thread server_thread;
+
+    // ── Ordered shutdown, shared by every exit path ──────────────────────────
+    // The gRPC server is already accepting requests when AutoInfer starts, so
+    // a startup failure can leave live async work. Run the same sequence as a
+    // signal shutdown: stop producers first, then quiesce async HAL callbacks
+    // (which own raw scheduler/service dependencies); if the bounded drain
+    // cannot quiesce them, terminate without running destructors rather than
+    // risk a use-after-free.
+    auto shutdown_runtime = [&](int exit_code) -> int {
+        server->Shutdown();
+        if (server_thread.joinable()) server_thread.join();
+        // 1. Stop auto-infer pipelines (no new frames submitted)
+        auto_infer.stop();
+        // 2. Stop scheduler workers (drain queued tasks, stop worker threads).
+        //    Async HAL callbacks for in-flight jobs may still fire after this.
+        scheduler.stop();
+        // 3. Bounded drain of all tracked asynchronous inference work. Scheduler
+        //    requests decrement the tracker from their HAL callbacks; InferBatch
+        //    extends the same tracker through completion of its postprocess task.
+        int orphaned = scheduler.drain_async(5000);
+        if (orphaned > 0) {
+            LOG_FATAL("Shutdown: %d scheduler async job(s) still in-flight; "
+                      "terminating without destroying callback dependencies",
+                      orphaned);
+            // A late callback owns raw scheduler/service dependencies. Running
+            // C++ destructors after the bounded drain would create a
+            // use-after-free; let the OS reclaim process resources instead.
+            std::_Exit(EXIT_FAILURE);
+        }
+        // 4. Stop postprocess pool (drain all post-process tasks so
+        //    free_outputs/release_model complete and model refs reach zero)
+        postprocess_pool.stop();
+        // 5. FD receiver + event bus
+        fd_receiver.stop_all();
+        event_bus.disconnect();
+        // model_mgr destructor handles HAL deinit
+        // hal_loader destructor handles dlclose
+        ::unlink(listen_addr.c_str());
+        return exit_code;
+    };
+
+    if (cfg.auto_infer_enabled && !auto_infer.start()) {
+        LOG_FATAL("AutoInfer startup failed; shutting down ai-runtime");
+        return shutdown_runtime(EXIT_FAILURE);
     }
 
     // ── Signal handling ──────────────────────────────────────────────────────
@@ -193,59 +256,25 @@ int main(int argc, char* argv[]) {
     // ── Wait for shutdown in a separate thread ───────────────────────────────
     // This avoids the deadlock that occurs when calling Shutdown() from signal
     // handler while Wait() holds the internal mutex.
-    std::thread server_thread([&server]() {
+    server_thread = std::thread([&server]() {
         server->Wait();
     });
 
     // ── Main loop: poll for shutdown signal ──────────────────────────────────
     while (!g_shutdown) {
+        // A started pipeline that exits unexpectedly makes the whole runtime
+        // unusable; shut down in the same controlled order as a signal.
+        if (cfg.auto_infer_enabled && auto_infer.failed()) {
+            LOG_FATAL("AutoInfer pipeline exited unexpectedly; "
+                      "shutting down ai-runtime");
+            return shutdown_runtime(EXIT_FAILURE);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     // ── Graceful shutdown ────────────────────────────────────────────────────
     LOG_INFO("Received shutdown signal, stopping server...");
-    server->Shutdown();  // Safe to call here, not in signal handler
-    server_thread.join();
-
-    // ── Cleanup (order matters) ──────────────────────────────────────────────
-    // 1. Stop auto-infer pipelines (no new frames submitted)
-    auto_infer.stop();
-    // 2. Stop scheduler workers (drain queued tasks, stop worker threads).
-    //    Async HAL callbacks for in-flight jobs may still fire after this.
-    scheduler.stop();
-    // 3. Bounded drain of in-flight async HAL callbacks submitted via
-    //    the scheduler. This covers Infer/StreamInfer/AutoInfer paths.
-    //
-    //    KNOWN LIMITATION (accepted for now, blocks strong-shutdown safety):
-    //    InferBatch calls model_mgr_->run_async() directly (not via
-    //    scheduler), so its in-flight jobs are NOT tracked by
-    //    async_in_flight_. If a batch RPC timed out with a late callback
-    //    still pending, drain_async() returns 0 (no scheduler jobs
-    //    pending) and we proceed to destroy postprocess_pool_ / model_mgr_.
-    //    The late callback may then access freed objects (UAF).
-    //
-    //    This is an architectural gap, not a mitigated risk. It is
-    //    accepted on the assumption that HAL callbacks complete in
-    //    milliseconds (pathological NPU hang is the only trigger).
-    //    To fully fix: route InferBatch through the scheduler, or
-    //    implement HAL job cancellation, or use shared_ptr lifetime
-    //    for tracker/dependency objects.
-    int orphaned = scheduler.drain_async(5000);
-    if (orphaned > 0) {
-        LOG_ERROR("Shutdown: %d scheduler async job(s) still in-flight. "
-                  "InferBatch jobs are NOT tracked — proceeding is unsafe "
-                  "if any batch callback is still pending.", orphaned);
-    }
-    // 4. Stop postprocess pool (drain all post-process tasks → free_outputs +
-    //    release_model complete; model refs reach zero, HAL sessions destroyed)
-    postprocess_pool.stop();
-    // 5. FD receiver + event bus
-    fd_receiver.stop_all();
-    event_bus.disconnect();
-    // model_mgr destructor handles HAL deinit
-    // hal_loader destructor handles dlclose
-
-    ::unlink(listen_addr.c_str());
+    shutdown_runtime(0);
     LOG_INFO("Shutdown complete");
     return 0;
 }

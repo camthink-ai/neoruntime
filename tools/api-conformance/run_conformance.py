@@ -4,7 +4,7 @@ a live device, safely, and emit report.json + report.md.
 
 Usage:
   python3 run_conformance.py \
-      --host 192.168.93.48 --username admin --password password \
+      --host 192.168.1.10 --username admin --password password \
       --swagger ./swagger.yaml --report-dir ./reports
 
 Safety model (see classify.py): S full probe, W reversible write with a

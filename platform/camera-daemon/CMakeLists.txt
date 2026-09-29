@@ -10,6 +10,7 @@ add_compile_options(-g)
 # Sanitizer options (enable with -DENABLE_ASAN=ON or -DENABLE_TSAN=ON)
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+option(CAMERA_DAEMON_BUILD_TESTS "Build camera-daemon native unit tests" OFF)
 if(ENABLE_ASAN)
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address)
@@ -23,6 +24,7 @@ endif()
 set(HAL_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/include)
 set(HAL_V2_INC ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/include)
 set(HAL_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/common)
+set(HAL_THIRD_PARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/third_party)
 set(AUTO_AF_CORE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/examples/AF_demo/core)
 set(HAL_COMMON_SOURCES
     ${HAL_COMMON_DIR}/hal_common.c
@@ -31,6 +33,7 @@ set(HAL_COMMON_SOURCES
     ${HAL_COMMON_DIR}/hal_postprocess_common.c
     ${HAL_COMMON_DIR}/hal_draw_cpu.cpp
     ${HAL_COMMON_DIR}/hal_draw_ops_cpu.cpp
+    ${HAL_COMMON_DIR}/devices/hal_lens_fg2009.c
 )
 # v2 headers are in subdirectories: media/, common/, model/, peripheral/
 # Each header uses relative includes (e.g. "../common/hal_common.h")
@@ -192,12 +195,18 @@ set(SOURCES
     src/ai_overlay_subscriber.cpp
     src/audio_service.cpp
     src/dpm_worker.cpp
+    src/dsp_service.cpp
+    src/injection_service.cpp
     src/autofocus_controller.cpp
+    src/lens_image_probe.cpp
+    src/illumination_controller.cpp
+    src/daynight_policy.cpp
     src/camera_control_service.cpp
     src/lens_hal_service.cpp
     src/camera_daemon.cpp
     ${AUTO_AF_CORE_DIR}/af_calibration.cpp
     ${AUTO_AF_CORE_DIR}/af_follow.cpp
+    ${AUTO_AF_CORE_DIR}/af_ir_follow.cpp
     ${AUTO_AF_CORE_DIR}/af_metric.cpp
     ${AUTO_AF_CORE_DIR}/af_scan.cpp
 )
@@ -219,6 +228,7 @@ target_include_directories(camera-daemon PRIVATE
     ${HAL_V2_INCLUDE_DIRS}
     ${PROTO_GEN_DIR}
     ${CAMERA_PROTO_GEN_ARM_DIR}
+    ${HAL_THIRD_PARTY_DIR}
     ${AUTO_AF_CORE_DIR}
 )
 
@@ -251,3 +261,202 @@ endif()
 
 # Install
 install(TARGETS camera-daemon DESTINATION /opt/aipc/bin)
+
+if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
+    enable_testing()
+    add_executable(illumination-controller-test
+        tests/illumination_controller_test.cpp
+        src/illumination_controller.cpp
+        ${AUTO_AF_CORE_DIR}/af_ir_follow.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(illumination-controller-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${AUTO_AF_CORE_DIR}
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+    )
+    target_link_libraries(illumination-controller-test PRIVATE pthread)
+    add_test(NAME illumination-controller-test COMMAND illumination-controller-test)
+
+    add_executable(daynight-policy-test
+        tests/daynight_policy_test.cpp
+        src/daynight_policy.cpp
+    )
+    target_include_directories(daynight-policy-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(daynight-policy-test PRIVATE pthread)
+    add_test(NAME daynight-policy-test COMMAND daynight-policy-test)
+
+    add_executable(ai-overlay-face-blur-test
+        tests/ai_overlay_face_blur_test.cpp
+        src/ai_overlay_subscriber.cpp
+        ${HAL_COMMON_DIR}/hal_draw_cpu.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(ai-overlay-face-blur-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(ai-overlay-face-blur-test PRIVATE pthread)
+    add_test(NAME ai-overlay-face-blur-test COMMAND ai-overlay-face-blur-test)
+
+    add_executable(ai-overlay-polygon-test
+        tests/ai_overlay_polygon_test.cpp
+        src/ai_overlay_subscriber.cpp
+        ${HAL_COMMON_DIR}/hal_draw_cpu.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(ai-overlay-polygon-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(ai-overlay-polygon-test PRIVATE pthread)
+    add_test(NAME ai-overlay-polygon-test COMMAND ai-overlay-polygon-test)
+
+    add_executable(ai-overlay-strict-test
+        tests/ai_overlay_strict_test.cpp
+        src/ai_overlay_subscriber.cpp
+        ${HAL_COMMON_DIR}/hal_draw_cpu.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(ai-overlay-strict-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(ai-overlay-strict-test PRIVATE pthread)
+    add_test(NAME ai-overlay-strict-test COMMAND ai-overlay-strict-test)
+
+    add_executable(ai-overlay-session-test
+        tests/ai_overlay_session_test.cpp
+        src/ai_overlay_subscriber.cpp
+        ${HAL_COMMON_DIR}/hal_draw_cpu.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(ai-overlay-session-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(ai-overlay-session-test PRIVATE pthread)
+    add_test(NAME ai-overlay-session-test COMMAND ai-overlay-session-test)
+
+    # Output-isolation scope cut: admission/layers/suppression/[] clear/
+    # epoch + frame-binding expiry. Host-only; counting fake draw_result.
+    add_executable(ai-overlay-binding-test
+        tests/ai_overlay_binding_test.cpp
+        src/ai_overlay_subscriber.cpp
+        ${HAL_COMMON_DIR}/hal_draw_cpu.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(ai-overlay-binding-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(ai-overlay-binding-test PRIVATE pthread)
+    add_test(NAME ai-overlay-binding-test COMMAND ai-overlay-binding-test)
+
+    # P1-9: per-lane vendor priority split (NORMAL ctx at cfg priority,
+    # BACKGROUND ctx at 0). Host-only; fake HalDspOps/ fb_ops.
+    add_executable(dsp-lane-split-test
+        tests/dsp_lane_split_test.cpp
+        src/dsp_service.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(dsp-lane-split-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(dsp-lane-split-test PRIVATE pthread rt)
+    add_test(NAME dsp-lane-split-test COMMAND dsp-lane-split-test)
+
+    # P1-9: pool-retention cache — released pool buffers park by geometry
+    # so per-call-pool clients (the accel router) stop recreating the
+    # vendor 32-buffer dma chunk every call. Host-only; fake HAL ops.
+    add_executable(dsp-pool-retention-test
+        tests/dsp_pool_retention_test.cpp
+        src/dsp_service.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(dsp-pool-retention-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(dsp-pool-retention-test PRIVATE pthread rt)
+    add_test(NAME dsp-pool-retention-test COMMAND dsp-pool-retention-test)
+
+    # keep_fd read-only contract guard: imported buffers are source-only
+    # (the one exception: BLEND ARGB32 overlay dst). Guards existing
+    # validate_and_pin policy; no production change. Host-only.
+    add_executable(dsp-import-write-target-test
+        tests/dsp_import_write_target_test.cpp
+        src/dsp_service.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(dsp-import-write-target-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(dsp-import-write-target-test PRIVATE pthread rt)
+    add_test(NAME dsp-import-write-target-test COMMAND dsp-import-write-target-test)
+
+    add_executable(injection-owner-test
+        tests/injection_owner_test.cpp
+        src/injection_service.cpp
+        src/dsp_service.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(injection-owner-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(injection-owner-test PRIVATE pthread rt)
+    add_test(NAME injection-owner-test COMMAND injection-owner-test)
+
+    add_executable(fg2009-position-test
+        tests/fg2009_position_test.cpp
+        ${HAL_COMMON_DIR}/devices/hal_lens_fg2009.c
+    )
+    target_include_directories(fg2009-position-test PRIVATE
+        ${HAL_V2_INC}
+    )
+    add_test(NAME fg2009-position-test COMMAND fg2009-position-test)
+
+    add_executable(dsp-service-async-lifecycle-test
+        tests/dsp_service_async_lifecycle_test.cpp
+        src/dsp_service.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_compile_definitions(dsp-service-async-lifecycle-test PRIVATE
+        DSP_SERVICE_TESTING=1
+    )
+    # This standalone test uses assert for both guards and assertions; keep
+    # them active even when the production build type is Release.
+    target_compile_options(dsp-service-async-lifecycle-test PRIVATE -UNDEBUG)
+    target_include_directories(dsp-service-async-lifecycle-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INCLUDE_DIRS}
+    )
+    target_link_libraries(dsp-service-async-lifecycle-test PRIVATE pthread)
+    add_test(NAME dsp-service-async-lifecycle-test
+             COMMAND dsp-service-async-lifecycle-test)
+endif()

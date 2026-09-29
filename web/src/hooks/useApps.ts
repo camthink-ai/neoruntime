@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { appsApi } from '@/services/api';
+import i18n from '@/i18n/config';
 import type { WizardConfig, AppPermissions } from '@/services/types';
 
 export interface InstallProgress {
@@ -87,12 +88,12 @@ export const useInstallApp = () => {
       const appDetail = detailResponse?.data;
 
       if (!appDetail) {
-        throw new Error('无法获取应用详情');
+        throw new Error(i18n.t('sys.apps.detail.fetch_failed', '无法获取应用详情'));
       }
 
       // 检查必需的字段
       if (!appDetail.manifest_path) {
-        throw new Error('应用缺少 manifest_path 信息');
+        throw new Error(i18n.t('sys.apps.detail.missing_manifest', '应用缺少 manifest_path 信息'));
       }
 
       const response = await appsApi.install({

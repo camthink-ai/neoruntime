@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -16,6 +17,9 @@ extern "C" {
 
 class FrameRouter;
 class LensController;
+class IlluminationController;
+
+using AutofocusVideoContextRefreshFn = std::function<void*()>;
 
 enum class AutofocusOperation {
     None,
@@ -46,10 +50,24 @@ struct AutofocusConfig {
     std::string calibration_path;
     float startup_zoom_ratio = 1.0f;
     float startup_focus_distance_m = 3.0f;
+    // Lens-position persistence: when set, the startup seed replays these
+    // archived motor positions verbatim instead of deriving targets from
+    // startup_zoom_ratio/startup_focus_distance_m (the archived focus already
+    // contains the calibration delta the last scan settled on). FG2009 never
+    // runs the startup job (its boot restore lives in CameraDaemon).
+    bool startup_seed_from_archive = false;
+    int32_t startup_seed_zoom_pos = 0;
+    int32_t startup_seed_focus_pos = 0;
     int startup_wait_frames = 15;
     int startup_recovery_span = 320;
     int startup_ready_timeout_ms = 120000;
     int frame_wait_timeout_ms = 900;
+    // One-shot warm-up: right after a daemon restart the ISP AF statistics
+    // path may not answer its first reads yet (media pipeline still coming
+    // up), which used to kill the first job with "coarse scan failed".
+    // Retry the initial observation this many times before scanning.
+    // 0 disables.  Zero cost when the first read already succeeds.
+    int stat_warmup_attempts = 5;
     int move_timeout_ms = 10000;
     int pps = 1600;
     bool follow_sync_motion = true;
@@ -73,10 +91,25 @@ struct AutofocusConfig {
     int max_focus_pos = 592;
     int coarse_step = 40;
     int coarse_span = 160;
+    // Zoom-tiered coarse window: when both are > 0 and the current optical
+    // ratio is below the threshold, one-shot scans use coarse_span_low_zoom
+    // instead of coarse_span (e.g. a wider window at low magnification and a
+    // compressed one at the thin-DOF tele end).  0 keeps single-span
+    // behavior.
+    int coarse_span_low_zoom = 0;
+    float coarse_span_zoom_threshold = 0.0f;
     int fine_step = 8;
     int fine_span = 24;
+    // Bench observability: log every scan probe (position, FV, duration) and
+    // the coarse/fine window bounds so tuning sessions can watch the scan
+    // live in journalctl.  Off by default.
+    bool trace_scan = false;
     int max_moves = 200;
     int balanced_retry = 1;
+    // Scan-acceptance gate: a scan reports Completed when confidence >=
+    // confidence_accept and the peak is not on the window edge.
+    // confidence_accept == 0 disables the gate — every valid scan is
+    // accepted as-is (no retry, no low-confidence failure).
     double confidence_accept = 0.80;
     double confidence_recovery = 0.65;
 
@@ -125,8 +158,10 @@ class AutofocusController {
 public:
     AutofocusController(HalIspOps* isp_ops, HalVideoOps* video_ops,
                         void* video_ctx, FrameRouter* frame_router,
-                        LensController* lens, const AutofocusConfig& config,
-                        int sensor_native_width = 0, int sensor_native_height = 0);
+                        LensController* lens, IlluminationController* illumination,
+                        const AutofocusConfig& config,
+                        int sensor_native_width = 0, int sensor_native_height = 0,
+                        AutofocusVideoContextRefreshFn refresh_video_context = {});
     ~AutofocusController();
 
     AutofocusController(const AutofocusController&) = delete;

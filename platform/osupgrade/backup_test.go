@@ -34,7 +34,7 @@ func TestCreateUpgradeBackup(t *testing.T) {
 	writeBackupFixture(t, sourceRoot, "/home/root/apps/resources/final_calibration.json", "{}\n")
 	// app-manifest.json is backed up separately from the archive groups.
 	writeBackupFixture(t, sourceRoot, "/data/app-manifest.json",
-		`{"app_version":"1.2.0","machine":"hailo15-ne503","required_compat_level":1,"supported_data_schema":[1],"target_data_schema":1}`)
+		`{"app_version":"1.2.0","machine":"hailo15-ne503","min_os_version":"1.10.0","max_os_version":"1.20.0","supported_data_schema":[1],"target_data_schema":1}`)
 
 	runner := NewRunner(NewStore(filepath.Join(dir, "state")))
 	runner.BackupRoot = filepath.Join(dir, "backups")
@@ -102,7 +102,7 @@ func TestCreateUpgradeBackupSkipsGeneratedResolvConf(t *testing.T) {
 
 	writeBackupFixture(t, sourceRoot, "/etc/timezone", "Asia/Shanghai\n")
 	writeBackupFixture(t, sourceRoot, "/data/app-manifest.json",
-		`{"app_version":"1.2.0","machine":"hailo15-ne503","required_compat_level":1,"supported_data_schema":[1],"target_data_schema":1}`)
+		`{"app_version":"1.2.0","machine":"hailo15-ne503","min_os_version":"1.10.0","max_os_version":"1.20.0","supported_data_schema":[1],"target_data_schema":1}`)
 	writeBackupFixture(t, sourceRoot, "/etc/os-release", "VERSION_ID=\"1.2.0\"\n")
 	resolvPath := filepath.Join(sourceRoot, "etc", "resolv.conf")
 	if err := os.MkdirAll(filepath.Dir(resolvPath), 0755); err != nil {

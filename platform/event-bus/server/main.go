@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"aipc/platform/common/config"
 	"aipc/platform/common/logger"
@@ -86,14 +89,20 @@ func NewEventBusServer(cfg *Config) *EventBusServer {
 
 // Publish implements EventBus
 func (s *EventBusServer) Publish(ctx context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
-	event := req.Event
+	return s.publishEvent(req.Event), nil
+}
+
+// publishEvent stamps the event (ID, timestamp), records statistics, and
+// delivers the event to all matching subscribers. Shared by the unary
+// Publish RPC and the client-streaming PublishBatch RPC.
+func (s *EventBusServer) publishEvent(event *pb.Event) *pb.PublishResponse {
 	if event == nil {
 		return &pb.PublishResponse{
 			Status: &pb.Status{
 				Success: false,
 				Message: "Event is nil",
 			},
-		}, nil
+		}
 	}
 
 	// Generate event ID if not provided
@@ -169,7 +178,7 @@ func (s *EventBusServer) Publish(ctx context.Context, req *pb.PublishRequest) (*
 			Success: true,
 		},
 		EventId: event.EventId,
-	}, nil
+	}
 }
 
 // Subscribe implements EventBus
@@ -276,6 +285,96 @@ func (s *EventBusServer) GetStats(ctx context.Context, req *pb.Empty) (*pb.Syste
 		TotalTopics:      uint32(len(s.subscribers)),
 		UptimeMs:         uint64(time.Since(startTime).Milliseconds()),
 	}, nil
+}
+
+// GetTopicInfo implements EventBus: per-topic subscriber count and message
+// totals. A topic "exists" if it has subscribers or recorded statistics
+// (stats appear after the first publish even with no subscribers).
+func (s *EventBusServer) GetTopicInfo(ctx context.Context, req *pb.TopicInfo) (*pb.TopicInfo, error) {
+	topic := req.Topic
+
+	s.subMutex.RLock()
+	subCount := uint32(len(s.subscribers[topic]))
+	s.subMutex.RUnlock()
+
+	s.statsMutex.RLock()
+	stats := s.stats[topic]
+	s.statsMutex.RUnlock()
+
+	if stats == nil && subCount == 0 {
+		return nil, status.Errorf(codes.NotFound, "topic %q not found", topic)
+	}
+
+	info := &pb.TopicInfo{
+		Topic:           topic,
+		SubscriberCount: subCount,
+	}
+	if stats != nil {
+		info.TotalMessages = stats.PublishedCount.Load()
+		info.LastMessageTs = stats.LastMessageTs.Load()
+	}
+	return info, nil
+}
+
+// GetTopicStats implements EventBus: per-topic publish/delivery counters.
+// avg_latency_us stays 0 because delivery is fire-and-forget into buffered
+// channels and no delivery-ack timing is recorded.
+func (s *EventBusServer) GetTopicStats(ctx context.Context, req *pb.TopicInfo) (*pb.EventStats, error) {
+	topic := req.Topic
+
+	s.subMutex.RLock()
+	subCount := len(s.subscribers[topic])
+	s.subMutex.RUnlock()
+
+	s.statsMutex.RLock()
+	stats := s.stats[topic]
+	s.statsMutex.RUnlock()
+
+	if stats == nil && subCount == 0 {
+		return nil, status.Errorf(codes.NotFound, "topic %q not found", topic)
+	}
+	if stats == nil {
+		// Subscribed but nothing published yet: report zeroed counters.
+		return &pb.EventStats{Topic: topic}, nil
+	}
+
+	return &pb.EventStats{
+		Topic:          topic,
+		PublishedCount: stats.PublishedCount.Load(),
+		DeliveredCount: stats.DeliveredCount.Load(),
+		DroppedCount:   stats.DroppedCount.Load(),
+	}, nil
+}
+
+// PublishBatch implements EventBus: client-streaming batch publish. Each
+// received event goes through the same path as unary Publish; the final
+// Status reports how many succeeded. A nil event in the stream counts as
+// failed rather than aborting the batch.
+func (s *EventBusServer) PublishBatch(stream pb.EventBus_PublishBatchServer) error {
+	published, failed := 0, 0
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			success := failed == 0
+			msg := fmt.Sprintf("published %d events", published)
+			if !success {
+				msg = fmt.Sprintf("published %d events, %d failed", published, failed)
+			}
+			return stream.SendAndClose(&pb.Status{
+				Success: success,
+				Message: msg,
+			})
+		}
+		if err != nil {
+			return err
+		}
+
+		if resp := s.publishEvent(req.Event); resp.Status != nil && resp.Status.Success {
+			published++
+		} else {
+			failed++
+		}
+	}
 }
 
 // Helper functions

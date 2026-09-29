@@ -193,11 +193,6 @@ static int stub_media_get_encoder_auto_feed_for_stream(void *media_ctx, const ch
     return HAL_ERR_NOT_SUPPORTED;
 }
 
-static const char *stub_media_get_version(void)
-{
-    return "HAL-MEDIA stub 2.0.0 (platform stub)";
-}
-
 static int stub_media_backup_current_profile(void *media_ctx, const char *path)
 {
     (void)media_ctx;
@@ -245,7 +240,87 @@ static int stub_media_reconfigure_pipeline(void *media_ctx, const HalPipelineRec
     return 0; /* stub: success */
 }
 
+/* Thermal throttling — static simulation (M1). */
+static HalThrottlingCallback g_stub_throttling_cb;
+static void *g_stub_throttling_user;
 
+static int stub_media_subscribe_throttling(void *media_ctx, HalThrottlingCallback callback, void *userdata)
+{
+    (void)media_ctx;
+    if (!callback)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    g_stub_throttling_cb = callback;
+    g_stub_throttling_user = userdata;
+    return HAL_OK;
+}
+
+static int stub_media_unsubscribe_throttling(void *media_ctx)
+{
+    (void)media_ctx;
+    g_stub_throttling_cb = NULL;
+    g_stub_throttling_user = NULL;
+    return HAL_OK;
+}
+
+static int stub_media_get_throttling_state(void *media_ctx, HalThrottlingState *state_out)
+{
+    (void)media_ctx;
+    if (!state_out)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    *state_out = HAL_THROTTLING_FULL_PERFORMANCE; /* simulated: never restricted */
+    return HAL_OK;
+}
+
+static const char *stub_media_get_version(void)
+{
+    return "HAL-MEDIA stub 2.2.0 (platform stub)";
+}
+
+/* Motion detection — static simulation (M2). */
+static HalMotionConfig g_stub_motion_cfg;
+
+static int stub_media_set_motion_config(void *media_ctx, const HalMotionConfig *config)
+{
+    (void)media_ctx;
+    if (!config || config->threshold < 0.0f || config->threshold > 1.0f)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    g_stub_motion_cfg = *config;
+    return HAL_OK;
+}
+
+static int stub_media_get_motion_config(void *media_ctx, HalMotionConfig *config)
+{
+    (void)media_ctx;
+    if (!config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    *config = g_stub_motion_cfg;
+    return HAL_OK;
+}
+
+static int stub_media_subscribe_motion(void *media_ctx, HalMotionCallback callback, void *userdata)
+{
+    (void)media_ctx;
+    (void)userdata;
+    if (!callback)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    return HAL_OK; /* stub: accepted, no frames are generated */
+}
+
+static int stub_media_unsubscribe_motion(void *media_ctx)
+{
+    (void)media_ctx;
+    return HAL_OK;
+}
 
 HalMediaOps HAL_MEDIA_OPS = {
     .init = stub_media_init,
@@ -276,4 +351,11 @@ HalMediaOps HAL_MEDIA_OPS = {
     .reconfigure_pipeline = stub_media_reconfigure_pipeline,
 
     .get_version = stub_media_get_version,
+    .subscribe_throttling = stub_media_subscribe_throttling,
+    .unsubscribe_throttling = stub_media_unsubscribe_throttling,
+    .get_throttling_state = stub_media_get_throttling_state,
+    .set_motion_config = stub_media_set_motion_config,
+    .get_motion_config = stub_media_get_motion_config,
+    .subscribe_motion = stub_media_subscribe_motion,
+    .unsubscribe_motion = stub_media_unsubscribe_motion,
 };

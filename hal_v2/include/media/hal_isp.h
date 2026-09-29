@@ -150,6 +150,72 @@ typedef struct {
     uint32_t luma[HAL_ISP_AF_MAX_WINDOWS];  /* luma[0]=luma1 ... mean luma in window */
 } HalIspAfMeasurement;
 
+/* --------------------------------------------------------------------
+ * ISP manual white balance (M2)
+ * -------------------------------------------------------------------- */
+
+/**
+ * Manual white balance configuration.
+ *
+ * When manual_state is true the AWB pipeline is frozen (awbv2 algorithm +
+ * isp_awb_enable + isp_awb_mode) and the per-channel gains below are applied
+ * directly (1.0 = neutral, Q8.8 controls). When false, auto white balance
+ * runs and the gain fields are ignored.
+ *
+ * Control ranges (Hailo imaging guide 6.2): r/gr gains ~[0.39..4.0],
+ * gb/b gains ~[0.39..1.56]; out-of-range values return HAL_ERR_INVALID_ARG.
+ *
+ * @note The optional 3x3 color-correction matrix (ccm, row-major, written to
+ * isp_wb_cc_matrix) is only applied when the platform exposes the control;
+ * an all-zero matrix (default) means "leave CCM unchanged".
+ */
+typedef struct {
+    bool  manual_state;      /* true: use gains below; false: auto (AWB) */
+    float r_gain;            /* red gain, 1.0 = neutral [~0.39..4.0] */
+    float gr_gain;           /* green-red gain, 1.0 = neutral [~0.39..4.0] */
+    float gb_gain;           /* green-blue gain, 1.0 = neutral [~0.39..1.56] */
+    float b_gain;            /* blue gain, 1.0 = neutral [~0.39..1.56] */
+    float ccm[9];            /* optional 3x3 CCM, row-major; all-zero = unchanged */
+} HalIspWbConfig;
+
+/* --------------------------------------------------------------------
+ * ISP temporal noise reduction (M2)
+ * -------------------------------------------------------------------- */
+
+/**
+ * 3DNR (temporal noise reduction) configuration.
+ *
+ * Hailo mapping: platform-dependent — the HAL probes the known V4L2 control
+ * names (temporal NR is configured through the ISP media-server tuning
+ * stack) and returns HAL_ERR_NOT_SUPPORTED when none is present.
+ */
+typedef struct {
+    bool enabled;
+    int  strength;           /* [0..100] */
+} HalIspNr3dConfig;
+
+/* --------------------------------------------------------------------
+ * ISP AE statistics (M2)
+ * -------------------------------------------------------------------- */
+
+/** AE luma statistics grid dimension (5x5 mean-luma zones). */
+#define HAL_ISP_AE_LUMA_GRID 25
+
+/**
+ * Auto-exposure statistics snapshot (poll model — same usage pattern as
+ * get_af_measurement()).
+ *
+ * Hailo mapping: V4L2 controls isp_ae_hist (256-bin luma histogram) and
+ * isp_ae_luma (5x5 mean-luma grid). Fields carry per-source validity flags
+ * so a platform exposing only one of the two still returns partial data.
+ */
+typedef struct {
+    uint32_t hist[256];                    /* luma histogram bins */
+    uint32_t luma[HAL_ISP_AE_LUMA_GRID];   /* 5x5 mean luma grid */
+    bool     hist_valid;                   /* false when the histogram control is absent */
+    bool     luma_valid;                   /* false when the luma-grid control is absent */
+} HalIspAeStats;
+
 /**
  * Function-pointer table for ISP operations.
  * Platform implementations populate HAL_ISP_OPS at link time.
@@ -273,6 +339,62 @@ typedef struct {
      * @return Static version string e.g. "Hailo15 HAL-ISP 2.0.0".
      */
     const char *(*get_version)(void);
+
+    /* ---------- M2 additions (appended; NULL = not supported) ---------- */
+
+    /**
+     * @brief Apply manual white balance gains (or return to auto AWB).
+     *
+     * @param video_ctx Video context owning the ISP.
+     * @param config    WB configuration; manual_state=false restores auto AWB.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*set_wb_config)(void *video_ctx, const HalIspWbConfig *config);
+
+    /**
+     * @brief Retrieve the current white balance configuration.
+     *
+     * Reads back the effective per-channel gains and manual/auto state.
+     *
+     * @param video_ctx Video context owning the ISP.
+     * @param config    Receives the current configuration.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*get_current_wb_config)(void *video_ctx, HalIspWbConfig *config);
+
+    /**
+     * @brief Configure temporal noise reduction (3DNR) independently of the
+     *        spatial (2DNR) noise_reduction field in the image config.
+     * @param video_ctx Video context owning the ISP.
+     * @param config    3DNR configuration.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*set_3dnr_config)(void *video_ctx, const HalIspNr3dConfig *config);
+
+    /**
+     * @brief Read a snapshot of auto-exposure statistics (poll model).
+     *
+     * Mirrors get_af_measurement() usage: call periodically. Per-field
+     * validity flags report which statistics the platform provides.
+     *
+     * @param video_ctx Video context owning the ISP.
+     * @param stats     Receives the statistics snapshot.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*get_ae_stats)(void *video_ctx, HalIspAeStats *stats);
+
+    /**
+     * @brief Adjust HDR long/short exposure ratios at runtime.
+     *
+     * Only meaningful while an HDR pipeline is active; returns
+     * HAL_ERR_INVALID_STATE otherwise.
+     *
+     * @param video_ctx Video context owning the ISP.
+     * @param ls_ratio  long-to-short exposure ratio (e.g. 16.0).
+     * @param vs_ratio  very-short exposure ratio (2DOL: ignored, pass 0).
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*set_hdr_ratios)(void *video_ctx, float ls_ratio, float vs_ratio);
 } HalIspOps;
 
 /** Platform-specific ISP operations (resolved at link time). */

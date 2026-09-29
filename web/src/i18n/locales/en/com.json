@@ -3,6 +3,8 @@
     "welcome": "Welcome",
     "confirm": "Confirm",
     "cancel": "Cancel",
+    "copy": "Copy",
+    "copied": "Copied",
     "default": "Default",
     "pick_date": "Pick a date",
     "save": "Save",
@@ -59,6 +61,7 @@
     "downloads": "Downloads",
     "category": "Category",
     "close": "Close",
+    "clear": "Clear",
     "device_info": "Device Info",
     "password_disable": "Password Disable",
     "firmware_upgrade": "Firmware Update",
@@ -121,7 +124,17 @@
     "next": "Next",
     "back": "Back",
     "yes": "Yes",
-    "no": "No"
+    "no": "No",
+    "export": "Export",
+    "import": "Import",
+    "processing": "Processing...",
+    "clear": "Clear",
+    "pause": "Pause",
+    "resume": "Resume",
+    "reconnect": "Reconnect",
+    "copy_failed": "Copy failed",
+    "save_failed": "Save Failed",
+    "prev": "Previous"
   },
   "events": {
     "title": "Event Center",
@@ -229,7 +242,9 @@
     "max_auth_tries": "Max Authentication Attempts",
     "restart_service": "Restart SSH service after saving",
     "update_success": "SSH configuration updated",
-    "update_error": "SSH configuration update failed: "
+    "update_error": "SSH configuration update failed: ",
+    "port_invalid": "Port must be between 1 and 65535",
+    "max_auth_tries_invalid": "Max authentication tries must be between 1 and 10"
   },
   "maintenance": {
     "processes": {
@@ -276,6 +291,102 @@
       "detail_ppid": "Parent PID",
       "detail_status": "Status",
       "detail_username": "User"
+    },
+    "backup": {
+      "title": "Backup & Migration",
+      "drop_hint": "Drag file here, or click to select",
+      "exporting": "Exporting…",
+      "file": "File",
+      "size": "Size",
+      "schema": "Schema",
+      "version": "Version",
+      "impact": "Impact",
+      "identity_preserved": "Preserved on target",
+      "clone_disconnect_warn": "This restarts core services — the UI will briefly disconnect, then reconnect automatically.",
+      "reconnecting": "Applying — reconnecting…",
+      "reconnected": "Reconnected",
+      "invalid_json": "The backup file is invalid or corrupted. Make sure it's a valid export from a matching device.",
+      "export_failed": "Export failed",
+      "export": "Export backup",
+      "import": "Import / restore",
+      "restore": "Restore clone",
+      "create_clone": "Create clone",
+      "import_config": "Import config",
+      "export_config": "Export config",
+      "risk": {
+        "low": "Low risk",
+        "mid": "Medium risk",
+        "high": "High risk"
+      },
+      "tier": {
+        "config": {
+          "title": "Media config",
+          "desc": "Export or import image and media configuration for quickly copying media settings.",
+          "includes": {
+            "image": "Image & ISP config",
+            "video": "Video encoding & streams",
+            "audio": "Audio config",
+            "lens": "Lens & infrared"
+          },
+          "effect1": "Replaces this device's media configuration (image, encoding, audio, lens, etc.) with the imported file's",
+          "effect2": "Camera and lens services restart; live view pauses briefly"
+        },
+        "bundle": {
+          "title": "Media config bundle",
+          "desc": "Camera settings + on-screen overlay images (logos/text)",
+          "effect1": "Replaces this device's camera settings and on-screen overlay images",
+          "effect2": "Camera service restarts (~10s); live view pauses briefly",
+          "effect3": "Larger file (~25MB, contains images)"
+        },
+        "clone": {
+          "title": "Full device clone",
+          "desc": "Back up or restore this device's complete configuration.",
+          "includes": {
+            "device": "Device config",
+            "network": "Network config",
+            "runtime": "App & AI runtime config"
+          },
+          "excludes": "Excludes device identity, security credentials, and installed apps & AI models",
+          "effect1": "Replaces the device's entire configuration (device identity excluded) with the imported file's",
+          "effect2": "Restarts core services (including this console)"
+        }
+      },
+      "identity": {
+        "password": "Admin password",
+        "certificates": "TLS certificates",
+        "device_name": "Device name",
+        "apps": "Installed apps",
+        "models": "AI models",
+        "network": "Network identity"
+      },
+      "importTiers": {
+        "config": {
+          "title": "Import media config"
+        },
+        "bundle": {
+          "title": "Import media bundle",
+          "desc": "Select a previously exported .tar.gz file"
+        },
+        "clone": {
+          "title": "Import device clone"
+        }
+      },
+      "toast": {
+        "export_config": "Media config exported",
+        "export_bundle": "Media bundle exported",
+        "export_clone": "Device clone exported",
+        "import_config": "Media config imported",
+        "import_bundle": "Media bundle imported",
+        "import_clone": "Device clone imported"
+      },
+      "confirm_action": "Apply",
+      "confirm_ack": "I understand the impact and want to continue",
+      "confirm_low_title": "Confirm import",
+      "confirm_low_desc": "This replaces the camera image and media settings; the camera service restarts. This action cannot be undone.",
+      "confirm_mid_title": "Confirm import",
+      "confirm_mid_desc": "This overwrites the current media config and overlay images, then restarts the camera services. This action cannot be undone.",
+      "confirm_high_title": "Confirm full-device clone",
+      "confirm_high_desc": "This replaces the target device's entire configuration; device identity, installed apps, and AI models are preserved. This action cannot be undone."
     }
   }
 }

@@ -22,6 +22,11 @@ static void *g_mcu_ctx = NULL;
 /* Single-instance AF0832 high-level device (created on demand). */
 static HalLensAf0832 *g_af0832 = NULL;
 
+/* Last lens profile pushed to the MCU. The MCU keeps the profile in RAM
+ * only (AF0832 power-on default), so it must be re-pushed after the MCU
+ * context is auto-reset below or after an MCU reboot. */
+static uint32_t g_profile_model = (uint32_t)HAL_LENS_MODEL_AF0832;
+
 /* ---- MCU auto-reset on persistent errors --------------------------------- */
 
 #define CONSECUTIVE_ERROR_THRESHOLD 5
@@ -82,6 +87,19 @@ static void try_reset_mcu_context(void) {
         HAL_MCU_OPS.deinit(g_mcu_ctx);
         g_mcu_ctx = NULL;
         return;
+    }
+
+    /* The MCU loses the RAM-only lens profile on reset; re-push the last
+     * selection so relative-motion scaling stays consistent. */
+    if (g_profile_model != (uint32_t)HAL_LENS_MODEL_AF0832) {
+        ret = HAL_LENS_OPS.profile_set(g_mcu_ctx, (HalLensModel)g_profile_model);
+        if (ret != 0) {
+            fprintf(stderr, "HAL_LENS_BRIDGE: profile re-push after MCU reset failed: %d\n",
+                    ret);
+            HAL_MCU_OPS.deinit(g_mcu_ctx);
+            g_mcu_ctx = NULL;
+            return;
+        }
     }
 
     g_consecutive_errors = 0;
@@ -294,6 +312,59 @@ int hal_bridge_zf_sync_run(int io_handle,
         .fs_micro_steps = fs_micro_steps,
     };
     int ret = HAL_LENS_OPS.zf_sync_run(g_mcu_ctx, &params);
+    TRACK_MCU_ERROR(ret);
+    return ret;
+}
+
+/* ── Lens profile & physical relative motion ──────────────── */
+
+int hal_bridge_profile_set(int io_handle, uint32_t model) {
+    (void)io_handle;
+    if (g_mcu_ctx == NULL) return -1;
+    int ret = HAL_LENS_OPS.profile_set(g_mcu_ctx, (HalLensModel)model);
+    TRACK_MCU_ERROR(ret);
+    if (ret == 0) {
+        g_profile_model = model;
+    }
+    return ret;
+}
+
+int hal_bridge_profile_get(int io_handle, HalLensProfileInfo *info) {
+    (void)io_handle;
+    if (g_mcu_ctx == NULL || info == NULL) return -1;
+    int ret = HAL_LENS_OPS.profile_get(g_mcu_ctx, info);
+    TRACK_MCU_ERROR(ret);
+    return ret;
+}
+
+int hal_bridge_zoom_rel(int io_handle, uint16_t pps, int32_t steps) {
+    (void)io_handle;
+    if (g_mcu_ctx == NULL) return -1;
+    HalLensPhysicalMotion m = {.pps = pps, .steps = steps};
+    int ret = HAL_LENS_OPS.zoom_rel(g_mcu_ctx, &m);
+    TRACK_MCU_ERROR(ret);
+    return ret;
+}
+
+int hal_bridge_focus_rel(int io_handle, uint16_t pps, int32_t steps) {
+    (void)io_handle;
+    if (g_mcu_ctx == NULL) return -1;
+    HalLensPhysicalMotion m = {.pps = pps, .steps = steps};
+    int ret = HAL_LENS_OPS.focus_rel(g_mcu_ctx, &m);
+    TRACK_MCU_ERROR(ret);
+    return ret;
+}
+
+int hal_bridge_dual_rel(int io_handle,
+                        uint16_t zoom_pps, int32_t zoom_steps,
+                        uint16_t focus_pps, int32_t focus_steps) {
+    (void)io_handle;
+    if (g_mcu_ctx == NULL) return -1;
+    HalLensDualPhysicalMotion m = {
+        .zoom  = {.pps = zoom_pps,  .steps = zoom_steps},
+        .focus = {.pps = focus_pps, .steps = focus_steps},
+    };
+    int ret = HAL_LENS_OPS.dual_rel(g_mcu_ctx, &m);
     TRACK_MCU_ERROR(ret);
     return ret;
 }

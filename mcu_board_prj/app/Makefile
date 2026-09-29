@@ -84,6 +84,10 @@ C_SOURCES += Custom/Lib/cJSON/cJSON.c
 C_SOURCES += Custom/Components/rs485_driver/rs485_driver.c
 C_SOURCES += Custom/Components/ms41908m/ms41908m.c
 C_SOURCES += Custom/Components/ms41908m/ms41908m_port.c
+C_SOURCES += Custom/Components/lens/lens_profile.c
+C_SOURCES += Custom/Components/lens/lens_profile_af0832.c
+C_SOURCES += Custom/Components/lens/lens_profile_fg2009.c
+C_SOURCES += Custom/Components/lens/lens_controller.c
 C_SOURCES += Custom/Components/host_link/host_link_core.c
 C_SOURCES += Custom/Components/host_link/host_link_port_freertos.c
 C_SOURCES += Custom/Components/cmd_console/cmd_console.c
@@ -121,6 +125,7 @@ C_INCLUDES := \
 	-ICustom/Components/bsp_ctrl \
 	-ICustom/Components/an41908a_af \
 	-ICustom/Components/ms41908m \
+	-ICustom/Components/lens \
 	-ICustom/Components/host_link \
 	-ICustom/Components/rs485_driver \
 	-ICustom/Components/ota_host \
@@ -215,7 +220,7 @@ clean:
 	@rm -rf $(BUILD_DIR)
 
 info:
-	@echo "TARGET=$(TARGET) BUILD_DIR=$(BUILD_DIR)"
+	@echo "TARGET=$(TARGET) BUILD_DIR=$(BUILD_DIR) LENS_PROFILES=AF0832,FG2009 DEFAULT=AF0832"
 	@echo "C sources: $(words $(C_SOURCES))  ASM: $(words $(ASM_SOURCES))"
 
 -include $(call rwildcard,$(BUILD_DIR),*.d)

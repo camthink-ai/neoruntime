@@ -24,10 +24,29 @@ struct ModelEntry {
     std::string  name;                  // Display name for the model
     std::string  path;
 
+    // Registration identity (model_type + variant exactly as registered).
+    // Co-ownership of the same id+path is only valid while these match: a
+    // differing re-registration would have the gRPC layer's
+    // init_post_process rewire the shared postprocess session to the new
+    // configuration, corrupting decode for the incumbent owner(s).
+    std::string  model_type;
+    std::string  variant;
+
+    // App-bundled model (extracted from an app image by app-manager).
+    // Transient models are hidden from the model page: platform-api's
+    // syncRuntimeModelsToDB skips them, so they never reach platform.db.
+    // Set at first registration; co-ownership re-registrations keep the
+    // stored value (a model already loaded under a visibility contract
+    // keeps it).
+    bool         transient = false;
+
     HalInferenceSession* infer_session = nullptr;  // HAL v2 inference session
     PostprocessSession   post_session;              // HAL v2 postprocess session
 
     HalModelInfo model_info{};
+    // NPU batch the HAL session was configured with (HalInferenceConfig).
+    // 1 = single-frame; >1 requires InferBatch (grouped into one NPU job).
+    uint32_t     batch_size = 1;
     int          ref_count  = 0;
     int64_t      load_time  = 0;        // Unix timestamp
 };
@@ -40,6 +59,7 @@ struct ModelSnapshot {
     HalPostprocessType     post_type     = HAL_POST_TYPE_NONE;
     HalModelInfo           model_info{};
     int                    num_outputs   = 0;
+    uint32_t               batch_size    = 1;
 };
 
 /// Thread-safe model lifecycle manager backed by HAL ops.
@@ -53,19 +73,47 @@ public:
     ~ModelManager();
 
     /// Register (load) a model. If owner_id is non-empty, it tracks ownership.
-    /// If the model is already loaded by another owner, this just adds co-ownership.
-    /// Returns 0 on success, <0 on error.
+    /// If the model is already loaded by another owner from the SAME path,
+    /// this just adds co-ownership; the same id under a different path is a
+    /// collision and is refused (the incumbent's weights must not silently
+    /// serve the new registrant). So is the same id+path with a different
+    /// registration identity (model_type/variant): re-initializing the
+    /// shared postprocess session to the new configuration would corrupt
+    /// decode for the incumbent owner(s).
+    /// transient marks an app-bundled model (hidden from the model page).
+    /// variant is the model's postprocess variant blob; for detections its
+    /// backend_function is forwarded to the HAL inference session so NMS output
+    /// tensors are named after the selected vendor function, not the file path.
+    /// batch_size configures the HAL inference session's NPU batch (>1 is only
+    /// valid for batch-compiled HEFs — registration verifies the reported
+    /// input byte_size equals batch x single-frame and refuses otherwise;
+    /// InferBatch then groups B frames into one NPU job). The batch is part of
+    /// the registration identity: a re-registration at a different batch is
+    /// refused like any other identity mismatch.
+    /// Returns 0 for a fresh registration, 1 when the identical entry was
+    /// already loaded and only ownership changed, <0 on error; why (optional)
+    /// carries the human-readable refusal reason.
     int register_model(const std::string& model_id, const std::string& model_path,
-                       const std::string& owner_id = "");
+                       const std::string& owner_id = "",
+                       bool transient = false,
+                       const std::string& variant = "",
+                       const std::string& model_type = "",
+                       std::string* why = nullptr,
+                       uint32_t batch_size = 1);
 
-    /// Unregister (unload) a model. If owner_id is given, only removes that owner.
-    /// The model is physically unloaded only when no owners remain AND ref_count == 0.
+    /// Unregister (unload) a model. With owner_id, an absent owner is an
+    /// idempotent no-op; other owners keep the model resident; the last owner
+    /// is removed atomically with physical unload and is retained when a live
+    /// inference ref_count refuses that unload. An empty owner_id requests a
+    /// system-level unload but still respects ref_count. Returns 0 only when
+    /// the physical model was removed, 1 for an idempotent/co-owner logical
+    /// release that leaves it resident, and <0 on refusal.
     int unregister_model(const std::string& model_id, const std::string& owner_id = "");
 
-    /// Force unregister all models, ignoring ref_count.
-    /// Destroys all HAL sessions and clears model registry.
+    /// Unregister all models atomically when none has a live inference ref.
+    /// Returns false without changing any registry state if any model is busy.
     /// Used before GenAI session creation to free NPU resources.
-    void force_unregister_all();
+    bool force_unregister_all();
 
     /// Check if a specific owner has ownership of a model.
     bool is_owner(const std::string& model_id, const std::string& owner_id) const;
@@ -102,7 +150,10 @@ public:
 
     /// Submit asynchronous inference. The NPU scheduler runs the job and
     /// invokes @p callback (from a HailoRT thread) once outputs are ready; the
-    /// caller MUST keep @p inputs/@p outputs alive until the callback fires.
+    /// callback may run before run_async() returns. The caller MUST keep
+    /// @p inputs/@p outputs alive until both the callback and this call have
+    /// returned. On a failing return or exception, the backend must not start a
+    /// callback after unwinding, though a callback may already have completed.
     /// Returns HAL_OK (0) on submission success, <0 if the HAL has no async
     /// path or submission failed.
     int run_async(HalInferenceSession* session,
@@ -138,12 +189,34 @@ public:
 
     bool has_post_ops() const;
 
+    /// HAL inference ops table — for service-layer tensor manipulation that
+    /// needs ops beyond the wrapped helpers (e.g. bind_dma_frame on
+    /// buffer_id inputs). May be null only before load.
+    const HalInferenceOps* infer_ops() const { return infer_ops_; }
+
+    /// Tail-member availability under the ops-table ABI guard: pass
+    /// offsetof(HalInferenceOps, <member>). With no loader (ops tables
+    /// injected directly in tests) the table is assumed complete.
+    bool has_infer_op(size_t member_offset) const {
+        return loader_ ? loader_->has_infer_op(member_offset) : true;
+    }
+
     /// Check if HAL supports async inference (run_async != nullptr).
     bool has_async() const;
 
     /// Update postprocess configuration at runtime (e.g., CLIP zero-shot prompts).
     /// Calls HAL's apply_config_json on the model's postprocess session.
     int update_postprocess_config(const std::string& model_id, const std::string& config_json);
+
+    /// Records a post-process run failure for a model and returns whether the
+    /// caller should emit a log line now. Rate-limits the journal: true on the
+    /// first failure and every kPostFailLogInterval-th thereafter, false in
+    /// between (a broken plugin fails per frame; logging every frame floods).
+    /// When count_out is non-null it receives the failure count after this
+    /// call (for the "failure #N" log line). The status flip on the response
+    /// is NOT rate-limited — only logging is.
+    bool note_post_failure(const std::string& model_id, int rc,
+                           uint64_t* count_out = nullptr);
 
     /// Query system-level NPU/CPU performance stats from HAL.
     /// Returns 0 on success, <0 if unavailable.
@@ -174,6 +247,10 @@ private:
     std::unordered_map<HalInferenceSession*, int>   infer_refs_;  // infer_session -> refcount
     std::unordered_map<HalPostprocessSession*, int> post_refs_;   // post_session  -> refcount
 
+    // Post-process run failures per model id, for note_post_failure's
+    // rate-limited logging. Guarded by mu_ (unique).
+    std::unordered_map<std::string, uint64_t> post_fail_counts_;
+
     // Require mu_ held. Bump/drop the session refcount; destroy via HAL ops
     // only when the count reaches zero.
     void add_infer_locked(HalInferenceSession* s);
@@ -182,12 +259,19 @@ private:
     void release_post_locked(HalPostprocessSession* s);
 };
 
-/// RAII guard: releases model ref_count on destruction.
+/// RAII guard prepared before model acquisition and armed only after the
+/// acquisition succeeds. Copying the id therefore cannot leak an acquired ref.
 struct ModelGuard {
     ModelManager* mgr = nullptr;
     std::string   id;
+    bool          armed = false;
+
     ModelGuard(ModelManager* m, const std::string& i) : mgr(m), id(i) {}
-    ~ModelGuard() { if (mgr) mgr->release_model(id); }
+    ~ModelGuard() { if (mgr && armed) mgr->release_model(id); }
+
+    void arm() noexcept { armed = true; }
+    void disarm() noexcept { armed = false; }
+
     ModelGuard(const ModelGuard&) = delete;
     ModelGuard& operator=(const ModelGuard&) = delete;
 };

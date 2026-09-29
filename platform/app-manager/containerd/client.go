@@ -26,10 +26,12 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/containerd/containerd/snapshots"
+	"github.com/opencontainers/image-spec/identity"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -244,6 +246,32 @@ func (c *Client) TagImage(ctx context.Context, sourceRef, targetRef string) erro
 	}
 
 	logger.Info("Tagged image: %s -> %s", sourceRef, targetRef)
+	return nil
+}
+
+// EnsureImageUnpacked unpacks an already-imported image into overlayfs
+// snapshots when it has none. ImportImage only unpacks the first image of a
+// multi-image archive, so references satisfied from later entries still need
+// their snapshots before CreateContainer can use them. Like ImportImage, an
+// unpack error is not fatal here — the image may already be unpacked, and a
+// genuinely broken unpack resurfaces at container creation.
+func (c *Client) EnsureImageUnpacked(ctx context.Context, ref string) error {
+	ctx = namespaces.WithNamespace(ctx, c.namespace)
+
+	image, err := c.client.GetImage(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("failed to get image %s: %w", ref, err)
+	}
+	unpacked, err := image.IsUnpacked(ctx, "overlayfs")
+	if err != nil {
+		return fmt.Errorf("failed to check unpack state for %s: %w", ref, err)
+	}
+	if unpacked {
+		return nil
+	}
+	if err := image.Unpack(ctx, "overlayfs"); err != nil {
+		logger.Warn("Failed to unpack image %s (may already be unpacked): %v", ref, err)
+	}
 	return nil
 }
 
@@ -657,6 +685,112 @@ func normalizeImageRef(ref string) string {
 func (c *Client) GetImage(ctx context.Context, imageName string) (containerd.Image, error) {
 	ctx = namespaces.WithNamespace(ctx, c.namespace)
 	return c.client.GetImage(ctx, imageName)
+}
+
+// ExtractFileFromImage copies a single regular file out of an image's rootfs
+// into destDir and returns the destination path. Used by the install flow to
+// pull app-bundled model files (spec.models.<alias>.path) out of the app
+// image so they can be registered with ai-runtime as transient models.
+//
+// The image rootfs is exposed through a readonly overlayfs view snapshot,
+// mounted at a temporary mount point, and both are always released on exit.
+// containerPath must be absolute and clean (validated by the manifest layer);
+// symlinks and non-regular files are rejected so an in-image symlink cannot
+// resolve against the host filesystem.
+func (c *Client) ExtractFileFromImage(ctx context.Context, imageRef, containerPath, destDir string) (string, error) {
+	ctx = namespaces.WithNamespace(ctx, c.namespace)
+
+	image, err := c.client.GetImage(ctx, imageRef)
+	if err != nil {
+		return "", fmt.Errorf("failed to get image %s: %w", imageRef, err)
+	}
+
+	// Ensure the layer chain has snapshots. Both install paths (PullImage /
+	// ImportImage) already unpack, so this is normally cheap; like
+	// ImportImage, treat an unpack failure as non-fatal and let Prepare
+	// decide (the image may already be unpacked).
+	if err := image.Unpack(ctx, "overlayfs"); err != nil {
+		logger.Warn("ExtractFileFromImage: unpack reported an error for %s (may already be unpacked): %v", imageRef, err)
+	}
+
+	diffIDs, err := image.RootFS(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve image rootfs for %s: %w", imageRef, err)
+	}
+	parent := identity.ChainID(diffIDs).String()
+
+	snapshotter := c.client.SnapshotService("overlayfs")
+	viewKey := fmt.Sprintf("extract-%s-%d", parent, time.Now().UnixNano())
+	// Registered before the unmount defer so it runs last (LIFO): the mount
+	// must be released before the backing view snapshot is removed.
+	defer func() {
+		if err := snapshotter.Remove(ctx, viewKey); err != nil {
+			logger.Warn("ExtractFileFromImage: failed to remove view snapshot %s: %v", viewKey, err)
+		}
+	}()
+
+	mounts, err := snapshotter.View(ctx, viewKey, parent)
+	if err != nil {
+		return "", fmt.Errorf("failed to create readonly view of image %s: %w", imageRef, err)
+	}
+
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create extraction dir %s: %w", destDir, err)
+	}
+	mountPoint := filepath.Join(destDir, ".extract-mount")
+	if err := os.MkdirAll(mountPoint, 0700); err != nil {
+		return "", fmt.Errorf("failed to create mount point %s: %w", mountPoint, err)
+	}
+	defer func() {
+		if err := mount.UnmountAll(mountPoint, 0); err != nil {
+			logger.Warn("ExtractFileFromImage: failed to unmount %s: %v", mountPoint, err)
+		}
+		if err := os.Remove(mountPoint); err != nil && !os.IsNotExist(err) {
+			logger.Warn("ExtractFileFromImage: failed to remove mount point %s: %v", mountPoint, err)
+		}
+	}()
+
+	if err := mount.All(mounts, mountPoint); err != nil {
+		return "", fmt.Errorf("failed to mount image rootfs at %s: %w", mountPoint, err)
+	}
+
+	src := filepath.Join(mountPoint, containerPath)
+	srcInfo, err := os.Lstat(src)
+	if err != nil {
+		return "", fmt.Errorf("file %s not found in image %s: %w", containerPath, imageRef, err)
+	}
+	if !srcInfo.Mode().IsRegular() {
+		// Rejects symlinks (which would resolve against the host), dirs and
+		// devices alike: a bundled model must be a plain file in the image.
+		return "", fmt.Errorf("%s in image %s is not a regular file (mode %s)", containerPath, imageRef, srcInfo.Mode())
+	}
+
+	destPath := filepath.Join(destDir, filepath.Base(containerPath))
+	if err := copyFile(destPath, src, srcInfo.Mode().Perm()); err != nil {
+		return "", fmt.Errorf("failed to extract %s from image %s: %w", containerPath, imageRef, err)
+	}
+	logger.Info("Extracted %s from image %s to %s (%d bytes)", containerPath, imageRef, destPath, srcInfo.Size())
+	return destPath, nil
+}
+
+// copyFile streams src into dst using the given permission bits.
+func copyFile(dst, src string, perm os.FileMode) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open source: %w", err)
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return fmt.Errorf("create destination: %w", err)
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return fmt.Errorf("copy contents: %w", err)
+	}
+	return dstFile.Sync()
 }
 
 // CreateContainer creates a new container with the specified configuration

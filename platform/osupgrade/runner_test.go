@@ -452,7 +452,7 @@ func configureTestBackup(t *testing.T, runner *Runner, dir string) {
 	}
 	appManifestPath := filepath.Join(sourceRoot, "opt", "aipc", "app-manifest.json")
 	if err := os.WriteFile(appManifestPath, []byte(
-		`{"app_version":"1.2.0","machine":"hailo15-ne503","required_compat_level":1,"supported_data_schema":[1],"target_data_schema":1}`,
+		`{"app_version":"1.2.0","machine":"hailo15-ne503","min_os_version":"1.10.0","max_os_version":"1.20.0","supported_data_schema":[1],"target_data_schema":1}`,
 	), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -485,8 +485,7 @@ func configureTestBackup(t *testing.T, runner *Runner, dir string) {
 		t.Fatal(err)
 	}
 	job.Machine = "hailo15-ne503"
-	job.CompatLevel = 1
-	job.DataSchema = 1
+	job.AppVersion = "1.2.0"
 	if err := runner.Store.Save(job); err != nil {
 		t.Fatal(err)
 	}

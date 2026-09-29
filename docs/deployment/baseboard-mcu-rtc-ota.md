@@ -138,9 +138,9 @@ timeout, the wrapper kills the child, logs `rc=124` or `rc=137`, and still exits
 
 ## Independence from `aipc-cli system disable`
 
-`aipc-cli system disable` only stops/disables the six runtime daemons in
-`aipcServices` (`event-bus`, `app-manager`, `ai-runtime`, `camera-daemon`,
-`device-control`, `platform-api`). `aipc-mcu-prep` is **not** in that list, so
+`aipc-cli system disable` stops/disables the runtime units in `aipcServices`
+(the set mirrored from `scripts/aipc-autostart.sh`) plus
+`aipc-autostart.service` itself. `aipc-mcu-prep` is **not** in that set, so
 disabling the platform leaves RTC sync and MCU OTA running at every boot. This
 is intentional: MCU firmware currency and clock sanity are baseboard concerns,
 not platform-runtime concerns.

@@ -9,7 +9,7 @@ a remote caller reads matches what the device actually does.
 
 ```bash
 python3 run_conformance.py \
-    --host 192.168.93.48 --username admin --password password \
+    --host 192.168.1.10 --username admin --password password \
     --swagger ./swagger.yaml        # repo copy, or scp the device's
     --report-dir ./reports          # ./reports/report.{json,md}
 ```

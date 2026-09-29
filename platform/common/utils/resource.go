@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,9 @@ func ParseCPU(cpu string) (float64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("invalid CPU percentage: %s", cpu)
 		}
+		if math.IsNaN(percent) || math.IsInf(percent, 0) || percent <= 0 {
+			return 0, fmt.Errorf("CPU percentage must be greater than zero: %s", cpu)
+		}
 		return percent / 100.0, nil
 	}
 
@@ -25,6 +29,9 @@ func ParseCPU(cpu string) (float64, error) {
 	cores, err := strconv.ParseFloat(cpu, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid CPU value: %s", cpu)
+	}
+	if math.IsNaN(cores) || math.IsInf(cores, 0) || cores <= 0 {
+		return 0, fmt.Errorf("CPU value must be greater than zero: %s", cpu)
 	}
 
 	return cores, nil
@@ -50,6 +57,9 @@ func ParseMemory(memory string) (int64, error) {
 			if err != nil {
 				return 0, fmt.Errorf("invalid memory value: %s", memory)
 			}
+			if value <= 0 || value > math.MaxInt64/multiplier {
+				return 0, fmt.Errorf("memory value must be greater than zero and fit in int64: %s", memory)
+			}
 			return value * multiplier, nil
 		}
 	}
@@ -58,6 +68,9 @@ func ParseMemory(memory string) (int64, error) {
 	bytes, err := strconv.ParseInt(memory, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid memory value: %s", memory)
+	}
+	if bytes <= 0 {
+		return 0, fmt.Errorf("memory value must be greater than zero: %s", memory)
 	}
 
 	return bytes, nil

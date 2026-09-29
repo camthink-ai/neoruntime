@@ -143,6 +143,41 @@ static int stub_lens_unsubscribe(void *mcu_ctx)
     STUB();
 }
 
+static int stub_profile_set(void *mcu_ctx, HalLensModel model)
+{
+    (void)mcu_ctx;
+    (void)model;
+    STUB();
+}
+
+static int stub_profile_get(void *mcu_ctx, HalLensProfileInfo *out_profile)
+{
+    (void)mcu_ctx;
+    (void)out_profile;
+    STUB();
+}
+
+static int stub_zoom_rel(void *mcu_ctx, const HalLensPhysicalMotion *motion)
+{
+    (void)mcu_ctx;
+    (void)motion;
+    STUB();
+}
+
+static int stub_focus_rel(void *mcu_ctx, const HalLensPhysicalMotion *motion)
+{
+    (void)mcu_ctx;
+    (void)motion;
+    STUB();
+}
+
+static int stub_dual_rel(void *mcu_ctx, const HalLensDualPhysicalMotion *motion)
+{
+    (void)mcu_ctx;
+    (void)motion;
+    STUB();
+}
+
 static const char *stub_lens_get_version(void)
 {
     return "HAL-LENS stub 2.0.0 (platform stub)";
@@ -171,4 +206,9 @@ HalLensOps HAL_LENS_OPS = {
     .subscribe = stub_lens_subscribe,
     .unsubscribe = stub_lens_unsubscribe,
     .get_version = stub_lens_get_version,
+    .profile_set = stub_profile_set,
+    .profile_get = stub_profile_get,
+    .zoom_rel = stub_zoom_rel,
+    .focus_rel = stub_focus_rel,
+    .dual_rel = stub_dual_rel,
 };

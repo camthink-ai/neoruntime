@@ -61,9 +61,15 @@ runtime and loader configuration always come from the new OS image.
 - `aipc-os-updater.service` writes only the inactive A/B copy. A failed
   `swupdate` never changes the selected boot copy.
 - `aipc-os-reboot.service` records the rebooting state before reboot.
-- `aipc-os-verify.service` checks the selected copy, OS version,
-  `platform-api`, `camera-daemon`, and persistent data for 60 seconds. A
-  failure selects the previous copy and reboots.
+- `aipc-os-verify.service` first runs `aipc-os-updater needs-verify`. Ordinary
+  boots and stale terminal jobs skip without pulling in any runtime service;
+  a pending post-boot verify/rollback job explicitly restarts
+  `aipc-autostart`, then checks the selected copy, OS version, restore
+  completion, and service health for 60 seconds. A failure selects the
+  previous copy and reboots. Application compatibility is advisory here —
+  an incompatible app yields terminal `success` with
+  `compatibility_valid=false` and skips the health window (see
+  [Unconditional OS upgrade](#unconditional-os-upgrade-and-self-healing)).
 - `aipc-restore.service` is embedded in the OS and runs before
   `network-pre.target`. It verifies `SHA256SUMS`, restores network/SSH and the
   system-configuration whitelist first, then rebuilds executable links while
@@ -75,6 +81,112 @@ runtime and loader configuration always come from the new OS image.
 
 The bootloader must also enforce a finite boot-attempt counter. Userspace
 verification cannot recover a target image that never reaches systemd.
+
+## Application compatibility model
+
+OS upgrades and application (AIPC package) upgrades answer compatibility in
+opposite directions:
+
+- **OS upgrades are unconditional.** Application compatibility never blocks,
+  fails, or rolls back an OS upgrade. An incompatible app is recorded on the
+  job (`compatibility_valid=false` + `compatibility_warning`) and surfaced in
+  the web UI; adapting the application afterwards is the operator's job.
+- **Application upgrades must be compatible** with the running OS before they
+  may install.
+
+### Version-range contract
+
+The app manifest (`opt/aipc/app-manifest.json` inside the package, installed
+at `/data/aipc/app-manifest.json`) declares a closed OS version range:
+
+```json
+{
+  "machine": "hailo15-ne503",
+  "product": "ne503",
+  "min_os_version": "1.12.0",
+  "max_os_version": "1.14.0",
+  "target_data_schema": 2,
+  "supported_data_schema": [1, 2]
+}
+```
+
+Both bounds must be strict `x.y.z` (three numeric components) and are compared
+semantically (`1.9.0 < 1.10.0`). Checks, in order:
+
+| Check | Failure code |
+|---|---|
+| `/etc/aipc-os-release` exists but has no `MACHINE` or an invalid `OS_VERSION` | `APP_OS_METADATA_UNAVAILABLE` |
+| manifest absent from the package | `APP_MANIFEST_MISSING` |
+| bounds not `x.y.z`, or `min > max` | `APP_COMPATIBILITY_METADATA_INVALID` |
+| `machine` differs from the OS machine | `APP_MACHINE_MISMATCH` |
+| `product` differs (compared only when both sides are non-empty) | `APP_PRODUCT_MISMATCH` |
+| `min_os_version <= OS_VERSION <= max_os_version` fails | `APP_OS_VERSION_UNSUPPORTED` |
+| `supported_data_schema` does not contain the current data schema (falls back to `target_data_schema` when the schema file is absent) | `APP_DATA_SCHEMA_UNSUPPORTED` |
+
+Legacy images with no `/etc/aipc-os-release` at all allow the install with a
+warning. Packaging defaults `min_os_version = max_os_version = <current OS
+version>` (`AIPC_OS_VERSION ?= 1.12.0` in the Makefile), which is equivalent
+to an exact match; widen the range explicitly when a package is known to span
+OS versions.
+
+The same rules are enforced at three points — API advisory, API hard gate, and
+an on-device backstop that cannot be bypassed through the API:
+
+1. `OTAParseFirmware` (advisory): the parse response carries
+   `compatibility: {valid, error_code?, message?, os_version,
+   app_min_os_version, app_max_os_version}` so the UI can show *why* a package
+   is incompatible before install.
+2. `performOTAUpgrade` (hard gate): install is refused before `systemd-run`
+   when the verdict is invalid.
+3. `scripts/deploy.sh check_package_compatibility` (backstop): re-checks the
+   extracted package on the device.
+4. `aipc-compat-check` as `ExecStartPre` on every app unit (hard gate): an
+   incompatible app can install but its services stay down.
+
+### Minimal mutual exclusion
+
+The two upgrade pipelines may not mutate the system at the same time:
+
+- An OS job in a non-terminal state (including `ready` and `awaiting_reboot`)
+  rejects app firmware installs — upload and parse stay available.
+- A non-terminal app OTA job rejects OS installs — upload and validate stay
+  available.
+
+## Unconditional OS upgrade and self-healing
+
+Application compatibility is advisory at every OS-upgrade decision point:
+
+| Stage | Behaviour |
+|---|---|
+| `validate` | SWU↔device checks (machine/product/signature/build-time/downgrade) stay hard; the installed app's verdict is recorded as `compatibility_valid` + warning and the job still reaches `ready` |
+| install | no application-compatibility check |
+| `aipc-restore.service` | advisory — the backup is restored even when it was taken from an app built for another OS range, otherwise the rescue channel would die with it |
+| `aipc-os-verify.service` | OS self-checks stay hard (booted copy, OS version, restore `.done` marker, real-failure rollback); the booted-app verdict is advisory — an incompatible app yields terminal `success` with `compatibility_valid=false` and skips the service health window |
+| service start | every app unit keeps its hard `aipc-compat-check` `ExecStartPre` except `platform-api`, which runs the check `--warn-only` because it *is* the rescue channel |
+
+Self-healing path after a cross-version OS upgrade:
+
+```text
+OS upgrade completes -> reboot -> restore runs (advisory)
+  -> incompatible app units held down by their ExecStartPre gate
+  -> platform-api starts (warn-only gate) and serves the web UI
+  -> UI shows compatibility_valid=false + warning on the OS job
+  -> operator installs an app package whose range covers the new OS
+  -> gates pass, services start, device is healthy again
+```
+
+If no compatible package is available, the previous A/B copy can still be
+re-selected (bootloader rollback) — an unconditional OS upgrade never removes
+that option.
+
+Accepted costs of this design:
+
+- A single `[min, max]` range cannot exclude a specific bad middle version;
+  narrow the range around it instead.
+- When the OS moves past `max_os_version`, older app packages stop installing
+  and must be repackaged with a raised range.
+- Packages that only carry the removed `required_compat_level` field are
+  rejected with `APP_COMPATIBILITY_METADATA_INVALID` and must be rebuilt.
 
 ## Production configuration
 

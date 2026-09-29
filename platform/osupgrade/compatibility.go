@@ -20,19 +20,24 @@ const (
 	DefaultDataSchemaPath     = "/data/aipc-data/schema-version"
 )
 
+// OSCompatibility describes the running OS image as declared in
+// /etc/aipc-os-release. Only the fields the app-side range check needs are
+// parsed; legacy AIPC_COMPAT_LEVEL / DATA_SCHEMA keys are ignored.
 type OSCompatibility struct {
-	OSVersion   string
-	Machine     string
-	Product     string
-	CompatLevel int
-	DataSchema  int
+	OSVersion string
+	Machine   string
+	Product   string
 }
 
+// AppManifest is the compatibility declaration shipped inside an app package
+// at opt/aipc/app-manifest.json. MinOSVersion/MaxOSVersion form a closed
+// range of supported OS versions (x.y.z, compared semantically).
 type AppManifest struct {
 	AppVersion          string `json:"app_version"`
 	Machine             string `json:"machine"`
 	Product             string `json:"product,omitempty"`
-	RequiredCompatLevel int    `json:"required_compat_level"`
+	MinOSVersion        string `json:"min_os_version"`
+	MaxOSVersion        string `json:"max_os_version"`
 	SupportedDataSchema []int  `json:"supported_data_schema"`
 	TargetDataSchema    int    `json:"target_data_schema"`
 }
@@ -52,23 +57,16 @@ func LoadOSCompatibility(path string) (*OSCompatibility, error) {
 		return nil, err
 	}
 	values := parseKeyValue(string(data))
-	compatLevel, err := positiveInt(values["AIPC_COMPAT_LEVEL"], "AIPC_COMPAT_LEVEL")
-	if err != nil {
-		return nil, err
-	}
-	dataSchema, err := positiveInt(values["DATA_SCHEMA"], "DATA_SCHEMA")
-	if err != nil {
-		return nil, err
-	}
 	result := &OSCompatibility{
-		OSVersion:   values["OS_VERSION"],
-		Machine:     values["MACHINE"],
-		Product:     values["PRODUCT"],
-		CompatLevel: compatLevel,
-		DataSchema:  dataSchema,
+		OSVersion: values["OS_VERSION"],
+		Machine:   values["MACHINE"],
+		Product:   values["PRODUCT"],
 	}
 	if result.Machine == "" {
 		return nil, fmt.Errorf("MACHINE is missing from %s", path)
+	}
+	if !isValidOSVersion(result.OSVersion) {
+		return nil, fmt.Errorf("OS_VERSION %q in %s is missing or not in x.y.z form", result.OSVersion, path)
 	}
 	return result, nil
 }
@@ -82,13 +80,33 @@ func LoadAppManifest(path string) (*AppManifest, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseAppManifest(data)
+}
+
+// LoadAppManifestFile loads the manifest from exactly path, without the
+// installed-manifest fallback resolution of LoadAppManifest. Callers judging
+// an app package must evaluate the manifest that ships inside the package.
+func LoadAppManifestFile(path string) (*AppManifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return parseAppManifest(data)
+}
+
+func parseAppManifest(data []byte) (*AppManifest, error) {
 	var manifest AppManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil, fmt.Errorf("parse app manifest: %w", err)
 	}
-	if manifest.AppVersion == "" || manifest.Machine == "" || manifest.RequiredCompatLevel <= 0 ||
+	if manifest.AppVersion == "" || manifest.Machine == "" ||
+		!isValidOSVersion(manifest.MinOSVersion) || !isValidOSVersion(manifest.MaxOSVersion) ||
 		len(manifest.SupportedDataSchema) == 0 || manifest.TargetDataSchema <= 0 {
 		return nil, fmt.Errorf("app manifest is incomplete")
+	}
+	if cmp, err := CompareVersion(manifest.MinOSVersion, manifest.MaxOSVersion); err != nil || cmp > 0 {
+		return nil, fmt.Errorf("app manifest os version range is invalid (min %q, max %q)",
+			manifest.MinOSVersion, manifest.MaxOSVersion)
 	}
 	return &manifest, nil
 }
@@ -159,6 +177,11 @@ func ReadDataSchema(path string) (int, error) {
 	return positiveInt(strings.TrimSpace(string(data)), "data schema")
 }
 
+// CheckCompatibility judges an app package (or installed app) against the
+// running OS: machine/product must match, the OS version must fall inside the
+// app's declared [min, max] range, and the app must support the schema of the
+// data currently on disk. OS upgrades never call this as a gate; only the
+// app-side install path enforces it.
 func CheckCompatibility(target *OSCompatibility, app *AppManifest, currentSchema int) error {
 	if target == nil || app == nil {
 		return fmt.Errorf("compatibility metadata is unavailable")
@@ -175,25 +198,30 @@ func CheckCompatibility(target *OSCompatibility, app *AppManifest, currentSchema
 			Message: fmt.Sprintf("OS product %s does not match App product %s", target.Product, app.Product),
 		}
 	}
-	if target.CompatLevel != app.RequiredCompatLevel {
+	if belowMin, err := CompareVersion(target.OSVersion, app.MinOSVersion); err != nil || belowMin < 0 {
 		return &CompatibilityError{
-			Code: "APP_COMPAT_LEVEL_MISMATCH",
+			Code: "APP_OS_VERSION_UNSUPPORTED",
 			Message: fmt.Sprintf(
-				"OS compatibility level is %d, App requires %d",
-				target.CompatLevel,
-				app.RequiredCompatLevel,
+				"current OS %s is below the app minimum %s (supported range %s-%s)",
+				target.OSVersion, app.MinOSVersion, app.MinOSVersion, app.MaxOSVersion,
 			),
 		}
 	}
-	if target.DataSchema != currentSchema || app.TargetDataSchema != target.DataSchema ||
-		!containsInt(app.SupportedDataSchema, currentSchema) {
+	if aboveMax, err := CompareVersion(target.OSVersion, app.MaxOSVersion); err != nil || aboveMax > 0 {
+		return &CompatibilityError{
+			Code: "APP_OS_VERSION_UNSUPPORTED",
+			Message: fmt.Sprintf(
+				"current OS %s is above the app maximum %s (supported range %s-%s)",
+				target.OSVersion, app.MaxOSVersion, app.MinOSVersion, app.MaxOSVersion,
+			),
+		}
+	}
+	if !containsInt(app.SupportedDataSchema, currentSchema) {
 		return &CompatibilityError{
 			Code: "APP_DATA_SCHEMA_UNSUPPORTED",
 			Message: fmt.Sprintf(
-				"OS data schema is %d, current data schema is %d, App targets %d and supports %v",
-				target.DataSchema,
+				"current data schema is %d, App supports %v",
 				currentSchema,
-				app.TargetDataSchema,
 				app.SupportedDataSchema,
 			),
 		}
@@ -222,6 +250,48 @@ func positiveInt(value, field string) (int, error) {
 		return 0, fmt.Errorf("%s must be a positive integer", field)
 	}
 	return number, nil
+}
+
+// CompareVersion compares two x.y.z version strings semantically (1.9.0 <
+// 1.10.0). It returns -1 when a < b, 0 when a == b, and 1 when a > b.
+func CompareVersion(a, b string) (int, error) {
+	aParts, err := parseVersionParts(a)
+	if err != nil {
+		return 0, fmt.Errorf("version %q: %w", a, err)
+	}
+	bParts, err := parseVersionParts(b)
+	if err != nil {
+		return 0, fmt.Errorf("version %q: %w", b, err)
+	}
+	for index := 0; index < len(aParts); index++ {
+		if aParts[index] != bParts[index] {
+			if aParts[index] < bParts[index] {
+				return -1, nil
+			}
+			return 1, nil
+		}
+	}
+	return 0, nil
+}
+
+func isValidOSVersion(value string) bool {
+	_, err := parseVersionParts(value)
+	return err == nil
+}
+
+func parseVersionParts(value string) ([3]int, error) {
+	var parts [3]int
+	segments := strings.Split(strings.TrimSpace(value), ".")
+	if len(segments) != 3 {
+		return parts, fmt.Errorf("must be x.y.z with numeric components")
+	}
+	for index, segment := range segments {
+		if segment == "" || strings.Trim(segment, "0123456789") != "" {
+			return parts, fmt.Errorf("component %q is not a non-negative integer", segment)
+		}
+		parts[index], _ = strconv.Atoi(segment)
+	}
+	return parts, nil
 }
 
 func containsInt(values []int, wanted int) bool {

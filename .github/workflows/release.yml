@@ -14,6 +14,16 @@ on:
         required: false
         type: boolean
         default: true
+      min_os_version:
+        description: Minimum supported OS version.
+        required: false
+        type: string
+        default: '1.12.0'
+      max_os_version:
+        description: Maximum supported OS version.
+        required: false
+        type: string
+        default: '1.12.0'
 
 permissions:
   contents: write
@@ -38,9 +48,13 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BUILD_MCU_FW_INPUT: ${{ inputs.build_mcu_fw }}
+          AIPC_MIN_OS_VERSION_INPUT: ${{ inputs.min_os_version }}
+          AIPC_MAX_OS_VERSION_INPUT: ${{ inputs.max_os_version }}
         run: |
           VERSION_INPUT="${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}"
           VERSION="${VERSION_INPUT:-${GITHUB_REF_NAME}}"
+          AIPC_MIN_OS_VERSION="${AIPC_MIN_OS_VERSION_INPUT:-1.12.0}"
+          AIPC_MAX_OS_VERSION="${AIPC_MAX_OS_VERSION_INPUT:-1.12.0}"
           BUILD_MCU_FW=1
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$BUILD_MCU_FW_INPUT" != "true" ]; then
             BUILD_MCU_FW=0
@@ -49,12 +63,24 @@ jobs:
           make docker-pack-release \
             DOCKER_RELEASE_IMAGE="$DOCKER_RELEASE_IMAGE" \
             VERSION="$VERSION" \
-            BUILD_MCU_FW="$BUILD_MCU_FW"
+            BUILD_MCU_FW="$BUILD_MCU_FW" \
+            AIPC_MIN_OS_VERSION="$AIPC_MIN_OS_VERSION" \
+            AIPC_MAX_OS_VERSION="$AIPC_MAX_OS_VERSION"
+
+      - name: Resolve artifact version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          RAW="${VERSION_INPUT:-${GITHUB_REF_NAME}}"
+          RAW="${RAW##*/}"   # release/v1.1.0 -> v1.1.0 (artifact names must not contain '/')
+          RAW="${RAW#v}"     # normalize to exactly one leading 'v'
+          echo "FIRMWARE_VERSION=v${RAW}" >> "$GITHUB_ENV"
 
       - name: Upload firmware package
         uses: actions/upload-artifact@v4
         with:
-          name: hailo-firmware
+          name: neoruntime-hailo-firmware-${{ env.FIRMWARE_VERSION }}
           path: build/release/neoruntime-hailo15-*.tar.gz
 
       - name: Publish GitHub release

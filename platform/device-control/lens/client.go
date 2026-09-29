@@ -285,6 +285,55 @@ func (c *LensClient) IsAF0832Bootstrapped() bool {
 	return resp.Bootstrapped
 }
 
+// ── Lens profile & FG2009 open-loop helpers ─────────────────────────────
+
+func (c *LensClient) ProfileGet() (hal.LensProfile, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := c.client.ProfileGet(ctx, &pb.Empty{})
+	if err != nil {
+		return hal.LensProfile{}, err
+	}
+	return hal.LensProfile{
+		Model:            resp.Model,
+		Relative:         resp.Relative,
+		Ircut:            resp.Ircut,
+		ZoomTravelSteps:  resp.ZoomTravelSteps,
+		FocusTravelSteps: resp.FocusTravelSteps,
+		MaxZoomRatio:     resp.MaxZoomRatio,
+	}, nil
+}
+
+func (c *LensClient) ZoomGotoRatio(zoomRatio float32, pps uint16) error {
+	return c.simple(func(ctx context.Context) (*pb.HalStatus, error) {
+		return c.client.ZoomGotoRatio(ctx, &pb.ZoomGotoRatioRequest{
+			Ratio: zoomRatio,
+			Pps:   uint32(pps),
+		})
+	})
+}
+
+func (c *LensClient) FocusGotoLevel(level float32, pps uint16) error {
+	return c.simple(func(ctx context.Context) (*pb.HalStatus, error) {
+		return c.client.FocusGotoLevel(ctx, &pb.FocusGotoLevelRequest{
+			Level: level,
+			Pps:   uint32(pps),
+		})
+	})
+}
+
+func (c *LensClient) ZoomMoveRel(pps uint16, steps int32) error {
+	return c.simple(func(ctx context.Context) (*pb.HalStatus, error) {
+		return c.client.ZoomMoveRel(ctx, &pb.MotorRunRequest{Pps: uint32(pps), Steps: steps})
+	})
+}
+
+func (c *LensClient) FocusMoveRel(pps uint16, steps int32) error {
+	return c.simple(func(ctx context.Context) (*pb.HalStatus, error) {
+		return c.client.FocusMoveRel(ctx, &pb.MotorRunRequest{Pps: uint32(pps), Steps: steps})
+	})
+}
+
 func (c *LensClient) SetAfWindows(config hal.AfWindowsConfig) error {
 	return fmt.Errorf("SetAfWindows: not yet supported by lens HAL bridge")
 }
@@ -335,6 +384,7 @@ func protoToState(s *pb.LensState) hal.LensState {
 		FocusRzDone: s.FocusRzDone,
 		ZoomPos:     s.ZoomPos,
 		FocusPos:    s.FocusPos,
+		FixedLens:   s.FixedLens,
 	}
 }
 
@@ -343,6 +393,11 @@ type HalError struct {
 	Code int32
 	Msg  string
 }
+
+// HAL_ERR_NOT_SUPPORTED from hal_v2/include/common/hal_common.h. A capability
+// rejection is permanent: retry/recovery loops must not fire for it (retrying
+// AF0832-only RPCs on the fg2009 reinitialized the lens per attempt).
+const HalErrNotSupported int32 = -2807
 
 func (e *HalError) Error() string {
 	return fmt.Sprintf("hal error %d: %s", e.Code, e.Msg)

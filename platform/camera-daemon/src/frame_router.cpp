@@ -97,7 +97,8 @@ void FrameRouter::unsubscribe(SubscriberId id) {
     }
 }
 
-void FrameRouter::on_frame_arrived(const std::string& stream_name, HalFrameBuffer* frame) {
+void FrameRouter::on_frame_arrived(const std::string& stream_name, HalFrameBuffer* frame,
+                                   uint32_t frame_flags) {
     // --- Fast path: shallow copy metadata, enqueue, release HAL buffer ---
     {
         std::lock_guard<std::mutex> lock(frame_clock_mu_);
@@ -138,6 +139,7 @@ void FrameRouter::on_frame_arrived(const std::string& stream_name, HalFrameBuffe
     mf->ref_count.store(active_count, std::memory_order_relaxed);
     mf->lend_time = std::chrono::steady_clock::now();
     mf->frame_id = next_frame_id_.fetch_add(1);
+    mf->flags = frame_flags;
 
     if (watchdog_) {
         watchdog_->track(mf->frame_id, mf->lend_time);

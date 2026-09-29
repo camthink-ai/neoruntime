@@ -21,10 +21,15 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 #include <memory>
 #include <atomic>
+#include <functional>
 #include <mutex>
+#include <optional>
+#include <condition_variable>
 #include <shared_mutex>
+#include <thread>
 #include <cstdint>
 #include <ctime>
 #include <chrono>
@@ -36,6 +41,7 @@ extern "C" {
 #include "media/hal_media.h"
 #include "peripheral/devices/hal_sensor.h"
 #include "peripheral/hal_mcu.h"
+#include "peripheral/devices/hal_lens_fg2009.h"
 }
 
 #ifdef HAS_GRPC
@@ -48,6 +54,8 @@ class CameraControlServiceImpl;
 class HalLoader;
 #include "audio_service.h"
 #include "autofocus_controller.h"
+#include "illumination_controller.h"
+#include "daynight_policy.h"
 class VideoSource;
 class FrameRouter;
 class FrameWatchdog;
@@ -59,6 +67,10 @@ class EncodedPublisher;
 class AiOverlaySubscriber;
 class AudioService;
 class DpmWorker;
+class DspService;
+#include "dsp_service.h"
+class InjectionService;
+#include "injection_service.h"
 struct AudioCfg;
 
 #ifdef HAS_GRPC
@@ -150,11 +162,20 @@ struct DaemonConfig {
     std::string fd_pub_sock_path;
     uint32_t    fd_pub_max_clients;
     uint32_t    fd_pub_max_outstanding;
+    uint32_t    fd_pub_lease_ms;
 
     // Watchdog
     uint32_t    watchdog_scan_ms;
     uint32_t    watchdog_timeout_ms;
     uint32_t    watchdog_warn_ms;
+
+    // DSP offload service (P2: `dsp:` YAML section; defaults in dsp_service.h)
+    DspServiceConfig dsp;
+
+    // App frame injection (P0: `injection:` YAML section; defaults in
+    // injection_service.h). Master gate ships OFF — see the wiring TODOs
+    // in injection_service.cpp.
+    InjectionServiceConfig injection;
 
     // RTSP
     bool        rtsp_enabled;
@@ -173,11 +194,31 @@ struct DaemonConfig {
     bool        ai_overlay_draw_confidence = true;
     bool        ai_overlay_draw_landmarks = true;
     bool        ai_overlay_enable_face_blur = false;
+    uint32_t    ai_overlay_face_blur_block_size = 8;   // mosaic cell size (px); 0 = blur
     uint32_t    ai_overlay_box_thickness = 2;
     // Stream mapping: inference_stream_id → display_encoder_stream
     // e.g. "third" → "main" means results from stream_id="third" drawn on "main" encoder.
     // If empty, auto-generated from configured streams (all → first encoder stream).
     std::unordered_map<std::string, std::string> ai_overlay_stream_map;
+    // Behavior decoupling (output-isolation scope cut): platform result
+    // events ("ai-runtime"/"auto-infer" publishers) draw only when their
+    // infer stream is explicitly bound here (infer → display, same
+    // direction as stream_map) or the legacy switch is on. App events
+    // (SDK publish) are always admitted. Static yaml only — never an
+    // UpdateAiOverlay RPC knob.
+    bool        ai_overlay_legacy_auto_bind = false;
+    std::map<std::string, std::string> ai_overlay_bindings;
+    // Result validity window (ms). 0 = derive per stream: per-result ttl
+    // (event metadata) > stream override (ai_overlay_stream_result_ttls) >
+    // this global > round(2000/fps) from the stream config > 500ms fallback.
+    uint32_t    ai_overlay_result_ttl_ms = 0;
+    std::unordered_map<std::string, uint32_t> ai_overlay_stream_result_ttls;
+    // Strict frame-lock (P1-6): identity-fed display streams (stream_map
+    // D→D) wait — bounded — for the frame's own inference result at the
+    // bake site. Wait cap 0 = derive (2 frame periods, clamp [1,500] ms);
+    // expiry degrades to preview semantics with a rate-limited warning.
+    bool        ai_overlay_strict_frame_lock = false;
+    uint32_t    ai_overlay_strict_wait_cap_ms = 0;
 
     // Logging
     std::string log_level;
@@ -199,7 +240,102 @@ struct DaemonConfig {
     int32_t     lens_focus_min     = -844;
     int32_t     lens_focus_max     = 592;
 
+    // Lens product model (factory-fixed, from /data/aipc/etc/product.yaml).
+    // "af0832" (legacy default when product.yaml is absent) | "fg2009".
+    std::string lens_model = "af0832";
+    // FG2009 open-loop bootstrap geometry (bench-calibrated, yaml-overridable)
+    HalLensFg2009Params lens_fg2009 = {};
+    // FG2009 focus-tracking curve CSV (zoom_step,focus_step; empty = default)
+    std::string lens_fg2009_focus_curve_path;
+    // FG2009 one-shot autofocus tunables.  Injected over the shared
+    // autofocus: section when lens_model == "fg2009" (geometry overrides
+    // min/max_focus_pos unconditionally; these code defaults win over the
+    // shared section so af0832 packages are unaffected).  yaml-overridable
+    // via lens.fg2009.af_* keys for bench tuning without a rebuild.
+    int lens_fg2009_af_coarse_step = 40;
+    // Local coarse window around the curve landing, tiered by zoom ratio:
+    // below 1.95x span 200 (~11 samples at step 40); at/above it the window
+    // compresses to 150 — at high magnification the depth of field is thin,
+    // so wide sweeps hold the image far out of focus through most probes
+    // (seen as long blur stretches in the stream).
+    int lens_fg2009_af_coarse_span = 150;
+    int lens_fg2009_af_coarse_span_low_zoom = 200;
+    float lens_fg2009_af_coarse_span_zoom_threshold = 1.95f;
+    int lens_fg2009_af_fine_span = 48;
+    // 700 pps: measurably quieter than 900 with no focus-quality cost —
+    // scan moves are short, travel time stays well inside move_timeout.
+    int lens_fg2009_af_pps = 700;
+    int lens_fg2009_af_move_timeout_ms = 15000;
+    // Trust the curve landing: accept the first scan without the
+    // confidence gate and never re-scan.
+    float lens_fg2009_af_confidence_accept = 0.0f;
+    int lens_fg2009_af_balanced_retry = 0;
+    // Run one refinement one-shot right after the boot park lands on the
+    // curve (the job queues immediately and waits for the lens to park).
+    int lens_fg2009_af_boot_oneshot = 1;
+
+    // Image-sharpness probe (motorized vs fixed lens): when the iris probe
+    // files the unit under the no-iris group, a short focus jog observed
+    // through the ISP AF statistics decides whether a focus motor answered
+    // (statistics dip and return) or nothing is attached (statistics flat on
+    // a textured scene). Runs deferred after the lens parks and the boot
+    // autofocus pass completes; bench-tunable via lens.image_probe.* keys.
+    // An inconclusive verdict (slow MCU init, transient AF activity, low
+    // texture) retries with backoff instead of stranding the identity for
+    // the whole boot — the fg2009 default would leave motor controls live
+    // on a motorless lens.
+    int lens_image_probe_enabled = 1;
+    int lens_image_probe_steps = 250;       // focus jog, curve steps each way
+    int lens_image_probe_frames = 5;        // frames per measurement point
+    int lens_image_probe_settle_ms = 400;   // mechanical settle after a jog
+    int lens_image_probe_pps = 600;
+    int lens_image_probe_ready_timeout_ms = 300000;  // lens+AF+stats readiness
+    int lens_image_probe_move_timeout_ms = 15000;
+    int lens_image_probe_retries = 4;       // extra attempts when inconclusive
+    int lens_image_probe_retry_interval_ms = 60000;  // backoff between attempts
+
+    // Headless-boot lens self-init (lens.self_init_enabled). The FG2009
+    // bootstrap otherwise only runs when lens API traffic reaches
+    // device-control's ensureLensBootstrapped; on a boot nobody polls the
+    // lens stays uninitialized forever (overnight 2026-09-21 incident:
+    // fixed lens shipped motorized UI until the first page view). AF0832
+    // keeps its legacy lazy init — its boot behavior is unchanged.
+    int lens_self_init_enabled = 1;
+    uint32_t lens_image_probe_texture_floor = 3000;  // raw AF sum, bench-calibrated
+    float lens_image_probe_motor_ratio = 0.25f;  // dip depth that proves a motor
+    float lens_image_probe_flat_ratio = 0.08f;   // flat band (gate + stability)
+    float lens_image_probe_return_ratio = 0.15f; // return-to-baseline tolerance
+    float lens_image_probe_luma_guard_ratio = 0.20f; // AE-shift rejection band
+
+    // Lens position persistence: archive the last user-settled zoom/focus
+    // (event-driven — the recorder arms on issued motion and writes only
+    // after the motors settle and the position actually changed) and replay
+    // it at boot instead of the config-derived startup position, followed by
+    // one autofocus pass. Survives deploys: /data/aipc/etc/*.json is not
+    // rewritten by deploy.sh.
+    bool lens_position_persistence = true;
+
     AutofocusConfig autofocus;
+    IlluminationConfig infrared;
+    LightSensorConfig light_sensor;
+};
+
+/* Operator-selected day/night mode (distinct from the optical ImagingMode):
+ * Auto = light-sensor driven; Day/Infrared = forced optical state. */
+enum class SelectedMode {
+    Auto,
+    Day,
+    Infrared,
+};
+const char* selected_mode_name(SelectedMode mode);
+SelectedMode parse_selected_mode(const std::string& text);
+
+/** IR preset = snapshot of (zoom position + near/far IR intensity) for one-click recall. */
+struct IrPresetEntry {
+    std::string name;
+    float zoom_ratio = 1.0f;   // 1.0 ~ 2.88
+    uint32_t near_pwm = 0;     // 0 ~ 100
+    uint32_t far_pwm = 0;      // 0 ~ 100
 };
 
 /* ========== Camera Daemon ========== */
@@ -246,8 +382,14 @@ public:
 
     /**
      * @brief Update transform configuration via HAL_MEDIA_OPS
+     *
+     * @param persisted_ok  optional out: true only when the applied config was
+     *   also durably mirrored (HAS_GRPC builds). False on every apply failure
+     *   and on a mirror-write failure — init uses this to decide whether the
+     *   lens hint may advance (avoiding a hint/mirror split-brain).
      */
-    bool set_transform_config(const aipc::camera::TransformConfig& config);
+    bool set_transform_config(const aipc::camera::TransformConfig& config,
+                              bool* persisted_ok = nullptr);
 
     /**
      * @brief Set a single scalar profile field at runtime (platform-owned config knob).
@@ -305,7 +447,10 @@ public:
      * @brief Update AI overlay configuration - hot reload
      */
     bool update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence,
-                                   uint32_t box_thickness);
+                                   uint32_t box_thickness,
+                                   std::optional<bool> enable_face_blur = {},
+                                   std::optional<bool> strict_frame_lock = {},
+                                   std::optional<uint32_t> strict_wait_cap_ms = {});
 
 #ifdef HAS_GRPC
     /**
@@ -335,6 +480,20 @@ public:
     // Reapply the cached web OSD after MediaLibrary recreates encoder/blender
     // objects. Also clears vendor profile defaults on active encoders first.
     bool reapply_osd_config_after_pipeline_rebuild(const char* reason);
+    // Reapply the persisted web-tuned ISP state after a pipeline rebuild that
+    // reloaded the active profile's IQ defaults (profile switch, MediaLibrary
+    // reinit, stream layout change, pipeline reconfigure; in-place changes
+    // like transform rotation re-push harmlessly). cached_isp_state_ and the
+    // isp_config.json mirror still hold the web values and get_isp_config()
+    // serves that cache, so without a re-push the web UI shows values the
+    // hardware no longer has, and the next daemon start replays them onto
+    // whatever profile is active. No-op when the mirror is absent (the user
+    // never tuned ISP; the fresh profile defaults must be kept). Skips with
+    // a WARNING when video_source_'s video context no longer belongs to the
+    // rebuilt pipeline (some paths recreate MediaLibrary without rebinding
+    // the source; update_isp_settings would write through the dangling ctx).
+    // Best-effort: a failure logs and never fails the rebuild caller.
+    bool reapply_isp_config_after_pipeline_rebuild(const char* reason);
 
     // Privacy-mask/DPM config persistence — best-effort disk mirror of the last
     // config applied via set_privacy_mask_config so web-configured static regions
@@ -364,11 +523,21 @@ public:
     // required. Both helpers live under #ifdef HAS_GRPC (same as the OSD/privacy
     // helpers); the persist call site inside set_transform_config carries its own
     // #ifdef guard.
-    void persist_transform_config(const aipc::camera::TransformConfig& req);
-    // load_transform_config: read the mirror at startup; returns false on
-    // missing (INFO), unparseable (WARNING + Clear), or identity (all fields at
-    // their defaults — nothing to reapply) — never aborts init.
-    bool load_transform_config(aipc::camera::TransformConfig* req);
+    // Persist the transform config WITH the lens it was written for in ONE
+    // atomic file (v2 wrapper {"lens_model", "transform"}), so transform and
+    // lens attribution can never be observed split. Returns false on
+    // serialize/write/rename failure so the caller knows nothing durable
+    // landed; a failure never aborts the already-applied HAL transform.
+    bool persist_transform_config(const aipc::camera::TransformConfig& req,
+                                  const std::string& lens_model);
+    // load_transform_config: read the mirror at startup; *lens_model receives
+    // the embedded v2 lens attribution ("" for v1/legacy mirrors → the caller
+    // falls back to the sidecar hint). Returns false on missing (INFO) or
+    // unparseable (WARNING + Clear) — never aborts init. An all-identity
+    // config still returns true: the media pipeline seeds image settings from
+    // the profile iq_settings (dewarp defaults to enabled), so the identity
+    // state must be replayed to actually hold.
+    bool load_transform_config(aipc::camera::TransformConfig* req, std::string* lens_model);
 
     // Scalar config-field persistence — best-effort disk mirror of the last
     // web-configured scalar profile knobs (frontend.hailort.use-hailort-service and
@@ -458,6 +627,22 @@ public:
     bool set_led_duty(uint32_t led_id, uint32_t duty_percent);
     bool get_led_duty(uint32_t led_id, uint32_t& duty_percent);
 
+    bool set_imaging_mode(ImagingMode mode, std::string* message = nullptr);
+    bool set_infrared_manual(uint32_t near_pwm, uint32_t far_pwm,
+                             std::string* message = nullptr);
+    bool clear_infrared_manual(std::string* message = nullptr);
+    bool set_infrared_auto_follow(bool enabled, std::string* message = nullptr);
+    IlluminationStatus get_illumination_status() const;
+
+    // Day/night auto (light-sensor) policy
+    bool set_selected_mode(const std::string& mode, std::string* message = nullptr);
+    bool set_light_thresholds(int night_enter, int day_enter, std::string* message = nullptr);
+
+    // IR preset save/load (zoom + IR intensity snapshot), persisted on the device.
+    std::vector<IrPresetEntry> list_ir_presets(std::string* error = nullptr);
+    bool save_ir_preset(const IrPresetEntry& preset, std::string* error = nullptr);
+    bool delete_ir_preset(const std::string& name, std::string* error = nullptr);
+
     // Device hardware status
     bool get_device_hardware_status(aipc::camera::DeviceHardwareStatus& status);
 
@@ -468,6 +653,10 @@ public:
     /** Access HAL loader for peripheral ops (env_ctrl, alarm, rs485). */
     HalLoader* hal_loader() const { return hal_loader_.get(); }
     AudioService* audio_service() const { return audio_service_.get(); }
+    /** App-facing DSP offload service (null when HAL lacks DSP/buffer ops). */
+    DspService* dsp_service() const { return dsp_service_.get(); }
+    /** App frame injection service (null when DSP registry is off). */
+    InjectionService* injection_service() const { return injection_service_.get(); }
 
 #ifdef HAS_GRPC
     /**
@@ -502,6 +691,7 @@ public:
 private:
     void try_share_lens_mcu_ctx();
     void init_mcu_context();
+    void* refresh_autofocus_video_context();
 
     DaemonConfig config_;
     std::atomic<bool> running_{false};
@@ -522,6 +712,22 @@ private:
     // Remains held while op_mu_ is temporarily released around blocking HAL calls.
     // This prevents two ReconfigurePipeline RPCs from entering MediaLibrary concurrently.
     std::mutex pipeline_reconfig_mu_;
+    // Serializes the full body of add_stream()/remove_stream()/
+    // reconfigure_pipeline()/reconfigure_encoder()/update_encoder_config().
+    // op_mu_ is intentionally released around blocking HAL calls in these
+    // paths, so without this guard a concurrent remove_stream +
+    // reconfigure_pipeline can interleave: reconfigure rebuilds
+    // config_.encoders from a codec list that still contains the stream being
+    // removed, resurrecting it as enabled=true right before remove finishes
+    // tearing down its HAL encoder -- every later AddStream for that stream
+    // is then rejected by the "already exists" guard until daemon restart.
+    // Held for the whole function; RAII covers every return path. Lock order:
+    // stream_op_mu_ -> pipeline_reconfig_mu_ -> op_mu_. NOT covered (known
+    // follow-ups): switch_profile() (has its own profile_switch_mu_ + throttle),
+    // set_transform_config()'s rotation_full_reinit path, and the AF worker's
+    // refresh_autofocus_video_context() (takes pipeline_reconfig_mu_ + op_mu_
+    // only, so it can still interleave with a stream add/remove HAL rebuild).
+    std::mutex stream_op_mu_;
     // Serializes the full body of switch_profile() (HAL switch + post-switch frame
     // verify + rollback). op_mu_ is intentionally released through the HAL-call and
     // verify/rollback windows, so without this guard a second concurrent profile
@@ -559,6 +765,18 @@ private:
     std::unique_ptr<OsdManager>     osd_mgr_;
     std::unique_ptr<EncoderManager> encoder_mgr_;
     std::unique_ptr<FdPublisher>    fd_pub_;
+    std::unique_ptr<DspService>     dsp_service_;
+    // Frame injection (PushFrame P0) — holds BufferPins against the DSP
+    // registry, so it must be destroyed BEFORE dsp_service_ (declared
+    // after it; members destruct in reverse order).
+    std::unique_ptr<InjectionService> injection_service_;
+    // Live per-stream encode dims, observed at the bake site and fed to
+    // InjectionService's best-effort stream_dims resolver (P2-12). The
+    // frame IS the authority — this cache just answers push-time
+    // geometry questions before the first frame of a restarted stream.
+    // shared_mutex: the frame path reads it every frame, pushes are rare.
+    mutable std::shared_mutex stream_dims_mu_;
+    std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> stream_dims_;
     std::shared_ptr<RtspServer>     rtsp_server_;
     std::unique_ptr<EncodedPublisher> encoded_pub_;
     std::unique_ptr<AiOverlaySubscriber> ai_overlay_;
@@ -570,6 +788,22 @@ private:
     // ~1-2s) happen OUTSIDE the lock so the frontend thread never stalls.
     std::shared_ptr<DpmWorker>           dpm_worker_;
     mutable std::shared_mutex            dpm_mu_;
+    std::unique_ptr<IlluminationController> illumination_controller_;
+    mutable std::mutex imaging_mode_mu_;
+    std::string day_profile_before_infrared_;
+
+    // Day/night auto (light-sensor) policy
+    mutable std::mutex daynight_mu_;
+    mutable DayNightPolicyState daynight_state_;
+    mutable LightSensorConfig light_sensor_cfg_;   // runtime thresholds (adjustable)
+    SelectedMode selected_mode_ = SelectedMode::Day;
+    std::thread light_thread_;
+    std::atomic<bool> light_stop_{true};
+
+    // IR preset persistence (zoom + IR intensity snapshots)
+    mutable std::mutex ir_preset_mu_;
+    std::vector<IrPresetEntry> ir_presets_cache_;
+    bool ir_presets_loaded_ = false;
 
 #ifdef HAS_GRPC
     std::unique_ptr<CameraControlServiceImpl> camera_control_service_;
@@ -579,7 +813,83 @@ private:
     std::unique_ptr<grpc::Server> grpc_server_;
     void start_grpc_server();
     void stop_grpc_server();
+
+    // Lens position persistence. The recorder is armed by the lens service's
+    // motion listener (never by init/bootstrap parking), waits for the motors
+    // to settle, and writes /data/aipc/etc/lens_position.json atomically only
+    // when the position changed. The FG2009 restore replaces the boot
+    // one-shot when a model-matching archive exists (AF0832 restores through
+    // the autofocus startup seed instead).
+    struct ArchivedLensPosition {
+        std::string model;
+        float zoom_ratio = 0.0f;
+        int32_t zoom_pos = 0;
+        int32_t focus_pos = 0;
+        int64_t saved_at = 0;  // epoch seconds
+        bool valid() const { return !model.empty(); }
+    };
+    ArchivedLensPosition load_archived_lens_position();
+    bool save_archived_lens_position(const ArchivedLensPosition& pos);
+    void start_lens_position_recorder();
+    void stop_lens_position_recorder();
+    void lens_position_recorder_loop();
+    ArchivedLensPosition lens_archive_cache_;  // guarded by lens_recorder_mu_
+    std::thread lens_recorder_thread_;
+    std::mutex lens_recorder_mu_;
+    std::condition_variable lens_recorder_cv_;
+    std::atomic<bool> lens_recorder_dirty_{false};
+    std::atomic<bool> lens_recorder_stop_{true};
+
+    void fg2009_restore_loop(ArchivedLensPosition pos);
+    std::thread fg2009_restore_thread_;
+    std::atomic<bool> fg2009_restore_stop_{true};
+    // True while the archived-position restore thread is between spawn and
+    // exit. The restore moves run outside any autofocus job, so the image
+    // probe waits on this flag before it starts measuring.
+    std::atomic<bool> fg2009_restore_active_{false};
+
+    // Stage-2 lens identity: the iris probe files the no-iris group as
+    // fg2009; this deferred probe separates a real motorized FG2009 from a
+    // fixed-focus lens (electrically identical) using the image sensor as
+    // the feedback channel. Runs once after the boot autofocus pass parks
+    // the lens; a FixedLens verdict marks the lens controller and every
+    // motor motion request is rejected from then on.
+    void lens_image_probe_loop();
+    std::thread lens_image_probe_thread_;
+    std::atomic<bool> lens_image_probe_stop_{true};
+
+    // Headless-boot lens self-init (FG2009): waits out a short grace period
+    // so an RPC trigger from device-control wins if lens traffic shows up,
+    // then runs the Init sequence in-process so the restore and image-probe
+    // threads have an initialized lens to wait on. Joined before the lens
+    // service is torn down (the hook below points into it).
+    void lens_boot_ensure_loop();
+    std::thread lens_boot_ensure_thread_;
+    std::atomic<bool> lens_boot_ensure_stop_{true};
+    std::function<int()> lens_ensure_bootstrapped_;  // bundle hook; valid while lens_hal_service_ lives
 #endif
+
+    bool switch_profile_internal(const std::string& profile_name, bool restart_af,
+                                 std::string* message);
+    bool set_led_duty_raw(uint32_t led_id, uint32_t duty_percent);
+    double current_zoom_ratio() const;
+
+    // FG2009: zoom-motion observer target — replays the IR zoom-follow LUT
+    // at the new ratio (the AF0832 path gets this for free from the AF
+    // zoom-follow job; the open-loop lens has no AF, so the LensHAL service
+    // notifies us instead). Runs on the caller's thread with the lens mutex
+    // held: must not call back into the lens controller.
+    void on_fg2009_zoom_moved(double zoom_ratio);
+
+    // Day/night auto (light-sensor) policy
+    void start_light_monitor();
+    void stop_light_monitor();
+    void light_monitor_loop();
+    LightSample read_light_sample();
+
+    // IR preset persistence helpers (callers hold ir_preset_mu_)
+    void load_ir_presets_locked(std::string* error = nullptr);
+    bool write_ir_presets_locked(std::string* error = nullptr);
 
     struct FpsTracker {
         uint64_t frame_count = 0;

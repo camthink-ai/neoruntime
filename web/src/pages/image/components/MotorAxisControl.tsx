@@ -18,6 +18,8 @@ interface MotorAxisControlProps {
   canDecrement: boolean;
   canIncrement: boolean;
   disabled?: boolean;
+  /** Granularity of the +/- buttons and slider drag, in percent of range. */
+  stepPercent?: number;
 }
 
 export default function MotorAxisControl({
@@ -30,11 +32,12 @@ export default function MotorAxisControl({
   canDecrement,
   canIncrement,
   disabled,
+  stepPercent = STEP_PERCENT,
 }: MotorAxisControlProps) {
   const isDisabled = disabled || busy;
 
   const handleStep = async (direction: -1 | 1) => {
-    const next = clamp(level + direction * STEP_PERCENT, 0, 100);
+    const next = clamp(level + direction * stepPercent, 0, 100);
     onLevelChange(next);
     await onCommit(clamp01(next / 100));
   };
@@ -61,7 +64,7 @@ export default function MotorAxisControl({
           value={[level]}
           min={0}
           max={100}
-          step={1}
+          step={stepPercent}
           disabled={isDisabled}
           onValueChange={values => {
             const next =              Array.isArray(values) && Number.isFinite(values[0])

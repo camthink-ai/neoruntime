@@ -19,9 +19,11 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <unordered_map>
 #include <vector>
 #include <memory>
+#include <chrono>
 
 namespace aipc::ai_runtime {
 
@@ -32,6 +34,25 @@ namespace aipc::ai_runtime {
 struct FdGroup {
     std::vector<int> fds;
     ~FdGroup();
+};
+
+struct FrameDeliveryState;
+
+class FrameDelivery {
+public:
+    FrameDelivery() = default;
+
+    /// Idempotently acknowledge this subscriber's delivery. The final delivery
+    /// acknowledgement sends one RELEASE for the physical frame.
+    void acknowledge() const noexcept;
+    explicit operator bool() const noexcept { return static_cast<bool>(state_); }
+
+private:
+    explicit FrameDelivery(std::shared_ptr<FrameDeliveryState> state)
+        : state_(std::move(state)) {}
+
+    std::shared_ptr<FrameDeliveryState> state_;
+    friend class FdReceiver;
 };
 
 struct ReceivedFrame {
@@ -46,6 +67,7 @@ struct ReceivedFrame {
     uint32_t sizes[3];
     
     std::shared_ptr<FdGroup> fd_group;
+    FrameDelivery delivery;
 };
 
 using FrameCallback = std::function<void(const ReceivedFrame& frame)>;
@@ -70,54 +92,76 @@ public:
     void unsubscribe(const std::string& stream_name,
                      const std::string& subscriber_id);
 
+    /// Deadline-aware unsubscribe used by bounded shutdown paths. Returns false
+    /// until callbacks and retained frame deliveries have drained, including when
+    /// called from the subscriber's own callback (whose removal is deferred).
+    bool unsubscribe_until(
+        const std::string& stream_name,
+        const std::string& subscriber_id,
+        std::chrono::steady_clock::time_point deadline);
+
     /// Legacy single-subscriber unsubscribe.
     void unsubscribe(const std::string& stream_name);
-
-    /// Increment reference count for a frame (called internally for each subscriber).
-    void ref_frame(const std::string& stream_name, uint64_t frame_id);
-
-    /// Decrement reference count and send RELEASE when it reaches zero.
-    void release_frame(const std::string& stream_name, uint64_t frame_id);
 
     /// Number of active subscribers for a stream.
     int subscriber_count(const std::string& stream_name) const;
 
+    /// Whether the stream's physical publisher connection is still receiving.
+    bool stream_connected(const std::string& stream_name) const;
+
+    /// Stop every stream and wait for receive threads to exit. When invoked by a
+    /// receive callback, that callback's own stream is stopped asynchronously
+    /// after the callback returns because a thread cannot join itself.
     void stop_all();
 
 private:
+    struct SubscriberDrainState {
+        size_t active_callbacks = 0;
+        size_t outstanding_deliveries = 0;
+        bool removed = false;
+    };
+
     struct Subscriber {
         std::string   id;
         FrameCallback callback;
+        std::shared_ptr<SubscriberDrainState> drain;
+        bool          removed = false;
     };
 
     struct StreamConn {
-        std::string              stream_name;
-        int                      sock_fd = -1;
-        std::thread              recv_thread;
-        std::atomic<bool>        running{false};
-        std::mutex               sub_mu;          // protects subscribers
-        std::vector<Subscriber>  subscribers;
+        std::string                              stream_name;
+        int                                      sock_fd = -1;
+        std::thread                              recv_thread;
+        std::thread::id                          recv_thread_id;
+        std::atomic<bool>                        running{false};
+        std::timed_mutex                         send_mu; // serializes control messages and close
+        std::timed_mutex                         teardown_mu;
+        std::timed_mutex                         sub_mu; // protects subscribers and callback state
+        std::condition_variable_any              callback_cv;
+        std::timed_mutex                         exit_mu;
+        std::condition_variable_any              exit_cv;
+        bool                                     exited = false;
+        size_t                                   active_callbacks = 0;
+        size_t                                   outstanding_frames = 0;
+        bool                                     teardown_when_idle = false;
+        std::vector<std::shared_ptr<Subscriber>> subscribers;
+        std::unordered_map<std::string,
+                           std::shared_ptr<SubscriberDrainState>> subscriber_drains;
     };
 
     int  connect_to_server();
-    bool setup_stream_connection(const std::string& stream_name);
-    void teardown_stream_connection(StreamConn* conn);
-    void recv_loop(StreamConn* conn);
+    bool setup_stream_connection(
+        const std::string& stream_name,
+        const std::shared_ptr<Subscriber>& initial_subscriber);
+    bool teardown_stream_connection_until(
+        const std::shared_ptr<StreamConn>& conn,
+        std::chrono::steady_clock::time_point deadline);
+    void teardown_stream_connection(const std::shared_ptr<StreamConn>& conn);
+    static void recv_loop(std::shared_ptr<StreamConn> conn) noexcept;
 
     std::string socket_path_;
-    mutable std::mutex  mu_;
-    std::unordered_map<std::string, std::unique_ptr<StreamConn>> streams_;
-
-    // Per-frame reference counting: key = (stream_name << 32 | frame_id)
-    // When count reaches 0, RELEASE is sent to camera-daemon.
-    std::mutex frame_ref_mu_;
-    std::unordered_map<uint64_t, int> frame_refs_;
-
-    // Simple hash combining stream+frame_id
-    static uint64_t frame_ref_key(const std::string& stream, uint64_t fid) {
-        // Use a fast hash: mix stream hash with frame_id
-        return std::hash<std::string>{}(stream) ^ (fid * 0x9e3779b97f4a7c15ULL);
-    }
+    mutable std::timed_mutex mu_;
+    std::unordered_map<std::string, std::shared_ptr<StreamConn>> streams_;
 };
 
 }  // namespace aipc::ai_runtime

@@ -795,18 +795,11 @@ else
     warn "Journal bind not active — persistent journal unavailable this boot"
 fi
 
-# 6d. Enable the healthmon black-box sampler. Service startup is deliberately
-#     left to aipc-autostart.service, which runs only after this oneshot exits.
-#     Starting healthmon synchronously here would deadlock because healthmon is
-#     ordered After=aipc-firstboot.service.
-if systemctl list-unit-files 2>/dev/null | grep -q '^aipc-healthmon.service'; then
-    systemctl enable aipc-healthmon.service 2>/dev/null || true
-    info "aipc-healthmon enabled; aipc-autostart will start it"
-else
-    warn "aipc-healthmon.service not installed — black-box sampling disabled"
-fi
+# Runtime service lifecycle (including aipc-healthmon) belongs exclusively to
+# aipc-autostart and aipc-cli. Enabling a unit here would silently undo
+# `aipc-cli system disable` on a later boot.
 
-# 6e. Pin Docker's data-root to /data/docker. Docker defaults to /var/lib/docker
+# 6d. Pin Docker's data-root to /data/docker. Docker defaults to /var/lib/docker
 #     on the 3.3G root partition, where a few app images can fill root and
 #     trigger the 93.72 full-hang failure mode. This writes daemon.json so every
 #     boot (including post-reflash) keeps images/containers on the 54G /data

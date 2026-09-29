@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { toast } from 'sonner';
@@ -12,11 +12,10 @@ import {
 } from 'lucide-react';
 import {
   useAutofocusStatus,
-  useDeviceStatus,
+  useLensGotoZoomRatio,
   useLensStatus,
   useOneshotAutofocus,
   useSetFocusLevel,
-  useSetIrCut,
   useStartZoomFollow,
 } from '@/hooks/useDeviceControl';
 import type { LensStatus } from '@/services/api/device';
@@ -24,7 +23,6 @@ import { MotorState } from '@/services/api/device';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 // import { Separator } from '@/components/ui/separator';
-import { Switch } from '@/components/ui/switch';
 import { LensControlSkeleton } from './DeviceControlSkeletons';
 import {
   Tooltip,
@@ -39,6 +37,12 @@ import MotorAxisControl from './MotorAxisControl';
 
 const ZOOM_DISPLAY_MIN = 1.0;
 const ZOOM_DISPLAY_MAX = 2.88;
+
+// Fine-grained +/- and slider steps (percent of range per click): zoom 0.5%
+// ≈ 12 steps ≈ 0.006x; focus 1% (FG2009: 1% of the 2453-step travel ≈ 24
+// steps).
+const ZOOM_STEP_PERCENT = 0.5;
+const FOCUS_STEP_PERCENT = 1;
 
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 
@@ -56,12 +60,6 @@ function focusLevelFromStatus(s: LensStatus): number {
   const range = focus_limit.max_pos - focus_limit.min_pos;
   if (!Number.isFinite(range) || range <= 0) return 0;
   return clamp01((focus_pos - focus_limit.min_pos) / range);
-}
-
-function focusDirectionLabel(level: number): string {
-  if (level < 0.2) return 'NEAR';
-  if (level > 0.8) return 'FAR';
-  return 'MID';
 }
 
 // Backend autofocus status messages (camera-daemon autofocus_controller.cpp)
@@ -87,24 +85,37 @@ export default function LensControl() {
     isLoading: isDeviceLoading,
     refetch: refetchLensStatus,
   } = useLensStatus();
-  const { data: deviceStatus } = useDeviceStatus();
+
+  // FG2009 = open-loop lens: pure manual zoom/focus, no autofocus stack.
+  // An old backend without lens_model reports undefined → AF0832 behavior.
+  const isFg2009 = lensStatus?.lens_model === 'fg2009';
+  const zoomDisplayMax = lensStatus?.zoom_ratio_range?.max && lensStatus.zoom_ratio_range.max > 1
+    ? lensStatus.zoom_ratio_range.max
+    : ZOOM_DISPLAY_MAX;
+
   const { data: autofocusStatus } = useAutofocusStatus();
 
   const oneshotAutofocus = useOneshotAutofocus();
   const startZoomFollow = useStartZoomFollow();
+  const lensGotoZoomRatio = useLensGotoZoomRatio();
   const setFocusLevel = useSetFocusLevel();
-  const { mutate: setIrCut, isPending: isIrCutPending } = useSetIrCut();
 
   const [zoomPercent, setZoomPercent] = useState(0);
   const [focusPercent, setFocusPercent] = useState(0);
   const previousAfBusy = useRef(false);
 
-  const isNight =    deviceStatus?.ircut_mode === 'IRCUT_NIGHT'
-    || deviceStatus?.ircut_mode === 2;
-
   // ── Derived state ─────────────────────────────────────────────────
 
   const zLevel = useMemo(() => {
+    if (isFg2009) {
+      // Open-loop lens: the reported optical ratio comes straight from the
+      // position model — there is no autofocus anchor to consult.
+      const ratio = lensStatus?.zoom_ratio;
+      if (ratio != null && ratio >= ZOOM_DISPLAY_MIN && ratio <= zoomDisplayMax) {
+        return clamp01((ratio - ZOOM_DISPLAY_MIN) / (zoomDisplayMax - ZOOM_DISPLAY_MIN));
+      }
+      return lensStatus ? zoomLevelFromStatus(lensStatus) : 0;
+    }
     if (
       autofocusStatus?.anchor_valid
       && autofocusStatus.effective_ratio >= ZOOM_DISPLAY_MIN
@@ -116,32 +127,34 @@ export default function LensControl() {
       );
     }
     return lensStatus ? zoomLevelFromStatus(lensStatus) : 0;
-  }, [autofocusStatus?.anchor_valid, autofocusStatus?.effective_ratio, lensStatus]);
+  }, [autofocusStatus?.anchor_valid, autofocusStatus?.effective_ratio, isFg2009, lensStatus, zoomDisplayMax]);
   const fLevel = useMemo(
     () => (lensStatus ? focusLevelFromStatus(lensStatus) : 0),
     [lensStatus]
   );
 
+  // FG2009 focus: full travel, same as AF0832. The one-shot AF may land the
+  // true peak well outside the INF curve landing (wide end), so a narrowed
+  // +/-300 window around the landing would hide the sharp focus position.
+
   // Sync local percent from server when it changes
   const prevZ = useMemo(() => zLevel, [zLevel]);
   useEffect(() => {
-    setZoomPercent(Math.round(prevZ * 100));
+    setZoomPercent(prevZ * 100);
   }, [prevZ]);
 
-  const prevF = useMemo(() => fLevel, [fLevel]);
+  const prevF = fLevel;
   useEffect(() => {
-    setFocusPercent(Math.round(prevF * 100));
+    setFocusPercent(prevF * 100);
   }, [prevF]);
 
   const zoomRatioDisplay = useMemo(() => {
     const level = clamp01(zoomPercent / 100);
-    return ZOOM_DISPLAY_MIN + (ZOOM_DISPLAY_MAX - ZOOM_DISPLAY_MIN) * level;
-  }, [zoomPercent]);
+    return ZOOM_DISPLAY_MIN + (zoomDisplayMax - ZOOM_DISPLAY_MIN) * level;
+  }, [zoomPercent, zoomDisplayMax]);
 
-  const focusDisplay = useMemo(() => {
-    const dir = focusDirectionLabel(fLevel);
-    return `${Math.round(fLevel * 100)}% · ${dir}`;
-  }, [fLevel]);
+  // Plain percent over the full travel, FG2009 and AF0832 alike.
+  const focusDisplay = `${(fLevel * 100).toFixed(1)}%`;
 
   const afBusy = autofocusStatus?.busy ?? false;
   const isOneshotAF = afBusy
@@ -152,31 +165,40 @@ export default function LensControl() {
   const focusState: MotorState = lensStatus?.focus_state ?? MotorState.NoCfg;
 
   const hasMotorError =    zoomState === MotorState.Error || focusState === MotorState.Error;
-  const isMotorInitializing =    !isDeviceLoading
+
+  // AF0832 reports Running/ResetZero while it homes at boot, which deserves
+  // the full "initializing" card below. The FG2009 is open-loop: every
+  // ordinary zoom/focus move reports Running too, so there the same state
+  // only disables the sliders until the motors stop — no card takeover.
+  const motorsRunning =    zoomState === MotorState.Running
+    || focusState === MotorState.Running;
+  const isMotorInitializing =    !isFg2009
+    && !isDeviceLoading
     && !afBusy
     && !hasMotorError
-    && (zoomState === MotorState.Running
+    && (motorsRunning
       || zoomState === MotorState.ResetZero
-      || focusState === MotorState.Running
       || focusState === MotorState.ResetZero);
+  const isMotorMoving = isFg2009 && !hasMotorError && motorsRunning;
 
-  const isZoomBusy =    startZoomFollow.isPending || afBusy || isMotorInitializing || hasMotorError;
-  const isFocusBusy =    setFocusLevel.isPending || afBusy || isMotorInitializing || hasMotorError;
+  const isZoomBusy =    (isFg2009 ? lensGotoZoomRatio.isPending : startZoomFollow.isPending)
+    || afBusy || isMotorInitializing || isMotorMoving || hasMotorError;
+  const isFocusBusy =    setFocusLevel.isPending || afBusy || isMotorInitializing || isMotorMoving || hasMotorError;
 
   const canZoomIn =    lensStatus != null && lensStatus.zoom_pos < lensStatus.zoom_limit.max_pos;
   const canZoomOut =    lensStatus != null && lensStatus.zoom_pos > lensStatus.zoom_limit.min_pos;
   const canFocusNear =    lensStatus != null && lensStatus.focus_pos > lensStatus.focus_limit.min_pos;
   const canFocusFar =    lensStatus != null && lensStatus.focus_pos < lensStatus.focus_limit.max_pos;
 
-  // ── Poll while motors initializing ────────────────────────────────
+  // ── Poll while motors are moving ─────────────────────────────────
 
   useEffect(() => {
-    if (!isMotorInitializing) return;
+    if (!isMotorInitializing && !isMotorMoving) return;
     const timer = setInterval(() => {
       refetchLensStatus();
     }, 1000);
     return () => clearInterval(timer);
-  }, [isMotorInitializing, refetchLensStatus]);
+  }, [isMotorInitializing, isMotorMoving, refetchLensStatus]);
 
   useEffect(() => {
     if (previousAfBusy.current && !afBusy && autofocusStatus?.job_id) {
@@ -192,30 +214,6 @@ export default function LensControl() {
 
   // ── Handlers ──────────────────────────────────────────────────────
 
-  const handleToggleIrCut = useCallback(
-    (night: boolean) => {
-      setIrCut(night ? 'night' : 'day', {
-        onSuccess: () => {
-          toast.success(
-            t(
-              'sys.media_settings.ir_cut_success',
-              night ? 'Switched to night mode' : 'Switched to day mode'
-            )
-          );
-        },
-        onError: () => {
-          toast.error(
-            t(
-              'sys.media_settings.ir_cut_failed',
-              'Failed to switch IR-cut mode'
-            )
-          );
-        },
-      });
-    },
-    [setIrCut, t]
-  );
-
   const handleOneshotAutofocus = async () => {
     try {
       await oneshotAutofocus.mutateAsync();
@@ -230,6 +228,10 @@ export default function LensControl() {
 
   const handleResetZoom = async () => {
     setZoomPercent(0);
+    if (isFg2009) {
+      await lensGotoZoomRatio.mutateAsync(ZOOM_DISPLAY_MIN);
+      return;
+    }
     await startZoomFollow.mutateAsync(ZOOM_DISPLAY_MIN);
   };
 
@@ -299,6 +301,14 @@ export default function LensControl() {
         <h3 className="flex items-center gap-1.5 text-sm font-bold text-muted-foreground">
           <Aperture className="h-4 w-4" />
           {t('sys.device.lens.title', 'Lens Control')}
+          {isFg2009 && (
+            <span
+              className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-muted-foreground"
+              title={t('sys.device.lens.model_badge', 'Factory-fitted lens model')}
+            >
+              FG2009
+            </span>
+          )}
         </h3>
 
         <div className="flex items-center justify-between">
@@ -372,12 +382,17 @@ export default function LensControl() {
 
         <MotorAxisControl
           label={t('sys.ptz.zoom', 'Zoom')}
-          displayValue={`${zoomRatioDisplay.toFixed(1)}x`}
+          displayValue={`${zoomRatioDisplay.toFixed(2)}x`}
           level={zoomPercent}
+          stepPercent={ZOOM_STEP_PERCENT}
           onLevelChange={setZoomPercent}
           onCommit={async level => {
             const ratio = ZOOM_DISPLAY_MIN
-              + (ZOOM_DISPLAY_MAX - ZOOM_DISPLAY_MIN) * clamp01(level);
+              + (zoomDisplayMax - ZOOM_DISPLAY_MIN) * clamp01(level);
+            if (isFg2009) {
+              await lensGotoZoomRatio.mutateAsync(ratio);
+              return;
+            }
             await startZoomFollow.mutateAsync(ratio);
           }}
           busy={isZoomBusy}
@@ -389,6 +404,7 @@ export default function LensControl() {
           label={t('sys.ptz.focus', 'Focus')}
           displayValue={focusDisplay}
           level={focusPercent}
+          stepPercent={FOCUS_STEP_PERCENT}
           onLevelChange={setFocusPercent}
           onCommit={async level => {
             await setFocusLevel.mutateAsync(level);
@@ -397,55 +413,6 @@ export default function LensControl() {
           canDecrement={canFocusNear}
           canIncrement={canFocusFar}
         />
-
-        {/* <Separator /> */}
-
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
-            <span>{t('sys.device.lighting.ircut', 'IR-Cut Filter')}</span>
-            <TooltipProvider delayDuration={200}>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
-                    aria-label={
-                      isNight
-                        ? t(
-                            'sys.media_settings.ir_cut_night_hint',
-                            'IR filter removed, black & white image with IR illumination'
-                          )
-                        : t(
-                            'sys.media_settings.ir_cut_day_hint',
-                            'IR filter active, full color image'
-                          )
-                    }
-                  >
-                    <Info className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="top" className="text-xs max-w-[280px]">
-                  {isNight
-                    ? t(
-                        'sys.media_settings.ir_cut_night_hint',
-                        'IR filter removed, black & white image with IR illumination'
-                      )
-                    : t(
-                        'sys.media_settings.ir_cut_day_hint',
-                        'IR filter active, full color image'
-                      )}
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-          </div>
-          <Switch
-            checked={isNight}
-            onCheckedChange={handleToggleIrCut}
-            disabled={isIrCutPending || afBusy}
-          />
-        </div>
       </CardContent>
     </Card>
   );

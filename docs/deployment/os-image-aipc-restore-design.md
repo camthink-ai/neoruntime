@@ -6,7 +6,7 @@
 > whether an upgrade is allowed to proceed.
 >
 > All references are `file:line` against the current tree. Values shown
-> (`1.12.0`, compat-level `1`, etc.) reflect the image under
+> (`1.12.0`, OS range `1.12.0–1.12.0`, etc.) reflect the image under
 > `/opt/meta-hailo-os` at the time of writing.
 
 ---
@@ -280,61 +280,69 @@ application units plus device-specific `network`/`ssh` and the `app-manifest`.
 
 ## 6. Compatibility gates
 
-Four gates decide whether an upgrade is allowed. Each compares values drawn
-from up to four sources:
+Compatibility is **directional**: application upgrades are checked against the
+running OS and refused when incompatible, while OS upgrades are unconditional —
+app compatibility is advisory at every OS-upgrade decision point (see
+[`os-upgrade.md`](./os-upgrade.md) for the operational view). The app-side
+rules draw values from three sources:
 
-- **SWU package** — fields parsed from `sw-description` by regexes in
-  `validate.go:51-62`
 - **Booted OS** — `/etc/aipc-os-release` (read by `LoadOSCompatibility`,
-  `compatibility.go:49`)
+  `compatibility.go:54`)
 - **App** — `/data/aipc/app-manifest.json` (read by `LoadAppManifest`,
-  `compatibility.go:76`; resolved robustly by `ResolveAppManifestPath` across
+  `compatibility.go:74`; resolved robustly by `ResolveAppManifestPath` across
   `/data/aipc`, `/opt/aipc`, `/data` roots)
 - **On-disk data** — `/data/aipc-data/schema-version` (single integer, read by
-  `ReadDataSchema`, `compatibility.go:154`)
+  `ReadDataSchema`, `compatibility.go:172`)
 
 ### 6.1 Summary
 
 | Gate | Semantics | Locks | Sources | Error code |
 |---|---|---|---|---|
-| `aipc-compat-level` | strict `==` | binary / runtime interface (HAL, proto, sysfs, container ABI) | SWU + OS + App | `APP_COMPAT_LEVEL_MISMATCH` |
-| `data-schema` | `==` + range `∈` | persistent data serialization format | SWU + OS + App + on-disk | `APP_DATA_SCHEMA_UNSUPPORTED` |
+| `machine` / `product` | strict `==` | hardware identity | OS + App | `APP_MACHINE_MISMATCH` / `APP_PRODUCT_MISMATCH` |
+| `min_os_version`–`max_os_version` | closed range, semantic compare | OS runtime interface the App was built for | OS + App | `APP_OS_VERSION_UNSUPPORTED` |
+| `data-schema` | current `∈ supported_data_schema` | persistent data serialization format | App + on-disk | `APP_DATA_SCHEMA_UNSUPPORTED` |
 | `min-recovery-version` | range `>=` | recovery toolchain forward-compat | SWU + bundled recovery | (recovery.go:99-105) |
-| `machine` / `product` | strict `==` | hardware identity | SWU + OS + App | `APP_MACHINE_MISMATCH` / `APP_PRODUCT_MISMATCH` |
 
-### 6.2 `aipc-compat-level` — paired release contract
+Metadata problems have their own codes: a malformed `/etc/aipc-os-release`
+yields `APP_OS_METADATA_UNAVAILABLE`, a missing manifest
+`APP_MANIFEST_MISSING`, and bounds that are not `x.y.z` or `min > max`
+`APP_COMPATIBILITY_METADATA_INVALID` (`parseAppManifest`,
+`compatibility.go:97`). Legacy images without `/etc/aipc-os-release` allow the
+app install with a warning.
 
-- SWU: `aipc-compat-level = "1"`  (parsed by `compatLevelRE`, validate.go:61)
-- OS: `AIPC_COMPAT_LEVEL=1` in `/etc/aipc-os-release`
-- App: `required_compat_level: 1` in `app-manifest.json`
+### 6.2 OS version range — `min_os_version`/`max_os_version`
 
-Enforced at `compatibility.go:178` as **strict equality** —
-`target.CompatLevel != app.RequiredCompatLevel` → `APP_COMPAT_LEVEL_MISMATCH`.
-
-Why `==` and not `>=`: compat-level is a *pairing* contract, not a
-forward-compat range. The OS runtime interface surface must be *exactly* the
-one the App was compiled against. Either side changing the interface forces a
-bump and a coordinated re-release.
-
-### 6.3 `data-schema` — range + migration
-
-- SWU: `data-schema = "1"`
-- OS: `DATA_SCHEMA=1` in `/etc/aipc-os-release`
-- On-disk: integer in `/data/aipc-data/schema-version`
-- App: `target_data_schema: 1` + `supported_data_schema: [1]` in
+- App: `"min_os_version": "1.12.0", "max_os_version": "1.14.0"` in
   `app-manifest.json`
 
-Unlike compat-level, the App declares a **list** of schemas it can read. The
-gate at `compatibility.go:188-199` fails unless **all three** hold:
+Enforced at `compatibility.go:201-216` via `CompareVersion`
+(`compatibility.go:257`): both bounds must be strict `x.y.z` (three numeric
+components) and are compared **semantically** — `1.9.0 < 1.10.0`, no string or
+octal traps. The gate requires
+`min_os_version <= OS_VERSION <= max_os_version` (closed interval).
 
-1. `target.DataSchema == currentSchema` — OS schema matches what is on disk
-2. `app.TargetDataSchema == target.DataSchema` — App and OS agree on the target
-3. `currentSchema ∈ app.SupportedDataSchema` — App can actually parse the data
+Why a range and not an exact match: the OS runtime interface is expected to
+stay stable across a bounded window, so an app package built and tested
+against 1.12.0 can declare `1.12.0–1.14.0` and keep installing through
+intermediate OS releases without repackaging. Default packaging pins
+`min = max = <current OS version>`, which is equivalent to the old exact-match
+behaviour; widening the range is an explicit release decision. A single range
+cannot exclude a specific bad middle version — narrow around it instead.
 
-This range semantics enables migration: bump the schema, ship a migrator in
+### 6.3 `data-schema` — app must read existing data
+
+- On-disk: integer in `/data/aipc-data/schema-version`
+- App: `target_data_schema: 2` + `supported_data_schema: [1, 2]` in
+  `app-manifest.json`
+
+The gate at `compatibility.go:219-227` fails unless
+`currentSchema ∈ app.SupportedDataSchema` — the app can actually parse the
+data that is on disk. When the schema file is absent (fresh device), the
+app's own `target_data_schema` stands in for the current schema.
+
+The list semantics enables migration: bump the schema, ship a migrator in
 `aipc-restore`, and keep the old schema in `supported_data_schema` until all
-data is converted. compat-level cannot do this — it is a hard generational
-break.
+data is converted.
 
 ### 6.4 `min-recovery-version` — recovery toolchain floor
 
@@ -350,21 +358,25 @@ rewrites the rootfs must be new enough to handle the target.
 
 ### 6.5 `machine` / `product`
 
-`compatibility.go:166-177`. `machine` is mandatory and compared
+`compatibility.go:189-199`. `machine` is mandatory and compared
 case-insensitively; `product` is compared only when both sides declare it.
 
 ### 6.6 Enforcement matrix
 
-| Gate | validate (presence) | install pre | verify post-reboot | aipc-restore (shell) |
-|---|---|---|---|---|
-| compat-level | validate.go:199 | runner.go:659 | runner.go:691 | aipc-restore:55,74 |
-| data-schema | validate.go:199 | runner.go:664 | runner.go:694 | aipc-restore:72-77 |
-| min-recovery-version | os_upgrade.go:243 (→ recovery.go:99-105) | — | — | — |
-| machine / product | — | runner.go:659 | runner.go:697 | aipc-restore:65-70 |
+| Check | app OTA parse | app OTA install | app unit start | OS validate | OS verify |
+|---|---|---|---|---|---|
+| machine / product | advisory | hard | hard | — | advisory |
+| OS version range | advisory | hard | hard | advisory | advisory |
+| data-schema | advisory | hard | hard | advisory | advisory |
 
-validate.go:199 is a shared presence check: when `RequireCompatibility` is set,
-the SWU must carry **both** `aipc-compat-level` and `data-schema` or it is
-rejected before anything else runs.
+App-side enforcement: `OTAParseFirmware` reports the verdict without blocking
+(advisory), `performOTAUpgrade` refuses to install (hard), and
+`deploy.sh check_package_compatibility` plus the per-unit `aipc-compat-check`
+`ExecStartPre` re-check on the device so the API cannot be bypassed. OS-side:
+every verdict is advisory — the upgrade proceeds and the job records
+`compatibility_valid=false` + `compatibility_warning`; only `platform-api`
+starts under `--warn-only` (rescue channel), the remaining app units stay
+held down until a compatible package is installed.
 
 ---
 
@@ -377,15 +389,18 @@ State                       idle...cancelled (see §4.1)
 UpgradeMode                 "single" | "dual"
 CurrentCopy / TargetCopy / PreviousCopy   boot-copy tracking
 RecoveryVersion             bundled recovery version (from manifest)
-CompatLevel / DataSchema    parsed from sw-description, replayed at verify
-CompatibilityValid          gates passed at install time
+AppVersion                  installed app version, recorded at validate
+CompatibilityValid          app verdict — advisory, never gates the OS job
+CompatibilityWarning        human-readable reason when CompatibilityValid=false
 SignatureValid              sw-description.sig verified
 RebootRequired              staging complete, awaiting user reboot
 ```
 
-`CompatLevel` and `DataSchema` are persisted on the job
-(`handlers/os_upgrade.go:312`, `store.go:56-57`) so the post-reboot verify can
-compare the booted OS against exactly what was validated, not a re-read.
+`CompatibilityValid`/`CompatibilityWarning` are re-evaluated after the reboot
+(`Runner.checkBootedAppCompatibility`) rather than replayed from validate,
+because the app manifest may change across the restore step. They never alter
+the job's terminal state — by verify time the OS upgrade has already
+succeeded.
 
 ---
 
@@ -398,14 +413,14 @@ compare the booted OS against exactly what was validated, not a re-read.
 /data/backups/aipc-os-upgrade/        pre-upgrade backup (current -> <job>, with manifest/SHA256SUMS/status)
 /data/aipc/recovery/                  extracted recovery cache (manifest.json + fitImage + rootfs)
 /data/aipc-data/schema-version        on-disk data schema integer
-/data/aipc/app-manifest.json          App manifest (required_compat_level, supported_data_schema, ...)
+/data/aipc/app-manifest.json          App manifest (min_os_version/max_os_version, supported_data_schema, ...)
 /data/aipc/bin, /data/aipc/libexec    persistent runtime; /usr/bin + /usr/libexec re-point here
 ```
 
 ### Baked into the OS image (rewritten on upgrade)
 
 ```text
-/etc/aipc-os-release                  OS_VERSION, AIPC_COMPAT_LEVEL, DATA_SCHEMA, MACHINE, PRODUCT, AIPC_BOOTSTRAP_OWNER
+/etc/aipc-os-release                  OS_VERSION, MACHINE, PRODUCT, AIPC_BOOTSTRAP_OWNER (legacy AIPC_COMPAT_LEVEL/DATA_SCHEMA keys, if present, are ignored by the loader)
 /usr/libexec/aipc-restore             restore entry point
 /usr/libexec/aipc-firstboot           firstboot entry point
 /sbin/init.initscripts-hailo-swupdate recovery PID-1 (aipc-swupdate-init.sh)
@@ -441,10 +456,12 @@ have direct test coverage under `platform/osupgrade/`.
 
 Reference the validated single-recovery flow on 93.72: upload SWU → job reaches
 `success`/`verified`, all platform services active post-reboot, `aipc-os-verify`
-exits 0, and the recovery bundle is non-empty. The four gates each have a
-negative case (mismatched compat-level, unsupported data-schema, recovery too
+exits 0, and the recovery bundle is non-empty. The OS-side gates each have a
+negative case (unsupported downgrade, missing signature file, recovery too
 old, wrong machine) that should land the job in `failed` without touching the
-boot copy.
+boot copy. App incompatibility must instead land the job in `success` with
+`compatibility_valid=false`, the incompatible app units held down, and
+`platform-api` still serving.
 
 ### Read-only self-check on device
 

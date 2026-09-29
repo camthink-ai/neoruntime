@@ -231,7 +231,7 @@ var modelStatsCmd = &cobra.Command{
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.GRPC.Timeout)
 		defer cancel()
 
-		stats, err := grpcCli.AIRuntime.GetStats(ctx, &inferencepb.Empty{})
+		stats, err := grpcCli.AIRuntime.GetStats(ctx, &inferencepb.GetStatsRequest{})
 		if err != nil {
 			return fmt.Errorf("failed to get stats: %w", err)
 		}

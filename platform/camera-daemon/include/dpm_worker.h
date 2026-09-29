@@ -120,10 +120,16 @@ struct DpmMaskState {
  * @brief Owns inference sessions and a worker thread. Multi-spec: one session per
  *        DetectorSpec (e.g. linknet seg for person, coco det for vehicle, plate,
  *        face). Per-spec init is GRACEFUL — a missing/unsupported HEF is skipped
- *        with a warning; start() succeeds even with zero loaded models (idle
- *        mode: worker runs, no inference, publishes no mask — used when DPM is
- *        enabled with an empty label set). If the person seg HEF is absent, a
- *        coco detection spec with keep_labels={person} serves as a bbox fallback.
+ *        with a warning, and so is a keep-filtered detection spec whose postproc
+ *        JSON labels do not intersect its keep_labels (such a spec could never
+ *        contribute a mask — every detection would be silently dropped; 2026-08
+ *        field incident: a visdrone 11-class pair overwrote the 4-class model).
+ *        start() succeeds even with zero loaded models (idle mode: worker runs,
+ *        no inference, publishes no mask — used when DPM is enabled with an
+ *        empty label set); the caller distinguishes "idle by request" from
+ *        "requested but none effective" via requested_spec_count() +
+ *        detector_skip_reasons(). If the person seg HEF is absent, a coco
+ *        detection spec with keep_labels={person} serves as a bbox fallback.
  *
  * Thread model:
  *   - start()/stop() called from the RPC thread (set_privacy_mask_config).
@@ -195,6 +201,19 @@ public:
     void stop();
 
     bool is_running() const { return running_.load(std::memory_order_acquire); }
+
+    // ---- Last-init diagnostics (stable between start() and stop()) ----
+    // camera_daemon uses these to revert the DPM toggle when specs were
+    // REQUESTED but none became effective (loaded + label-compatible): an
+    // armed-but-empty worker used to bake nothing while the UI showed ON.
+    /** @brief How many specs cfg.detectors carried at the last start() (0 = the
+     *         valid empty-label idle case, NOT a failure). */
+    size_t requested_spec_count() const { return requested_specs_; }
+    /** @brief How many detectors actually loaded and can produce a mask. */
+    size_t effective_detector_count() const { return detectors_.size(); }
+    /** @brief One human-readable reason per requested spec that did not ship
+     *         (HEF missing, postproc JSON unusable, labels mismatch, ...). */
+    const std::vector<std::string>& detector_skip_reasons() const { return skip_reasons_; }
 
     /**
      * @brief Clean-capture entry (streaming thread, called BEFORE the per-stream
@@ -278,6 +297,11 @@ private:
     // Loaded models (subset of cfg_.detectors that initialized successfully).
     // Empty = idle mode (worker runs, no inference).
     std::vector<DetectorSession> detectors_;
+
+    // Last-init diagnostics backing the accessors above: how many specs were
+    // requested, and why each requested-but-skipped spec did not ship.
+    size_t requested_specs_ = 0;
+    std::vector<std::string> skip_reasons_;
 
     // Worker thread + clean-capture hand-off. offer_mu_ guards the ping-pong
     // buffers AND offer_seq_/taken_seq_ (the drop-on-pending latch). stop() locks

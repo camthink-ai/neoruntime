@@ -93,6 +93,9 @@ download_multi() {
     return 0
 }
 
+# Copy a file from a local path. Returns 1 (without counting FAIL) when the
+# source is absent — the caller decides whether that is fatal or whether it
+# falls back to another source.
 copy_local() {
     local src="$1"
     local dest="$2"
@@ -107,10 +110,11 @@ copy_local() {
         cp "$src" "$dest"
         echo "  OK (copied from $src)"
         inc OK
-    else
-        echo "  FAIL (source not found: $src)"
-        inc FAIL
+        return 0
     fi
+
+    echo "  local source not found: $src"
+    return 1
 }
 
 echo "============================================"
@@ -198,7 +202,18 @@ download_multi "$MODEL_BASE/ocr/paddle_ocr_v5_mobile_recognition_nv12.hef" \
 # --- Tier 3: Special handling ---
 
 echo "[12/13] linknet_mbv1_ss_dpm_256 (segmentation)"
-copy_local "$LOCAL_LINKNET" "$MODEL_BASE/segmentation/linknet_mbv1_ss_dpm_256.hef"
+# Prefer the copy bundled with the legacy DPM reference app. Fresh deployments
+# have no such residual install, so also probe the model-zoo S3 naming pattern
+# (both compiler versions) before giving up. NOTE: never substitute a different
+# segmentation model here — camera-daemon hardcodes this exact filename, and a
+# wrong model at that path loads fine but silently breaks the person channel.
+LINKNET_DEST="$MODEL_BASE/segmentation/linknet_mbv1_ss_dpm_256.hef"
+if ! copy_local "$LOCAL_LINKNET" "$LINKNET_DEST"; then
+    echo "  falling back to model zoo ..."
+    download_multi "$LINKNET_DEST" \
+        "$S3_BASE/ModelZoo/Compiled/v5.3.0/hailo15h/linknet_mbv1_ss_dpm_256.hef" \
+        "$S3_BASE/ModelZoo/Compiled/v5.2.0/hailo15h/linknet_mbv1_ss_dpm_256.hef"
+fi
 
 echo "[13/13] Qwen3-VL-2B-Instruct (genai)"
 if $WITH_GENAI; then
@@ -220,6 +235,23 @@ if [[ $FAIL -gt 0 ]]; then
     echo ""
     echo "Some models failed to download."
     echo "Check network connectivity and retry."
+    # Name the DPM-critical files that are still missing: camera-daemon
+    # hardcodes these exact paths, and any one of them being absent silently
+    # disarms that AI privacy-mask channel on the device (armed toggle, no
+    # mask). linknet is NOT in the public model zoo — restore it from another
+    # device or the Hailo DPM reference app.
+    dpm_missing=""
+    for f in detection/hailo_yolov8n_384_640.hef \
+             detection/hailo_yolov8n_384_640.json \
+             segmentation/linknet_mbv1_ss_dpm_256.hef \
+             detection/tiny_yolov4_license_plates.hef; do
+        [[ -f "$MODEL_BASE/$f" ]] || dpm_missing="${dpm_missing}  - MISSING: $f"$'\n'
+    done
+    if [[ -n "$dpm_missing" ]]; then
+        echo ""
+        echo "WARNING: AI privacy mask (DPM) will NOT fully work on this device:"
+        printf '%s' "$dpm_missing"
+    fi
     exit 1
 fi
 

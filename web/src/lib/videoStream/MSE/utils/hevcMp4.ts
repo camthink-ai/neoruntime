@@ -166,12 +166,77 @@ export function parseHevcSpsPtl(
   }
 }
 
-/** Track layout hint for tkhd/stsd; real display size comes from decoded frames. */
-export function parseHevcSpsResolution(_spsNalWithHeader: Uint8Array): {
+/**
+ * Skip profile_tier_level(1, maxNumSubLayersMinus1) (H.265 7.3.3).
+ * The general part is a fixed 96 bits; each sub-layer adds a present-flag pair
+ * plus optional profile (88 bits) and level (8 bits) fields.
+ */
+function skipProfileTierLevel(br: BitReader, maxSubLayersMinus1: number): void {
+  br.readBits(96);
+  if (maxSubLayersMinus1 <= 0) return;
+  const subLayerProfilePresent: boolean[] = [];
+  const subLayerLevelPresent: boolean[] = [];
+  for (let i = 0; i < maxSubLayersMinus1; i++) {
+    subLayerProfilePresent.push(br.readBit() === 1);
+    subLayerLevelPresent.push(br.readBit() === 1);
+  }
+  br.readBits(2 * (8 - maxSubLayersMinus1)); // reserved_zero_2bits
+  for (let i = 0; i < maxSubLayersMinus1; i++) {
+    if (subLayerProfilePresent[i]) br.readBits(88);
+    if (subLayerLevelPresent[i]) br.readBits(8);
+  }
+}
+
+/**
+ * Visible resolution from the SPS: coded luma size minus the conformance
+ * window. Mobile MSE pipelines size the video surface from the hvc1/tkhd
+ * dimensions declared in the init segment, so a wrong value here shows up as
+ * green padding around the picture. Returns null when the SPS cannot be
+ * parsed — guessing a size is worse than failing.
+ */
+export function parseHevcSpsResolution(spsNalWithHeader: Uint8Array): {
   width: number;
   height: number;
-} {
-  return { width: 1920, height: 1080 };
+} | null {
+  try {
+    const rbsp = rbspFromNalUnit(spsNalWithHeader);
+    if (rbsp.length < 12) return null;
+    const br = new BitReader(rbsp);
+    br.readBits(4); // sps_video_parameter_set_id
+    const maxSubLayersMinus1 = br.readBits(3);
+    br.readBit(); // sps_temporal_id_nesting_flag
+    skipProfileTierLevel(br, maxSubLayersMinus1);
+    br.readUE(); // sps_seq_parameter_set_id
+    const chromaFormatIdc = br.readUE();
+    const separateColourPlaneFlag = chromaFormatIdc === 3 ? br.readBit() : 0;
+    const codedWidth = br.readUE();
+    const codedHeight = br.readUE();
+    if (codedWidth <= 0 || codedHeight <= 0) return null;
+
+    let cropLeft = 0;
+    let cropRight = 0;
+    let cropTop = 0;
+    let cropBottom = 0;
+    if (br.readBit()) {
+      cropLeft = br.readUE();
+      cropRight = br.readUE();
+      cropTop = br.readUE();
+      cropBottom = br.readUE();
+    }
+    // Conformance-window offsets are in chroma samples (H.265 7.4.3.2)
+    const chromaArrayType = separateColourPlaneFlag ? 0 : chromaFormatIdc;
+    const subWidthC = chromaArrayType === 1 || chromaArrayType === 2 ? 2 : 1;
+    const subHeightC = chromaArrayType === 1 ? 2 : 1;
+    const width = codedWidth - (cropLeft + cropRight) * subWidthC;
+    const height = codedHeight - (cropTop + cropBottom) * subHeightC;
+    // hvc1/tkhd carry the size as u16 — anything beyond that is a parse error
+    if (width <= 0 || height <= 0 || width > 65535 || height > 65535) {
+      return null;
+    }
+    return { width, height };
+  } catch {
+    return null;
+  }
 }
 
 function buildHvcc(
@@ -480,9 +545,10 @@ export function createHevcInitSegment(
   const mimeCodec = pickMimeCodec(ptl);
   if (!mimeCodec) return null;
   const hvcc = buildHvcc(vps, sps, pps, ptl);
-  const { width, height } = parseHevcSpsResolution(sps);
+  const dims = parseHevcSpsResolution(sps);
+  if (!dims) return null;
   return {
-    segment: concat(ftypHevc(), moovHevc(hvcc, width, height)),
+    segment: concat(ftypHevc(), moovHevc(hvcc, dims.width, dims.height)),
     mimeCodec,
   };
 }

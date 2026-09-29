@@ -23,11 +23,14 @@ export default function ImagingControls({
   const lens = useLensStatus();
   const device = useDeviceStatus();
   const isLoading = lens.isLoading || device.isLoading;
+  // Image-probe verdict: a fixed lens has no motor controls to expose — drop
+  // the lens card entirely so this tab shows only the lighting control.
+  const isFixedLens = lens.data?.fixed_lens === true;
 
   if (isLoading) {
     return (
       <div className="space-y-6">
-        {hasMcu && <LensControlSkeleton />}
+        {hasMcu && !isFixedLens && <LensControlSkeleton />}
         {hasLed && <LightingControlSkeleton />}
       </div>
     );
@@ -35,7 +38,7 @@ export default function ImagingControls({
 
   return (
     <div className="space-y-6">
-      {hasMcu && <LensControl />}
+      {hasMcu && !isFixedLens && <LensControl />}
       {hasLed && <LightingControl />}
     </div>
   );

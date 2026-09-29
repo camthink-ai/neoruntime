@@ -101,9 +101,57 @@ static int stub_codec_dynamic_change_config(void *codec_ctx, const HalCodecConfi
     return HAL_ERR_NOT_SUPPORTED;
 }
 
+/* Smart encoding / runtime control — static simulation (M1). */
+static HalCodecRoiConfig g_stub_roi_config;
+
+static int stub_codec_set_roi_config(void *codec_ctx, const HalCodecRoiConfig *config)
+{
+    (void)codec_ctx;
+    if (!config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    if (config->roi_count > HAL_CODEC_ROI_MAX)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    g_stub_roi_config = *config;
+    return HAL_OK;
+}
+
+static int stub_codec_get_roi_config(void *codec_ctx, HalCodecRoiConfig *config)
+{
+    (void)codec_ctx;
+    if (!config)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    *config = g_stub_roi_config;
+    return HAL_OK;
+}
+
+static int stub_codec_force_idr(void *codec_ctx)
+{
+    (void)codec_ctx;
+    return HAL_OK;
+}
+
+static int stub_codec_get_stream_stats(void *codec_ctx, HalCodecStreamStats *stats)
+{
+    (void)codec_ctx;
+    if (!stats)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    stats->fps = 30.0f;         /* simulated output rate */
+    stats->bitrate_kbps = 0;    /* unknown */
+    stats->monitor_period_s = 0;
+    return HAL_OK;
+}
+
 static const char *stub_codec_get_version(void)
 {
-    return "HAL-CODEC stub 2.0.0 (platform stub)";
+    return "HAL-CODEC stub 2.1.0 (platform stub)";
 }
 
 HalCodecOps HAL_CODEC_OPS = {
@@ -121,4 +169,8 @@ HalCodecOps HAL_CODEC_OPS = {
     .get_version = stub_codec_get_version,
     .init_from_context = NULL,     /* not supported by stub */
     .deinit_from_context = NULL,   /* not supported by stub */
+    .set_roi_config = stub_codec_set_roi_config,
+    .get_roi_config = stub_codec_get_roi_config,
+    .force_idr = stub_codec_force_idr,
+    .get_stream_stats = stub_codec_get_stream_stats,
 };

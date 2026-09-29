@@ -56,6 +56,114 @@ private:
 
 } // namespace
 
+namespace
+{
+
+/* HAL frame-difference motion engine (the medialib module never runs — stock
+ * profiles ship it disabled with an empty analysis stream_id). Called from the
+ * frontend bridge on the smallest output stream; downsampled block-mean luma
+ * keeps the cost at ~w*h/256 compares per frame. Returns true on a state
+ * TRANSITION (caller fires the subscriber outside the lock). */
+bool hailo15_motion_detect_update(Hailo15MediaPriv *p, const std::string &sid,
+                                  const HailoMediaLibraryBufferPtr &buf, bool &detected_out)
+{
+    detected_out = p->motion_last_state;
+    if (!p->motion_engine_enabled || !p->motion_cb || sid != p->motion_analysis_sid)
+    {
+        return false;
+    }
+    if (!buf)
+    {
+        return false;
+    }
+    const uint32_t fw = buf->buffer_data ? buf->buffer_data->width : 0U;
+    const uint32_t fh = buf->buffer_data ? buf->buffer_data->height : 0U;
+    if (fw == 0 || fh == 0)
+    {
+        return false;
+    }
+    const uint32_t gw = fw / 16;   /* 16x16 blocks */
+    const uint32_t gh = fh / 16;
+    if (gw < 2 || gh < 2)
+    {
+        return false;
+    }
+    /* Plane 0 access via the buffer's dma-buf-mapped memory. */
+    const uint32_t stride = fw;
+    uint8_t *base = static_cast<uint8_t *>(buf->get_plane_ptr(0));
+    if (!base)
+    {
+        return false;
+    }
+    const uint8_t *y = base;
+
+    std::vector<uint8_t> grid(static_cast<size_t>(gw) * gh);
+    for (uint32_t bj = 0; bj < gh; ++bj)
+    {
+        for (uint32_t bi = 0; bi < gw; ++bi)
+        {
+            uint32_t acc = 0;
+            const uint8_t *row = y + (size_t)(bj * 16) * stride + bi * 16;
+            for (uint32_t j = 0; j < 16; j += 2)   /* sample every 2nd row/pixel */
+            {
+                const uint8_t *r = row + (size_t)j * stride;
+                for (uint32_t i = 0; i < 16; i += 2)
+                {
+                    acc += r[i];
+                }
+            }
+            grid[(size_t)bj * gw + bi] = static_cast<uint8_t>(acc / 64);
+        }
+    }
+
+    bool detected = p->motion_last_state;
+    if (p->motion_prev_grid.size() == grid.size() && p->motion_grid_w == gw)
+    {
+        /* Restrict the comparison to blocks intersecting the configured ROI
+         * (all-zero ROI = full frame). The trigger ratio counts ROI blocks
+         * only, so motion outside the ROI cannot fire callbacks. */
+        uint32_t bx0 = 0, bx1 = gw, by0 = 0, by1 = gh;
+        if (p->motion_roi_w > 0 && p->motion_roi_h > 0)
+        {
+            const uint32_t rx1 = std::min(p->motion_roi_x + p->motion_roi_w, fw);
+            const uint32_t ry1 = std::min(p->motion_roi_y + p->motion_roi_h, fh);
+            bx0 = std::min(p->motion_roi_x / 16, gw);
+            bx1 = std::min((rx1 + 15) / 16, gw);
+            by0 = std::min(p->motion_roi_y / 16, gh);
+            by1 = std::min((ry1 + 15) / 16, gh);
+        }
+        uint32_t changed = 0, total = 0;
+        const int diff = p->motion_diff_level;
+        for (uint32_t bj = by0; bj < by1; ++bj)
+        {
+            for (uint32_t bi = bx0; bi < bx1; ++bi)
+            {
+                const int d = (int)grid[(size_t)bj * gw + bi] - (int)p->motion_prev_grid[(size_t)bj * gw + bi];
+                if (d > diff || d < -diff)
+                {
+                    ++changed;
+                }
+                ++total;
+            }
+        }
+        const float ratio = total ? (float)changed / (float)total : 0.0f;
+        detected = ratio > p->motion_threshold;
+    }
+    p->motion_prev_grid = std::move(grid);
+    p->motion_grid_w = gw;
+    p->motion_grid_h = gh;
+
+    if (detected != p->motion_last_state)
+    {
+        p->motion_last_state = detected;
+        detected_out = detected;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
 int hailo15_connect_media_priv_frontend(Hailo15MediaPriv *p)
 {
     if (!p || !p->media_lib || !p->media_lib->m_frontend)
@@ -135,6 +243,28 @@ int hailo15_connect_media_priv_frontend(Hailo15MediaPriv *p)
                  * here (HalMediaOps.attach_frame_analytics); the blender consumes it during
                  * add_buffer() below. The HAL does not auto-attach — the upper layer decides. */
                 cb(vctx, &frame, cb_ud);
+            }
+
+            /* Motion events: HAL frame-difference engine on the analysis stream,
+             * fired on state transitions only. */
+            {
+                HalMotionCallback mcb = nullptr;
+                void *mcb_ud = nullptr;
+                bool fire = false;
+                bool detected = false;
+                {
+                    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+                    fire = hailo15_motion_detect_update(p, sid, buf, detected);
+                    if (fire)
+                    {
+                        mcb = p->motion_cb;
+                        mcb_ud = p->motion_cb_user;
+                    }
+                }
+                if (fire)
+                {
+                    mcb(p->hal_media_ctx, detected, seq, buf->pts, mcb_ud);
+                }
             }
 
             if (do_auto_feed)

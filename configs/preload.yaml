@@ -8,7 +8,12 @@
 
 models:
   # Detection
+  # NOTE: hailo_yolov8n_384_640.json is the vendor postproc config the DPM
+  # (dynamic privacy mask) yolov8n detector requires next to its HEF — without
+  # it d.label stays empty and the keep_labels filter never matches, so the
+  # JSON must ship with the HEF.
   - detection/hailo_yolov8n_384_640.hef
+  - detection/hailo_yolov8n_384_640.json
   - detection/yolov5m_vehicles.hef
   - detection/tiny_yolov4_license_plates.hef
 

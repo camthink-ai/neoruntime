@@ -262,8 +262,21 @@ message DeviceEvent {
   }
   EventType type = 1;
   uint64 timestamp_ns = 2;
+
+  oneof data {
+    GPIOReadResponse gpio_state = 10;
+    uint32 light_sensor_value = 11;
+    float temperature = 12;
+  }
 }
 ```
+
+`SubscribeEvents` currently emits light-sensor changes and SoC temperature
+transitions. The server samples every two seconds. A light event is emitted for
+the first sample and after an absolute change of 50 mV or a relative change of
+5%. Temperature alerts latch at 85 °C and clear at 80 °C. Each subscriber has
+an independent bounded queue, so a client that stops reading cannot delay
+other subscribers or the hardware poller.
 
 ## Configuration
 

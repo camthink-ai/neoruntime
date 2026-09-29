@@ -109,6 +109,14 @@ type DeviceControlServer struct {
 	lastLensStatus   lensStatusCache
 	hasLensStatus    bool
 
+	// Factory-fitted lens model and its optical ratio ceiling, learned via
+	// ProfileGet during lens init. Guarded by lensStatusMu. Empty model (or
+	// an old camera-daemon without the RPC) means "assume AF0832".
+	lensModel            string
+	lensMaxZoomRatio     float32
+	lensZoomTravelSteps  int32
+	lensFocusTravelSteps int32
+
 	// Camera-daemon gRPC client for IR-Cut control
 	cameraDaemonClient camerapb.CameraControlClient
 	cameraDaemonConn   *grpc.ClientConn
@@ -117,6 +125,15 @@ type DeviceControlServer struct {
 	eventBusClient eventpb.EventBusClient
 	eventBusConn   *grpc.ClientConn
 	eventBusMutex  sync.RWMutex
+
+	// Device event hub. A single poller samples
+	// the light sensor (camera-daemon hardware status) and SoC temperature
+	// (sysfs) and fans DeviceEvents out to subscribers. Sends never block
+	// the poller: a slow subscriber's channel fills and events are
+	// dropped for that subscriber only.
+	eventSubsMu        sync.Mutex
+	eventSubs          map[chan *pb.DeviceEvent]struct{}
+	eventPollerStarted bool
 }
 
 type lensStatusCache struct {
@@ -131,6 +148,9 @@ type lensStatusCache struct {
 	ZoomLimitMax  int32
 	FocusLimitMin int32
 	FocusLimitMax int32
+	ZoomRatio     float32
+	HasZoomRatio  bool
+	FixedLens     bool
 }
 
 func NewDeviceControlServer(cfg *Config, lensHal hal.LensHAL, cameraDaemonClient camerapb.CameraControlClient, cameraDaemonConn *grpc.ClientConn) *DeviceControlServer {
@@ -365,6 +385,23 @@ func (s *DeviceControlServer) ensureLensBootstrapped() error {
 	if s.halLens == nil {
 		return fmt.Errorf("lens HAL not initialized")
 	}
+	if s.lensIsFg2009() {
+		// Open-loop lens: StateGet reports the dead-reckoning anchor state
+		// as rz-done. An unanchored model is only repaired by the full
+		// profile-push + anchor + park sequence inside ReInit.
+		state, err := s.halLens.StateGet()
+		if err != nil {
+			return fmt.Errorf("state_get failed: %w", err)
+		}
+		if state.ZoomRzDone && state.FocusRzDone {
+			return nil
+		}
+		logger.Warn("fg2009 lens not anchored, running full reinit bootstrap")
+		if err := s.halLens.ReInit(); err != nil {
+			return fmt.Errorf("fg2009 reinit failed: %w", err)
+		}
+		return nil
+	}
 	if !s.halLens.IsAF0832Bootstrapped() {
 		// Flag is absent (post-restart, or a transient IsAF0832Bootstrapped
 		// transport error), but the motors may already be homed. Skip the
@@ -404,6 +441,14 @@ func (s *DeviceControlServer) recoverLensLink() error {
 		return fmt.Errorf("lens HAL not initialized")
 	}
 	_ = s.halLens.StopAndWaitAll(2 * time.Second)
+	if s.lensIsFg2009() {
+		// ReInit re-pushes the MCU profile and re-anchors the open-loop
+		// model; there is no AF0832 zero/bootstrap step to redo.
+		if err := s.halLens.ReInit(); err != nil {
+			return fmt.Errorf("fg2009 reinit failed: %w", err)
+		}
+		return nil
+	}
 	if err := s.halLens.ReInit(); err != nil {
 		return fmt.Errorf("lens reinit failed: %w", err)
 	}
@@ -429,6 +474,15 @@ func (s *DeviceControlServer) lensHomed() (zoomDone, focusDone bool, err error) 
 		return false, false, err
 	}
 	return st.ZoomRzDone, st.FocusRzDone, nil
+}
+
+// lensIsFg2009 reports whether the factory-fitted lens is the FG2009
+// open-loop model. False until ProfileGet succeeds during lens init (or on
+// an old camera-daemon without the RPC), which by default means AF0832.
+func (s *DeviceControlServer) lensIsFg2009() bool {
+	s.lensStatusMu.RLock()
+	defer s.lensStatusMu.RUnlock()
+	return s.lensModel == "fg2009"
 }
 
 // runToZeroAndHome recovers an axis stuck in the "reset-done event fired but home
@@ -504,12 +558,14 @@ func isRecoverable(err error) bool {
 		return false
 	}
 
-	// All HAL errors from the lens bridge are potentially recoverable.
-	// Must be checked before status.FromError to prevent gRPC-wrapped
-	// HAL errors from reaching the code-based switch below.
+	// All HAL errors from the lens bridge are potentially recoverable,
+	// except capability rejections: no amount of link recovery makes an
+	// unsupported operation supported. Must be checked before
+	// status.FromError to prevent gRPC-wrapped HAL errors from reaching the
+	// code-based switch below.
 	var halErr *lens.HalError
 	if errors.As(err, &halErr) {
-		return true
+		return halErr.Code != lens.HalErrNotSupported
 	}
 
 	// gRPC transport-layer errors: status.FromError returns ok=true only
@@ -753,6 +809,132 @@ func (s *DeviceControlServer) SetIrCut(ctx context.Context, req *pb.IrCutRequest
 	}
 
 	return &pb.Status{Success: resp.Success, Message: resp.Message}, nil
+}
+
+func infraredStatusFromCamera(resp *camerapb.InfraredStatusResponse) *pb.InfraredStatusResponse {
+	if resp == nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: "empty camera response"}
+	}
+	return &pb.InfraredStatusResponse{
+		Success: resp.Success, Message: resp.Message, Mode: resp.Mode,
+		Transition: resp.Transition, OutputSource: resp.OutputSource,
+		AutoFollow: resp.AutoFollow, FollowActive: resp.FollowActive,
+		ManualOverride: resp.ManualOverride, Degraded: resp.Degraded,
+		RequestedNearPwm: resp.RequestedNearPwm, RequestedFarPwm: resp.RequestedFarPwm,
+		AppliedNearPwm: resp.AppliedNearPwm, AppliedFarPwm: resp.AppliedFarPwm,
+		ZoomRatio: resp.ZoomRatio, ActiveProfile: resp.ActiveProfile,
+		SelectedMode: resp.SelectedMode, LightPercent: resp.LightPercent,
+		LightMv: resp.LightMv, LightMilli: resp.LightMilli,
+		LightValid: resp.LightValid, NightEnter: resp.NightEnter, DayEnter: resp.DayEnter,
+	}
+}
+
+func (s *DeviceControlServer) SetImagingMode(ctx context.Context, req *pb.ImagingModeRequest) (*pb.InfraredStatusResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.SetImagingMode(ctx, &camerapb.ImagingModeRequest{Mode: req.Mode})
+	if err != nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: err.Error()}, nil
+	}
+	return infraredStatusFromCamera(resp), nil
+}
+
+func (s *DeviceControlServer) GetInfraredStatus(ctx context.Context, _ *pb.Empty) (*pb.InfraredStatusResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.GetInfraredStatus(ctx, &camerapb.Empty{})
+	if err != nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: err.Error()}, nil
+	}
+	return infraredStatusFromCamera(resp), nil
+}
+
+func (s *DeviceControlServer) SetInfraredSettings(ctx context.Context, req *pb.InfraredSettingsRequest) (*pb.InfraredStatusResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	cameraReq := &camerapb.InfraredSettingsRequest{}
+	if req.AutoFollow != nil {
+		cameraReq.AutoFollow = req.AutoFollow
+	}
+	if req.NearPwm != nil {
+		cameraReq.NearPwm = req.NearPwm
+	}
+	if req.FarPwm != nil {
+		cameraReq.FarPwm = req.FarPwm
+	}
+	if req.NightEnter != nil {
+		cameraReq.NightEnter = req.NightEnter
+	}
+	if req.DayEnter != nil {
+		cameraReq.DayEnter = req.DayEnter
+	}
+	resp, err := s.cameraDaemonClient.SetInfraredSettings(ctx, cameraReq)
+	if err != nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: err.Error()}, nil
+	}
+	return infraredStatusFromCamera(resp), nil
+}
+
+func (s *DeviceControlServer) ClearInfraredManual(ctx context.Context, _ *pb.Empty) (*pb.InfraredStatusResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.ClearInfraredManual(ctx, &camerapb.Empty{})
+	if err != nil {
+		return &pb.InfraredStatusResponse{Success: false, Message: err.Error()}, nil
+	}
+	return infraredStatusFromCamera(resp), nil
+}
+
+func irPresetListFromCamera(resp *camerapb.IrPresetListResponse) *pb.IrPresetListResponse {
+	if resp == nil {
+		return &pb.IrPresetListResponse{Success: false, Message: "empty camera response"}
+	}
+	out := &pb.IrPresetListResponse{Success: resp.Success, Message: resp.Message}
+	for _, p := range resp.Presets {
+		out.Presets = append(out.Presets, &pb.IrPreset{
+			Name: p.Name, ZoomRatio: p.ZoomRatio, NearPwm: p.NearPwm, FarPwm: p.FarPwm,
+		})
+	}
+	return out
+}
+
+func (s *DeviceControlServer) ListIrPresets(ctx context.Context, _ *pb.Empty) (*pb.IrPresetListResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.IrPresetListResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.ListIrPresets(ctx, &camerapb.Empty{})
+	if err != nil {
+		return &pb.IrPresetListResponse{Success: false, Message: err.Error()}, nil
+	}
+	return irPresetListFromCamera(resp), nil
+}
+
+func (s *DeviceControlServer) SaveIrPreset(ctx context.Context, req *pb.IrPreset) (*pb.IrPresetListResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.IrPresetListResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.SaveIrPreset(ctx, &camerapb.IrPreset{
+		Name: req.Name, ZoomRatio: req.ZoomRatio, NearPwm: req.NearPwm, FarPwm: req.FarPwm,
+	})
+	if err != nil {
+		return &pb.IrPresetListResponse{Success: false, Message: err.Error()}, nil
+	}
+	return irPresetListFromCamera(resp), nil
+}
+
+func (s *DeviceControlServer) DeleteIrPreset(ctx context.Context, req *pb.DeleteIrPresetRequest) (*pb.IrPresetListResponse, error) {
+	if s.cameraDaemonClient == nil {
+		return &pb.IrPresetListResponse{Success: false, Message: "Camera daemon not connected"}, nil
+	}
+	resp, err := s.cameraDaemonClient.DeleteIrPreset(ctx, &camerapb.DeleteIrPresetRequest{Name: req.Name})
+	if err != nil {
+		return &pb.IrPresetListResponse{Success: false, Message: err.Error()}, nil
+	}
+	return irPresetListFromCamera(resp), nil
 }
 
 // PTZ Control
@@ -1027,6 +1209,18 @@ func (s *DeviceControlServer) SetZoomLevel(ctx context.Context, req *pb.ZoomLeve
 	if s.halLens == nil {
 		return &pb.Status{Success: false, Message: "Lens HAL not initialized"}, nil
 	}
+	if s.lensIsFg2009() {
+		// Level is normalized full travel; map it onto the optical-ratio
+		// model instead of the AF0832 step limits.
+		s.lensStatusMu.RLock()
+		maxRatio := s.lensMaxZoomRatio
+		s.lensStatusMu.RUnlock()
+		if maxRatio <= 1 {
+			maxRatio = 2.88
+		}
+		ratio := 1.0 + req.Level*(maxRatio-1.0)
+		return s.LensGotoZoomRatio(ctx, &pb.ZoomRatioRequest{ZoomRatio: ratio})
+	}
 	state, err := s.ensureZoomReady()
 	if err != nil {
 		return &pb.Status{Success: false, Message: err.Error()}, nil
@@ -1063,11 +1257,37 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 
 	zlim := s.halLens.ZoomLimits()
 	flim := s.halLens.FocusLimits()
+	// Lens identity is server-level state (learned at init), so it stays
+	// available even when the live HAL poll below fails.
+	s.lensStatusMu.RLock()
+	lensModel := s.lensModel
+	maxRatio := s.lensMaxZoomRatio
+	zoomTravel := s.lensZoomTravelSteps
+	focusTravel := s.lensFocusTravelSteps
+	cached := s.lastLensStatus
+	hasCached := s.hasLensStatus
+	s.lensStatusMu.RUnlock()
+	fillLensIdentity := func(resp *pb.LensStatusResponse, ratio float32, hasRatio bool) {
+		if lensModel == "" {
+			return
+		}
+		resp.LensModel = lensModel
+		if maxRatio > 1 {
+			resp.ZoomRatioRange = &pb.ZoomRatioRange{Min: 1.0, Max: maxRatio}
+		}
+		if hasRatio {
+			resp.ZoomRatio = ratio
+		}
+		// The open-loop model reports positions in curve coordinates; pair
+		// them with the profile's travel limits instead of the AF0832 step
+		// limits this service was configured with.
+		if lensModel == "fg2009" && zoomTravel > 0 && focusTravel > 0 {
+			resp.ZoomLimit = &pb.LensLimit{MinPos: 0, MaxPos: zoomTravel}
+			resp.FocusLimit = &pb.LensLimit{MinPos: 0, MaxPos: focusTravel}
+		}
+	}
 	fallbackStatus := func() *pb.LensStatusResponse {
-		s.lensStatusMu.RLock()
-		defer s.lensStatusMu.RUnlock()
-		if s.hasLensStatus {
-			cached := s.lastLensStatus
+		if hasCached {
 			// Clamp motor states to Stopped(1) — cached Running(2)/ResetZero(3)
 			// would cause the frontend to show "initializing" indefinitely when
 			// the lens HAL link is down.
@@ -1079,7 +1299,7 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 			if focusState != 1 && focusState != 4 {
 				focusState = 1
 			}
-			return &pb.LensStatusResponse{
+			resp := &pb.LensStatusResponse{
 				ZoomState:        zoomState,
 				FocusState:       focusState,
 				ZoomRzDone:       cached.ZoomRzDone,
@@ -1090,13 +1310,20 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 				AutofocusEnabled: s.autofocusEnabled,
 				ZoomLimit:        &pb.LensLimit{MinPos: cached.ZoomLimitMin, MaxPos: cached.ZoomLimitMax},
 				FocusLimit:       &pb.LensLimit{MinPos: cached.FocusLimitMin, MaxPos: cached.FocusLimitMax},
+				// Keep the fixed-lens verdict across fallbacks so the web keeps
+				// hiding motor controls even when the lens HAL link drops.
+				FixedLens: cached.FixedLens,
 			}
+			fillLensIdentity(resp, cached.ZoomRatio, cached.HasZoomRatio)
+			return resp
 		}
-		return &pb.LensStatusResponse{
+		resp := &pb.LensStatusResponse{
 			AutofocusEnabled: s.autofocusEnabled,
 			ZoomLimit:        &pb.LensLimit{MinPos: zlim.MinPos, MaxPos: zlim.MaxPos},
 			FocusLimit:       &pb.LensLimit{MinPos: flim.MinPos, MaxPos: flim.MaxPos},
 		}
+		fillLensIdentity(resp, 0, false)
+		return resp
 	}
 
 	state, err := s.halLens.StateGetTry()
@@ -1112,6 +1339,11 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 		irisADC = uint32(adc)
 	}
 
+	// Ratio conversion covers both lenses: the lens HAL maps the FG2009
+	// curve coordinate through the position model and the AF0832 position
+	// through its ratio table.
+	zoomRatio := s.halLens.AF0832PosToRatio(state.ZoomPos)
+
 	resp := &pb.LensStatusResponse{
 		ZoomState:        uint32(state.ZoomState),
 		FocusState:       uint32(state.FocusState),
@@ -1123,7 +1355,9 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 		AutofocusEnabled: s.autofocusEnabled,
 		ZoomLimit:        &pb.LensLimit{MinPos: zlim.MinPos, MaxPos: zlim.MaxPos},
 		FocusLimit:       &pb.LensLimit{MinPos: flim.MinPos, MaxPos: flim.MaxPos},
+		FixedLens:        state.FixedLens,
 	}
+	fillLensIdentity(resp, zoomRatio, true)
 	s.lensStatusMu.Lock()
 	s.lastLensStatus = lensStatusCache{
 		ZoomState:     resp.ZoomState,
@@ -1137,6 +1371,9 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 		ZoomLimitMax:  resp.ZoomLimit.GetMaxPos(),
 		FocusLimitMin: resp.FocusLimit.GetMinPos(),
 		FocusLimitMax: resp.FocusLimit.GetMaxPos(),
+		ZoomRatio:     zoomRatio,
+		HasZoomRatio:  true,
+		FixedLens:     resp.FixedLens,
 	}
 	s.hasLensStatus = true
 	s.lensStatusMu.Unlock()
@@ -1154,6 +1391,25 @@ func (s *DeviceControlServer) SetFocusLevel(ctx context.Context, req *pb.FocusLe
 	}
 	if s.autofocusEnabled {
 		return &pb.Status{Success: false, Message: "manual focus disabled while autofocus is enabled"}, nil
+	}
+	if s.lensIsFg2009() {
+		// Level 0..1 maps to NEAR..FAR on the open-loop focus curve inside
+		// the lens HAL; the AF0832 step limits do not apply.
+		if err := s.halLens.StopAndWaitAll(2 * time.Second); err != nil {
+			return &pb.Status{Success: false, Message: "stop motors before focus goto: " + err.Error()}, nil
+		}
+		if err := s.retryWithRecover("focus_goto_level", func() error {
+			return s.halLens.FocusGotoLevel(req.Level, 0)
+		}); err != nil {
+			return &pb.Status{Success: false, Message: err.Error()}, nil
+		}
+		if err := s.retryWithRecover("wait_focus_stopped", func() error {
+			return s.halLens.WaitFocusStopped(15 * time.Second)
+		}); err != nil {
+			return &pb.Status{Success: false, Message: err.Error()}, nil
+		}
+		s.publishEvent("lens_focus", map[string]interface{}{"level": req.Level})
+		return &pb.Status{Success: true}, nil
 	}
 	state, err := s.ensureFocusReady()
 	if err != nil {
@@ -1371,6 +1627,16 @@ func (s *DeviceControlServer) LensInit(ctx context.Context, req *pb.LensInitRequ
 		return &pb.Status{Success: false, Message: "Lens HAL not initialized"}, nil
 	}
 
+	if s.lensIsFg2009() {
+		// Full open-loop sequence: profile push, hard-stop anchor, park.
+		// There is no AF0832 bootstrap for this lens.
+		if err := s.halLens.Init(); err != nil {
+			return &pb.Status{Success: false, Message: "lens init failed: " + err.Error()}, nil
+		}
+		logger.Info("LensInit: fg2009 profile + bootstrap completed")
+		return &pb.Status{Success: true}, nil
+	}
+
 	// Full bootstrap: init + af0832 create + reset-zero via C event polling
 	if err := s.halLens.AF0832Bootstrap(); err != nil {
 		return &pb.Status{Success: false, Message: "lens init failed: " + err.Error()}, nil
@@ -1386,6 +1652,13 @@ func (s *DeviceControlServer) LensGotoRatioDistance(ctx context.Context, req *pb
 
 	if s.halLens == nil {
 		return &pb.Status{Success: false, Message: "Lens HAL not initialized"}, nil
+	}
+	if s.lensIsFg2009() {
+		// Ratio+distance semantics are AF0832-only (closed-loop distance
+		// table). The open-loop lens has LensGotoZoomRatio. Reject before
+		// any motor stop so the AF0832 retry/fallback machinery below never
+		// "recovers" a capability rejection with reinit ram cycles.
+		return &pb.Status{Success: false, Message: "lens goto ratio+distance requires lens af0832; use goto-ratio for fg2009"}, nil
 	}
 
 	// Stop all motors first
@@ -1425,6 +1698,52 @@ func (s *DeviceControlServer) LensGotoRatioDistance(ctx context.Context, req *pb
 	}
 
 	s.invalidateAutofocusAnchor("absolute zoom-focus goto")
+	return &pb.Status{Success: true}, nil
+}
+
+// LensGotoZoomRatio moves the FG2009 open-loop zoom axis to an optical
+// ratio target. The ratio→steps conversion and the virtual-absolute move
+// (relative step delta against the dead-reckoned model) live in the lens
+// HAL, so no AF0832 step limits are consulted here.
+func (s *DeviceControlServer) LensGotoZoomRatio(ctx context.Context, req *pb.ZoomRatioRequest) (*pb.Status, error) {
+	logger.Info("LensGotoZoomRatio: zoom_ratio=%.4f", req.ZoomRatio)
+
+	if s.halLens == nil {
+		return &pb.Status{Success: false, Message: "Lens HAL not initialized"}, nil
+	}
+	if !s.lensIsFg2009() {
+		return &pb.Status{Success: false, Message: "LensGotoZoomRatio requires lens fg2009"}, nil
+	}
+	if req.ZoomRatio < 1.0 {
+		return &pb.Status{Success: false, Message: "zoom_ratio must be >= 1.0"}, nil
+	}
+	s.lensStatusMu.RLock()
+	maxRatio := s.lensMaxZoomRatio
+	s.lensStatusMu.RUnlock()
+	if maxRatio > 1 && req.ZoomRatio > maxRatio {
+		return &pb.Status{Success: false, Message: fmt.Sprintf("zoom_ratio must be <= %.4f", maxRatio)}, nil
+	}
+
+	// Stop all axes before the move to avoid MCU BUSY rejection.
+	if err := s.halLens.StopAndWaitAll(2 * time.Second); err != nil {
+		return &pb.Status{Success: false, Message: "stop motors before goto: " + err.Error()}, nil
+	}
+	if err := s.ensureLensBootstrapped(); err != nil {
+		return &pb.Status{Success: false, Message: err.Error()}, nil
+	}
+	if err := s.retryWithRecover("zoom_goto_ratio", func() error {
+		return s.halLens.ZoomGotoRatio(req.ZoomRatio, 0)
+	}); err != nil {
+		return &pb.Status{Success: false, Message: err.Error()}, nil
+	}
+	if err := s.retryWithRecover("wait_zoom_stopped", func() error {
+		return s.halLens.WaitZoomStopped(15 * time.Second)
+	}); err != nil {
+		return &pb.Status{Success: false, Message: err.Error()}, nil
+	}
+
+	s.publishEvent("lens_zoom", map[string]interface{}{"zoom_ratio": req.ZoomRatio})
+	s.invalidateAutofocusAnchor("absolute zoom movement")
 	return &pb.Status{Success: true}, nil
 }
 
@@ -1640,14 +1959,161 @@ func readSoCTemp() float32 {
 
 // Event Stream
 
+// Event detection thresholds for the poller below. Light changes emit on
+// a 50 mV absolute or 5% relative move (whichever trips first) so both
+// dark-baseline swings and bright small-signal drift are visible;
+// temperature alerts latch at 85°C and clear at 80°C — 5°C of hysteresis
+// so riding the threshold does not machine-gun events.
+const (
+	eventPollInterval      = 2 * time.Second
+	eventQueryTimeout      = time.Second
+	lightDeltaMv           = 50
+	lightDeltaRelPct       = 5
+	socTempAlertC          = 85.0
+	socTempClearC          = 80.0
+	eventSubscriberBacklog = 16
+)
+
+// StartEventPoller launches the single hardware poller behind
+// SubscribeEvents. Idempotent; the poller exits when ctx is cancelled.
+func (s *DeviceControlServer) StartEventPoller(ctx context.Context) {
+	s.eventSubsMu.Lock()
+	if s.eventPollerStarted {
+		s.eventSubsMu.Unlock()
+		return
+	}
+	s.eventPollerStarted = true
+	if s.eventSubs == nil {
+		s.eventSubs = make(map[chan *pb.DeviceEvent]struct{})
+	}
+	s.eventSubsMu.Unlock()
+
+	go s.eventPollerLoop(ctx)
+}
+
+func (s *DeviceControlServer) eventPollerLoop(ctx context.Context) {
+	ticker := time.NewTicker(eventPollInterval)
+	defer ticker.Stop()
+
+	lastLightMv := int64(-1) // -1 = no baseline yet; first sample emits
+	hot := false             // temperature alert latch
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		if mv, ok := s.sampleLightMv(ctx); ok && lightChanged(lastLightMv, mv) {
+			s.publishDeviceEvent(&pb.DeviceEvent{
+				Type:        pb.DeviceEvent_LIGHT_SENSOR_CHANGE,
+				TimestampNs: uint64(time.Now().UnixNano()),
+				Data:        &pb.DeviceEvent_LightSensorValue{LightSensorValue: uint32(mv)},
+			})
+			lastLightMv = mv
+		}
+
+		if t := readSoCTemp(); t > 0 {
+			// Emit on both transitions; recovery carries the same
+			// temperature payload and consumers compare against the
+			// documented thresholds above.
+			if !hot && t >= socTempAlertC {
+				hot = true
+				s.publishDeviceEvent(&pb.DeviceEvent{
+					Type:        pb.DeviceEvent_TEMPERATURE_ALERT,
+					TimestampNs: uint64(time.Now().UnixNano()),
+					Data:        &pb.DeviceEvent_Temperature{Temperature: t},
+				})
+			} else if hot && t <= socTempClearC {
+				hot = false
+				s.publishDeviceEvent(&pb.DeviceEvent{
+					Type:        pb.DeviceEvent_TEMPERATURE_ALERT,
+					TimestampNs: uint64(time.Now().UnixNano()),
+					Data:        &pb.DeviceEvent_Temperature{Temperature: t},
+				})
+			}
+		}
+	}
+}
+
+// sampleLightMv reads the light sensor via camera-daemon's hardware
+// status RPC — the same source GetDeviceStatus reports. False when the
+// daemon is unreachable; the poller just tries again next tick.
+func (s *DeviceControlServer) sampleLightMv(ctx context.Context) (int64, bool) {
+	if s.cameraDaemonClient == nil {
+		return 0, false
+	}
+	qctx, cancel := context.WithTimeout(ctx, eventQueryTimeout)
+	defer cancel()
+	resp, err := s.cameraDaemonClient.GetDeviceHardwareStatus(qctx, &camerapb.Empty{})
+	if err != nil || !resp.GetSuccess() {
+		return 0, false
+	}
+	return int64(resp.GetLightSensorMv()), true
+}
+
+// lightChanged applies the dual hysteresis: absolute 50 mV or relative
+// 5% of the last EMITTED value. The first sample (last < 0) always
+// emits, giving subscribers a baseline.
+func lightChanged(last, now int64) bool {
+	if last < 0 {
+		return true
+	}
+	d := now - last
+	if d < 0 {
+		d = -d
+	}
+	if d >= lightDeltaMv {
+		return true
+	}
+	return last > 0 && d*100 >= int64(lightDeltaRelPct)*last
+}
+
+// publishDeviceEvent fans an event out to every subscriber without
+// blocking: a full channel means that subscriber is not draining — drop
+// for that subscriber only, so one slow client can never stall the
+// poller for the rest. (Distinct from publishEvent, which forwards app
+// lifecycle events to the Event Bus service.)
+func (s *DeviceControlServer) publishDeviceEvent(ev *pb.DeviceEvent) {
+	s.eventSubsMu.Lock()
+	defer s.eventSubsMu.Unlock()
+	for ch := range s.eventSubs {
+		select {
+		case ch <- ev:
+		default:
+			logger.Debug("SubscribeEvents: subscriber backlog full, event dropped (type=%v)", ev.Type)
+		}
+	}
+}
+
 func (s *DeviceControlServer) SubscribeEvents(req *pb.Empty, stream pb.DeviceControl_SubscribeEventsServer) error {
 	logger.Info("Client subscribed to device events")
 
-	// TODO: Implement event subscription
-	// This would monitor MCU for events like GPIO changes, temperature alerts, etc.
+	ch := make(chan *pb.DeviceEvent, eventSubscriberBacklog)
+	s.eventSubsMu.Lock()
+	if s.eventSubs == nil {
+		s.eventSubs = make(map[chan *pb.DeviceEvent]struct{})
+	}
+	s.eventSubs[ch] = struct{}{}
+	s.eventSubsMu.Unlock()
+	defer func() {
+		s.eventSubsMu.Lock()
+		delete(s.eventSubs, ch)
+		s.eventSubsMu.Unlock()
+	}()
 
-	<-stream.Context().Done()
-	return stream.Context().Err()
+	ctx := stream.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ev := <-ch:
+			if err := stream.Send(ev); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func main() {
@@ -1746,6 +2212,10 @@ func main() {
 	deviceServer := NewDeviceControlServer(&cfg, halLens, cameraDaemonClient, cameraDaemonConn)
 	pb.RegisterDeviceControlServer(grpcServer, deviceServer)
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
+
+	// Device event poller (SubscribeEvents) — tied to the reconcile
+	// context so shutdown stops it.
+	deviceServer.StartEventPoller(reconcileCtx)
 
 	// Handle shutdown gracefully
 	sigChan := make(chan os.Signal, 1)
@@ -1862,9 +2332,53 @@ func reconcileLens(ctx context.Context, s *DeviceControlServer, client *lens.Len
 }
 
 func initializeRemoteLens(s *DeviceControlServer, client *lens.LensClient) error {
+	// Leaving READY is not proof of a camera-daemon restart: an overloaded
+	// daemon can also flap the transport transiently. The daemon-side AF0832
+	// bootstrapped flag (in-memory, cleared only by a real restart) and the
+	// MCU home status distinguish the two. When the lens never went away,
+	// skip the mechanical re-home — replaying it on every flap is what moved
+	// the lens to 1.0x/home-focus "by itself" while a page stream loaded.
+	if client.IsAF0832Bootstrapped() {
+		logger.Info("Lens reconnect without daemon restart (AF0832 still bootstrapped); skipping re-home")
+		client.ReplayPersistedConfig()
+		return nil
+	}
+	// Flag absent (post-restart, or a transient IsAF0832Bootstrapped transport
+	// error under load), but the motors may already be homed. Both axes
+	// rz-done means the lens never went away: re-mark and skip the re-home.
+	if zd, fd, err := s.lensHomed(); err == nil && zd && fd {
+		logger.Info("Lens already homed after reconnect (zoom+focus rz-done); re-marking bootstrapped without re-home")
+		_ = client.AF0832MarkBootstrapped()
+		client.ReplayPersistedConfig()
+		return nil
+	}
+
 	if err := client.Init(); err != nil {
 		return fmt.Errorf("remote Init: %w", err)
 	}
+
+	// Learn the factory-fitted lens. ProfileGet is additive: an older
+	// camera-daemon fails the RPC and we fall through to the AF0832 path.
+	if profile, err := client.ProfileGet(); err == nil {
+		s.lensStatusMu.Lock()
+		s.lensModel = profile.Model
+		s.lensMaxZoomRatio = profile.MaxZoomRatio
+		s.lensZoomTravelSteps = profile.ZoomTravelSteps
+		s.lensFocusTravelSteps = profile.FocusTravelSteps
+		s.lensStatusMu.Unlock()
+		if profile.Model == "fg2009" {
+			// Init already pushed the MCU profile, anchored the open-loop
+			// model against the hard stops and parked it. No AF0832
+			// bootstrap and no startup goto — the lens stays at park.
+			client.ReplayPersistedConfig()
+			logger.Info("Lens HAL initialized via camera-daemon (fg2009 open-loop, max zoom ratio %.4f)",
+				profile.MaxZoomRatio)
+			return nil
+		}
+	} else {
+		logger.Warn("Lens ProfileGet failed (%v); assuming af0832", err)
+	}
+
 	if err := client.AF0832Bootstrap(); err != nil {
 		return fmt.Errorf("AF0832 bootstrap: %w", err)
 	}

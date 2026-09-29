@@ -2,6 +2,15 @@ import request from '@/services/request';
 import type { DiskInfo } from '@/services/types';
 import { encryptPassword } from '@/utils/crypto';
 
+export interface OTACompatibilityReport {
+  valid: boolean;
+  error_code?: string;
+  message?: string;
+  os_version?: string;
+  app_min_os_version?: string;
+  app_max_os_version?: string;
+}
+
 export interface OTAParseResponse {
   current_version: string;
   target_version: string;
@@ -9,6 +18,8 @@ export interface OTAParseResponse {
   git_commit: string;
   firmware_path: string;
   firmware_size: number;
+  /** Advisory verdict against the running OS; install is rejected when invalid. */
+  compatibility?: OTACompatibilityReport;
 }
 
 export interface OTAStatusResponse {
@@ -99,9 +110,8 @@ export interface OSUpgradeStatus {
   recovery_version?: string;
   secure_boot_key_id?: string;
   app_version?: string;
-  compat_level?: number;
-  data_schema?: number;
   compatibility_valid?: boolean;
+  compatibility_warning?: string;
   rollback_supported?: boolean;
   service_interruption_required?: boolean;
   downgrade_allowed?: boolean;
@@ -158,9 +168,9 @@ export const systemApi = {
 
   // OTA 状态
   otaStatus: (jobId?: string, silent = false) => request.get<OTAStatusResponse>('/api/v1/system/ota/status', {
-    params: jobId ? { job_id: jobId } : undefined,
-    ...(silent ? { silent: true } : {}),
-  } as any),
+      params: jobId ? { job_id: jobId } : undefined,
+      ...(silent ? { silent: true } : {}),
+    } as any),
 
   // OTA 执行固件升级
   otaUpgrade: () => request.post('/api/v1/system/ota/install'),

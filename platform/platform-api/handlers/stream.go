@@ -298,6 +298,68 @@ func (h *StreamHandlers) ForceKeyframe(streamID string) {
 }
 
 // ==========================================
+// Stream inventory endpoints (read-only)
+// ==========================================
+
+// streamView projects a StreamConfig into the JSON response shape for the
+// stream list/get endpoints, adding the playback URLs derivable from it:
+// rtsp_url (the RTSP mount, named after the stream) and h264_ws_path (the
+// H264-over-WebSocket route served by this API; clients prefix their own
+// API base URL and swap http->ws).
+func streamView(s StreamConfig, rtspBaseURL string) gin.H {
+	rtspURL := ""
+	if rtspBaseURL != "" {
+		rtspURL = rtspBaseURL + "/" + s.ID
+	}
+	return gin.H{
+		"id":           s.ID,
+		"name":         s.Name,
+		"codec":        s.Codec,
+		"width":        s.Width,
+		"height":       s.Height,
+		"fps":          s.FPS,
+		"bitrate":      s.Bitrate,
+		"gop":          s.GOP,
+		"enabled":      s.Enabled,
+		"status":       s.Status,
+		"rtsp_url":     rtspURL,
+		"h264_ws_path": "/api/v1/h264/" + s.ID,
+	}
+}
+
+// ListStreams handles GET /api/v1/media/streams: the stream inventory as
+// parsed from camera-daemon.yaml (kept in sync after config writes via
+// ReloadStreams). For runtime encoder state use GET /media/status instead.
+func (h *StreamHandlers) ListStreams(c *gin.Context) {
+	h.mu.RLock()
+	views := make([]gin.H, 0, len(h.streams))
+	for i := range h.streams {
+		views = append(views, streamView(h.streams[i], h.rtspBaseURL))
+	}
+	h.mu.RUnlock()
+	Resp(c).OK(gin.H{"streams": views})
+}
+
+// GetStream handles GET /api/v1/media/streams/:name.
+func (h *StreamHandlers) GetStream(c *gin.Context) {
+	name := c.Param("name")
+
+	h.mu.RLock()
+	sc, ok := h.streamMap[name]
+	var view gin.H
+	if ok {
+		view = streamView(*sc, h.rtspBaseURL)
+	}
+	h.mu.RUnlock()
+
+	if !ok {
+		Resp(c).FailMsg(CodeNotFound, "Stream not found: "+name)
+		return
+	}
+	Resp(c).OK(view)
+}
+
+// ==========================================
 // H264 over WebSocket (MSE)
 // ==========================================
 
@@ -319,8 +381,11 @@ func (h *StreamHandlers) HandleH264WebSocket(c *gin.Context) {
 		return
 	}
 
-	// Validate stream exists in config
+	// Validate stream exists in config (guard the map read: ReloadStreams
+	// replaces streamMap concurrently on config writes)
+	h.mu.RLock()
 	stream, ok := h.streamMap[streamID]
+	h.mu.RUnlock()
 	if !ok {
 		Resp(c).FailMsg(CodeNotFound, "Stream not found: "+streamID)
 		return

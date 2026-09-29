@@ -88,7 +88,10 @@ export default function PasswordDisable() {
                     'sys.password_settings.warning',
                     'Disabling the password allows anyone to access the device, which poses a security risk'
                   )
-                : '确定要启用设备密码吗？启用后需要密码才能访问设备。'}
+                : t(
+                    'sys.password_settings.enable_warning',
+                    '确定要启用设备密码吗？启用后需要密码才能访问设备。'
+                  )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

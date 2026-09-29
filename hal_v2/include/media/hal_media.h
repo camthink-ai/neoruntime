@@ -70,6 +70,9 @@ typedef enum {
 #define HAL_PM_MAX_LABELS 8     /* max masked labels per dynamic config */
 #define HAL_PM_LABEL_LEN  64    /* max label string length (incl. NUL) */
 
+/* Max codec context name length (incl. NUL); matches HalCodecContext::codec_name. */
+#define HAL_CODEC_NAME_MAX 64
+
 /** A single privacy mask region defined by up to 8 polygon vertices. */
 typedef struct {
     const char *id;             /* unique identifier for this mask region */
@@ -155,7 +158,7 @@ typedef struct {
     HalFlipDirection flip_direction;    /* image flip / mirror */
 
     bool digital_zoom;                  /* enable digital zoom (mutually exclusive with privacy_mask) */
-    int  digital_zoom_value;            /* zoom magnification level [1..5] (only used when digital_zoom == true) */
+    int  digital_zoom_value;            /* zoom magnification level [1..31] (only used when digital_zoom == true) */
 
     bool dewarp;                        /* enable Lens Distortion Correction (LDC) */
     bool dis;                           /* enable Digital Image Stabilization */
@@ -211,8 +214,13 @@ typedef struct {
  * Configuration passed to media init().
  *
  * Priority: config_json > config_path > platform default.
- * If image_config fields are non-zero they override corresponding values
- * parsed from the JSON / file.
+ * If image_config.rotation_angle is non-zero it is baked into the medialib
+ * profile files before the pipeline is created, so the pipeline is BUILT
+ * rotated (rotation is the only image_config field whose post-init change
+ * forces a medialib pipeline restart — the path that can wedge the DSP
+ * rotation buffers; see dynamic_change_image_config). The remaining
+ * image_config fields are captured for reference but applied via the normal
+ * dynamic_change_image_config() flow after init.
  *
  * On Hailo-15, when both @ref config_path and @ref config_json are NULL/empty, init() falls
  * back to a compiled-in default media-library config (the SDK webserver config for the Basic
@@ -232,7 +240,7 @@ typedef struct {
     const char *config_json;            /* in-memory JSON string (takes priority over config_path) */
     const char *encoder_overrides_json; /* per-stream encoder dimension overrides (JSON array) */
 
-    HalMediaImageConfig image_config;   /* image overrides applied after JSON parsing */
+    HalMediaImageConfig image_config;   /* image overrides; rotation_angle is baked into the initial build (see above) */
 
     void *priv;                         /* platform-specific extension (opaque) */
 } HalMediaConfig;
@@ -304,6 +312,91 @@ typedef struct {
     HalPipelineStreamConfig *streams;
     uint32_t                 stream_count;    /* number of streams (1-4) */
 } HalPipelineReconfig;
+
+/* --------------------------------------------------------------------
+ * Motion detection
+ * -------------------------------------------------------------------- */
+
+/** Motion detection sensitivity. */
+typedef enum {
+    HAL_MOTION_SENSITIVITY_LOWEST = 0,
+    HAL_MOTION_SENSITIVITY_LOW,
+    HAL_MOTION_SENSITIVITY_MEDIUM,
+    HAL_MOTION_SENSITIVITY_HIGH,
+    HAL_MOTION_SENSITIVITY_HIGHEST,
+} HalMotionSensitivity;
+
+/**
+ * Motion detection configuration (frontend frame-difference engine).
+ *
+ * Hailo mapping: medialib application_settings.motion_detection
+ * (motion_detection_config_t). Enabling allocates an internal low-resolution
+ * analysis stream, so toggling @c enabled may briefly restart the pipeline.
+ *
+ * An all-zero roi means full frame.
+ *
+ * @note ROI coordinates are pixels on the motion analysis stream (the
+ * smallest output stream), not the main/full-resolution sensor image.
+ */
+typedef struct {
+    bool     enabled;
+    int32_t  roi_x, roi_y, roi_w, roi_h;  /* analysis-stream pixels; all-zero = full frame */
+    HalMotionSensitivity sensitivity;     /* LOWEST..HIGHEST */
+    float    threshold;                   /* 0..1 changed-pixel ratio in ROI to trigger */
+} HalMotionConfig;
+
+/**
+ * Motion state change callback.
+ *
+ * Fires on state transitions (no-motion -> motion, motion -> no-motion) of
+ * the frontend analysis, not on every frame.
+ *
+ * @param media_ctx       Media context the event belongs to.
+ * @param motion_detected true when motion started, false when it stopped.
+ * @param frame_id        Monotonic frontend frame counter.
+ * @param timestamp_ns    Frame timestamp (nanoseconds).
+ * @param userdata        Opaque pointer registered at subscribe time.
+ *
+ * @note Invoked from an internal worker thread; return quickly.
+ */
+typedef void (*HalMotionCallback)(void *media_ctx, bool motion_detected,
+                                  uint64_t frame_id, uint64_t timestamp_ns, void *userdata);
+
+/* --------------------------------------------------------------------
+ * Thermal throttling
+ * -------------------------------------------------------------------- */
+
+/**
+ * Pipeline throttling state.
+ * Maps to Hailo Media Library @c media_library_throttling_state_t.
+ *
+ * The SoC thermal manager degrades performance stepwise (S0..S4) when the
+ * chip heats up and recovers through COOLING back to FULL_PERFORMANCE.
+ */
+typedef enum {
+    HAL_THROTTLING_UNINITIALIZED = 0,
+    HAL_THROTTLING_FULL_PERFORMANCE,     /* no restriction */
+    HAL_THROTTLING_COOLING,              /* recovering towards full performance */
+    HAL_THROTTLING_S0,                   /* restriction level 0 (mildest) */
+    HAL_THROTTLING_S1,
+    HAL_THROTTLING_S2,
+    HAL_THROTTLING_S3,
+    HAL_THROTTLING_S4,                   /* restriction level 4 (strongest) */
+} HalThrottlingState;
+
+/**
+ * Thermal throttling state change callback.
+ *
+ * @param media_ctx    Media context the event belongs to.
+ * @param state        New throttling state.
+ * @param profile_name Active profile after the restriction was applied
+ *                     (platform string; may be empty), NUL-terminated.
+ * @param userdata     Opaque pointer registered at subscribe time.
+ *
+ * @note Invoked from an internal worker thread; return quickly.
+ */
+typedef void (*HalThrottlingCallback)(void *media_ctx, HalThrottlingState state,
+                                      const char *profile_name, void *userdata);
 
 /* --------------------------------------------------------------------
  * Media operations table
@@ -704,6 +797,98 @@ typedef struct {
     int (*attach_frame_analytics)(void *media_ctx, HalFrameBuffer *frame,
                                   const HalFrameDetection *dets, uint32_t det_count,
                                   const HalFrameSegmentation *segs, uint32_t seg_count);
+
+    /* ---------- thermal throttling events (M1 additions) ---------- */
+
+    /**
+     * @brief Subscribe to thermal throttling state changes.
+     *
+     * The callback fires when the SoC thermal manager restricts or restores
+     * pipeline performance (e.g. AI-ISP gated off under heat — previously
+     * only visible as HAL_ERR_PROFILE_RESTRICTED on switch_profile()).
+     *
+     * Only one subscriber is supported; a second subscribe replaces the first.
+     *
+     * @param media_ctx Media context.
+     * @param callback  State change callback.
+     * @param userdata  Opaque pointer passed to the callback.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*subscribe_throttling)(void *media_ctx, HalThrottlingCallback callback, void *userdata);
+
+    /**
+     * @brief Unsubscribe from throttling state changes.
+     * @param media_ctx Media context.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*unsubscribe_throttling)(void *media_ctx);
+
+    /**
+     * @brief Query the current thermal throttling state (poll variant).
+     * @param media_ctx Media context.
+     * @param state_out Receives the current state.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*get_throttling_state)(void *media_ctx, HalThrottlingState *state_out);
+
+    /* ---------- motion detection (M2 additions) ---------- */
+
+    /**
+     * @brief Configure the frontend motion detection engine.
+     *
+     * @param media_ctx Media context.
+     * @param config    Motion configuration; enabled=false disables detection.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*set_motion_config)(void *media_ctx, const HalMotionConfig *config);
+
+    /**
+     * @brief Retrieve the current motion detection configuration.
+     * @param media_ctx Media context.
+     * @param config    Receives the current configuration.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*get_motion_config)(void *media_ctx, HalMotionConfig *config);
+
+    /**
+     * @brief Subscribe to motion state change events (transition-triggered).
+     *
+     * @param media_ctx Media context.
+     * @param callback  Motion callback.
+     * @param userdata  Opaque pointer passed to the callback.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*subscribe_motion)(void *media_ctx, HalMotionCallback callback, void *userdata);
+
+    /**
+     * @brief Unsubscribe from motion events.
+     * @param media_ctx Media context.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*unsubscribe_motion)(void *media_ctx);
+
+    /**
+     * @brief Snapshot the codec context names, race-free against rebuilds.
+     *
+     * get_codec_list() hands out internal pointers whose lifetime ends at the
+     * next layout rebuild (profile switch / rotation / add-remove reinit);
+     * dereferencing them from a context that cannot hold the caller's
+     * serialization locks races the rebuild's free. This op copies the current
+     * codec_name of every FROM_MEDIA codec context into caller storage under
+     * the implementation's context-list lock, so the snapshot is always
+     * self-consistent. Trailing ops entry: older HAL implementations leave it
+     * NULL — callers must NULL-check and fall back to get_codec_list().
+     *
+     * @param media_ctx  Media context.
+     * @param names_out  Caller-allocated array of name buffers, each
+     *                   HAL_CODEC_NAME_MAX bytes.
+     * @param max_names  Capacity of @p names_out (entries beyond it are not
+     *                   copied; the call still succeeds with a capped count).
+     * @param count_out  Receives the number of names written.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*get_codec_names)(void *media_ctx, char (*names_out)[HAL_CODEC_NAME_MAX],
+                           uint32_t max_names, uint32_t *count_out);
 } HalMediaOps;
 
 /** Platform-specific media operations (resolved at link time). */

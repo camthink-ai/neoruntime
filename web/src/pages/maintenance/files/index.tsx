@@ -625,7 +625,7 @@ export default function FileManagement() {
         <div className="flex-1 min-h-0 overflow-hidden">
           <FileTable
             files={paged}
-            isLoading={isLoading}
+            isLoading={isLoading || !resolved}
             searchText=""
             selectedPaths={selectedPaths}
             allCurrentSelected={allCurrentSelected}

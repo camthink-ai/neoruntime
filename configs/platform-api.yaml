@@ -1,6 +1,11 @@
 service:
   name: "platform-api"
   http_addr: "127.0.0.1:8080"
+  # Local auth-exempt face: CLI and on-device tools talk to this unix socket
+  # without a bearer token. Trust model matches the gRPC services (socket
+  # file permission 0660 root+group gates access). The TCP face above still
+  # requires authentication. Empty disables the socket face.
+  unix_socket: "/run/aipc/platform-api.sock"
   # Total time allowed to read request headers and body. Keep this long enough
   # for large .swu OS upgrade uploads over slower LAN/Wi-Fi links.
   read_timeout_seconds: 1800

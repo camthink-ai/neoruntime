@@ -34,7 +34,7 @@ public:
     /// Submit a post-processing task. Returns false if the queue is full
     /// or the pool is stopped. On false, @p task is NOT moved-from and the
     /// caller can execute it synchronously as a fallback.
-    bool submit(Task& task);
+    bool submit(Task& task) noexcept;
 
     int queue_depth() const;
 

@@ -79,6 +79,12 @@ func (h *OSUpgradeHandlers) ReconcileOnBoot() {
 	}()
 }
 
+// Store exposes the OS upgrade job store for cross-handler wiring (the app
+// OTA handlers use it for the app/OS upgrade mutual-exclusion gate).
+func (h *OSUpgradeHandlers) Store() *osupgrade.Store {
+	return h.store
+}
+
 func (h *OSUpgradeHandlers) Upload(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -235,15 +241,14 @@ func (h *OSUpgradeHandlers) Validate(c *gin.Context) {
 		expectedSHA = job.SHA256
 	}
 	result, err := osupgrade.ValidatePackage(job.PackagePath, osupgrade.ValidationOptions{
-		ExpectedSHA256:       expectedSHA,
-		ExpectedMachine:      h.expectedMachine,
-		ExpectedProduct:      h.expectedProduct,
-		ExpectedHW:           h.expectedHW,
-		ExpectedDevice:       h.filesystemDevice,
-		RequireBuildTime:     h.requireBuildTime,
-		RequireAB:            false,
-		RequireCompatibility: true,
-		RequireSignature:     h.requireSig,
+		ExpectedSHA256:   expectedSHA,
+		ExpectedMachine:  h.expectedMachine,
+		ExpectedProduct:  h.expectedProduct,
+		ExpectedHW:       h.expectedHW,
+		ExpectedDevice:   h.filesystemDevice,
+		RequireBuildTime: h.requireBuildTime,
+		RequireAB:        false,
+		RequireSignature: h.requireSig,
 	})
 	if err != nil {
 		h.failJob(job, err)
@@ -272,28 +277,32 @@ func (h *OSUpgradeHandlers) Validate(c *gin.Context) {
 			return
 		}
 	}
+	// App compatibility is advisory for OS upgrades: the install proceeds
+	// regardless, and the job records whether the currently installed app is
+	// expected to run on the target OS (re-checked after the reboot).
+	appVersion := ""
+	compatValid := true
+	compatWarning := ""
 	appManifestPath := envDefault("AIPC_APP_MANIFEST", osupgrade.DefaultAppManifestPath)
 	dataSchemaPath := envDefault("AIPC_DATA_SCHEMA_FILE", osupgrade.DefaultDataSchemaPath)
 	appManifest, err := osupgrade.LoadAppManifest(appManifestPath)
-	if err != nil {
-		h.failJob(job, fmt.Errorf("cannot read current App manifest: %w", err))
-		Resp(c).FailMsg(CodeInvalidParameter, "current App compatibility manifest is unavailable: "+err.Error())
-		return
-	}
-	currentDataSchema, err := osupgrade.ReadDataSchema(dataSchemaPath)
-	if err != nil {
-		h.failJob(job, fmt.Errorf("cannot read current data schema: %w", err))
-		Resp(c).FailMsg(CodeInvalidParameter, "current data schema is unavailable: "+err.Error())
-		return
-	}
-	targetCompatibility := &osupgrade.OSCompatibility{
-		OSVersion: result.Version, Machine: result.Machine, Product: result.Product,
-		CompatLevel: result.CompatLevel, DataSchema: result.DataSchema,
-	}
-	if err := osupgrade.CheckCompatibility(targetCompatibility, appManifest, currentDataSchema); err != nil {
-		h.failJob(job, err)
-		Resp(c).FailMsg(CodeInvalidParameter, err.Error())
-		return
+	switch {
+	case err != nil:
+		compatValid = false
+		compatWarning = fmt.Sprintf("cannot evaluate the installed app against the target OS: %v", err)
+	default:
+		appVersion = appManifest.AppVersion
+		currentDataSchema, schemaErr := osupgrade.ReadDataSchema(dataSchemaPath)
+		if schemaErr != nil {
+			currentDataSchema = appManifest.TargetDataSchema
+		}
+		targetCompatibility := &osupgrade.OSCompatibility{
+			OSVersion: result.Version, Machine: result.Machine, Product: result.Product,
+		}
+		if compatErr := osupgrade.CheckCompatibility(targetCompatibility, appManifest, currentDataSchema); compatErr != nil {
+			compatValid = false
+			compatWarning = "installed app may be incompatible with the target OS: " + compatErr.Error()
+		}
 	}
 	signatureValid := false
 	if h.requireSig {
@@ -351,10 +360,9 @@ func (h *OSUpgradeHandlers) Validate(c *gin.Context) {
 		job.RecoveryVersion = recovery.Manifest.RecoveryVersion
 	}
 	job.SecureBootKeyID = result.SecureBootKeyID
-	job.AppVersion = appManifest.AppVersion
-	job.CompatLevel = result.CompatLevel
-	job.DataSchema = result.DataSchema
-	job.CompatibilityValid = true
+	job.AppVersion = appVersion
+	job.CompatibilityValid = compatValid
+	job.CompatibilityWarning = compatWarning
 	job.SHA256 = result.SHA256
 	job.DowngradeAllowed = allowDowngrade
 	job.SignatureValid = signatureValid
@@ -382,6 +390,13 @@ func (h *OSUpgradeHandlers) Install(c *gin.Context) {
 	}
 	if job.State != osupgrade.StateReady {
 		Resp(c).FailMsg(CodeInvalidRequest, "job is not ready")
+		return
+	}
+	// Minimal mutual exclusion: refuse to start while an app OTA deploy is in
+	// flight on the same data partition. Upload and validation stay allowed.
+	if appOTAInProgress() {
+		Resp(c).FailMsg(CodeOperationFailed,
+			"an app firmware upgrade is in progress; retry after it finishes")
 		return
 	}
 	var strategy osupgrade.UpgradeStrategy

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,7 +26,10 @@ import (
 	"aipc/platform/common/constants"
 	"aipc/platform/common/events"
 	"aipc/platform/common/logger"
+	"aipc/platform/common/socket"
+	"aipc/platform/common/utils"
 	eventpb "aipc/platform/event-bus/proto"
+	mediaadapter "aipc/platform/platform-api/adapters/media"
 	"aipc/platform/platform-api/auth"
 	cfgctrl "aipc/platform/platform-api/config"
 	platformdb "aipc/platform/platform-api/db"
@@ -44,6 +48,7 @@ type Config struct {
 	Service struct {
 		Name               string    `yaml:"name"`
 		HTTPAddr           string    `yaml:"http_addr"`
+		UnixSocket         string    `yaml:"unix_socket"`
 		ReadTimeoutSeconds int       `yaml:"read_timeout_seconds" default:"1800"`
 		LogLevel           string    `yaml:"log_level"`
 		LogFile            string    `yaml:"log_file"`
@@ -78,6 +83,7 @@ type Config struct {
 		RootPath      string `yaml:"root_path"`
 		ModelBlobPath string `yaml:"model_blob_path"`
 		MinFreeBytes  uint64 `yaml:"min_free_bytes"`
+		MaxTotalBytes uint64 `yaml:"max_total_bytes"`
 	} `yaml:"storage"`
 
 	Files struct {
@@ -155,20 +161,23 @@ func (c *Config) Validate() error {
 }
 
 type PlatformAPIServer struct {
-	config        *Config
-	engine        *gin.Engine
-	httpServer    *http.Server
-	tlsServer     *http.Server // non-nil when Config.Service.TLS.Enabled
-	tlsCertFile   string
-	tlsKeyFile    string
-	db            *gorm.DB
-	eventLogger   *events.Logger
-	persistCtx    context.Context
-	persistCancel context.CancelFunc
-	gyroSrc       gyro.Source
-	gyroCancel    context.CancelFunc
-	monitor       *handlers.MonitorHandler
-	grpcClients   struct {
+	config          *Config
+	engine          *gin.Engine
+	httpServer      *http.Server
+	tlsServer       *http.Server // non-nil when Config.Service.TLS.Enabled
+	unixServer      *http.Server // non-nil when Config.Service.UnixSocket is set
+	unixSocketPath  string       // resolved socket path for cleanup on shutdown
+	tlsCertFile     string
+	tlsKeyFile      string
+	db              *gorm.DB
+	eventLogger     *events.Logger
+	persistCtx      context.Context
+	persistCancel   context.CancelFunc
+	gyroSrc         gyro.Source
+	gyroCancel      context.CancelFunc
+	modelHealCancel context.CancelFunc
+	monitor         *handlers.MonitorHandler
+	grpcClients     struct {
 		aiRuntime     *grpc.ClientConn
 		eventBus      *grpc.ClientConn
 		deviceControl *grpc.ClientConn
@@ -254,7 +263,29 @@ func NewPlatformAPIServer(cfg *Config) (*PlatformAPIServer, error) {
 		logger.Info("HTTPS enabled on %s (cert=%s)", cfg.Service.TLS.HTTPSAddr, certPath)
 	}
 
+	// Setup the local unix socket face when configured. It serves the same
+	// engine as TCP but marks requests as locally trusted, matching the gRPC
+	// services' trust model (socket file permission = authentication).
+	if cfg.Service.UnixSocket != "" {
+		server.unixServer = &http.Server{
+			Handler:      localTrustHandler(server.engine),
+			ReadTimeout:  readTimeout,
+			WriteTimeout: 0, // streaming endpoints (WebSocket, SSE, H264) need long-lived connections
+			IdleTimeout:  60 * time.Second,
+		}
+	}
+
 	return server, nil
+}
+
+// localTrustHandler wraps the engine so every request served through it
+// carries the local-trust context mark that exempts it from bearer auth.
+// The mark is injected here server-side; TCP-facing requests can never
+// carry it, so the exemption cannot be reached over the network.
+func localTrustHandler(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r.WithContext(auth.WithLocalTrust(r.Context())))
+	})
 }
 
 func sanitizedGinLogFormatter(param gin.LogFormatterParams) string {
@@ -373,9 +404,14 @@ func (s *PlatformAPIServer) setupRoutes() {
 	if minFree == 0 {
 		minFree = 100 * 1024 * 1024 // 100MB default
 	}
-	modelStore, err := storage.NewModelStorage(blobPath, minFree)
+	// Total blob budget; 0 leaves the store uncapped (only the free-space
+	// floor applies) so existing deployments keep their current behavior.
+	maxTotal := s.config.Storage.MaxTotalBytes
+	modelStore, err := storage.NewModelStorage(blobPath, minFree, maxTotal)
 	if err != nil {
 		logger.Warn("Failed to initialize model storage: %v (uploads will use legacy path)", err)
+	} else {
+		logModelStorageBudget(modelStore, maxTotal)
 	}
 
 	// Password crypto setup (once per boot, before handlers are built):
@@ -403,6 +439,31 @@ func (s *PlatformAPIServer) setupRoutes() {
 		AppManager:    s.grpcClients.appManager,
 	}, modelStoragePath, modelStore, s.db, s.config.Auth.Username, s.config.Auth.Password, authValidator, rsaPriv, rsaPubPEM, s.eventLogger)
 
+	// Disk-seeded model rows carry no file hash (only web imports compute one).
+	// Backfill in the background — hashing every model can take seconds per
+	// multi-GB file and must not delay startup.
+	go apiHandlers.BackfillMissingHashes()
+
+	// Heal stale model rows against the runtime (e.g. ai-runtime restarted
+	// alone: DB still claims loaded). The models page reconciles on every
+	// list; this pass covers devices nobody is browsing.
+	go apiHandlers.ReconcileRuntimeModels()
+
+	// Correct desired_state on rows registered-but-never-loaded before the
+	// import/disk-seed paths wrote it explicitly (the old column default
+	// "loaded" made the heal loop auto-load them). Must run before the heal
+	// loop's first tick — that pass is the consumer of the stale promise.
+	apiHandlers.DemoteNeverLoadedImports()
+
+	// Periodic desired-state restore: models loaded by the user but lost
+	// from the runtime (solo ai-runtime restart, force_unregister_all wipe,
+	// crash mid-operation) are re-registered automatically every minute —
+	// the recovery consumer for desired_state=loaded. It shares loadModelCore
+	// with the REST load endpoint so behavior is identical.
+	modelHealCtx, modelHealCancel := context.WithCancel(context.Background())
+	s.modelHealCancel = modelHealCancel
+	go apiHandlers.StartModelSelfHeal(modelHealCtx, time.Minute)
+
 	// Phase 2: reconcile the desired-state store with live config at startup.
 	// Currently scopes the media domain (camera-daemon.yaml): confirms the live
 	// file matches the desired row (in-sync no-op), re-projects the desired
@@ -410,6 +471,21 @@ func (s *PlatformAPIServer) setupRoutes() {
 	// store (R-migration) without overwriting the file. Non-fatal: a reconcile
 	// error is logged and the server continues serving.
 	if cm := apiHandlers.ConfigManager(); cm != nil {
+		cameraConfigPath := s.config.Stream.CameraConfig
+		if cameraConfigPath == "" {
+			cameraConfigPath = constants.ConfigPath() + "/camera-daemon.yaml"
+		}
+		migrated, changed, migrateErr := mediaadapter.MigrateProductInfraredConfig(cameraConfigPath)
+		if migrateErr != nil {
+			logger.Warn("Infrared media config migration skipped: %v", migrateErr)
+		} else if changed {
+			if _, revision, applyErr := cm.Apply(context.Background(), "media", "config", string(migrated), "system"); applyErr != nil {
+				logger.Warn("Infrared media config migration failed: %v", applyErr)
+			} else {
+				logger.Info("Infrared media config migration applied at revision %d", revision)
+			}
+		}
+
 		targets := []cfgctrl.ReconcileTarget{{Domain: "media", Key: "config"}}
 		if err := cm.Reconcile(context.Background(), targets, "system"); err != nil {
 			logger.Warn("Config reconcile completed with errors: %v", err)
@@ -482,6 +558,9 @@ func (s *PlatformAPIServer) setupRoutes() {
 	s.engine.GET("/api/v1/system/ota/status", systemHandler.OTAGetStatus)
 
 	osUpgradeHandler := handlers.NewOSUpgradeHandlers(os.Getenv("AIPC_OS_UPGRADE_DIR"))
+	// App OTA installs refuse to start while an OS upgrade job is not terminal
+	// (and vice versa) so the two upgraders never share the data partition.
+	systemHandler.SetOSUpgradeStore(osUpgradeHandler.Store())
 	// On boot, advance any job stuck in rebooting/verifying to a terminal
 	// state in case aipc-os-verify.service did not fire after the reboot.
 	osUpgradeHandler.ReconcileOnBoot()
@@ -518,13 +597,16 @@ func (s *PlatformAPIServer) setupRoutes() {
 	ai := api.Group("/ai")
 	ai.GET("/capabilities", apiHandlers.GetCapabilities)
 	ai.POST("/models/parse", apiHandlers.ParseModel)
+	ai.POST("/models/parse/abandon", apiHandlers.AbandonStagedModel)
 	ai.POST("/models/upload", apiHandlers.UploadModel)
 	ai.GET("/models", apiHandlers.ListModels)
 	ai.POST("/models/scan", apiHandlers.ScanModels)
 	ai.POST("/models", apiHandlers.RegisterModel)
 	ai.GET("/models/:model_id", apiHandlers.GetModelInfo)
+	ai.PUT("/models/:model_id", apiHandlers.UpdateModel)
 	ai.DELETE("/models/:model_id", apiHandlers.UnregisterModel)
 	ai.GET("/models/:model_id/apps", apiHandlers.GetModelApps)
+	ai.GET("/models/:model_id/export", apiHandlers.ExportModel)
 	ai.POST("/models/:model_id/load", apiHandlers.LoadModel)
 	ai.POST("/models/:model_id/unload", apiHandlers.UnloadModel)
 	ai.GET("/stats", apiHandlers.GetAIStats)
@@ -556,6 +638,13 @@ func (s *PlatformAPIServer) setupRoutes() {
 	device.POST("/light", apiHandlers.SetLight)
 	device.POST("/ir-led", apiHandlers.SetIrLed)
 	device.POST("/ir-cut", apiHandlers.SetIrCut)
+	device.PUT("/imaging-mode", apiHandlers.SetImagingMode)
+	device.GET("/infrared/status", apiHandlers.GetInfraredStatus)
+	device.PUT("/infrared/settings", apiHandlers.SetInfraredSettings)
+	device.DELETE("/infrared/manual", apiHandlers.ClearInfraredManual)
+	device.GET("/ir-presets", apiHandlers.ListIrPresets)
+	device.PUT("/ir-presets", apiHandlers.SaveIrPreset)
+	device.DELETE("/ir-presets/:name", apiHandlers.DeleteIrPreset)
 	device.POST("/ptz", apiHandlers.ControlPTZ)
 	device.POST("/zoom", apiHandlers.ControlZoom)
 	device.POST("/focus", apiHandlers.ControlFocus)
@@ -574,6 +663,7 @@ func (s *PlatformAPIServer) setupRoutes() {
 	device.PUT("/lens/limits", apiHandlers.SetLensLimits)
 	device.POST("/lens/init", apiHandlers.LensInit)
 	device.POST("/lens/goto", apiHandlers.LensGotoRatioDistance)
+	device.POST("/lens/goto-ratio", apiHandlers.LensGotoZoomRatio)
 	device.POST("/gpio", apiHandlers.GPIOWrite)
 	device.GET("/gpio", apiHandlers.GPIOBatchRead)
 	device.GET("/gpio/:pin", apiHandlers.GPIORead)
@@ -602,6 +692,9 @@ func (s *PlatformAPIServer) setupRoutes() {
 	apps.POST("/wizard", apiHandlers.WizardInstall)
 	apps.POST("/upload-image", apiHandlers.UploadImage)
 	apps.POST("/upload-manifest", apiHandlers.UploadManifest)
+	apps.POST("/upload-package", apiHandlers.UploadPackage)
+	apps.POST("/staging/abandon", apiHandlers.AbandonAppStaging)
+	apps.PATCH("/manifest", apiHandlers.PatchManifest)
 	apps.POST("/install-package", apiHandlers.InstallPackage)
 	apps.GET("/install-progress/:task_id", apiHandlers.GetInstallProgress)
 	apps.GET("/:app_id/stats", apiHandlers.GetAppStats)
@@ -624,6 +717,17 @@ func (s *PlatformAPIServer) setupRoutes() {
 	configJobs := api.Group("/config/jobs")
 	configJobs.GET("", apiHandlers.ListConfigJobs)
 	configJobs.GET("/:id", apiHandlers.GetConfigJob)
+
+	// Device-scope config clone (the device-wide sibling of /media/config/bundle).
+	// Export ships the /data/aipc/etc tree + the four config Controller DB tables
+	// as one self-describing tar.gz; import applies them onto a same-model device.
+	// Scope is config + state DB only (apps/models stay on the target), and the
+	// source identity (token_key/password/certs/device name + auth/device_info DB
+	// rows) is never packed so the target keeps its own identity + regenerates
+	// secrets. See handlers/clone.go for the identity + DB-coupling rationale.
+	clone := api.Group("/system/clone")
+	clone.GET("/export", apiHandlers.ExportDeviceConfig)
+	clone.POST("/import", apiHandlers.ImportDeviceConfig)
 
 	// Store routes (App Store)
 	storeHandlers := handlers.NewStoreHandlers(s.db)
@@ -805,10 +909,15 @@ func (s *PlatformAPIServer) setupRoutes() {
 	mediaGroup.GET("/config/field", mediaHandler.GetConfigField)
 	mediaGroup.PUT("/config/field", mediaHandler.SetConfigField)
 	// Unified media-config import/export (Option B aggregation layer).
-	// Export aggregates the base YAML + six runtime JSONs into one versioned
-	// envelope; import writes them back and restarts camera-daemon to apply.
+	// Export aggregates the base YAML + seven runtime JSONs into one versioned
+	// envelope; import writes them back and restarts camera-daemon + device-control.
+	// The JSON endpoints carry config only; the bundle endpoints also carry the
+	// OSD overlay image binaries referenced by osd_config.json (without them an
+	// image_path overlay points at a missing file on a fresh device).
 	mediaGroup.GET("/config/export", mediaHandler.ExportMediaConfig)
 	mediaGroup.POST("/config/import", mediaHandler.ImportMediaConfig)
+	mediaGroup.GET("/config/bundle", mediaHandler.ExportMediaBundle)
+	mediaGroup.POST("/config/import-bundle", mediaHandler.ImportMediaBundle)
 	// Hot reload endpoints (no service restart required)
 	mediaGroup.PUT("/encoder", mediaHandler.UpdateEncoderConfig)
 	mediaGroup.PUT("/rtsp", mediaHandler.SetRtspEnabled)
@@ -847,6 +956,12 @@ func (s *PlatformAPIServer) setupRoutes() {
 	streamConfigs := handlers.LoadStreamsFromCameraConfig(s.config.Stream.CameraConfig, rtspBase, encodedPubDir)
 	streamHandlers := handlers.NewStreamHandlers(streamConfigs, rtspBase, encodedPubDir)
 	mediaHandler.SetStreamReloader(streamHandlers)
+
+	// Read-only stream inventory (config view; runtime state is /media/status).
+	// GET must be registered after streamHandlers is built; same paths as the
+	// POST/DELETE routes above are fine — gin differentiates by method.
+	mediaGroup.GET("/streams", streamHandlers.ListStreams)
+	mediaGroup.GET("/streams/:name", streamHandlers.GetStream)
 
 	// Audio control endpoints
 	audioHandler := handlers.NewAudioHandlers(s.grpcClients.cameraControl, s.config.Stream.CameraConfig, apiHandlers.ConfigManager())
@@ -925,6 +1040,30 @@ func (s *PlatformAPIServer) setupRoutes() {
 			c.JSON(404, gin.H{"code": 404, "message": "Not found"})
 		})
 	}
+}
+
+// logModelStorageBudget reports the model store's disk position once at boot:
+// how much the blobs consume, how much is free, and the budget if one is set.
+// Measurement failures degrade to a warn — a missing statfs must not block boot.
+func logModelStorageBudget(store *storage.ModelStorage, maxTotal uint64) {
+	usage, err := store.UsageBytes()
+	if err != nil {
+		logger.Warn("Failed to measure model storage usage: %v", err)
+		return
+	}
+	free, freeErr := store.FreeBytes()
+	if freeErr != nil {
+		logger.Warn("Failed to measure free disk space for model storage: %v", freeErr)
+		return
+	}
+	if maxTotal > 0 {
+		logger.Info("Model storage: %d bytes of blobs, %d bytes free, budget %d bytes", usage, free, maxTotal)
+		if usage >= maxTotal {
+			logger.Warn("Model storage already at its %d-byte budget; new model uploads will be refused", maxTotal)
+		}
+		return
+	}
+	logger.Info("Model storage: %d bytes of blobs, %d bytes free (no total budget configured)", usage, free)
 }
 
 func (s *PlatformAPIServer) setupSwaggerRoutes() {
@@ -1008,6 +1147,23 @@ func resolveGyroCalibration(cfg GyroConfig, mount [9]float64) (resolvedMount [9]
 
 func (s *PlatformAPIServer) Start() error {
 	logger.Info("Starting Platform API server on %s", s.config.Service.HTTPAddr)
+	// Reap abandoned import staging from previous process lifetimes, then keep
+	// doing so periodically. Cleanup is token-directory-only and never follows
+	// symlinks outside the staging root.
+	handlers.CleanupAppStaging(time.Now())
+	stagingCleanupStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case now := <-ticker.C:
+				handlers.CleanupAppStaging(now)
+			case <-stagingCleanupStop:
+				return
+			}
+		}
+	}()
 
 	// Handle shutdown gracefully
 	sigChan := make(chan os.Signal, 1)
@@ -1015,6 +1171,7 @@ func (s *PlatformAPIServer) Start() error {
 
 	go func() {
 		<-sigChan
+		close(stagingCleanupStop)
 		logger.Info("Shutting down Platform API server...")
 
 		// Stop persist loop
@@ -1024,6 +1181,10 @@ func (s *PlatformAPIServer) Start() error {
 		// Stop gyro source read loop
 		if s.gyroCancel != nil {
 			s.gyroCancel()
+		}
+		// Stop periodic model self-heal loop
+		if s.modelHealCancel != nil {
+			s.modelHealCancel()
 		}
 		// Stop background CPU sampler goroutine
 		if s.monitor != nil {
@@ -1039,6 +1200,14 @@ func (s *PlatformAPIServer) Start() error {
 			if err := s.tlsServer.Shutdown(ctx); err != nil {
 				logger.Error("Error shutting down TLS server: %v", err)
 			}
+		}
+		if s.unixServer != nil {
+			if err := s.unixServer.Shutdown(ctx); err != nil {
+				logger.Error("Error shutting down unix socket server: %v", err)
+			}
+		}
+		if s.unixSocketPath != "" {
+			os.Remove(s.unixSocketPath)
 		}
 
 		// Close gRPC connections
@@ -1077,6 +1246,36 @@ func (s *PlatformAPIServer) Start() error {
 			}
 		}()
 		logger.Info("HTTPS listener started on %s", s.config.Service.TLS.HTTPSAddr)
+	}
+
+	// Local unix socket face: listen + serve in the background (same pattern
+	// as the TLS listener). Requests on it skip bearer auth; access is gated
+	// by the socket file permission instead, like the platform gRPC services.
+	if s.unixServer != nil {
+		sock, err := utils.ParseListenAddress(s.config.Service.UnixSocket)
+		if err != nil {
+			return fmt.Errorf("failed to parse unix socket address: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(sock), 0755); err != nil {
+			return fmt.Errorf("failed to create unix socket directory: %w", err)
+		}
+		// Remove a stale socket left over from an ungraceful exit.
+		os.Remove(sock)
+		lis, err := net.Listen("unix", sock)
+		if err != nil {
+			return fmt.Errorf("failed to listen on unix socket %s: %w", sock, err)
+		}
+		if err := socket.SetSocketGroupPermission(sock); err != nil {
+			logger.Warn("Failed to set socket permissions on %s: %v (group access unavailable)", sock, err)
+		}
+		s.unixSocketPath = sock
+
+		go func() {
+			if err := s.unixServer.Serve(lis); err != nil && err != http.ErrServerClosed {
+				logger.Error("Unix socket server stopped unexpectedly: %v", err)
+			}
+		}()
+		logger.Info("Unix socket listener started on %s (auth-exempt local face)", sock)
 	}
 
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

@@ -19,6 +19,7 @@ import (
 
 	"aipc/platform/common/events"
 	"aipc/platform/common/logger"
+	"aipc/platform/osupgrade"
 	"aipc/platform/platform-api/adapters/auth"
 	"aipc/platform/platform-api/config"
 	"aipc/platform/platform-api/internal/secrets"
@@ -187,10 +188,11 @@ func attachOTALogTail(status *OTAStatus) {
 
 // SystemHandlers handles system level configurations
 type SystemHandlers struct {
-	configPath  string
-	eventLogger *events.Logger
-	configMgr   *config.Manager
-	rsaPriv     *rsa.PrivateKey // decrypts frontend-encrypted old/new passwords; nil -> plaintext fallback
+	configPath     string
+	eventLogger    *events.Logger
+	configMgr      *config.Manager
+	rsaPriv        *rsa.PrivateKey  // decrypts frontend-encrypted old/new passwords; nil -> plaintext fallback
+	osUpgradeStore *osupgrade.Store // optional: enables the app/OS upgrade mutual-exclusion gate
 }
 
 func NewSystemHandlers(configPath string, configMgr *config.Manager, rsaPriv *rsa.PrivateKey) *SystemHandlers {
@@ -202,6 +204,37 @@ func NewSystemHandlers(configPath string, configMgr *config.Manager, rsaPriv *rs
 
 func (h *SystemHandlers) SetEventLogger(logger *events.Logger) {
 	h.eventLogger = logger
+}
+
+// SetOSUpgradeStore wires the OS upgrade job store for the app/OS upgrade
+// mutual-exclusion gate. nil (the default) skips the check.
+func (h *SystemHandlers) SetOSUpgradeStore(store *osupgrade.Store) {
+	h.osUpgradeStore = store
+}
+
+// osUpgradeInProgress reports whether an OS upgrade job is currently staged,
+// installing, or otherwise not terminal (including awaiting_reboot). App OTA
+// installs refuse to start while one is active so the two upgraders never
+// touch the same partitions at the same time.
+func (h *SystemHandlers) osUpgradeInProgress() bool {
+	if h.osUpgradeStore == nil {
+		return false
+	}
+	job, err := h.osUpgradeStore.Active()
+	if err != nil {
+		return false
+	}
+	return !job.Terminal()
+}
+
+// appOTAInProgress reports whether an app OTA deploy is currently running.
+// The disk status file is authoritative: deploy.sh updates it from a transient
+// systemd service even while platform-api is being restarted underneath it.
+func appOTAInProgress() bool {
+	otaStatusMu.Lock()
+	defer otaStatusMu.Unlock()
+	reloadOTAStatusLocked()
+	return !isOTATerminalStatus(otaStatus.Status)
 }
 
 // projectAuthConfig persists the marshaled platform-api.yaml through the Config
@@ -478,6 +511,11 @@ func (h *SystemHandlers) OTAParseFirmware(c *gin.Context) {
 		}
 	}
 
+	// Judge the package against the running OS before anything is installed.
+	// Advisory here: the response tells the UI what would happen; the hard
+	// gate lives in performOTAUpgrade (and deploy.sh as a backstop).
+	compatibility := evaluateAppPackageCompatibility(tmpDir)
+
 	// Save firmware path for later install
 	savedPath := filepath.Join("/tmp", "ota_firmware_pending.tar.gz")
 	os.Rename(dest, savedPath)
@@ -489,6 +527,7 @@ func (h *SystemHandlers) OTAParseFirmware(c *gin.Context) {
 		"git_commit":      gitCommit,
 		"firmware_path":   savedPath,
 		"firmware_size":   file.Size,
+		"compatibility":   compatibility,
 	})
 }
 
@@ -503,6 +542,13 @@ func (h *SystemHandlers) OTAInstall(c *gin.Context) {
 	otaStatusMu.Unlock()
 	if inProgress {
 		Resp(c).FailMsg(CodeOperationFailed, "Upgrade already in progress")
+		return
+	}
+	// Minimal mutual exclusion: an OS upgrade that is staged (ready) or not yet
+	// terminal owns the partitions; parsing stays allowed.
+	if h.osUpgradeInProgress() {
+		Resp(c).FailMsg(CodeOperationFailed,
+			"an OS upgrade is in progress; retry after it finishes or is cancelled")
 		return
 	}
 
@@ -584,6 +630,11 @@ func (h *SystemHandlers) OTAInstallFromPath(c *gin.Context) {
 	otaStatusMu.Unlock()
 	if inProgress {
 		Resp(c).FailMsg(CodeOperationFailed, "Upgrade already in progress")
+		return
+	}
+	if h.osUpgradeInProgress() {
+		Resp(c).FailMsg(CodeOperationFailed,
+			"an OS upgrade is in progress; retry after it finishes or is cancelled")
 		return
 	}
 
@@ -681,6 +732,23 @@ func (h *SystemHandlers) performOTAUpgrade(firmwarePath, tmpDir, username string
 		updateOTAStatus("failed", "deploy.sh not found in firmware package", "validate", 0)
 		if eventLogger != nil {
 			h.eventLogger.LogWithCodeAsync(string(events.EventFirmwareUpdateFailed), events.MessageParams{"version": targetVersion, "error": "deploy.sh not found"}, username)
+		}
+		return
+	}
+
+	// Hard gate: the package must be compatible with the running OS before
+	// the deploy service is started. OTAParseFirmware already reported the
+	// same verdict advisory at parse time; deploy.sh re-checks as backstop.
+	compatibility := evaluateAppPackageCompatibility(filepath.Dir(scriptPath))
+	if !compatibility.Valid {
+		updateOTAStatus("failed",
+			fmt.Sprintf("App package is incompatible with this OS: %s", compatibility.Message),
+			"validate", 0)
+		if eventLogger != nil {
+			h.eventLogger.LogWithCodeAsync(string(events.EventFirmwareUpdateFailed), events.MessageParams{
+				"version": targetVersion,
+				"error":   "incompatible: " + compatibility.ErrorCode,
+			}, username)
 		}
 		return
 	}

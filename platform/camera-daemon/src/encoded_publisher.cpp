@@ -29,6 +29,12 @@ extern "C" {
 namespace {
 constexpr size_t kMaxClientsPerStream = 16;
 constexpr auto kClientProbeInterval = std::chrono::seconds(1);
+// Partial-frame drain budget: once bytes of a frame are already in the
+// socket, tearing it off would corrupt framing — give the client this long
+// to drain, then drop the connection instead of the frame.
+constexpr int kPartialDrainMs = 20;
+// Minimum spacing between encoder IDR requests for one stream.
+constexpr int64_t kKeyframeReqMinIntervalMs = 1000;
 }
 
 static bool set_nonblocking(int fd) {
@@ -173,6 +179,19 @@ void EncodedPublisher::remove_stream(const std::string& name) {
     }
     streams_.erase(it);
     HAL_LOG_INFO("EncodedPublisher: Removed stream '%s'", name.c_str());
+}
+
+bool EncodedPublisher::has_stream(const std::string& name) const {
+    return streams_.find(name) != streams_.end();
+}
+
+std::vector<std::string> EncodedPublisher::stream_names() const {
+    std::vector<std::string> names;
+    names.reserve(streams_.size());
+    for (const auto& entry : streams_) {
+        names.push_back(entry.first);
+    }
+    return names;
 }
 
 void EncodedPublisher::add_local_listener(LocalCallback cb) {
@@ -353,10 +372,18 @@ void EncodedPublisher::on_packet(const std::string& stream_name, const HalPacket
 
     {
         std::lock_guard<std::mutex> lock(queue_mu_);
+        // Seq assigned at enqueue: a queue-overflow eviction of an earlier
+        // packet leaves a permanent, client-visible hole in the sequence.
+        uint64_t seq = ++next_seq_[stream_name];
+        qp->packet_seq = seq;
         if (queue_.size() >= MAX_QUEUE_SIZE) {
             queue_.pop_front();
+            it->second->queue_overflow_drops.fetch_add(1, std::memory_order_relaxed);
         }
         queue_.push_back(std::move(qp));
+        it->second->last_packet_seq.store(seq, std::memory_order_relaxed);
+        it->second->packets_published.fetch_add(1, std::memory_order_relaxed);
+        it->second->bytes_published.fetch_add(packet->size, std::memory_order_relaxed);
     }
     queue_cv_.notify_one();
 }
@@ -391,11 +418,32 @@ void EncodedPublisher::dispatch_loop() {
         pkt_count++;
 
         // --- Keyframe detection (NAL parsing, safe to do here) ---
+        // Video codecs only: audio flows through this publisher too and can
+        // never contain an IDR — parsing it as H.264 would count random
+        // start-code+type-5 byte pairs as keyframes and (worse) trip the
+        // encoder-health alarm below on a perfectly healthy audio stream.
+        static const std::string kH264 = "h264";
+        static const std::string kH265 = "h265";
         auto it = streams_.find(pkt->stream_name);
-        if (it != streams_.end()) {
+        if (it != streams_.end() &&
+            (it->second->config.codec == kH264 || it->second->config.codec == kH265)) {
             pkt->is_keyframe = detect_h264_keyframe(
                 pkt->raw_data.data(), pkt->raw_data.size(),
                 it->second->config.codec);
+            if (pkt->is_keyframe) {
+                auto& st = *it->second;
+                st.keyframes_published.fetch_add(1, std::memory_order_relaxed);
+                st.last_keyframe_ms.store(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count(),
+                    std::memory_order_relaxed);
+                if (st.encoder_health_alarm_latched.exchange(false,
+                        std::memory_order_relaxed)) {
+                    HAL_LOG_INFO("EncodedPublisher [stream=%s]: encoder health "
+                                 "RECOVERED — keyframe coding resumed",
+                                 pkt->stream_name.c_str());
+                }
+            }
         }
 
         if (pkt->is_keyframe) keyframe_count++;
@@ -408,6 +456,9 @@ void EncodedPublisher::dispatch_loop() {
                         (unsigned long)max_broadcast_us);
             slow_broadcast_count = 0;
             max_broadcast_us = 0;
+            if (it != streams_.end()) {
+                check_encoder_health(pkt->stream_name, *it->second);
+            }
         }
 
         // --- Timing: start of dispatch work ---
@@ -443,8 +494,8 @@ void EncodedPublisher::dispatch_loop() {
             // codec
             p[4] = (ss.config.codec == "h265") ? 1 : 0;
 
-            // flags — bit0 = keyframe
-            p[5] = pkt->is_keyframe ? 0x01 : 0x00;
+            // flags — bit0 = keyframe, bit1 = packet_seq present (V3)
+            p[5] = (pkt->is_keyframe ? FLAG_KEYFRAME : 0x00) | FLAG_SEQ_PRESENT;
 
             // timestamp_ns (LE) - PTS
             uint64_t pts = pkt->timestamp_ns;
@@ -472,11 +523,17 @@ void EncodedPublisher::dispatch_loop() {
                 p[22 + i] = (dts >> (i * 8)) & 0xFF;
             }
 
+            // packet_seq (LE) — V3 extension at offset 30
+            uint64_t seq = pkt->packet_seq;
+            for (int i = 0; i < 8; i++) {
+                p[30 + i] = (seq >> (i * 8)) & 0xFF;
+            }
+
             // payload
             memcpy(p + HEADER_SIZE, pkt->raw_data.data(), pkt->raw_size);
 
             auto bcast_t0 = std::chrono::steady_clock::now();
-            broadcast(ss, pkt->data.data(), pkt->data.size());
+            broadcast(ss, pkt->data.data(), pkt->data.size(), pkt->is_keyframe);
             auto bcast_t1 = std::chrono::steady_clock::now();
             auto bcast_us = std::chrono::duration_cast<std::chrono::microseconds>(bcast_t1 - bcast_t0).count();
             if ((uint64_t)bcast_us > max_broadcast_us) max_broadcast_us = bcast_us;
@@ -499,26 +556,32 @@ void EncodedPublisher::dispatch_loop() {
     HAL_LOG_INFO("EncodedPublisher: Dispatch thread stopped");
 }
 
-void EncodedPublisher::check_client_control(const std::string& stream_name, ClientInfo& c) {
+void EncodedPublisher::check_client_control(StreamState& ss, ClientInfo& c) {
     // Non-blocking read of control bytes from client
     uint8_t ctrl;
     while (true) {
         ssize_t n = ::recv(c.fd, &ctrl, 1, MSG_DONTWAIT);
         if (n == 0) {
+            // Peer gone (close/SIGKILL): EOF on the control poll is how the
+            // publisher normally notices a dead subscriber — usually before
+            // any send would EPIPE. Count it so the loss shows up on the
+            // observability surface instead of only the reap log.
+            ss.client_disconnects.fetch_add(1, std::memory_order_relaxed);
             c.alive = false;
             break;
         }
         if (n < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            ss.client_disconnects.fetch_add(1, std::memory_order_relaxed);
             c.alive = false;
             break;
         }
         if (ctrl == CTRL_REQUEST_KEYFRAME && keyframe_request_fn_) {
             // HAL_LOG_INFO("EncodedPublisher [%s]: Keyframe request from client fd=%d",
-            //            stream_name.c_str(), c.fd);
+            //            ss.config.name.c_str(), c.fd);
             try {
-                keyframe_request_fn_(stream_name);
+                keyframe_request_fn_(ss.config.name);
             } catch (const std::exception& e) {
                 HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed: %s", e.what());
             } catch (...) {
@@ -532,7 +595,7 @@ void EncodedPublisher::probe_clients(const std::string& stream_name, StreamState
     std::lock_guard<std::mutex> lock(ss.clients_mu);
     for (auto& c : ss.clients) {
         if (!c->alive) continue;
-        check_client_control(stream_name, *c);
+        check_client_control(ss, *c);
     }
     reap_dead_clients_locked(stream_name, ss);
 }
@@ -553,53 +616,177 @@ void EncodedPublisher::reap_dead_clients_locked(const std::string& stream_name, 
 }
 
 /**
- * Send all bytes with retry + poll. Unix domain sockets can transfer 55KB
- * in microseconds locally, so a 100ms timeout is extremely generous.
- * Returns: true if all bytes sent, false on error/timeout.
+ * Non-blocking frame send for one client. One MSG_DONTWAIT attempt: a full
+ * socket buffer with nothing sent drops THIS frame for THIS client (the
+ * frame stays intact for everyone else); a partial send gets a bounded
+ * POLLOUT drain because tearing a frame would corrupt the client's framing
+ * — past the deadline the client is dropped instead.
  */
-static bool send_all(int fd, const uint8_t* buf, size_t len) {
+EncodedPublisher::SendOutcome EncodedPublisher::send_frame_nb(ClientInfo& c,
+                                                              const uint8_t* buf,
+                                                              size_t len,
+                                                              bool is_keyframe) {
+    // A frame we dropped earlier broke this client's reference chain: only a
+    // keyframe can resync it, everything else would decode as garbage.
+    if (c.needs_keyframe && !is_keyframe) return SendOutcome::SKIP_WAIT_KEYFRAME;
+
     size_t total = 0;
     while (total < len) {
-        ssize_t n = ::send(fd, buf + total, len - total, MSG_NOSIGNAL | MSG_DONTWAIT);
+        ssize_t n = ::send(c.fd, buf + total, len - total, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (n > 0) {
             total += (size_t)n;
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            // Socket buffer full — wait briefly for drain
-            struct pollfd pfd = { fd, POLLOUT, 0 };
-            int r = ::poll(&pfd, 1, 100);  // 100ms
-            if (r > 0 && (pfd.revents & POLLOUT)) continue;  // Buffer drained, retry
-            return false;  // Timeout — client too slow
+            if (total == 0) return SendOutcome::SKIP_AGAIN;  // frame never started
+            struct pollfd pfd = { c.fd, POLLOUT, 0 };
+            int r = ::poll(&pfd, 1, kPartialDrainMs);
+            if (r > 0 && (pfd.revents & POLLOUT)) continue;
+            return SendOutcome::FAIL;  // mid-frame stall: framing at risk
         }
-        return false;  // Real error (EPIPE, ECONNRESET, etc.)
+        return SendOutcome::FAIL;  // EPIPE / ECONNRESET / ...
     }
-    return true;
+    return SendOutcome::SENT;
 }
 
-void EncodedPublisher::broadcast(StreamState& ss, const uint8_t* buf, size_t len) {
+void EncodedPublisher::maybe_request_keyframe(StreamState& ss) {
+    if (!keyframe_request_fn_) return;
+    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    int64_t last = ss.last_keyframe_req_ms.load(std::memory_order_relaxed);
+    if (now_ms - last < kKeyframeReqMinIntervalMs) return;
+    if (!ss.last_keyframe_req_ms.compare_exchange_strong(last, now_ms)) return;
+    try {
+        keyframe_request_fn_(ss.config.name);
+    } catch (const std::exception& e) {
+        HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed: %s", e.what());
+    } catch (...) {
+        HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed (unknown)");
+    }
+}
+
+void EncodedPublisher::check_encoder_health(const std::string& stream_name,
+                                            StreamState& ss) {
+    // Video streams only — audio can never code an IDR (see dispatch_loop).
+    if (ss.config.codec != "h264" && ss.config.codec != "h265") return;
+
+    const uint64_t pkts = ss.packets_published.load(std::memory_order_relaxed);
+    const uint64_t bytes = ss.bytes_published.load(std::memory_order_relaxed);
+    const uint64_t kfs  = ss.keyframes_published.load(std::memory_order_relaxed);
+    const int64_t  last_kf = ss.last_keyframe_ms.load(std::memory_order_relaxed);
+
+    bool degraded = false;
+    int64_t idr_gap_ms = -1;  // -1 = never had a keyframe
+    if (kfs == 0 && pkts >= kHealthMinPktsNoIdr) {
+        // Dual-signal: no keyframe ever AND tiny average packets. The size
+        // guard keeps a detect_h264_keyframe false negative (healthy frames
+        // misparsed) from firing a false alarm — real coded video averages
+        // KBs per packet, SEI/SPS/PPS metadata ~165B.
+        if (bytes / pkts < kHealthMinAvgBytes) degraded = true;
+    } else if (kfs > 0 && last_kf > 0) {
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        idr_gap_ms = now_ms - last_kf;
+        if (idr_gap_ms > kHealthMaxIdrGapMs) degraded = true;  // IDR went away
+    }
+    if (!degraded) return;
+
+    if (!ss.encoder_health_alarm_latched.exchange(true, std::memory_order_relaxed)) {
+        if (idr_gap_ms < 0) {
+            HAL_LOG_ERROR(
+                "EncodedPublisher [stream=%s]: ENCODER HEALTH ALARM — %lu packets "
+                "published but no keyframe ever coded. The encoder is emitting "
+                "metadata-only packets and coding no video. Suspected DMA/CMA "
+                "buffer starvation: check 'dmesg | grep cma_alloc' for ret: -12. "
+                "A daemon restart usually does NOT fix this; a device reboot is "
+                "the known remedy.",
+                stream_name.c_str(), (unsigned long)pkts);
+        } else {
+            HAL_LOG_ERROR(
+                "EncodedPublisher [stream=%s]: ENCODER HEALTH ALARM — %lu packets "
+                "published but only %lu keyframes (last IDR %ld ms ago). The "
+                "encoder is emitting metadata-only packets and coding no video. "
+                "Suspected DMA/CMA buffer starvation: check 'dmesg | grep "
+                "cma_alloc' for ret: -12. A daemon restart usually does NOT fix "
+                "this; a device reboot is the known remedy.",
+                stream_name.c_str(), (unsigned long)pkts, (unsigned long)kfs,
+                (long)idr_gap_ms);
+        }
+    }
+    // Nudge the encoder — harmless if it cannot comply, and it is the only
+    // in-process self-heal available (restart would not clear kernel state).
+    maybe_request_keyframe(ss);
+}
+
+void EncodedPublisher::broadcast(StreamState& ss, const uint8_t* buf, size_t len,
+                                 bool is_keyframe) {
     std::lock_guard<std::mutex> lock(ss.clients_mu);
+
+    // Non-video streams (audio) have no reference chains — a dropped packet
+    // doesn't desync the next one, and is_keyframe is only ever set for
+    // h264/h265. Clear the gate so a needs_keyframe flag left by an earlier
+    // drop can't starve a non-video client forever.
+    const bool video = ss.config.codec == "h264" || ss.config.codec == "h265";
 
     for (auto& c : ss.clients) {
         if (!c->alive) continue;
+        if (!video) c->needs_keyframe = false;
 
         // Check for reverse control messages (keyframe request etc.)
-        check_client_control(ss.config.name, *c);
+        check_client_control(ss, *c);
         if (!c->alive) continue;
 
         auto send_t0 = std::chrono::steady_clock::now();
-        if (!send_all(c->fd, buf, len)) {
-            // Either real error or client too slow (timeout)
-            c->alive = false;
-        }
+        SendOutcome oc = send_frame_nb(*c, buf, len, is_keyframe);
         auto send_t1 = std::chrono::steady_clock::now();
         auto send_us = std::chrono::duration_cast<std::chrono::microseconds>(send_t1 - send_t0).count();
         if (send_us > 5000) {
-            HAL_LOG_WARNING("EncodedPublisher: SLOW send_all fd=%d %ld us (%zu bytes), stream=%s",
+            HAL_LOG_WARNING("EncodedPublisher: SLOW send fd=%d %ld us (%zu bytes), stream=%s",
                            c->fd, (long)send_us, len, ss.config.name.c_str());
+        }
+
+        switch (oc) {
+        case SendOutcome::SENT:
+            c->needs_keyframe = false;
+            break;
+        case SendOutcome::SKIP_AGAIN:
+        case SendOutcome::SKIP_WAIT_KEYFRAME:
+            // Frame dropped for this client only; it resyncs at the next
+            // keyframe (requested, rate-limited) instead of decoding garbage.
+            c->frames_dropped++;
+            c->needs_keyframe = true;
+            ss.client_send_drops.fetch_add(1, std::memory_order_relaxed);
+            maybe_request_keyframe(ss);
+            break;
+        case SendOutcome::FAIL:
+            c->alive = false;
+            ss.client_send_failures.fetch_add(1, std::memory_order_relaxed);
+            break;
         }
     }
 
     reap_dead_clients_locked(ss.config.name, ss);
+}
+
+bool EncodedPublisher::get_stream_stats(const std::string& name, StreamDropStats* out) {
+    if (!out) return false;
+    auto it = streams_.find(name);
+    if (it == streams_.end()) return false;
+    auto& ss = *it->second;
+    out->packets_published = ss.packets_published.load(std::memory_order_relaxed);
+    out->bytes_published = ss.bytes_published.load(std::memory_order_relaxed);
+    out->keyframes_published = ss.keyframes_published.load(std::memory_order_relaxed);
+    out->last_keyframe_ms = ss.last_keyframe_ms.load(std::memory_order_relaxed);
+    out->queue_overflow_drops = ss.queue_overflow_drops.load(std::memory_order_relaxed);
+    out->client_send_drops = ss.client_send_drops.load(std::memory_order_relaxed);
+    out->client_send_failures = ss.client_send_failures.load(std::memory_order_relaxed);
+    out->client_disconnects = ss.client_disconnects.load(std::memory_order_relaxed);
+    out->last_packet_seq = ss.last_packet_seq.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(ss.clients_mu);
+        out->clients = (uint32_t)ss.clients.size();
+    }
+    return true;
 }

@@ -48,6 +48,13 @@ type LensHAL interface {
 	AF0832PosToRatio(halZoomPos int32) float32
 	IsAF0832Bootstrapped() bool
 
+	// Lens profile & FG2009 open-loop helpers
+	ProfileGet() (LensProfile, error)
+	ZoomGotoRatio(zoomRatio float32, pps uint16) error
+	FocusGotoLevel(level float32, pps uint16) error
+	ZoomMoveRel(pps uint16, steps int32) error
+	FocusMoveRel(pps uint16, steps int32) error
+
 	// AF window / measurement (ISP-level)
 	SetAfWindows(config AfWindowsConfig) error
 	GetAfMeasurement() (*AfMeasurement, error)
@@ -83,12 +90,26 @@ type LensState struct {
 	FocusRzDone bool
 	ZoomPos     int32
 	FocusPos    int32
+	// FixedLens reports the image-probe verdict that this lens has no motors;
+	// consumers hide motor controls instead of surfacing MCU errors.
+	FixedLens bool
 }
 
 // LensLimit mirrors HalIOLensLimit from hal_io.h.
 type LensLimit struct {
 	MinPos int32
 	MaxPos int32
+}
+
+// LensProfile describes the factory-fitted lens (from the lens HAL service).
+// Model is "af0832" or "fg2009".
+type LensProfile struct {
+	Model            string
+	Relative         bool
+	Ircut            bool
+	ZoomTravelSteps  int32
+	FocusTravelSteps int32
+	MaxZoomRatio     float32
 }
 
 // LensConfig holds HAL lens configuration.

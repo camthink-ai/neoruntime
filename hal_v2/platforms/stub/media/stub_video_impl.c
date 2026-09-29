@@ -123,7 +123,7 @@ static int stub_video_release_frame(void *video_ctx, HalFrameBuffer *frame)
 
 static const char *stub_video_get_version(void)
 {
-    return "HAL-VIDEO stub 2.0.0 (platform stub)";
+    return "HAL-VIDEO stub 2.1.0 (platform stub)";
 }
 
 static int stub_video_get_sensor_module_info(void *video_ctx, uint32_t sensor_index, HalVideoSensorModuleInfo *info)
@@ -138,6 +138,25 @@ static int stub_video_get_sensor_module_info(void *video_ctx, uint32_t sensor_in
     info->i2c_bus = -1;
     info->sensor_pixel_format = -1;
     return HAL_ERR_NOT_SUPPORTED;
+}
+
+/* Multi-stage snapshot — static simulation (M2). */
+static int stub_video_request_snapshot(void *video_ctx, const char *stage)
+{
+    (void)video_ctx;
+    (void)stage;
+    return HAL_ERR_NOT_SUPPORTED; /* stub: no pipeline stages */
+}
+
+static int stub_video_list_snapshot_stages(void *video_ctx, char *buf, size_t buf_len)
+{
+    (void)video_ctx;
+    if (!buf || buf_len == 0)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    buf[0] = '\0';
+    return HAL_OK;
 }
 
 HalVideoOps HAL_VIDEO_OPS = {
@@ -156,4 +175,6 @@ HalVideoOps HAL_VIDEO_OPS = {
     .release_frame = stub_video_release_frame,
     .get_version = stub_video_get_version,
     .get_sensor_module_info = stub_video_get_sensor_module_info,
+    .request_snapshot = stub_video_request_snapshot,
+    .list_snapshot_stages = stub_video_list_snapshot_stages,
 };

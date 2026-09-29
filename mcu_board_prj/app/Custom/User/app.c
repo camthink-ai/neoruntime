@@ -4,6 +4,7 @@
 #include "app.h"
 #include "bsp_ctrl.h"
 #include "ota_module.h"
+#include "lens_controller.h"
 
 void app_task(void *arg)
 {
@@ -29,6 +30,10 @@ void app_init(void)
 {
     if (bsp_ctrl_init() != SYS_OK) {
         WIC_LOGE("[app_init] Failed to initialize bsp_ctrl!");
+        return;
+    }
+    if (lens_controller_bootstrap() != SYS_OK) {
+        WIC_LOGE("[app_init] Failed to initialize lens controller!");
         return;
     }
     if (cmd_console_init() != SYS_OK) {

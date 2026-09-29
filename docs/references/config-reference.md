@@ -309,6 +309,8 @@ ai_overlay:
   draw_labels: true
   draw_confidence: true
   draw_landmarks: true
+  enable_face_blur: false         # mosaic detections labeled "face" (any case)
+  face_blur_block_size: 8         # mosaic cell size in px; 0 = blur
   box_thickness: 2
   stream_map: "third:main,sub:main"
 

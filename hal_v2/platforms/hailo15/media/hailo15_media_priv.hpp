@@ -45,6 +45,13 @@ struct Hailo15MediaPriv
     std::string current_config_field_value;
 
     std::vector<std::string> profile_names;
+    /** Authored iq_settings.grayscale.enabled per profile, snapshotted once at first
+     *  init from the pristine (pre-override) SDK state. The live value is unsafe
+     *  afterwards: set_override_parameters() replaces the stored profile_by_name
+     *  entries with toggled values (see profile_authored_grayscale in
+     *  hailo15_media_impl.cpp). Survives media_lib reinits; deliberately NOT
+     *  rebuilt from patched json. */
+    std::map<std::string, bool> authored_profile_grayscale;
     std::vector<std::string> frontend_stream_ids;
     std::vector<std::string> encoder_stream_ids;
     /** Snapshot after last successful build; used to detect profile-only updates vs stream layout changes. */
@@ -65,6 +72,19 @@ struct Hailo15MediaPriv
 
     uint64_t frame_seq{0};
     uint64_t packet_seq{0};
+
+    /**
+     * Leaf lock guarding hm->video_ctx_list / hm->codec_ctx_list (+counts and
+     * the by_stream maps) against get_codec_names() snapshots. destroy_contexts()
+     * and build_contexts() mutate the lists under it; it is NEVER held across
+     * MediaLibrary calls (build_contexts takes it only after its
+     * get_current_profile() returns) and never nests with mutex, so no
+     * lock-order interaction exists. Exists because daemon-side codec-name
+     * probes (zombie heal / profile-switch reconcile) cannot hold the daemon
+     * serialization locks without an AB-BA against switch_profile_internal —
+     * the snapshot op lets them read names race-free instead.
+     */
+    std::mutex ctx_list_mu;
 
     std::map<std::string, HalVideoContext *> video_by_stream;
     std::map<std::string, HalCodecContext *> codec_by_stream;
@@ -102,6 +122,30 @@ struct Hailo15MediaPriv
     /* Diagnostics: per-stream counters for troubleshooting buffer pool exhaustion. */
     std::map<std::string, size_t> enc_pkt_count;
     std::map<std::string, size_t> feed_err_count;
+
+    /* Thermal throttling subscription (subscribe_throttling). Guarded by mutex. */
+    HalThrottlingCallback throttling_cb{nullptr};
+    void *throttling_cb_user{nullptr};
+
+    /* Motion detection subscription (subscribe_motion). Guarded by mutex.
+     * Events come from the HAL's own frame-difference engine (see
+     * hailo15_motion_detect_update): the medialib module is effectively
+     * unusable — every stock profile ships it disabled and its analysis
+     * stream_id is never populated (output_frames lookup silently skips). */
+    HalMotionCallback motion_cb{nullptr};
+    void *motion_cb_user{nullptr};
+    bool motion_last_state{false};
+    bool motion_engine_enabled{false};
+    float motion_threshold{0.05f};
+    int motion_diff_level{24}; /* per-pixel delta 8..40 mapped from sensitivity */
+    std::string motion_analysis_sid;
+    std::vector<uint8_t> motion_prev_grid; /* downsampled luma of previous frame */
+    uint32_t motion_grid_w{0};
+    uint32_t motion_grid_h{0};
+    /* Analysis ROI in pixels of the motion analysis stream (the smallest
+     * output stream); all-zero = full frame. The frame-difference engine
+     * only compares blocks intersecting this ROI. */
+    uint32_t motion_roi_x{0}, motion_roi_y{0}, motion_roi_w{0}, motion_roi_h{0};
 };
 
 inline Hailo15MediaPriv *hailo15_media_priv_from_hal(void *media_ctx)

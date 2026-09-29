@@ -77,6 +77,25 @@ schema_supported() {
     return 1
 }
 
+version_valid() {
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+# version_lte A B — numeric x.y.z comparison. Hand-rolled because busybox
+# `sort -V` availability is not guaranteed across image configurations.
+version_lte() {
+    local a=(${1//./ }) b=(${2//./ }) i
+    for i in 0 1 2; do
+        (( 10#${a[i]} < 10#${b[i]} )) && return 0
+        (( 10#${a[i]} > 10#${b[i]} )) && return 1
+    done
+    return 0
+}
+
+# Compatibility is advisory on restore: an app package built for another OS
+# range must still be restored onto the new OS, otherwise the rescue channel
+# (platform-api) dies with it. aipc-compat-check at service start holds
+# incompatible application units down; this only records why.
 check_compatibility() {
     local manifest="$1"
     if [[ ! -f "$OS_COMPAT_FILE" ]]; then
@@ -85,35 +104,52 @@ check_compatibility() {
         rm -f "${CURRENT}"
         exit 0
     fi
-    [[ -f "$manifest" ]] || fail "APP_MANIFEST_MISSING: $manifest"
-    [[ -f "$DATA_SCHEMA_FILE" ]] || fail "APP_DATA_SCHEMA_MISSING: $DATA_SCHEMA_FILE"
+    if [[ ! -f "$manifest" ]]; then
+        log "WARN: APP_MANIFEST_MISSING: $manifest; restoring without compatibility verdict"
+        return 0
+    fi
 
-    local os_machine os_product os_level os_schema app_machine app_product app_level app_schema current_schema
+    local os_machine os_product os_version app_machine app_product app_min app_max app_schema current_schema
     os_machine="$(sed -n 's/^MACHINE=//p' "$OS_COMPAT_FILE" | tr -d "\"'" | head -1)"
     os_product="$(sed -n 's/^PRODUCT=//p' "$OS_COMPAT_FILE" | tr -d "\"'" | head -1)"
-    os_level="$(sed -n 's/^AIPC_COMPAT_LEVEL=//p' "$OS_COMPAT_FILE" | tr -d "\"'" | head -1)"
-    os_schema="$(sed -n 's/^DATA_SCHEMA=//p' "$OS_COMPAT_FILE" | tr -d "\"'" | head -1)"
+    os_version="$(sed -n 's/^OS_VERSION=//p' "$OS_COMPAT_FILE" | tr -d "\"'" | head -1)"
     app_machine="$(json_string "$manifest" machine)"
     app_product="$(json_string "$manifest" product)"
-    app_level="$(json_number "$manifest" required_compat_level)"
+    app_min="$(json_string "$manifest" min_os_version)"
+    app_max="$(json_string "$manifest" max_os_version)"
     app_schema="$(json_number "$manifest" target_data_schema)"
-    current_schema="$(tr -d '[:space:]' < "$DATA_SCHEMA_FILE")"
+    current_schema="$(tr -d '[:space:]' < "$DATA_SCHEMA_FILE" 2>/dev/null || true)"
+    # Fresh device without a persisted schema: judge against the app's target.
+    [[ -n "$current_schema" ]] || current_schema="$app_schema"
 
-    [[ -n "$os_machine" && -n "$os_level" && -n "$os_schema" ]] ||
-        fail "OS_COMPATIBILITY_METADATA_INVALID"
-    [[ "$os_machine" == "$app_machine" ]] ||
-        fail "APP_MACHINE_MISMATCH: OS=$os_machine App=$app_machine"
-    if [[ -n "$os_product" && -n "$app_product" && "$os_product" != "$app_product" ]]; then
-        fail "APP_PRODUCT_MISMATCH: OS=$os_product App=$app_product"
+    if [[ -z "$os_machine" || -z "$os_product" ]] || ! version_valid "$os_version"; then
+        log "WARN: APP_OS_METADATA_UNAVAILABLE: $OS_COMPAT_FILE lacks MACHINE/PRODUCT or valid OS_VERSION ($os_version)"
+        return 0
     fi
-    [[ "$os_level" == "$app_level" ]] ||
-        fail "APP_COMPAT_LEVEL_MISMATCH: OS=$os_level App=$app_level"
-    [[ "$os_schema" == "$current_schema" ]] ||
-        fail "APP_DATA_SCHEMA_UNSUPPORTED: OS=$os_schema current=$current_schema"
-    [[ "$os_schema" == "$app_schema" ]] ||
-        fail "APP_DATA_SCHEMA_UNSUPPORTED: OS=$os_schema App target=$app_schema"
-    schema_supported "$manifest" "$current_schema" ||
-        fail "APP_DATA_SCHEMA_UNSUPPORTED: App does not support schema $current_schema"
+    if [[ -z "$app_machine" || -z "$app_min" || -z "$app_max" || -z "$app_schema" ]]; then
+        log "WARN: APP_COMPATIBILITY_METADATA_INVALID: manifest lacks machine/min_os_version/max_os_version (old-format package?)"
+        return 0
+    fi
+    if ! version_valid "$app_min" || ! version_valid "$app_max"; then
+        log "WARN: APP_COMPATIBILITY_METADATA_INVALID: min_os_version=$app_min max_os_version=$app_max must be x.y.z"
+        return 0
+    fi
+    if ! version_lte "$app_min" "$app_max"; then
+        log "WARN: APP_COMPATIBILITY_METADATA_INVALID: min_os_version $app_min is greater than max_os_version $app_max"
+        return 0
+    fi
+    if [[ "$os_machine" != "$app_machine" ]]; then
+        log "WARN: APP_MACHINE_MISMATCH: OS=$os_machine App=$app_machine"
+    fi
+    if [[ -n "$os_product" && -n "$app_product" && "$os_product" != "$app_product" ]]; then
+        log "WARN: APP_PRODUCT_MISMATCH: OS=$os_product App=$app_product"
+    fi
+    if ! version_lte "$app_min" "$os_version" || ! version_lte "$os_version" "$app_max"; then
+        log "WARN: APP_OS_VERSION_UNSUPPORTED: current OS $os_version is outside the app range $app_min-$app_max"
+    fi
+    if ! schema_supported "$manifest" "$current_schema"; then
+        log "WARN: APP_DATA_SCHEMA_UNSUPPORTED: App does not support schema $current_schema"
+    fi
 }
 
 mkdir -p "${STATE_ROOT}"
@@ -304,6 +340,7 @@ SERVICES_ORDERED=(
     app-manager
     device-control
     device-discovery
+    onvif-device
 )
 if [[ -d /data/aipc/bin ]]; then
     for bin in "${SERVICES_ORDERED[@]}" aipc-cli; do

@@ -16,8 +16,6 @@ func TestValidatePackage(t *testing.T) {
 		"sw-description": []byte(`software = {
 			version = "1.12.0";
 			product = "ne503";
-			aipc-compat-level = "1";
-			data-schema = "1";
 			hardware-compatibility: [ "1.0" ];
 			embedded-script = "vars = { FILESYSTEM_DEVICE = 'mmcblk1' }";
 			stable = { copy-a: {}; copy-b: {}; };
@@ -28,22 +26,18 @@ func TestValidatePackage(t *testing.T) {
 	})
 
 	result, err := ValidatePackage(path, ValidationOptions{
-		ExpectedMachine:      "hailo15-ne503",
-		ExpectedProduct:      "ne503",
-		ExpectedHW:           "1.0",
-		ExpectedDevice:       "mmcblk1",
-		RequireAB:            true,
-		RequireCompatibility: true,
-		RequireSignature:     true,
+		ExpectedMachine:  "hailo15-ne503",
+		ExpectedProduct:  "ne503",
+		ExpectedHW:       "1.0",
+		ExpectedDevice:   "mmcblk1",
+		RequireAB:        true,
+		RequireSignature: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Version != "1.12.0" || result.Machine != "hailo15-ne503" {
 		t.Fatalf("unexpected result: %+v", result)
-	}
-	if result.CompatLevel != 1 || result.DataSchema != 1 {
-		t.Fatalf("missing compatibility metadata: %+v", result)
 	}
 	if result.SHA256 == "" || result.Entries != 4 || !result.HasSignature {
 		t.Fatalf("missing validation details: %+v", result)

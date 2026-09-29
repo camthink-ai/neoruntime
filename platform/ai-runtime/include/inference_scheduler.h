@@ -3,6 +3,7 @@
 #include "model_manager.h"
 #include "session_manager.h"
 #include "common.h"
+#include "async_submission_gate.h"
 #include <queue>
 #include <thread>
 #include <mutex>
@@ -41,25 +42,34 @@ struct InferRequest {
 
     // When true, on_complete takes ownership of the HAL output buffers: it
     // must call free_outputs() and release_model() when done (possibly
-    // asynchronously via PostprocessPool). It must NOT delete the callback's
+    // asynchronously via PostprocessPool), and must contain all exceptions so
+    // cleanup is complete before it returns. It must NOT delete the callback's
     // HalTensor* storage; that pointer may be owned by the HAL async context.
     // When false (default), the scheduler worker frees outputs and releases
     // the model ref after on_complete returns — the legacy synchronous path.
     bool owns_outputs = false;
 };
 
-/// State threaded through the HAL async callback via userdata.
-/// Allocated on the heap per-submission; deleted in the callback.
+/// State threaded through the HAL async callback via userdata. The submitter and
+/// callback each hold one intrusive reference because the HAL is allowed to run
+/// the callback before run_async() returns.
 struct WorkerCallbackState {
-    InferenceScheduler*         scheduler;
-    ModelManager*              mgr;
-    SessionManager*            smgr;
+    std::atomic<int> owners{2};
+    AsyncSubmissionGate gate;
+    int callback_status = HAL_ERROR;
+    int callback_num_outputs = 0;
+    InferenceScheduler*         scheduler = nullptr;
+    ModelManager*              mgr = nullptr;
+    SessionManager*            smgr = nullptr;
     std::unique_ptr<InferRequest> req;
-    HalTensor*                 outputs;
-    int                        max_outputs;
+    std::unique_ptr<HalTensor[]> output_slots;
+    int                        max_outputs = 0;
     TimePoint                  infer_start;
-    uint64_t                   queue_time_us;
+    uint64_t                   queue_time_us = 0;
     std::shared_ptr<Session>   session;
+    bool                       tracker_active = false;
+
+    void release_owner() noexcept;
 };
 
 class InferenceScheduler {
@@ -80,14 +90,28 @@ public:
     /// for here — call drain_async() afterwards.
     void stop();
 
-    /// Bounded drain of in-flight async callbacks (submitted via run_async
-    /// but not yet completed). Call after stop() and before destroying
-    /// dependent objects (ModelManager, PostprocessPool). Returns the number
-    /// of orphaned jobs that did not complete within the timeout.
+    /// Bounded drain of all tracked async work, including direct HAL jobs that
+    /// finish in a post-processing task. Call after stop() and before destroying
+    /// dependent objects. Returns the number of orphaned jobs at timeout.
     int drain_async(int timeout_ms = 5000);
 
-    /// Submit an inference request. Returns false if queue is full.
+    /// Extend shutdown tracking to direct run_async users such as InferBatch.
+    /// Each successful begin must have exactly one matching complete, after all
+    /// callback and post-processing work has stopped using scheduler dependencies.
+    void begin_external_async();
+    void complete_external_async();
+
+    /// Submit an inference request. Returns false if stopped or queue is full.
     bool submit(std::unique_ptr<InferRequest> req);
+
+#ifdef AIPC_AI_RUNTIME_TESTING
+    void set_submit_prelock_hook_for_test(std::function<void()> hook) {
+        submit_prelock_hook_for_test_ = std::move(hook);
+    }
+    void set_async_drain_wait_hook_for_test(std::function<void()> hook) {
+        async_drain_wait_hook_for_test_ = std::move(hook);
+    }
+#endif
 
     int queue_depth() const;
 
@@ -98,6 +122,7 @@ private:
     /// Owns and deletes the WorkerCallbackState passed via userdata.
     static void on_hw_complete(HalTensor* outputs, int num_outputs,
                                int status, void* userdata);
+    static void complete_async(WorkerCallbackState* state) noexcept;
 
     /// Common completion logic shared by sync and async paths.
     void handle_completion(int rc, HalTensor* outputs, int num_outputs,
@@ -127,6 +152,10 @@ private:
 
     std::vector<std::thread> workers_;
     std::atomic<bool>        running_{false};
+#ifdef AIPC_AI_RUNTIME_TESTING
+    std::function<void()> submit_prelock_hook_for_test_;
+    std::function<void()> async_drain_wait_hook_for_test_;
+#endif
 
     // Track async jobs submitted via run_async whose HAL callbacks haven't
     // fired yet. Incremented on submit, decremented in on_hw_complete.

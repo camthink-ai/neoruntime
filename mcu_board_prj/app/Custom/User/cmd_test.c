@@ -3,6 +3,7 @@
 #include "bsp_ctrl.h"
 #include "nr_micro_shell.h"
 #include "ms41908m.h"
+#include "lens_controller.h"
 #include "host_link_app.h"
 #include "host_link.h"
 #include "rs485_driver.h"
@@ -188,7 +189,7 @@ int cmd_ircut(uint8_t argc, char **argv)
     int ret = 0;
 
     if (argc < 2U) {
-        en = bsp_ctrl_get_ir_cut();
+        en = lens_ircut_get_raw_level();
         shell_printf("ircut: state=%u\r\n", en);
         shell_printf("Usage:\r\n");
         shell_printf("  ircut [0|1]               : get/set IR-CUT state\r\n");
@@ -196,7 +197,7 @@ int cmd_ircut(uint8_t argc, char **argv)
     }
 
     en = (uint8_t)atoi(argv[1]);
-    ret = bsp_ctrl_set_ir_cut(en);
+    ret = lens_ircut_set_raw_level(en);
     shell_printf("ircut: set %u, ret=%d\r\n", en, ret);
     return ret;
 }
@@ -449,18 +450,24 @@ static const char *cmd_lens_state_name(ms41908m_state_t s)
 
 static void cmd_lens_usage(void)
 {
-    shell_printf("MS41908M lens test (call init -> cfg -> iris/zoom/focus):\r\n");
+    shell_printf("Profile-aware lens test (call init -> cfg -> zoom/focus):\r\n");
     shell_printf("  lens init|deinit\r\n");
+    shell_printf("  lens profile [list|set af0832|fg2009]|caps\r\n");
     shell_printf("  lens cfg [all|iris|motor]     : load defaults (default: all)\r\n");
     shell_printf("  lens state                    : iris/zoom/focus state + positions\r\n");
     shell_printf("  lens iris run|stop|adc|tgt <0-1023>\r\n");
-    shell_printf("  lens zoom|focus run <pps> <micro_steps>   (+ => max, - => min)\r\n");
+    shell_printf("  lens zoom|focus run|raw <raw_pps> <raw_psum>\r\n");
+    shell_printf("  lens zoom|focus rel <physical_pps> <physical_steps>\r\n");
     shell_printf("  lens zoom|focus abs <pps> <position>      (absolute; need zero, limits if configured)\r\n");
     shell_printf("  lens zoom|focus stop\r\n");
     shell_printf("  lens zoom|focus wait [timeout_ms]        (default 5000)\r\n");
     shell_printf("  lens zoom|focus rz [timeout_ms]          : async reset zero (default wait 120s)\r\n");
     shell_printf("  lens zoom|focus lim <min> <max>          : position limits for reset\r\n");
     shell_printf("  lens pi [zoom|focus]                   : read PI level (1=HIGH, 0=LOW)\r\n");
+    shell_printf("  lens dual raw <z_pps> <z_psum> <f_pps> <f_psum>\r\n");
+    shell_printf("  lens dual rel <z_pps> <z_steps> <f_pps> <f_steps>\r\n");
+    shell_printf("  lens dual wait [timeout_ms]\r\n");
+    shell_printf("  lens ircut day|night|state\r\n");
 }
 
 static void cmd_lens_pi_print(const char *axis, int pi, int is_zoom)
@@ -468,6 +475,10 @@ static void cmd_lens_pi_print(const char *axis, int pi, int is_zoom)
     const char *level = (pi != 0) ? "HIGH" : "LOW";
 
     shell_printf("lens: pi_%s=%d (%s)", axis, pi, level);
+    if (pi == SYS_ERR_NOT_SUPPORTED) {
+        shell_printf(" (not supported by active profile)\r\n");
+        return;
+    }
     if (pi < 0) {
         shell_printf(" (not initialized)\r\n");
         return;
@@ -498,14 +509,67 @@ int cmd_lens(uint8_t argc, char **argv)
     }
 
     if (strcmp(argv[1], "init") == 0) {
-        ret = ms41908m_init();
+        ret = lens_controller_init();
         shell_printf("lens: init ret=%d\r\n", ret);
         return (ret == SYS_OK) ? 0 : -1;
     }
 
     if (strcmp(argv[1], "deinit") == 0) {
-        ms41908m_deinit();
+        lens_controller_deinit();
         shell_printf("lens: deinit done\r\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "profile") == 0) {
+        if (argc >= 3U && strcmp(argv[2], "list") == 0) {
+            shell_printf("lens: profiles: af0832(model=%d, default), fg2009(model=%d)\r\n",
+                         (int)LENS_MODEL_AF0832, (int)LENS_MODEL_FG2009);
+            return 0;
+        }
+        if (argc >= 3U && strcmp(argv[2], "set") == 0) {
+            lens_model_t model;
+            if (argc < 4U) {
+                shell_printf("lens: profile set af0832|fg2009\r\n");
+                return -1;
+            }
+            if (strcmp(argv[3], "af0832") == 0 || strcmp(argv[3], "AF0832") == 0) {
+                model = LENS_MODEL_AF0832;
+            } else if (strcmp(argv[3], "fg2009") == 0 || strcmp(argv[3], "FG2009") == 0) {
+                model = LENS_MODEL_FG2009;
+            } else {
+                shell_printf("lens: unknown profile '%s'\r\n", argv[3]);
+                return -1;
+            }
+            ret = lens_controller_select_profile(model);
+            shell_printf("lens: profile set %s ret=%d active=%s\r\n",
+                         argv[3], ret, lens_get_active_profile()->name);
+            return (ret == SYS_OK) ? 0 : -1;
+        }
+        const lens_profile_t *profile = lens_get_active_profile();
+        shell_printf("lens: profile=%s model=%d zoom[step_scale=%u pps=%u-%u default=%u travel=%u+-%u dir=%d] "
+                     "focus[step_scale=%u pps=%u-%u default=%u travel=%u+-%u dir=%d]\r\n",
+                     profile->name, (int)profile->model,
+                     (unsigned)profile->zoom.psum_units_per_step,
+                     (unsigned)profile->zoom.min_pps, (unsigned)profile->zoom.max_pps,
+                     (unsigned)profile->zoom.default_pps,
+                     (unsigned)profile->zoom.nominal_travel_steps,
+                     (unsigned)profile->zoom.travel_tolerance_steps,
+                     (int)profile->zoom.direction_sign,
+                     (unsigned)profile->focus.psum_units_per_step,
+                     (unsigned)profile->focus.min_pps, (unsigned)profile->focus.max_pps,
+                     (unsigned)profile->focus.default_pps,
+                     (unsigned)profile->focus.nominal_travel_steps,
+                     (unsigned)profile->focus.travel_tolerance_steps,
+                     (int)profile->focus.direction_sign);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "caps") == 0) {
+        const lens_capabilities_t *caps = lens_get_capabilities();
+        shell_printf("lens: caps relative=%u absolute=%u home=%u pi=%u sync_relative=%u ircut=%u iris=%u\r\n",
+                     caps->supports_relative, caps->supports_absolute, caps->supports_home,
+                     caps->supports_pi, caps->supports_sync_relative,
+                     caps->supports_ircut, caps->supports_iris);
         return 0;
     }
 
@@ -516,22 +580,17 @@ int cmd_lens(uint8_t argc, char **argv)
             what = argv[2];
         }
         if (strcmp(what, "all") == 0) {
-            ret = ms41908m_iris_config(&g_default_iris_config);
-            if (ret != SYS_OK) {
-                shell_printf("lens: iris cfg ret=%d\r\n", ret);
-                return -1;
-            }
-            ret = ms41908m_motor_config(&g_default_motor_config);
+            ret = lens_controller_configure(LENS_CONFIG_ALL);
             shell_printf("lens: cfg all ret=%d\r\n", ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(what, "iris") == 0) {
-            ret = ms41908m_iris_config(&g_default_iris_config);
+            ret = lens_controller_configure(LENS_CONFIG_IRIS);
             shell_printf("lens: cfg iris ret=%d\r\n", ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(what, "motor") == 0) {
-            ret = ms41908m_motor_config(&g_default_motor_config);
+            ret = lens_controller_configure(LENS_CONFIG_MOTOR);
             shell_printf("lens: cfg motor ret=%d\r\n", ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
@@ -540,38 +599,34 @@ int cmd_lens(uint8_t argc, char **argv)
     }
 
     if (strcmp(argv[1], "state") == 0) {
-        int pi_z = ms41908m_read_pi_zoom();
-        int pi_f = ms41908m_read_pi_focus();
+        int pi_z = lens_read_pi_zoom();
+        int pi_f = lens_read_pi_focus();
 
         shell_printf("lens: iris=%s zoom=%s focus=%s pos_z=%d pos_f=%d\r\n",
-                     cmd_lens_state_name(ms41908m_iris_get_state()),
-                     cmd_lens_state_name(ms41908m_get_zoom_state()),
-                     cmd_lens_state_name(ms41908m_get_focus_state()),
-                     ms41908m_get_zoom_position(),
-                     ms41908m_get_focus_position());
+                     cmd_lens_state_name(lens_get_iris_state()),
+                     cmd_lens_state_name(lens_get_zoom_state()),
+                     cmd_lens_state_name(lens_get_focus_state()),
+                     lens_get_zoom_position(),
+                     lens_get_focus_position());
         shell_printf("lens: zoom_rz_done=%d focus_rz_done=%d\r\n",
-                     ms41908m_zoom_is_reset_zero(),
-                     ms41908m_focus_is_reset_zero());
-        if (pi_z >= 0) {
-            cmd_lens_pi_print("zoom", pi_z, 1);
-        }
-        if (pi_f >= 0) {
-            cmd_lens_pi_print("focus", pi_f, 0);
-        }
+                     lens_zoom_is_homed(),
+                     lens_focus_is_homed());
+        cmd_lens_pi_print("zoom", pi_z, 1);
+        cmd_lens_pi_print("focus", pi_f, 0);
         return 0;
     }
 
     if (strcmp(argv[1], "pi") == 0) {
         if (argc >= 3U && strcmp(argv[2], "zoom") == 0) {
-            cmd_lens_pi_print("zoom", ms41908m_read_pi_zoom(), 1);
+            cmd_lens_pi_print("zoom", lens_read_pi_zoom(), 1);
             return 0;
         }
         if (argc >= 3U && strcmp(argv[2], "focus") == 0) {
-            cmd_lens_pi_print("focus", ms41908m_read_pi_focus(), 0);
+            cmd_lens_pi_print("focus", lens_read_pi_focus(), 0);
             return 0;
         }
-        cmd_lens_pi_print("zoom", ms41908m_read_pi_zoom(), 1);
-        cmd_lens_pi_print("focus", ms41908m_read_pi_focus(), 0);
+        cmd_lens_pi_print("zoom", lens_read_pi_zoom(), 1);
+        cmd_lens_pi_print("focus", lens_read_pi_focus(), 0);
         return 0;
     }
 
@@ -581,19 +636,20 @@ int cmd_lens(uint8_t argc, char **argv)
             return -1;
         }
         if (strcmp(argv[2], "run") == 0) {
-            ret = ms41908m_iris_run();
+            ret = lens_iris_run();
             shell_printf("lens: iris run ret=%d\r\n", ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(argv[2], "stop") == 0) {
-            ret = ms41908m_iris_stop();
+            ret = lens_iris_stop();
             shell_printf("lens: iris stop ret=%d\r\n", ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(argv[2], "adc") == 0) {
-            uint16_t adc = ms41908m_iris_read_adc();
-            shell_printf("lens: iris adc=%u\r\n", (unsigned)adc);
-            return 0;
+            uint16_t adc = 0;
+            ret = lens_iris_read_adc(&adc);
+            shell_printf("lens: iris adc=%u ret=%d\r\n", (unsigned)adc, ret);
+            return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(argv[2], "tgt") == 0) {
             if (argc < 4U) {
@@ -601,7 +657,7 @@ int cmd_lens(uint8_t argc, char **argv)
                 return -1;
             }
             uint16_t tgt = (uint16_t)strtoul(argv[3], NULL, 0);
-            ret = ms41908m_iris_update_target(tgt);
+            ret = lens_iris_update_target(tgt);
             shell_printf("lens: iris tgt=%u ret=%d\r\n", (unsigned)tgt, ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
@@ -609,21 +665,110 @@ int cmd_lens(uint8_t argc, char **argv)
         return -1;
     }
 
-    if (strcmp(argv[1], "zoom") == 0) {
-        if (argc < 3U) {
-            shell_printf("lens: zoom run|abs|stop|wait|rz|lim ...\r\n");
+    if (strcmp(argv[1], "ircut") == 0) {
+        if (argc < 3U || strcmp(argv[2], "state") == 0) {
+            const char *mode = "unknown";
+            if (lens_ircut_get_mode() == LENS_IRCUT_DAY) mode = "day";
+            else if (lens_ircut_get_mode() == LENS_IRCUT_NIGHT) mode = "night";
+            shell_printf("lens: ircut mode=%s raw_level=%u\r\n",
+                         mode, (unsigned)lens_ircut_get_raw_level());
+            return 0;
+        }
+        if (strcmp(argv[2], "day") == 0) {
+            ret = lens_ircut_set_day();
+            shell_printf("lens: ircut day ret=%d raw_level=%u\r\n",
+                         ret, (unsigned)lens_ircut_get_raw_level());
+            return (ret == SYS_OK) ? 0 : -1;
+        }
+        if (strcmp(argv[2], "night") == 0) {
+            ret = lens_ircut_set_night();
+            shell_printf("lens: ircut night ret=%d raw_level=%u\r\n",
+                         ret, (unsigned)lens_ircut_get_raw_level());
+            return (ret == SYS_OK) ? 0 : -1;
+        }
+        shell_printf("lens: ircut day|night|state\r\n");
+        return -1;
+    }
+
+    if (strcmp(argv[1], "dual") == 0) {
+        if (argc >= 3U && strcmp(argv[2], "wait") == 0) {
+            timeout_ms = (argc >= 4U) ? (uint32_t)strtoul(argv[3], NULL, 0) : 5000U;
+            ret = lens_dual_wait(timeout_ms);
+            shell_printf("lens: dual wait %lu ms ret=%d\r\n", (unsigned long)timeout_ms, ret);
+            return (ret == SYS_OK) ? 0 : -1;
+        }
+        if (argc < 7U) {
+            shell_printf("lens: dual raw|rel <z_pps> <z_steps> <f_pps> <f_steps>\r\n");
             return -1;
         }
-        if (strcmp(argv[2], "run") == 0) {
+        {
+            uint16_t z_pps = (uint16_t)strtoul(argv[3], NULL, 0);
+            int32_t z_steps = (int32_t)strtol(argv[4], NULL, 0);
+            uint16_t f_pps = (uint16_t)strtoul(argv[5], NULL, 0);
+            int32_t f_steps = (int32_t)strtol(argv[6], NULL, 0);
+            if (strcmp(argv[2], "raw") == 0) {
+                ret = lens_dual_run_raw(z_pps, z_steps, f_pps, f_steps);
+                shell_printf("lens: dual raw z=%u/%ld f=%u/%ld ret=%d\r\n",
+                             (unsigned)z_pps, (long)z_steps,
+                             (unsigned)f_pps, (long)f_steps, ret);
+                return (ret == SYS_OK) ? 0 : -1;
+            }
+            if (strcmp(argv[2], "rel") == 0) {
+                uint16_t z_raw_pps = 0, f_raw_pps = 0;
+                int32_t z_raw_steps = 0, f_raw_steps = 0;
+                int zr = lens_convert_relative(LENS_AXIS_ZOOM, z_pps, z_steps,
+                                               &z_raw_pps, &z_raw_steps);
+                int fr = lens_convert_relative(LENS_AXIS_FOCUS, f_pps, f_steps,
+                                               &f_raw_pps, &f_raw_steps);
+                ret = (zr != SYS_OK) ? zr : ((fr != SYS_OK) ? fr :
+                      lens_dual_move_relative(z_pps, z_steps, f_pps, f_steps));
+                shell_printf("lens: dual rel z=%u/%ld->raw=%u/%ld "
+                             "f=%u/%ld->raw=%u/%ld ret=%d\r\n",
+                             (unsigned)z_pps, (long)z_steps,
+                             (unsigned)z_raw_pps, (long)z_raw_steps,
+                             (unsigned)f_pps, (long)f_steps,
+                             (unsigned)f_raw_pps, (long)f_raw_steps, ret);
+                return (ret == SYS_OK) ? 0 : -1;
+            }
+        }
+        shell_printf("lens: dual raw|rel <z_pps> <z_steps> <f_pps> <f_steps>\r\n");
+        return -1;
+    }
+
+    if (strcmp(argv[1], "zoom") == 0) {
+        if (argc < 3U) {
+            shell_printf("lens: zoom run|raw|rel|abs|stop|wait|rz|lim ...\r\n");
+            return -1;
+        }
+        if (strcmp(argv[2], "run") == 0 || strcmp(argv[2], "raw") == 0) {
             if (argc < 5U) {
                 shell_printf("lens: zoom run <pps> <micro_steps>\r\n");
                 return -1;
             }
             uint16_t pps = (uint16_t)strtoul(argv[3], NULL, 0);
             long steps = strtol(argv[4], NULL, 0);
-            ret = ms41908m_zoom_run(pps, (int32_t)steps);
-            shell_printf("lens: zoom run pps=%u steps=%ld ret=%d\r\n",
+            ret = lens_zoom_run_raw(pps, (int32_t)steps);
+            shell_printf("lens: zoom raw pps=%u psum=%ld ret=%d\r\n",
                          (unsigned)pps, steps, ret);
+            return (ret == SYS_OK) ? 0 : -1;
+        }
+        if (strcmp(argv[2], "rel") == 0) {
+            uint16_t physical_pps, raw_pps = 0;
+            int32_t physical_steps, raw_steps = 0;
+            if (argc < 5U) {
+                shell_printf("lens: zoom rel <physical_pps> <physical_steps>\r\n");
+                return -1;
+            }
+            physical_pps = (uint16_t)strtoul(argv[3], NULL, 0);
+            physical_steps = (int32_t)strtol(argv[4], NULL, 0);
+            ret = lens_convert_relative(LENS_AXIS_ZOOM, physical_pps, physical_steps,
+                                        &raw_pps, &raw_steps);
+            if (ret == SYS_OK) {
+                ret = lens_zoom_move_relative(physical_pps, physical_steps);
+            }
+            shell_printf("lens: zoom rel pps=%u steps=%ld -> raw_pps=%u raw_psum=%ld ret=%d\r\n",
+                         (unsigned)physical_pps, (long)physical_steps,
+                         (unsigned)raw_pps, (long)raw_steps, ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(argv[2], "abs") == 0) {
@@ -633,29 +778,29 @@ int cmd_lens(uint8_t argc, char **argv)
             }
             uint16_t pps = (uint16_t)strtoul(argv[3], NULL, 0);
             long pos = strtol(argv[4], NULL, 0);
-            ret = ms41908m_zoom_run_to_position(pps, (int32_t)pos);
+            ret = lens_zoom_move_absolute(pps, (int32_t)pos);
             shell_printf("lens: zoom abs pps=%u pos=%ld ret=%d\r\n",
                          (unsigned)pps, pos, ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(argv[2], "stop") == 0) {
-            ret = ms41908m_zoom_stop();
+            ret = lens_zoom_stop();
             shell_printf("lens: zoom stop ret=%d\r\n", ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(argv[2], "wait") == 0) {
             timeout_ms = (argc >= 4U) ? (uint32_t)strtoul(argv[3], NULL, 0) : 5000U;
-            ret = ms41908m_zoom_wait_for_completion(timeout_ms);
+            ret = lens_zoom_wait(timeout_ms);
             shell_printf("lens: zoom wait %lu ms ret=%d\r\n", (unsigned long)timeout_ms, ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(argv[2], "rz") == 0) {
             timeout_ms = (argc >= 4U) ? (uint32_t)strtoul(argv[3], NULL, 0) : 120000U;
-            ret = ms41908m_zoom_reset_zero();
+            ret = lens_zoom_home();
             shell_printf("lens: zoom rz queue ret=%d\r\n", ret);
             if (ret == SYS_OK) {
-                ret = ms41908m_zoom_wait_reset_done(timeout_ms);
-                shell_printf("lens: zoom rz wait ret=%d pos=%d\r\n", ret, ms41908m_get_zoom_position());
+                ret = lens_zoom_wait_home(timeout_ms);
+                shell_printf("lens: zoom rz wait ret=%d pos=%d\r\n", ret, lens_get_zoom_position());
             }
             return (ret == SYS_OK) ? 0 : -1;
         }
@@ -666,7 +811,7 @@ int cmd_lens(uint8_t argc, char **argv)
             }
             int32_t mn = (int32_t)strtol(argv[3], NULL, 0);
             int32_t mx = (int32_t)strtol(argv[4], NULL, 0);
-            ret = ms41908m_zoom_set_position_limit(mn, mx);
+            ret = lens_zoom_set_position_limit(mn, mx);
             shell_printf("lens: zoom lim %ld %ld ret=%d\r\n", (long)mn, (long)mx, ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
@@ -676,19 +821,38 @@ int cmd_lens(uint8_t argc, char **argv)
 
     if (strcmp(argv[1], "focus") == 0) {
         if (argc < 3U) {
-            shell_printf("lens: focus run|abs|stop|wait|rz|lim ...\r\n");
+            shell_printf("lens: focus run|raw|rel|abs|stop|wait|rz|lim ...\r\n");
             return -1;
         }
-        if (strcmp(argv[2], "run") == 0) {
+        if (strcmp(argv[2], "run") == 0 || strcmp(argv[2], "raw") == 0) {
             if (argc < 5U) {
                 shell_printf("lens: focus run <pps> <micro_steps>\r\n");
                 return -1;
             }
             uint16_t pps = (uint16_t)strtoul(argv[3], NULL, 0);
             long steps = strtol(argv[4], NULL, 0);
-            ret = ms41908m_focus_run(pps, (int32_t)steps);
-            shell_printf("lens: focus run pps=%u steps=%ld ret=%d\r\n",
+            ret = lens_focus_run_raw(pps, (int32_t)steps);
+            shell_printf("lens: focus raw pps=%u psum=%ld ret=%d\r\n",
                          (unsigned)pps, steps, ret);
+            return (ret == SYS_OK) ? 0 : -1;
+        }
+        if (strcmp(argv[2], "rel") == 0) {
+            uint16_t physical_pps, raw_pps = 0;
+            int32_t physical_steps, raw_steps = 0;
+            if (argc < 5U) {
+                shell_printf("lens: focus rel <physical_pps> <physical_steps>\r\n");
+                return -1;
+            }
+            physical_pps = (uint16_t)strtoul(argv[3], NULL, 0);
+            physical_steps = (int32_t)strtol(argv[4], NULL, 0);
+            ret = lens_convert_relative(LENS_AXIS_FOCUS, physical_pps, physical_steps,
+                                        &raw_pps, &raw_steps);
+            if (ret == SYS_OK) {
+                ret = lens_focus_move_relative(physical_pps, physical_steps);
+            }
+            shell_printf("lens: focus rel pps=%u steps=%ld -> raw_pps=%u raw_psum=%ld ret=%d\r\n",
+                         (unsigned)physical_pps, (long)physical_steps,
+                         (unsigned)raw_pps, (long)raw_steps, ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(argv[2], "abs") == 0) {
@@ -698,29 +862,29 @@ int cmd_lens(uint8_t argc, char **argv)
             }
             uint16_t pps = (uint16_t)strtoul(argv[3], NULL, 0);
             long pos = strtol(argv[4], NULL, 0);
-            ret = ms41908m_focus_run_to_position(pps, (int32_t)pos);
+            ret = lens_focus_move_absolute(pps, (int32_t)pos);
             shell_printf("lens: focus abs pps=%u pos=%ld ret=%d\r\n",
                          (unsigned)pps, pos, ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(argv[2], "stop") == 0) {
-            ret = ms41908m_focus_stop();
+            ret = lens_focus_stop();
             shell_printf("lens: focus stop ret=%d\r\n", ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(argv[2], "wait") == 0) {
             timeout_ms = (argc >= 4U) ? (uint32_t)strtoul(argv[3], NULL, 0) : 5000U;
-            ret = ms41908m_focus_wait_for_completion(timeout_ms);
+            ret = lens_focus_wait(timeout_ms);
             shell_printf("lens: focus wait %lu ms ret=%d\r\n", (unsigned long)timeout_ms, ret);
             return (ret == SYS_OK) ? 0 : -1;
         }
         if (strcmp(argv[2], "rz") == 0) {
             timeout_ms = (argc >= 4U) ? (uint32_t)strtoul(argv[3], NULL, 0) : 120000U;
-            ret = ms41908m_focus_reset_zero();
+            ret = lens_focus_home();
             shell_printf("lens: focus rz queue ret=%d\r\n", ret);
             if (ret == SYS_OK) {
-                ret = ms41908m_focus_wait_reset_done(timeout_ms);
-                shell_printf("lens: focus rz wait ret=%d pos=%d\r\n", ret, ms41908m_get_focus_position());
+                ret = lens_focus_wait_home(timeout_ms);
+                shell_printf("lens: focus rz wait ret=%d pos=%d\r\n", ret, lens_get_focus_position());
             }
             return (ret == SYS_OK) ? 0 : -1;
         }
@@ -731,7 +895,7 @@ int cmd_lens(uint8_t argc, char **argv)
             }
             int32_t mn = (int32_t)strtol(argv[3], NULL, 0);
             int32_t mx = (int32_t)strtol(argv[4], NULL, 0);
-            ret = ms41908m_focus_set_position_limit(mn, mx);
+            ret = lens_focus_set_position_limit(mn, mx);
             shell_printf("lens: focus lim %ld %ld ret=%d\r\n", (long)mn, (long)mx, ret);
             return (ret == SYS_OK) ? 0 : -1;
         }

@@ -14,7 +14,11 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Label } from '@/components/ui/label';
 import FileUpload from '@/components/file-upload';
 import SystemLoadingMask from '@/components/system-loading-mask';
-import { systemApi, type OTAStatusResponse } from '@/services/api/system';
+import {
+  systemApi,
+  type OTACompatibilityReport,
+  type OTAStatusResponse,
+} from '@/services/api/system';
 import { enterNetworkErrorToastSuppress } from '@/services/request';
 import { useAuthStore } from '@/store/auth';
 import {
@@ -104,7 +108,7 @@ export function FirmwareUpdateDialog({
         },
         onSuccess: ({ status }) => {
           if (!status) return false;
-          const terminalStatus = status.status === 'success' || status.status === 'failed';
+          const terminalStatus =            status.status === 'success' || status.status === 'failed';
           if (
             jobId
             && status.job_id
@@ -228,12 +232,16 @@ export function FirmwareUpdateDialog({
     setUploading(true);
     onOpenChange(false);
 
-    // Phase 1: upload
+    // Phase 1: upload + parse. The compatibility verdict is advisory here;
+    // stopping on an invalid one keeps the reason (OS range, machine, schema)
+    // visible instead of surfacing the backend's generic install rejection.
     setMaskPhase('uploading');
     let firmwarePath = '';
+    let compatibility: OTACompatibilityReport | undefined;
     try {
       const parseResp: any = await systemApi.otaParse(file);
       firmwarePath = parseResp?.data?.firmware_path || '';
+      compatibility = parseResp?.data?.compatibility;
       if (!firmwarePath) {
         throw new Error('missing firmware_path');
       }
@@ -247,6 +255,33 @@ export function FirmwareUpdateDialog({
       return;
     }
 
+    if (compatibility && compatibility.valid === false) {
+      releaseNetworkErrorSuppress();
+      const parts = [
+        t('sys.device_info.ota_incompatible_title', '应用包与当前系统不兼容'),
+      ];
+      if (compatibility.message) {
+        parts.push(compatibility.message);
+      }
+      if (
+        compatibility.app_min_os_version
+        && compatibility.app_max_os_version
+      ) {
+        parts.push(
+          t('sys.device_info.ota_incompatible_range', {
+            defaultValue: '当前 OS {{os}}，应用支持范围 {{min}}–{{max}}',
+            os: compatibility.os_version || '?',
+            min: compatibility.app_min_os_version,
+            max: compatibility.app_max_os_version,
+          })
+        );
+      }
+      setMaskErrorMessage(parts.join('：'));
+      setMaskPhase('error');
+      setUploading(false);
+      return;
+    }
+
     // Phase 2: trigger upgrade
     setMaskPhase('upgrading');
     try {
@@ -254,11 +289,16 @@ export function FirmwareUpdateDialog({
       const jobId = installResp?.data?.job_id || '';
       jobIdRef.current = jobId;
       startOTAStatusPolling(jobId);
-    } catch {
+    } catch (err) {
       releaseNetworkErrorSuppress();
-      setMaskErrorMessage(
-        t('sys.device_info.ota_install_failed', '启动升级失败，请重试')
-      );
+      const detail: string = (err as any)?.data?.error?.detail || '';
+      const message = /os upgrade is in progress/i.test(detail)
+        ? t(
+            'sys.device_info.ota_blocked_os_in_progress',
+            'OS 升级正在进行中，应用固件安装被拒绝；请等待 OS 升级结束或取消后重试'
+          )
+        : t('sys.device_info.ota_install_failed', '启动升级失败，请重试');
+      setMaskErrorMessage(message);
       setMaskPhase('error');
       setUploading(false);
     }

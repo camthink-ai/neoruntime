@@ -111,9 +111,41 @@ static int stub_dsp_job_release(void *dsp_ctx, HalDspJobHandle job)
     STUB_RET();
 }
 
+/* ---- M3: rotate / dewarp / telescopic (static simulation) ---- */
+
+static int stub_dsp_rotate(void *dsp_ctx, const HalDspRotateParams *params)
+{
+    (void)dsp_ctx;
+    if (!params || !params->src || !params->dst)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    return HAL_ERR_NOT_SUPPORTED; /* stub: no DSP hardware */
+}
+
+static int stub_dsp_dewarp(void *dsp_ctx, const HalDspDewarpParams *params)
+{
+    (void)dsp_ctx;
+    if (!params || !params->src || !params->dst)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    return HAL_ERR_NOT_SUPPORTED; /* stub: no DSP hardware */
+}
+
+static int stub_dsp_multi_crop_resize_telescopic(void *dsp_ctx, const HalDspMultiCropResizeParams *params)
+{
+    (void)dsp_ctx;
+    if (!params || !params->src || params->output_count == 0U || !params->outputs)
+    {
+        return HAL_ERR_INVALID_ARG;
+    }
+    return HAL_ERR_NOT_SUPPORTED; /* stub: no DSP hardware */
+}
+
 static const char *stub_dsp_get_version(void)
 {
-    return "HAL-DSP stub 2.0.0 (platform stub)";
+    return "HAL-DSP stub 2.1.0 (platform stub)";
 }
 
 HalDspOps HAL_DSP_OPS = {
@@ -131,4 +163,7 @@ HalDspOps HAL_DSP_OPS = {
     .cancel = stub_dsp_cancel,
     .job_release = stub_dsp_job_release,
     .get_version = stub_dsp_get_version,
+    .rotate = stub_dsp_rotate,
+    .dewarp = stub_dsp_dewarp,
+    .multi_crop_resize_telescopic = stub_dsp_multi_crop_resize_telescopic,
 };

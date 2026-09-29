@@ -12,19 +12,14 @@ hal:
   library_path: /data/aipc/lib/hal/libaipc_hal.so
   # library_path: /data/aipc/lib/hal/libaipc_hal.so   # HAL v2 stub for host testing
   device_path: /dev/hailo0
-  # Scheduler config passed to HAL create() as platform_config.
-  # Enables shared VDevice + Round-Robin model scheduling on Hailo-15 NPU.
-  platform_config: |
-    {
-      "scheduler": {
-        "algorithm": "round_robin",
-        "group_id": "aipc",
-        "multi_process_service": true,
-        "threshold": 4,
-        "timeout_ms": 100
-      }
-    }
-  
+  # NPU VDevice scheduling lives in the HAL, not here: libaipc_hal opens its
+  # shared VDevice with group_id = the medialib's hailort.device-id
+  # ("device0") + multi_process_service + ROUND_ROBIN
+  # (hal_v2 kSharedVDeviceGroupId). Any other group makes hailort_server
+  # refuse the attach while AI-ISP is active. The platform_config JSON that
+  # used to sit here (scheduler.group_id "aipc" ...) was never parsed by the
+  # HAL and has been removed; per-model backend_function is spliced by
+  # ModelManager without needing a YAML skeleton.
 # Model repository
 models:
   repository_path: /data/aipc/models
@@ -57,6 +52,31 @@ scheduler:
 # FD Receiver (zero-copy DMA-BUF from camera-daemon)
 fd_receiver:
   socket_path: /run/aipc/camera.sock
+  # Test-only synthetic responses when camera frames are unavailable.
+  simulation_enabled: false
+
+# Admission limits for long-lived StreamInfer RPCs and their async work.
+# Zero disables an individual limit; production defaults remain bounded.
+stream_infer:
+  max_active_rpcs: 16
+  max_active_rpcs_per_peer: 16
+  max_subscribers_per_stream: 4
+  max_in_flight_total: 12
+  max_in_flight_per_rpc: 3
+
+# Stream DSP preprocess (opt-in): frames whose geometry doesn't match the model
+# input are resized on the DSP into a private model-geometry dmabuf pool and
+# fd-bound (zero CPU copies). Off or unavailable = direct DMA input; mismatched
+# geometry is rejected by the existing HAL size validation.
+stream_preprocess:
+  enabled: false
+  pool_slots: 4
+  # Bound simultaneous model geometries so one client cannot reserve all
+  # camera-daemon DSP buffers with idle mismatched streams.
+  max_pools: 4
+  job_timeout_ms: 100
+  # camera-daemon CameraControl gRPC endpoint (SubmitDspJob job plane)
+  job_endpoint: unix:///run/aipc/camera-control.sock
 
 # Performance configuration
 performance:

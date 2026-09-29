@@ -297,6 +297,19 @@ Config load_config(const std::string& path) {
             else if (key == "queue_size") cfg.postprocess_queue_size = parse_u32_config(val, "postprocess.queue_size");
         } else if (section == "fd_receiver") {
             if (key == "socket_path") cfg.fd_socket_path = val;
+            else if (key == "simulation_enabled") cfg.stream_simulation_enabled = (val == "true");
+        } else if (section == "stream_infer") {
+            if (key == "max_active_rpcs") cfg.stream_max_active_rpcs = parse_u32_config(val, "stream_infer.max_active_rpcs");
+            else if (key == "max_active_rpcs_per_peer") cfg.stream_max_active_rpcs_per_peer = parse_u32_config(val, "stream_infer.max_active_rpcs_per_peer");
+            else if (key == "max_subscribers_per_stream") cfg.stream_max_subscribers_per_stream = parse_u32_config(val, "stream_infer.max_subscribers_per_stream");
+            else if (key == "max_in_flight_total") cfg.stream_max_in_flight_total = parse_u32_config(val, "stream_infer.max_in_flight_total");
+            else if (key == "max_in_flight_per_rpc") cfg.stream_max_in_flight_per_rpc = parse_u32_config(val, "stream_infer.max_in_flight_per_rpc");
+        } else if (section == "stream_preprocess") {
+            if (key == "enabled")     cfg.stream_dsp_preprocess = (val == "true");
+            else if (key == "pool_slots") cfg.stream_preprocess_slots = parse_u32_config(val, "stream_preprocess.pool_slots");
+            else if (key == "max_pools") cfg.stream_preprocess_max_pools = parse_u32_config(val, "stream_preprocess.max_pools");
+            else if (key == "job_timeout_ms") cfg.stream_preprocess_job_ms = parse_u32_config(val, "stream_preprocess.job_timeout_ms");
+            else if (key == "job_endpoint")   cfg.stream_preprocess_job_endpoint = val;
         } else if (section == "performance") {
             if (key == "device_mode") cfg.device_mode = val;
         } else if (section == "event_bus") {

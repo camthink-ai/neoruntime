@@ -72,7 +72,7 @@ export function AlertDialogContent({
   return (
     <div
       className={cn(
-        'bg-background border border-border rounded-lg shadow-lg p-6 max-w-md w-full mx-4',
+        'bg-background border border-border rounded-lg shadow-lg p-6 max-w-md w-full mx-4 max-h-[85vh] overflow-y-auto',
         className
       )}
     >

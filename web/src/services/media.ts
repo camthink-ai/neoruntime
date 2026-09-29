@@ -28,6 +28,8 @@ export const updateAiOverlay = (data: {
   show_label?: boolean;
   show_confidence?: boolean;
   line_thickness?: number;
+  // Mosaic detections labeled "face"; omit to keep the current setting.
+  enable_face_blur?: boolean;
 }) => request.put('/api/v1/media/ai-overlay', data, { silent: true });
 
 // ==================== OSD Types & API ====================

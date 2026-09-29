@@ -1,5 +1,6 @@
 import type { FileInfo } from '../hooks/useFiles';
 import { getFileExtension } from '../hooks/useFiles';
+import { useTranslation } from 'react-i18next';
 import {
   Folder,
   FileText,
@@ -76,10 +77,11 @@ const EXT_COLORS: Record<string, string> = {
 };
 
 export function FileTypeBadge({ file }: { file: FileInfo }) {
+  const { t } = useTranslation();
   if (file.is_dir) {
     return (
       <span className="inline-flex items-center rounded px-2 py-0.5 text-[11px] font-semibold bg-orange-100 text-[#F24A00] dark:bg-orange-950 dark:text-orange-400">
-        文件夹
+        {t('sys.file_management.type_folder', '文件夹')}
       </span>
     );
   }

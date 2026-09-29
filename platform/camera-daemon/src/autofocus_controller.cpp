@@ -6,6 +6,7 @@
 #include "../include/autofocus_controller.h"
 #include "../include/frame_router.h"
 #include "../include/lens_controller.h"
+#include "../include/illumination_controller.h"
 
 #include "af_calibration.h"
 #include "af_follow.h"
@@ -106,10 +107,13 @@ class AutofocusController::Impl {
 public:
     Impl(HalIspOps* isp_ops, HalVideoOps* video_ops, void* video_ctx,
          FrameRouter* frame_router, LensController* lens,
-         const AutofocusConfig& config,
-         int sensor_native_width, int sensor_native_height)
+         IlluminationController* illumination, const AutofocusConfig& config,
+         int sensor_native_width, int sensor_native_height,
+         AutofocusVideoContextRefreshFn refresh_video_context)
         : isp_ops_(isp_ops), video_ops_(video_ops), video_ctx_(video_ctx),
-          frame_router_(frame_router), lens_(lens), config_(config) {
+          frame_router_(frame_router), lens_(lens), illumination_(illumination),
+          refresh_video_context_(std::move(refresh_video_context)),
+          config_(config) {
         // Priority: explicit constructor params > config fields > video_ctx query
         if (sensor_native_width > 0 && sensor_native_height > 0) {
             af_native_width_ = sensor_native_width;
@@ -288,6 +292,8 @@ private:
     std::atomic<void*> video_ctx_{nullptr};
     FrameRouter* frame_router_ = nullptr;
     LensController* lens_ = nullptr;
+    IlluminationController* illumination_ = nullptr;
+    AutofocusVideoContextRefreshFn refresh_video_context_;
     AutofocusConfig config_;
     hal_auto_af::IntegrationDefaults defaults_{};
     hal_auto_af::MetricConfig metric_config_{};
@@ -374,12 +380,17 @@ private:
         return false;
     }
 
-    bool configure_windows() {
-        void* video_ctx = video_ctx_.load();
-        if (!isp_ops_ || !isp_ops_->set_af_windows_config || !video_ctx) {
-            HAL_LOG_WARNING("Autofocus: configure_windows skipped — isp=%p set_af=%p ctx=%p",
-                         (void*)isp_ops_, (void*)(isp_ops_ ? isp_ops_->set_af_windows_config : nullptr),
-                         video_ctx);
+    bool configure_windows_once(void* video_ctx) {
+        if (!isp_ops_) {
+            HAL_LOG_ERROR("Autofocus: AF window setup failed: ISP operations are unavailable");
+            return false;
+        }
+        if (!isp_ops_->set_af_windows_config) {
+            HAL_LOG_ERROR("Autofocus: AF window setup failed: set_af_windows_config is unavailable");
+            return false;
+        }
+        if (!video_ctx) {
+            HAL_LOG_ERROR("Autofocus: AF window setup failed: video context is null");
             return false;
         }
 
@@ -425,6 +436,33 @@ private:
         return true;
     }
 
+    bool configure_windows() {
+        void* video_ctx = video_ctx_.load();
+        if (configure_windows_once(video_ctx)) {
+            return true;
+        }
+
+        // A MediaLibrary/profile rebuild can invalidate HalVideoContext while
+        // the daemon itself remains alive. Refresh the FROM_MEDIA contexts once
+        // and retry with the new primary context instead of requiring a manual
+        // resolution change to rebuild the binding.
+        if (!refresh_video_context_) {
+            return false;
+        }
+
+        HAL_LOG_WARNING("Autofocus: AF window setup failed; refreshing video context and retrying once");
+        void* refreshed_ctx = refresh_video_context_();
+        if (!refreshed_ctx) {
+            HAL_LOG_ERROR("Autofocus: video context refresh returned null");
+            return false;
+        }
+
+        update_video_context(refreshed_ctx);
+        HAL_LOG_INFO("Autofocus: retrying AF window setup with refreshed video_ctx=%p",
+                     refreshed_ctx);
+        return configure_windows_once(refreshed_ctx);
+    }
+
     int wait_frames(int count) {
         if (!frame_router_) return HAL_ERR_NOT_READY;
         return frame_router_->wait_next_frames(
@@ -453,6 +491,28 @@ private:
         return observation->valid_mask == 0 ? HAL_ERR_INVALID_STATE : HAL_OK;
     }
 
+    /* Bounded warm-up before a one-shot scan: right after a daemon restart
+     * the ISP AF statistics path can reject its first reads while the media
+     * pipeline is still coming up (fd/ctrl not ready), which used to abort
+     * the very first job with "coarse scan failed".  Each attempt waits a
+     * frame inside read_observation, so a healthy pipeline pays one read. */
+    void warm_up_stats() {
+        const int attempts = config_.stat_warmup_attempts;
+        if (attempts <= 0) return;
+        for (int attempt = 1; attempt <= attempts; ++attempt) {
+            hal_auto_af::MetricObservation obs{};
+            if (read_observation(1, 1, &obs) == HAL_OK) {
+                if (attempt > 1) {
+                    HAL_LOG_INFO("Autofocus: AF stats ready after %d warm-up "
+                                 "attempt(s)", attempt);
+                }
+                return;
+            }
+        }
+        HAL_LOG_WARNING("Autofocus: AF stats still not ready after %d warm-up "
+                        "attempts; scanning anyway", attempts);
+    }
+
     int measure_focus(int position, int metric_frames,
                       hal_auto_af::FocusSample* sample,
                       const hal_auto_af::TextureModel* texture = nullptr) {
@@ -475,6 +535,10 @@ private:
             return HAL_ERR_INVALID_ARG;
         const auto cached = cache->find(position);
         if (cached != cache->end() && cached->second.metric_frames >= metric_frames) {
+            if (config_.trace_scan) {
+                HAL_LOG_INFO("Autofocus trace: probe pos=%d cached fv=%.4f",
+                             position, cached->second.sample.m);
+            }
             curve->push_back(cached->second.sample);
             if (cached->second.sample.m > *best_metric) {
                 *best_metric = cached->second.sample.m;
@@ -484,7 +548,16 @@ private:
         }
         if (++*moves > config_.max_moves) return HAL_ERR_INVALID_STATE;
         hal_auto_af::FocusSample sample{};
+        const auto probe_t0 = std::chrono::steady_clock::now();
         const int ret = measure_focus(position, metric_frames, &sample);
+        if (config_.trace_scan) {
+            const int took_ms = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - probe_t0).count());
+            HAL_LOG_INFO("Autofocus trace: probe pos=%d frames=%d fv=%.4f took=%dms moves=%d%s",
+                         position, metric_frames, sample.m, took_ms, *moves,
+                         ret == HAL_OK ? "" : " FAILED");
+        }
         if (ret != HAL_OK) return ret;
         curve->push_back(sample);
         (*cache)[position] = {sample, metric_frames};
@@ -534,6 +607,12 @@ private:
         const int coarse_hi = std::min(max_pos, center + span);
         result.scan_lo = coarse_lo;
         result.scan_hi = coarse_hi;
+        if (config_.trace_scan) {
+            HAL_LOG_INFO("Autofocus trace: coarse window [%d..%d] center=%d step=%d "
+                         "focus_range=[%d..%d]",
+                         coarse_lo, coarse_hi, center, config_.coarse_step,
+                         min_pos, max_pos);
+        }
 
         std::unordered_map<int, CachedFocusSample> cache;
         std::vector<hal_auto_af::FocusSample> coarse_curve;
@@ -567,6 +646,12 @@ private:
         const int fine_hi = std::min(max_pos, fine_center + fine_span);
         int fine_best = best_pos;
         double fine_metric = best_metric;
+        if (config_.trace_scan) {
+            HAL_LOG_INFO("Autofocus trace: fine window [%d..%d] center=%d step=%d "
+                         "coarse_best=%d fv=%.4f",
+                         fine_lo, fine_hi, fine_center, config_.fine_step,
+                         best_pos, best_metric);
+        }
         set_state(AutofocusState::Fine, endpoint ? 0.92 : 0.48,
                   balanced ? "balanced fine scan" : "fast fine scan");
         ret = scan_symmetric(fine_center, fine_lo, fine_hi, config_.fine_step,
@@ -714,8 +799,15 @@ private:
         confidence_inputs.scene_stable = true;
         confidence_inputs.verification_passed = result.verification_passed;
         result.confidence = hal_auto_af::confidence_v2(confidence_inputs);
-        result.confident = result.confidence >= config_.confidence_accept &&
-                           !result.best_on_edge;
+        if (config_.confidence_accept <= 0.0) {
+            // Gate disabled (open-loop lens with a trusted curve landing):
+            // accept the scan winner regardless of score or edge position.
+            // af0832 never enters this branch — its accept stays 0.80.
+            result.confident = result.valid;
+        } else {
+            result.confident = result.confidence >= config_.confidence_accept &&
+                               !result.best_on_edge;
+        }
         result.message = result.confident ? "focus acquired" : "low confidence focus";
         HAL_LOG_INFO("Autofocus: peak=%s confidence_v2=%.3f repro=%.3f prominence=%.3f "
                      "temporal=%.3f texture=%.3f luma=%.3f verify=%d edge=%d",
@@ -824,6 +916,39 @@ private:
             !std::isfinite(config_.startup_focus_distance_m) ||
             config_.startup_focus_distance_m <= 0.0f) {
             return HAL_ERR_INVALID_ARG;
+        }
+
+        if (config_.startup_seed_from_archive) {
+            // Boot restore: replay the archived motor positions verbatim.
+            // They are already lens-space targets (the last scan's landing,
+            // calibration delta included), so no table lookup, no extra
+            // delta, no clamp beyond focus limits.
+            const int32_t zoom_target = config_.startup_seed_zoom_pos;
+            int32_t focus_target = std::clamp(config_.startup_seed_focus_pos,
+                                              config_.min_focus_pos,
+                                              config_.max_focus_pos);
+            HAL_LOG_INFO("Autofocus: restoring archived lens position "
+                         "zoom=%d focus=%d",
+                         zoom_target, focus_target);
+            set_state(AutofocusState::StartupAf, 0.04,
+                      "restoring archived lens position");
+            if (move_zoom_focus(zoom_target, focus_target,
+                                "archived restore") == HAL_OK) {
+                *focus_center = focus_target;
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    status_.effective_ratio = lens_->pos_to_ratio(zoom_target);
+                    status_.zoom_pos = zoom_target;
+                    status_.focus_pos = focus_target;
+                }
+                return HAL_OK;
+            }
+            // A malformed archive (e.g. out-of-travel zoom) fails the
+            // replay; fall through to the config-derived seed rather than
+            // killing the startup job. FG2009's restore has the equivalent
+            // fallback to its boot one-shot.
+            HAL_LOG_WARNING("Autofocus: archived lens position replay failed; "
+                            "falling back to config startup seed");
         }
 
         int32_t zoom_target = 0;
@@ -1017,12 +1142,38 @@ private:
         }
 
         set_state(AutofocusState::PathMoving, 0.05, "moving zoom-focus path");
+        struct IlluminationFollowScope {
+            IlluminationController* controller = nullptr;
+            double ratio = 1.0;
+            ~IlluminationFollowScope() {
+                if (!controller) return;
+                std::string ignored;
+                controller->end_zoom_follow(ratio, &ignored);
+            }
+        } illumination_scope{illumination_, path.front().zoom_ratio};
+        if (illumination_) {
+            std::string ir_error;
+            if (!illumination_->begin_zoom_follow(path.front().zoom_ratio, &ir_error)) {
+                HAL_LOG_WARNING("Autofocus: IR follow start degraded: %s",
+                                ir_error.c_str());
+            }
+        }
         for (size_t i = 1; i < path.size(); ++i) {
             if (cancelled()) {
                 ScanResult cancelled_result;
                 cancelled_result.error = HAL_ERR_INVALID_STATE;
                 cancelled_result.message = "cancelled";
                 return cancelled_result;
+            }
+            if (illumination_) {
+                const double segment_ratio =
+                    (static_cast<double>(path[i - 1].zoom_ratio) +
+                     static_cast<double>(path[i].zoom_ratio)) * 0.5;
+                std::string ir_error;
+                if (!illumination_->apply_follow_ratio(segment_ratio, &ir_error)) {
+                    HAL_LOG_WARNING("Autofocus: IR waypoint update degraded: %s",
+                                    ir_error.c_str());
+                }
             }
             const int ret = move_zoom_focus(
                 path[i].zoom_pos, path[i].focus_pos, "follow segment");
@@ -1043,10 +1194,24 @@ private:
                 status_.focus_pos = path[i].focus_pos;
                 status_.message = "moving zoom-focus path";
             }
+            illumination_scope.ratio = path[i].zoom_ratio;
         }
 
         set_state(AutofocusState::EndpointAf, 0.85, "endpoint autofocus");
         const auto& endpoint_sample = path.back();
+        if (illumination_) {
+            std::string ir_error;
+            if (!illumination_->apply_endpoint_ratio(effective_ratio, &ir_error)) {
+                HAL_LOG_WARNING("Autofocus: IR endpoint update degraded: %s",
+                                ir_error.c_str());
+            }
+            const int extra_settle = std::max(
+                0, illumination_->config().endpoint_settle_frames -
+                       defaults_.exploration_sync_frames);
+            if (extra_settle > 0 && wait_frames(extra_settle) != HAL_OK) {
+                HAL_LOG_WARNING("Autofocus: IR endpoint settle frame wait timed out");
+            }
+        }
         const int endpoint_span = hal_auto_af::refine_span_for_ratio(
             effective_ratio, config_.fine_span, follow_config_);
         return run_one_shot_at(endpoint_sample.focus_pos, endpoint_span, true);
@@ -1105,7 +1270,17 @@ private:
                 result.error = HAL_ERR_NOT_READY;
                 result.message = "lens state unavailable";
             } else {
-                result = run_one_shot_at(state.focus_pos, config_.coarse_span, false);
+                int span = config_.coarse_span;
+                if (config_.coarse_span_low_zoom > 0
+                    && config_.coarse_span_zoom_threshold > 0.0f) {
+                    const float ratio = lens_->pos_to_ratio(state.zoom_pos);
+                    if (ratio > 0.0f
+                        && ratio < config_.coarse_span_zoom_threshold) {
+                        span = config_.coarse_span_low_zoom;
+                    }
+                }
+                warm_up_stats();
+                result = run_one_shot_at(state.focus_pos, span, false);
             }
         }
 
@@ -1113,6 +1288,16 @@ private:
             lens_->stop_all(1000);
             finish_job(AutofocusState::Cancelled, HAL_ERR_INVALID_STATE, "cancelled");
         } else if (result.error == HAL_OK && result.confident) {
+            // Mirror the failure branch: publish the winning scan stats so a
+            // completed job does not report the previous failure's numbers.
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                status_.best_focus = result.best_pos;
+                status_.focus_pos = result.best_pos;
+                status_.metric = result.metric;
+                status_.confidence = result.confidence;
+                status_.reproducibility = result.reproducibility;
+            }
             finish_job(AutofocusState::Completed, HAL_OK, "autofocus completed");
         } else {
             {
@@ -1136,11 +1321,13 @@ private:
 AutofocusController::AutofocusController(
     HalIspOps* isp_ops, HalVideoOps* video_ops, void* video_ctx,
     FrameRouter* frame_router, LensController* lens,
-    const AutofocusConfig& config,
-    int sensor_native_width, int sensor_native_height)
+    IlluminationController* illumination, const AutofocusConfig& config,
+    int sensor_native_width, int sensor_native_height,
+    AutofocusVideoContextRefreshFn refresh_video_context)
     : impl_(std::make_unique<Impl>(isp_ops, video_ops, video_ctx,
-                                   frame_router, lens, config,
-                                   sensor_native_width, sensor_native_height)) {}
+                                   frame_router, lens, illumination, config,
+                                   sensor_native_width, sensor_native_height,
+                                   std::move(refresh_video_context))) {}
 
 AutofocusController::~AutofocusController() = default;
 void AutofocusController::start() { impl_->start(); }

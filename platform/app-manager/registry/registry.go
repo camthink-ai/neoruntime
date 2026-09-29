@@ -99,21 +99,28 @@ func (r *Registry) Register(app *AppInfo) error {
 	app.State = AppStateInstalled
 
 	r.apps[app.ID] = app
-
-	return r.save()
+	if err := r.save(); err != nil {
+		delete(r.apps, app.ID)
+		return err
+	}
+	return nil
 }
 
 func (r *Registry) Unregister(appID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if _, exists := r.apps[appID]; !exists {
+	old, exists := r.apps[appID]
+	if !exists {
 		return fmt.Errorf("app %s not found", appID)
 	}
 
 	delete(r.apps, appID)
-
-	return r.save()
+	if err := r.save(); err != nil {
+		r.apps[appID] = old
+		return err
+	}
+	return nil
 }
 
 func (r *Registry) Get(appID string) (*AppInfo, error) {
@@ -134,13 +141,17 @@ func (r *Registry) Update(app *AppInfo) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if _, exists := r.apps[app.ID]; !exists {
+	old, exists := r.apps[app.ID]
+	if !exists {
 		return fmt.Errorf("app %s not found", app.ID)
 	}
 
 	r.apps[app.ID] = app
-
-	return r.save()
+	if err := r.save(); err != nil {
+		r.apps[app.ID] = old
+		return err
+	}
+	return nil
 }
 
 func (r *Registry) List() []*AppInfo {
@@ -179,6 +190,7 @@ func (r *Registry) SetState(appID string, state AppState) error {
 		return fmt.Errorf("app %s not found", appID)
 	}
 
+	old := *app
 	app.State = state
 
 	switch state {
@@ -187,8 +199,11 @@ func (r *Registry) SetState(appID string, state AppState) error {
 	case AppStateStopped:
 		app.StoppedAt = time.Now()
 	}
-
-	return r.save()
+	if err := r.save(); err != nil {
+		*app = old
+		return err
+	}
+	return nil
 }
 
 func (r *Registry) IncrementRestartCount(appID string) error {
@@ -200,9 +215,13 @@ func (r *Registry) IncrementRestartCount(appID string) error {
 		return fmt.Errorf("app %s not found", appID)
 	}
 
+	old := app.RestartCount
 	app.RestartCount++
-
-	return r.save()
+	if err := r.save(); err != nil {
+		app.RestartCount = old
+		return err
+	}
+	return nil
 }
 
 func (r *Registry) SetContainerID(appID, containerID string) error {
@@ -214,9 +233,13 @@ func (r *Registry) SetContainerID(appID, containerID string) error {
 		return fmt.Errorf("app %s not found", appID)
 	}
 
+	old := app.ContainerID
 	app.ContainerID = containerID
-
-	return r.save()
+	if err := r.save(); err != nil {
+		app.ContainerID = old
+		return err
+	}
+	return nil
 }
 
 func (r *Registry) SetWebURL(appID, webURL string) error {
@@ -228,9 +251,13 @@ func (r *Registry) SetWebURL(appID, webURL string) error {
 		return fmt.Errorf("app %s not found", appID)
 	}
 
+	old := app.WebURL
 	app.WebURL = webURL
-
-	return r.save()
+	if err := r.save(); err != nil {
+		app.WebURL = old
+		return err
+	}
+	return nil
 }
 
 func (r *Registry) load() error {
@@ -263,7 +290,28 @@ func (r *Registry) save() error {
 		return err
 	}
 
-	return os.WriteFile(path, data, 0644)
+	tmp, err := os.CreateTemp(r.dataPath, ".registry.json-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0644); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // ListPlugins returns all registered plugin apps
