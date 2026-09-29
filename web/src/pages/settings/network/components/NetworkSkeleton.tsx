@@ -3,6 +3,9 @@ import { Skeleton } from '@/components/ui/skeleton';
 export function NetworkSkeleton() {
   return (
     <div className="p-6 md:p-12 space-y-6 max-w-4xl mx-auto">
+      {/* Page title */}
+      <Skeleton className="h-8 w-24" />
+
       <div className="bg-card rounded-lg p-6">
         {/* Header */}
         <div className="flex items-center justify-between mb-8">

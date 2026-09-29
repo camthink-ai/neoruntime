@@ -4,10 +4,10 @@ import { Loader2, ShieldCheck, AlertTriangle, ArrowLeft } from 'lucide-react';
 import { toast } from 'sonner';
 import FileUpload from '@/components/file-upload';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -22,7 +22,6 @@ export interface ImportFileTransferDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   title: string;
-  description: string;
   /** react-dropzone accept map, e.g. { 'application/gzip': ['.tar.gz', '.tgz'] }. */
   accept: Record<string, string[]>;
   /** Max upload size in bytes. */
@@ -40,12 +39,6 @@ export interface ImportFileTransferDialogProps {
   successMessage: string;
 }
 
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 // Single-layer dialog: the confirm step is an in-dialog state change, NOT a
 // second stacked portal. The previous design rendered a second AlertDialog
 // portal (z-9999) as a sibling of the outer Radix Dialog; the stacked overlays
@@ -57,7 +50,6 @@ export default function ImportFileTransferDialog({
   open,
   onOpenChange,
   title,
-  description,
   accept,
   maxSize,
   effects,
@@ -71,6 +63,8 @@ export default function ImportFileTransferDialog({
   const [file, setFile] = useState<File | null>(null);
   const [importing, setImporting] = useState(false);
   const [step, setStep] = useState<Step>('select');
+  // Ack gate for the confirm step: Apply stays disabled until checked.
+  const [acknowledged, setAcknowledged] = useState(false);
 
   const releaseRef = useRef<(() => void) | null>(null);
   const pollingRef = useRef<PollingHandle | null>(null);
@@ -100,6 +94,7 @@ export default function ImportFileTransferDialog({
     if (!open) {
       setFile(null);
       setStep('select');
+      setAcknowledged(false);
     }
   }, [open]);
 
@@ -162,7 +157,6 @@ export default function ImportFileTransferDialog({
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
-          <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
 
         {step === 'select' ? (
@@ -181,23 +175,6 @@ export default function ImportFileTransferDialog({
                 'Drag file here, or click to select'
               )}
             />
-
-            {file && (
-              <div className="rounded-lg border bg-muted/30 p-3 text-sm">
-                <div className="flex items-center justify-between gap-4">
-                  <span className="text-muted-foreground">
-                    {t('maintenance.backup.file', 'File')}
-                  </span>
-                  <span className="truncate font-medium">{file.name}</span>
-                </div>
-                <div className="mt-1 flex items-center justify-between gap-4">
-                  <span className="text-muted-foreground">
-                    {t('maintenance.backup.size', 'Size')}
-                  </span>
-                  <span className="font-medium">{formatSize(file.size)}</span>
-                </div>
-              </div>
-            )}
 
             {/* Impact disclosure */}
             <div className="rounded-lg border p-3">
@@ -288,19 +265,21 @@ export default function ImportFileTransferDialog({
                       )}
               </span>
             </div>
-
-            {file && (
-              <div className="rounded-lg border bg-muted/30 p-3 text-sm">
-                <span className="text-muted-foreground">
-                  {t('maintenance.backup.file', 'File')}:{' '}
-                </span>
-                <span className="font-medium">{file.name}</span>
-                <span className="text-muted-foreground">
-                  {' '}
-                  ({formatSize(file.size)})
-                </span>
-              </div>
-            )}
+            <label
+              htmlFor="import-confirm-ack"
+              className="flex cursor-pointer items-center gap-2.5 text-sm font-medium text-foreground"
+            >
+              <Checkbox
+                id="import-confirm-ack"
+                checked={acknowledged}
+                onCheckedChange={v => setAcknowledged(v === true)}
+                disabled={importing}
+              />
+              {t(
+                'maintenance.backup.confirm_ack',
+                '我已了解上述影响，确认继续'
+              )}
+            </label>
           </div>
         )}
 
@@ -322,7 +301,7 @@ export default function ImportFileTransferDialog({
                 {importing ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
                 ) : null}
-                {t('maintenance.backup.next', 'Next')}
+                {t('common.next', 'Next')}
               </Button>
             </>
           ) : (
@@ -338,7 +317,7 @@ export default function ImportFileTransferDialog({
               <Button
                 variant={isHigh ? 'destructive' : 'carbon'}
                 onClick={runImport}
-                disabled={importing}
+                disabled={importing || !acknowledged}
                 className={cn(
                   !isHigh
                     && 'bg-foreground text-background hover:bg-foreground/90'
