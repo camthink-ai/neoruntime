@@ -2,9 +2,19 @@
  * @file hailo15_osd_impl.cpp
  * @brief Hailo-15 HAL OSD implementation (FROM_MEDIA encoder-scoped overlays).
  *
- * Delegates to the MediaLibrary osd::Configurer (osd::Blender) obtained from
- * each encoder via encoder->get_osd_blender().  HAL <-> ML type conversions
- * use the helpers in hailo15_osd_ml.hpp.
+ * Medialib 1.13 (SDK 4.0.23) declarative OSD model: overlays live in the
+ * per-stream config_stream_osd_t of the medialib profile; every mutation is
+ * get_current_profile() -> mutate -> set_override_parameters(), and the
+ * internal blender picks the config up from the profile attached to each
+ * encoded buffer. There is no enabled flag any more, so disable/enable is
+ * modelled with a shadow snapshot map (Hailo15MediaPriv::osd_disabled_by_stream)
+ * guarded by Hailo15MediaPriv::osd_state_mu, which also serializes OSD ops.
+ *
+ * Custom (raw ARGB/A420 buffer) overlays became internal in medialib 1.13 —
+ * there is no public path to register them, so add/set custom return
+ * HAL_ERR_NOT_SUPPORTED (the ops stay in the table to preserve the HAL ABI).
+ *
+ * HAL <-> ML type conversions use the helpers in hailo15_osd_ml.hpp.
  */
 
 #include "hailo15_common.hpp"
@@ -16,6 +26,7 @@
 #include "media/hal_codec_internal.h"
 
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -27,14 +38,13 @@ namespace
 {
 
 /* -------------------------------------------------------------------
- * OSD context helper — resolves codec_ctx to blender + stream id.
+ * OSD context helper — resolves codec_ctx to media priv + stream id.
  * ------------------------------------------------------------------- */
 
 struct OsdContext
 {
     Hailo15MediaPriv *priv;
     std::string stream_id;
-    std::shared_ptr<osd::Blender> blender;
 };
 
 int resolve_osd_context(void *codec_ctx, OsdContext *out)
@@ -58,24 +68,8 @@ int resolve_osd_context(void *codec_ctx, OsdContext *out)
         return HAL_ERR_NOT_INITIALIZED;
     }
 
-    std::string stream_id(cc->codec_name);
-    auto enc_it = priv->media_lib->m_encoders.find(stream_id);
-    if (enc_it == priv->media_lib->m_encoders.end())
-    {
-        HAL_LOG_ERROR("Hailo15 OSD: encoder '%s' not found", cc->codec_name);
-        return HAL_ERR_NOT_FOUND;
-    }
-
-    auto blender = enc_it->second->get_osd_blender();
-    if (!blender)
-    {
-        HAL_LOG_ERROR("Hailo15 OSD: get_osd_blender() returned null for '%s'", cc->codec_name);
-        return HAL_ERR_NOT_INITIALIZED;
-    }
-
     out->priv = priv;
-    out->stream_id = std::move(stream_id);
-    out->blender = std::move(blender);
+    out->stream_id = std::string(cc->codec_name);
     return HAL_OK;
 }
 
@@ -89,56 +83,164 @@ bool readable_image_file(const char *path)
     return (::stat(path, &st) == 0) && S_ISREG(st.st_mode) && (::access(path, R_OK) == 0);
 }
 
-static int copy_custom_overlay_data(OsdContext &ctx, const HalOsdCustomOverlay &h)
+/* -------------------------------------------------------------------
+ * Declarative-model helpers. All assume the caller holds priv->osd_state_mu.
+ * ------------------------------------------------------------------- */
+
+/** Fetch a copy of the current profile; logs + returns false on failure. */
+bool fetch_profile_locked(Hailo15MediaPriv *priv, config_profile_t *out)
 {
-    if (h.data == nullptr || h.data_size == 0)
+    auto prof_exp = priv->media_lib->get_current_profile();
+    if (!prof_exp)
     {
-        return HAL_OK; /* metadata-only update */
+        HAL_LOG_ERROR("Hailo15 OSD: get_current_profile failed (%d)", static_cast<int>(prof_exp.error()));
+        return false;
     }
-    auto exp = ctx.blender->get_overlay(std::string(h.base.id));
-    if (!exp.has_value())
-    {
-        return HAL_ERR_NOT_FOUND;
-    }
-    auto custom = std::static_pointer_cast<osd::CustomOverlay>(exp.value());
-    if (!custom)
-    {
-        return HAL_ERROR;
-    }
-    auto buf = custom->get_buffer();
-    if (!buf)
-    {
-        return HAL_ERR_NOT_INITIALIZED;
-    }
+    *out = prof_exp.value();
+    return true;
+}
 
-    const uint32_t plane_count = (h.format == HAL_OSD_CUSTOM_FMT_A420) ? 4u : 1u;
-    size_t need = 0;
-    for (uint32_t i = 0; i < plane_count; i++)
+/** Apply a mutated profile. Caller holds osd_state_mu (never priv->mutex). */
+int apply_profile_locked(Hailo15MediaPriv *priv, config_profile_t &prof)
+{
+    media_library_return ret = priv->media_lib->set_override_parameters(prof);
+    if (ret != MEDIA_LIBRARY_SUCCESS)
     {
-        need += (size_t)buf->get_plane_size(i);
-    }
-    if (need == 0 || (size_t)h.data_size != need)
-    {
-        HAL_LOG_ERROR("Hailo15 OSD custom overlay '%s': data_size=%u expected=%zu (format=%s)",
-                      h.base.id, (unsigned)h.data_size, need,
-                      (h.format == HAL_OSD_CUSTOM_FMT_A420) ? "A420" : "ARGB");
-        return HAL_ERR_INVALID_SIZE;
-    }
-
-    const uint8_t *src = static_cast<const uint8_t *>(h.data);
-    size_t off = 0;
-    for (uint32_t i = 0; i < plane_count; i++)
-    {
-        void *dst = buf->get_plane_ptr(i);
-        const size_t sz = (size_t)buf->get_plane_size(i);
-        if (dst == nullptr || sz == 0)
-        {
-            return HAL_ERROR;
-        }
-        std::memcpy(dst, src + off, sz);
-        off += sz;
+        return hailo15_ml_err(ret);
     }
     return HAL_OK;
+}
+
+/** Which overlay vector an id lives in. */
+enum class OsdSlot
+{
+    None,
+    Image,
+    Text,
+    DateTime,
+};
+
+OsdSlot find_overlay_slot(const config_stream_osd_t &osd, const std::string &id)
+{
+    for (const auto &ptr : osd.image_overlays)
+    {
+        if (ptr && ptr->id == id)
+        {
+            return OsdSlot::Image;
+        }
+    }
+    for (const auto &ptr : osd.text_overlays)
+    {
+        if (ptr && ptr->id == id)
+        {
+            return OsdSlot::Text;
+        }
+    }
+    for (const auto &ptr : osd.datetime_overlays)
+    {
+        if (ptr && ptr->id == id)
+        {
+            return OsdSlot::DateTime;
+        }
+    }
+    return OsdSlot::None;
+}
+
+/** Convert one profile overlay into its HAL snapshot form. */
+bool ml_overlay_to_hal_snapshot(const config_stream_osd_t &osd, const std::string &id, bool enabled,
+                                HalOsdOverlay *out)
+{
+    for (const auto &ptr : osd.image_overlays)
+    {
+        if (ptr && ptr->id == id)
+        {
+            out->type = HAL_OSD_OVERLAY_IMAGE;
+            hailo15::osd_ml::ml_to_hal_image(*ptr, &out->data.image, enabled);
+            return true;
+        }
+    }
+    for (const auto &ptr : osd.text_overlays)
+    {
+        if (ptr && ptr->id == id)
+        {
+            out->type = HAL_OSD_OVERLAY_TEXT;
+            hailo15::osd_ml::ml_to_hal_text(*ptr, &out->data.text, enabled);
+            return true;
+        }
+    }
+    for (const auto &ptr : osd.datetime_overlays)
+    {
+        if (ptr && ptr->id == id)
+        {
+            out->type = HAL_OSD_OVERLAY_DATETIME;
+            hailo15::osd_ml::ml_to_hal_datetime(*ptr, &out->data.datetime, enabled);
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Push a HAL overlay (by type) into the matching profile vector. */
+void push_hal_overlay(config_stream_osd_t &osd, const HalOsdOverlay &ov)
+{
+    switch (ov.type)
+    {
+        case HAL_OSD_OVERLAY_IMAGE:
+            osd.image_overlays.push_back(hailo15::osd_ml::hal_to_ml_image(ov.data.image));
+            break;
+        case HAL_OSD_OVERLAY_TEXT:
+            osd.text_overlays.push_back(hailo15::osd_ml::hal_to_ml_text(ov.data.text));
+            break;
+        case HAL_OSD_OVERLAY_DATETIME:
+            osd.datetime_overlays.push_back(hailo15::osd_ml::hal_to_ml_datetime(ov.data.datetime));
+            break;
+        case HAL_OSD_OVERLAY_CUSTOM:
+        default:
+            break; /* unreachable: custom adds are rejected up front */
+    }
+}
+
+/** Replace-by-id that only compiles an assignment when the vector element type
+ *  matches the converted overlay type (mismatched vectors are skipped). */
+template <typename PtrT, typename MlT>
+bool try_replace_overlay(std::vector<PtrT> &vec, const std::string &id, const MlT &ml)
+{
+    if constexpr (std::is_same_v<PtrT, MlT>)
+    {
+        for (auto &ptr : vec)
+        {
+            if (ptr && ptr->id == id)
+            {
+                ptr = ml;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/** Remove one overlay (by id) from all three vectors; true if anything was erased. */
+bool erase_overlay_by_id(config_stream_osd_t &osd, const std::string &id)
+{
+    bool erased = false;
+    auto drop = [&id, &erased](auto &vec) {
+        for (auto it = vec.begin(); it != vec.end();)
+        {
+            if (*it && (*it)->id == id)
+            {
+                it = vec.erase(it);
+                erased = true;
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    };
+    drop(osd.image_overlays);
+    drop(osd.text_overlays);
+    drop(osd.datetime_overlays);
+    return erased;
 }
 
 } // namespace
@@ -188,14 +290,36 @@ static int hailo15_osd_add_image(void *codec_ctx, const HalOsdImageOverlay *over
                 adjusted.base.y = oy;
             }
         }
-        osd::ImageOverlay ml = hailo15::osd_ml::hal_to_ml_image(adjusted);
-        media_library_return ret = ctx.blender->add_overlay(ml);
-        if (ret != MEDIA_LIBRARY_SUCCESS)
+        std::lock_guard<std::mutex> lock(ctx.priv->osd_state_mu);
+        config_profile_t prof;
+        if (!fetch_profile_locked(ctx.priv, &prof))
         {
-            return hailo15_ml_err(ret);
+            return HAL_ERROR;
         }
-        ret = ctx.blender->set_overlay_enabled(std::string(overlay->base.id), overlay->base.enabled);
-        return hailo15_ml_err(ret);
+        auto stream_it = prof.encoded_output_streams.find(ctx.stream_id);
+        if (stream_it == prof.encoded_output_streams.end())
+        {
+            HAL_LOG_ERROR("Hailo15 OSD: stream '%s' not found in profile", ctx.stream_id.c_str());
+            return HAL_ERR_NOT_FOUND;
+        }
+        config_stream_osd_t &osd = stream_it->second.osd;
+        const std::string id(adjusted.base.id);
+        if (find_overlay_slot(osd, id) != OsdSlot::None ||
+            ctx.priv->osd_disabled_by_stream[ctx.stream_id].count(id) != 0U)
+        {
+            HAL_LOG_ERROR("Hailo15 OSD: add image '%s' failed: id already exists", id.c_str());
+            return HAL_ERR_INVALID_STATE;
+        }
+        if (!adjusted.base.enabled)
+        {
+            HalOsdOverlay snap{};
+            snap.type = HAL_OSD_OVERLAY_IMAGE;
+            snap.data.image = adjusted;
+            ctx.priv->osd_disabled_by_stream[ctx.stream_id][id] = snap;
+            return HAL_OK;
+        }
+        osd.image_overlays.push_back(hailo15::osd_ml::hal_to_ml_image(adjusted));
+        return apply_profile_locked(ctx.priv, prof);
     }
     catch (const std::exception &e)
     {
@@ -239,14 +363,36 @@ static int hailo15_osd_add_text(void *codec_ctx, const HalOsdTextOverlay *overla
                 adjusted.base.y = oy;
             }
         }
-        osd::TextOverlay ml = hailo15::osd_ml::hal_to_ml_text(adjusted);
-        media_library_return ret = ctx.blender->add_overlay(ml);
-        if (ret != MEDIA_LIBRARY_SUCCESS)
+        std::lock_guard<std::mutex> lock(ctx.priv->osd_state_mu);
+        config_profile_t prof;
+        if (!fetch_profile_locked(ctx.priv, &prof))
         {
-            return hailo15_ml_err(ret);
+            return HAL_ERROR;
         }
-        ret = ctx.blender->set_overlay_enabled(std::string(overlay->base.id), overlay->base.enabled);
-        return hailo15_ml_err(ret);
+        auto stream_it = prof.encoded_output_streams.find(ctx.stream_id);
+        if (stream_it == prof.encoded_output_streams.end())
+        {
+            HAL_LOG_ERROR("Hailo15 OSD: stream '%s' not found in profile", ctx.stream_id.c_str());
+            return HAL_ERR_NOT_FOUND;
+        }
+        config_stream_osd_t &osd = stream_it->second.osd;
+        const std::string id(adjusted.base.id);
+        if (find_overlay_slot(osd, id) != OsdSlot::None ||
+            ctx.priv->osd_disabled_by_stream[ctx.stream_id].count(id) != 0U)
+        {
+            HAL_LOG_ERROR("Hailo15 OSD: add text '%s' failed: id already exists", id.c_str());
+            return HAL_ERR_INVALID_STATE;
+        }
+        if (!adjusted.base.enabled)
+        {
+            HalOsdOverlay snap{};
+            snap.type = HAL_OSD_OVERLAY_TEXT;
+            snap.data.text = adjusted;
+            ctx.priv->osd_disabled_by_stream[ctx.stream_id][id] = snap;
+            return HAL_OK;
+        }
+        osd.text_overlays.push_back(hailo15::osd_ml::hal_to_ml_text(adjusted));
+        return apply_profile_locked(ctx.priv, prof);
     }
     catch (const std::exception &e)
     {
@@ -290,14 +436,36 @@ static int hailo15_osd_add_datetime(void *codec_ctx, const HalOsdDateTimeOverlay
                 adjusted.text.base.y = oy;
             }
         }
-        osd::DateTimeOverlay ml = hailo15::osd_ml::hal_to_ml_datetime(adjusted);
-        media_library_return ret = ctx.blender->add_overlay(ml);
-        if (ret != MEDIA_LIBRARY_SUCCESS)
+        std::lock_guard<std::mutex> lock(ctx.priv->osd_state_mu);
+        config_profile_t prof;
+        if (!fetch_profile_locked(ctx.priv, &prof))
         {
-            return hailo15_ml_err(ret);
+            return HAL_ERROR;
         }
-        ret = ctx.blender->set_overlay_enabled(std::string(overlay->text.base.id), overlay->text.base.enabled);
-        return hailo15_ml_err(ret);
+        auto stream_it = prof.encoded_output_streams.find(ctx.stream_id);
+        if (stream_it == prof.encoded_output_streams.end())
+        {
+            HAL_LOG_ERROR("Hailo15 OSD: stream '%s' not found in profile", ctx.stream_id.c_str());
+            return HAL_ERR_NOT_FOUND;
+        }
+        config_stream_osd_t &osd = stream_it->second.osd;
+        const std::string id(adjusted.text.base.id);
+        if (find_overlay_slot(osd, id) != OsdSlot::None ||
+            ctx.priv->osd_disabled_by_stream[ctx.stream_id].count(id) != 0U)
+        {
+            HAL_LOG_ERROR("Hailo15 OSD: add datetime '%s' failed: id already exists", id.c_str());
+            return HAL_ERR_INVALID_STATE;
+        }
+        if (!adjusted.text.base.enabled)
+        {
+            HalOsdOverlay snap{};
+            snap.type = HAL_OSD_OVERLAY_DATETIME;
+            snap.data.datetime = adjusted;
+            ctx.priv->osd_disabled_by_stream[ctx.stream_id][id] = snap;
+            return HAL_OK;
+        }
+        osd.datetime_overlays.push_back(hailo15::osd_ml::hal_to_ml_datetime(adjusted));
+        return apply_profile_locked(ctx.priv, prof);
     }
     catch (const std::exception &e)
     {
@@ -308,10 +476,44 @@ static int hailo15_osd_add_datetime(void *codec_ctx, const HalOsdDateTimeOverlay
 
 static int hailo15_osd_add_custom(void *codec_ctx, const HalOsdCustomOverlay *overlay)
 {
-    if (!overlay)
+    (void)codec_ctx;
+    (void)overlay;
+    static bool logged = false; /* process-local, benign race (worst case: duplicate log) */
+    if (!logged)
     {
-        return HAL_ERR_INVALID_ARG;
+        logged = true;
+        HAL_LOG_WARNING("Hailo15 OSD: custom (raw-buffer) overlays are not supported under "
+                        "medialib 1.13 (CustomOverlay became internal); add_custom_overlay "
+                        "returns NOT_SUPPORTED");
     }
+    return !overlay ? HAL_ERR_INVALID_ARG : HAL_ERR_NOT_SUPPORTED;
+}
+
+/* ====================================================================
+ * Set (update) overlays
+ * ==================================================================== */
+
+/** Overlay id of a HAL snapshot, dispatched by its recorded type. */
+const char *hal_snapshot_id(const HalOsdOverlay &s)
+{
+    switch (s.type)
+    {
+        case HAL_OSD_OVERLAY_IMAGE:
+            return s.data.image.base.id;
+        case HAL_OSD_OVERLAY_TEXT:
+            return s.data.text.base.id;
+        case HAL_OSD_OVERLAY_DATETIME:
+            return s.data.datetime.text.base.id;
+        case HAL_OSD_OVERLAY_CUSTOM:
+        default:
+            return "";
+    }
+}
+
+template <typename HalOverlayT, typename ToMl, typename ToSnap>
+static int osd_set_by_type(void *codec_ctx, const HalOverlayT *overlay, ToMl to_ml, ToSnap to_snap,
+                           const char *kind)
+{
     OsdContext ctx;
     int r = resolve_osd_context(codec_ctx, &ctx);
     if (r != HAL_OK)
@@ -320,30 +522,49 @@ static int hailo15_osd_add_custom(void *codec_ctx, const HalOsdCustomOverlay *ov
     }
     try
     {
-        osd::CustomOverlay ml = hailo15::osd_ml::hal_to_ml_custom(*overlay);
-        media_library_return ret = ctx.blender->add_overlay(ml);
-        if (ret != MEDIA_LIBRARY_SUCCESS)
+        std::lock_guard<std::mutex> lock(ctx.priv->osd_state_mu);
+        config_profile_t prof;
+        if (!fetch_profile_locked(ctx.priv, &prof))
         {
-            return hailo15_ml_err(ret);
+            return HAL_ERROR;
         }
-        int cr = copy_custom_overlay_data(ctx, *overlay);
-        if (cr != HAL_OK)
+        auto stream_it = prof.encoded_output_streams.find(ctx.stream_id);
+        if (stream_it == prof.encoded_output_streams.end())
         {
-            return cr;
+            return HAL_ERR_NOT_FOUND;
         }
-        ret = ctx.blender->set_overlay_enabled(std::string(overlay->base.id), overlay->base.enabled);
-        return hailo15_ml_err(ret);
+        config_stream_osd_t &osd = stream_it->second.osd;
+        const HalOsdOverlay snap = to_snap(*overlay);
+        const std::string id(hal_snapshot_id(snap));
+
+        /* Replace in place if currently blended. */
+        const auto ml = to_ml(*overlay);
+        if (try_replace_overlay(osd.image_overlays, id, ml) ||
+            try_replace_overlay(osd.text_overlays, id, ml) ||
+            try_replace_overlay(osd.datetime_overlays, id, ml))
+        {
+            return apply_profile_locked(ctx.priv, prof);
+        }
+
+        /* Not blended: update the shadow snapshot only (stays hidden). The snapshot
+         * takes the caller's overlay and type wholesale. */
+        auto &shadow = ctx.priv->osd_disabled_by_stream[ctx.stream_id];
+        auto sh_it = shadow.find(id);
+        if (sh_it != shadow.end())
+        {
+            sh_it->second = snap;
+            return HAL_OK;
+        }
+
+        HAL_LOG_ERROR("Hailo15 OSD: set %s '%s' failed: not found", kind, id.c_str());
+        return HAL_ERR_NOT_FOUND;
     }
     catch (const std::exception &e)
     {
-        HAL_LOG_ERROR("Hailo15 OSD add_custom exception: %s", e.what());
+        HAL_LOG_ERROR("Hailo15 OSD set %s exception: %s", kind, e.what());
         return HAL_ERROR;
     }
 }
-
-/* ====================================================================
- * Set (update) overlays
- * ==================================================================== */
 
 static int hailo15_osd_set_image(void *codec_ctx, const HalOsdImageOverlay *overlay)
 {
@@ -356,23 +577,16 @@ static int hailo15_osd_set_image(void *codec_ctx, const HalOsdImageOverlay *over
         HAL_LOG_ERROR("Hailo15 OSD set_image: invalid image_path='%s'", overlay->image_path);
         return HAL_ERR_INVALID_ARG;
     }
-    OsdContext ctx;
-    int r = resolve_osd_context(codec_ctx, &ctx);
-    if (r != HAL_OK)
-    {
-        return r;
-    }
-    try
-    {
-        osd::ImageOverlay ml = hailo15::osd_ml::hal_to_ml_image(*overlay);
-        media_library_return ret = ctx.blender->set_overlay(ml);
-        return hailo15_ml_err(ret);
-    }
-    catch (const std::exception &e)
-    {
-        HAL_LOG_ERROR("Hailo15 OSD set_image exception: %s", e.what());
-        return HAL_ERROR;
-    }
+    return osd_set_by_type(
+        codec_ctx, overlay,
+        [](const HalOsdImageOverlay &o) { return hailo15::osd_ml::hal_to_ml_image(o); },
+        [](const HalOsdImageOverlay &o) {
+            HalOsdOverlay snap{};
+            snap.type = HAL_OSD_OVERLAY_IMAGE;
+            snap.data.image = o;
+            return snap;
+        },
+        "image");
 }
 
 static int hailo15_osd_set_text(void *codec_ctx, const HalOsdTextOverlay *overlay)
@@ -381,23 +595,16 @@ static int hailo15_osd_set_text(void *codec_ctx, const HalOsdTextOverlay *overla
     {
         return HAL_ERR_INVALID_ARG;
     }
-    OsdContext ctx;
-    int r = resolve_osd_context(codec_ctx, &ctx);
-    if (r != HAL_OK)
-    {
-        return r;
-    }
-    try
-    {
-        osd::TextOverlay ml = hailo15::osd_ml::hal_to_ml_text(*overlay);
-        media_library_return ret = ctx.blender->set_overlay(ml);
-        return hailo15_ml_err(ret);
-    }
-    catch (const std::exception &e)
-    {
-        HAL_LOG_ERROR("Hailo15 OSD set_text exception: %s", e.what());
-        return HAL_ERROR;
-    }
+    return osd_set_by_type(
+        codec_ctx, overlay,
+        [](const HalOsdTextOverlay &o) { return hailo15::osd_ml::hal_to_ml_text(o); },
+        [](const HalOsdTextOverlay &o) {
+            HalOsdOverlay snap{};
+            snap.type = HAL_OSD_OVERLAY_TEXT;
+            snap.data.text = o;
+            return snap;
+        },
+        "text");
 }
 
 static int hailo15_osd_set_datetime(void *codec_ctx, const HalOsdDateTimeOverlay *overlay)
@@ -406,58 +613,31 @@ static int hailo15_osd_set_datetime(void *codec_ctx, const HalOsdDateTimeOverlay
     {
         return HAL_ERR_INVALID_ARG;
     }
-    OsdContext ctx;
-    int r = resolve_osd_context(codec_ctx, &ctx);
-    if (r != HAL_OK)
-    {
-        return r;
-    }
-    try
-    {
-        osd::DateTimeOverlay ml = hailo15::osd_ml::hal_to_ml_datetime(*overlay);
-        media_library_return ret = ctx.blender->set_overlay(ml);
-        return hailo15_ml_err(ret);
-    }
-    catch (const std::exception &e)
-    {
-        HAL_LOG_ERROR("Hailo15 OSD set_datetime exception: %s", e.what());
-        return HAL_ERROR;
-    }
+    return osd_set_by_type(
+        codec_ctx, overlay,
+        [](const HalOsdDateTimeOverlay &o) { return hailo15::osd_ml::hal_to_ml_datetime(o); },
+        [](const HalOsdDateTimeOverlay &o) {
+            HalOsdOverlay snap{};
+            snap.type = HAL_OSD_OVERLAY_DATETIME;
+            snap.data.datetime = o;
+            return snap;
+        },
+        "datetime");
 }
 
 static int hailo15_osd_set_custom(void *codec_ctx, const HalOsdCustomOverlay *overlay)
 {
-    if (!overlay)
+    (void)codec_ctx;
+    (void)overlay;
+    static bool logged = false; /* process-local, benign race (worst case: duplicate log) */
+    if (!logged)
     {
-        return HAL_ERR_INVALID_ARG;
+        logged = true;
+        HAL_LOG_WARNING("Hailo15 OSD: custom (raw-buffer) overlays are not supported under "
+                        "medialib 1.13 (CustomOverlay became internal); set_custom_overlay "
+                        "returns NOT_SUPPORTED");
     }
-    OsdContext ctx;
-    int r = resolve_osd_context(codec_ctx, &ctx);
-    if (r != HAL_OK)
-    {
-        return r;
-    }
-    try
-    {
-        osd::CustomOverlay ml = hailo15::osd_ml::hal_to_ml_custom(*overlay);
-        media_library_return ret = ctx.blender->set_overlay(ml);
-        int rr = hailo15_ml_err(ret);
-        if (rr != HAL_OK)
-        {
-            return rr;
-        }
-        int cr = copy_custom_overlay_data(ctx, *overlay);
-        if (cr != HAL_OK)
-        {
-            return cr;
-        }
-        return HAL_OK;
-    }
-    catch (const std::exception &e)
-    {
-        HAL_LOG_ERROR("Hailo15 OSD set_custom exception: %s", e.what());
-        return HAL_ERROR;
-    }
+    return !overlay ? HAL_ERR_INVALID_ARG : HAL_ERR_NOT_SUPPORTED;
 }
 
 /* ====================================================================
@@ -478,8 +658,25 @@ static int hailo15_osd_remove(void *codec_ctx, const char *overlay_id)
     }
     try
     {
-        media_library_return ret = ctx.blender->remove_overlay(std::string(overlay_id));
-        return hailo15_ml_err(ret);
+        std::lock_guard<std::mutex> lock(ctx.priv->osd_state_mu);
+        config_profile_t prof;
+        if (!fetch_profile_locked(ctx.priv, &prof))
+        {
+            return HAL_ERROR;
+        }
+        auto stream_it = prof.encoded_output_streams.find(ctx.stream_id);
+        if (stream_it == prof.encoded_output_streams.end())
+        {
+            return HAL_ERR_NOT_FOUND;
+        }
+        const std::string id(overlay_id);
+        const bool in_profile = erase_overlay_by_id(stream_it->second.osd, id);
+        const size_t removed_shadow = ctx.priv->osd_disabled_by_stream[ctx.stream_id].erase(id);
+        if (!in_profile && removed_shadow == 0U)
+        {
+            return HAL_ERR_NOT_FOUND;
+        }
+        return apply_profile_locked(ctx.priv, prof);
     }
     catch (const std::exception &e)
     {
@@ -502,8 +699,52 @@ static int hailo15_osd_set_enabled(void *codec_ctx, const char *overlay_id, bool
     }
     try
     {
-        media_library_return ret = ctx.blender->set_overlay_enabled(std::string(overlay_id), enabled);
-        return hailo15_ml_err(ret);
+        std::lock_guard<std::mutex> lock(ctx.priv->osd_state_mu);
+        config_profile_t prof;
+        if (!fetch_profile_locked(ctx.priv, &prof))
+        {
+            return HAL_ERROR;
+        }
+        auto stream_it = prof.encoded_output_streams.find(ctx.stream_id);
+        if (stream_it == prof.encoded_output_streams.end())
+        {
+            return HAL_ERR_NOT_FOUND;
+        }
+        config_stream_osd_t &osd = stream_it->second.osd;
+        auto &shadow = ctx.priv->osd_disabled_by_stream[ctx.stream_id];
+        const std::string id(overlay_id);
+
+        if (!enabled)
+        {
+            /* Disable: present in the profile -> snapshot + remove. */
+            if (find_overlay_slot(osd, id) == OsdSlot::None)
+            {
+                return shadow.count(id) != 0U ? HAL_OK : HAL_ERR_NOT_FOUND;
+            }
+            HalOsdOverlay snap{};
+            if (!ml_overlay_to_hal_snapshot(osd, id, false, &snap))
+            {
+                return HAL_ERR_NOT_FOUND;
+            }
+            erase_overlay_by_id(osd, id);
+            shadow[id] = snap;
+            return apply_profile_locked(ctx.priv, prof);
+        }
+
+        /* Enable: shadowed -> restore into the matching vector. */
+        auto sh_it = shadow.find(id);
+        if (sh_it == shadow.end())
+        {
+            return find_overlay_slot(osd, id) != OsdSlot::None ? HAL_OK : HAL_ERR_NOT_FOUND;
+        }
+        if (sh_it->second.type == HAL_OSD_OVERLAY_CUSTOM)
+        {
+            HAL_LOG_ERROR("Hailo15 OSD: cannot enable '%s': custom overlays are unsupported", id.c_str());
+            return HAL_ERR_NOT_SUPPORTED;
+        }
+        push_hal_overlay(osd, sh_it->second);
+        shadow.erase(sh_it);
+        return apply_profile_locked(ctx.priv, prof);
     }
     catch (const std::exception &e)
     {
@@ -530,26 +771,28 @@ static int hailo15_osd_get_overlays(void *codec_ctx, HalOsdOverlay *overlays, ui
     }
     try
     {
-        /* Do not hold priv->mutex across MediaLibrary calls. */
-        auto prof_exp = ctx.priv->media_lib->get_current_profile();
-        if (!prof_exp)
+        std::lock_guard<std::mutex> lock(ctx.priv->osd_state_mu);
+        config_profile_t prof;
+        if (!fetch_profile_locked(ctx.priv, &prof))
         {
             HAL_LOG_ERROR("Hailo15 OSD get_overlays: get_current_profile failed");
             return HAL_ERROR;
         }
-        const config_profile_t &prof = prof_exp.value();
-        auto stream_it = prof.encoded_output_streams.find(ctx.stream_id);
-        if (stream_it == prof.encoded_output_streams.end())
+        const config_profile_t &p = prof;
+        auto stream_it = p.encoded_output_streams.find(ctx.stream_id);
+        if (stream_it == p.encoded_output_streams.end())
         {
             HAL_LOG_ERROR("Hailo15 OSD get_overlays: stream '%s' not found in profile", ctx.stream_id.c_str());
             return HAL_ERR_NOT_FOUND;
         }
 
         const config_stream_osd_t &osd = stream_it->second.osd;
+        const auto &shadow = ctx.priv->osd_disabled_by_stream[ctx.stream_id];
         const uint32_t n_image = static_cast<uint32_t>(osd.image_overlays.size());
         const uint32_t n_text = static_cast<uint32_t>(osd.text_overlays.size());
         const uint32_t n_datetime = static_cast<uint32_t>(osd.datetime_overlays.size());
-        const uint32_t total = n_image + n_text + n_datetime;
+        const uint32_t n_shadow = static_cast<uint32_t>(shadow.size());
+        const uint32_t total = n_image + n_text + n_datetime + n_shadow;
 
         /* Query-only: caller wants to know the required count. */
         if (!overlays || *count < total)
@@ -567,7 +810,7 @@ static int hailo15_osd_get_overlays(void *codec_ctx, HalOsdOverlay *overlays, ui
                 continue;
             }
             overlays[idx].type = HAL_OSD_OVERLAY_IMAGE;
-            hailo15::osd_ml::ml_to_hal_image(*osd.image_overlays[i], &overlays[idx].data.image);
+            hailo15::osd_ml::ml_to_hal_image(*osd.image_overlays[i], &overlays[idx].data.image, true);
             ++idx;
         }
 
@@ -578,7 +821,7 @@ static int hailo15_osd_get_overlays(void *codec_ctx, HalOsdOverlay *overlays, ui
                 continue;
             }
             overlays[idx].type = HAL_OSD_OVERLAY_TEXT;
-            hailo15::osd_ml::ml_to_hal_text(*osd.text_overlays[i], &overlays[idx].data.text);
+            hailo15::osd_ml::ml_to_hal_text(*osd.text_overlays[i], &overlays[idx].data.text, true);
             ++idx;
         }
 
@@ -589,7 +832,14 @@ static int hailo15_osd_get_overlays(void *codec_ctx, HalOsdOverlay *overlays, ui
                 continue;
             }
             overlays[idx].type = HAL_OSD_OVERLAY_DATETIME;
-            hailo15::osd_ml::ml_to_hal_datetime(*osd.datetime_overlays[i], &overlays[idx].data.datetime);
+            hailo15::osd_ml::ml_to_hal_datetime(*osd.datetime_overlays[i], &overlays[idx].data.datetime, true);
+            ++idx;
+        }
+
+        /* Shadowed (disabled) overlays are reported with enabled=false. */
+        for (const auto &kv : shadow)
+        {
+            overlays[idx] = kv.second; /* snapshot already carries enabled=false + type */
             ++idx;
         }
 
@@ -617,13 +867,12 @@ static int hailo15_osd_get_overlay(void *codec_ctx, const char *overlay_id, HalO
     }
     try
     {
-        /* Do not hold priv->mutex across MediaLibrary calls. */
-        auto prof_exp = ctx.priv->media_lib->get_current_profile();
-        if (!prof_exp)
+        std::lock_guard<std::mutex> lock(ctx.priv->osd_state_mu);
+        config_profile_t prof;
+        if (!fetch_profile_locked(ctx.priv, &prof))
         {
             return HAL_ERROR;
         }
-        const config_profile_t &prof = prof_exp.value();
         auto stream_it = prof.encoded_output_streams.find(ctx.stream_id);
         if (stream_it == prof.encoded_output_streams.end())
         {
@@ -633,37 +882,17 @@ static int hailo15_osd_get_overlay(void *codec_ctx, const char *overlay_id, HalO
         const config_stream_osd_t &osd = stream_it->second.osd;
         const std::string id(overlay_id);
 
-        /* Search image overlays. */
-        for (const auto &ptr : osd.image_overlays)
+        if (ml_overlay_to_hal_snapshot(osd, id, true, overlay))
         {
-            if (ptr && ptr->id == id)
-            {
-                overlay->type = HAL_OSD_OVERLAY_IMAGE;
-                hailo15::osd_ml::ml_to_hal_image(*ptr, &overlay->data.image);
-                return HAL_OK;
-            }
+            return HAL_OK;
         }
 
-        /* Search text overlays. */
-        for (const auto &ptr : osd.text_overlays)
+        const auto &shadow = ctx.priv->osd_disabled_by_stream[ctx.stream_id];
+        auto sh_it = shadow.find(id);
+        if (sh_it != shadow.end())
         {
-            if (ptr && ptr->id == id)
-            {
-                overlay->type = HAL_OSD_OVERLAY_TEXT;
-                hailo15::osd_ml::ml_to_hal_text(*ptr, &overlay->data.text);
-                return HAL_OK;
-            }
-        }
-
-        /* Search datetime overlays. */
-        for (const auto &ptr : osd.datetime_overlays)
-        {
-            if (ptr && ptr->id == id)
-            {
-                overlay->type = HAL_OSD_OVERLAY_DATETIME;
-                hailo15::osd_ml::ml_to_hal_datetime(*ptr, &overlay->data.datetime);
-                return HAL_OK;
-            }
+            *overlay = sh_it->second; /* snapshot carries enabled=false + type */
+            return HAL_OK;
         }
 
         return HAL_ERR_NOT_FOUND;
@@ -689,51 +918,31 @@ static int hailo15_osd_clear(void *codec_ctx)
     }
     try
     {
-        /* Do not hold priv->mutex across MediaLibrary calls. */
-        auto prof_exp = ctx.priv->media_lib->get_current_profile();
-        if (!prof_exp)
+        std::lock_guard<std::mutex> lock(ctx.priv->osd_state_mu);
+        config_profile_t prof;
+        if (!fetch_profile_locked(ctx.priv, &prof))
         {
             return HAL_ERROR;
         }
-        const config_profile_t &prof = prof_exp.value();
         auto stream_it = prof.encoded_output_streams.find(ctx.stream_id);
         if (stream_it == prof.encoded_output_streams.end())
         {
             return HAL_ERR_NOT_FOUND;
         }
 
-        /* Collect all overlay ids from the profile's OSD config. */
-        std::vector<std::string> ids;
-        const config_stream_osd_t &osd = stream_it->second.osd;
-        for (const auto &ptr : osd.image_overlays)
-        {
-            if (ptr)
-            {
-                ids.push_back(ptr->id);
-            }
-        }
-        for (const auto &ptr : osd.text_overlays)
-        {
-            if (ptr)
-            {
-                ids.push_back(ptr->id);
-            }
-        }
-        for (const auto &ptr : osd.datetime_overlays)
-        {
-            if (ptr)
-            {
-                ids.push_back(ptr->id);
-            }
-        }
+        config_stream_osd_t &osd = stream_it->second.osd;
+        const bool had_overlays = !osd.image_overlays.empty() || !osd.text_overlays.empty() ||
+                                  !osd.datetime_overlays.empty();
+        osd.image_overlays.clear();
+        osd.text_overlays.clear();
+        osd.datetime_overlays.clear();
+        ctx.priv->osd_disabled_by_stream.erase(ctx.stream_id);
 
-        /* Remove each overlay via the blender (updates both repository and profile). */
-        for (const auto &id : ids)
+        if (!had_overlays)
         {
-            ctx.blender->remove_overlay(id);
+            return HAL_OK;
         }
-
-        return HAL_OK;
+        return apply_profile_locked(ctx.priv, prof);
     }
     catch (const std::exception &e)
     {
@@ -748,7 +957,7 @@ static int hailo15_osd_clear(void *codec_ctx)
 
 static const char *hailo15_osd_get_version(void)
 {
-    return "Hailo15 HAL-OSD 2.0.0";
+    return "Hailo15 HAL-OSD 2.1.0";
 }
 
 /* ====================================================================

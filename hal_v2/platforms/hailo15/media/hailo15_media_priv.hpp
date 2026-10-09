@@ -8,6 +8,7 @@
 
 #include "media/hal_codec_internal.h"
 #include "media/hal_media_internal.h"
+#include "media/hal_osd.h"
 #include "media/hal_video_internal.h"
 
 #include <map>
@@ -94,6 +95,17 @@ struct Hailo15MediaPriv
 
     /** Per-encoder OSD layout state for font-size rescaling on resolution/rotation changes. */
     std::map<std::string, OsdLayoutState> osd_layout_by_encoder;
+
+    /** OSD declarative-model shadow state (medialib >= 1.13): config_stream_osd_t has no
+     *  enabled flag — presence in the overlay vectors == blended — so disable = remove from
+     *  the profile and snapshot here; enable = convert the snapshot back into the profile.
+     *  Keyed by encoder stream_id, then overlay id. Cleared by osd clear / layout changes. */
+    std::map<std::string, std::map<std::string, HalOsdOverlay>> osd_disabled_by_stream;
+    /** Guards osd_disabled_by_stream AND serializes OSD ops (profile fetch -> mutate ->
+     *  set_override_parameters runs entirely under this lock). Never held together with
+     *  `mutex` — the existing discipline forbids holding `mutex` across MediaLibrary
+     *  calls, and OSD ops never acquire `mutex`. */
+    std::mutex osd_state_mu;
 
     /** Patched encoder dimensions from camera-daemon overrides (stream_id → {width, height}).
      *  Cached at init time so rotation swaps use the correct (patched) dimensions
