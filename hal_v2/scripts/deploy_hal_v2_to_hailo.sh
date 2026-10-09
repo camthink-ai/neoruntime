@@ -247,13 +247,18 @@ deploy_remote() {
         # rpath ($ORIGIN/../lib/hal beats the ldconfig cache) makes scp fail with
         # "Text file busy" while the rest of the deploy succeeds — every later launch
         # then keeps loading the OLD library from this path. Verify the copy took.
-        local want_md5 v1_md5
-        want_md5="$(md5sum "${BUILD_DIR}/libaipc_hal.so.2.0.0" 2>/dev/null | awk '{print $1}')"
-        v1_md5="$(run_ssh "$TARGET" "md5sum ${V1_LIB}/libaipc_hal.so.2.0.0 2>/dev/null" | awk '{print $1}')"
-        if [[ -n "$want_md5" && "$want_md5" != "$v1_md5" ]]; then
-            echo "WARNING: ${V1_LIB}/libaipc_hal.so.2.0.0 is stale (want ${want_md5}, have ${v1_md5:-missing})." >&2
-            echo "         A running process is holding the old library; stop it (systemctl stop camera-daemon /" >&2
-            echo "         kill hal-* tests) and re-deploy, or apps will keep loading the stale lib via rpath." >&2
+        # Soname is derived from the build artifacts so the check survives version bumps.
+        local mono_real
+        mono_real="$(basename "$(ls -1 "${BUILD_DIR}"/libaipc_hal.so.*.*.* 2>/dev/null | sort -V | tail -1)")"
+        if [[ -n "$mono_real" ]]; then
+            local want_md5 v1_md5
+            want_md5="$(md5sum "${BUILD_DIR}/${mono_real}" 2>/dev/null | awk '{print $1}')"
+            v1_md5="$(run_ssh "$TARGET" "md5sum ${V1_LIB}/${mono_real} 2>/dev/null" | awk '{print $1}')"
+            if [[ -n "$want_md5" && "$want_md5" != "$v1_md5" ]]; then
+                echo "WARNING: ${V1_LIB}/${mono_real} is stale (want ${want_md5}, have ${v1_md5:-missing})." >&2
+                echo "         A running process is holding the old library; stop it (systemctl stop camera-daemon /" >&2
+                echo "         kill hal-* tests) and re-deploy, or apps will keep loading the stale lib via rpath." >&2
+            fi
         fi
     fi
 

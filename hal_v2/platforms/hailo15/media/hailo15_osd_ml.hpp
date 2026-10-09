@@ -652,6 +652,17 @@ inline void clear_encoder_osd(config_profile_t &p, const std::string *stream_id)
  * Recalculate OSD overlays for a specific encoder stream when resolution
  * or rotation changes.
  *
+ * Serialized under priv->osd_state_mu for the WHOLE fetch -> mutate ->
+ * set_override_parameters cycle, exactly like the OSD ops in
+ * hailo15_osd_impl.cpp: a concurrent OSD op running its own cycle on a
+ * pre-clear profile copy would otherwise re-apply cleared overlays (lost
+ * update). Callers must NOT hold priv->mutex (same discipline as OSD ops —
+ * verified for both call sites in hailo15_media_impl.cpp: the
+ * rotation_full_reinit step-13 loop and set_transform's light path). NB: the
+ * callers apply their own earlier-fetched profile copy afterwards
+ * (set_override_parameters(p) in dynamic_change/rotation paths) OUTSIDE this
+ * lock — a pre-existing residual race, unchanged by this serialization.
+ *
  * @param priv          Hailo15MediaPriv (for media_lib access and osd_layout_by_encoder).
  * @param stream_id     Encoder stream id (e.g. "sink0").
  * @param new_w         New encoder input width after change.
@@ -665,6 +676,8 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
 {
     if (!priv || !priv->media_lib)
         return;
+
+    std::lock_guard<std::mutex> osd_lock(priv->osd_state_mu);
 
     /* 1. Look up old state. If not found, just save current and return. */
     auto layout_it = priv->osd_layout_by_encoder.find(stream_id);
@@ -726,9 +739,9 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
     }
 
     /* Shadow-disabled overlays are snapshots of the old geometry; drop them so a
-     * later osd_enable can't resurrect an overlay with stale absolute fields. */
+     * later osd_enable can't resurrect an overlay with stale absolute fields.
+     * (Caller holds osd_state_mu — plain access, no nested lock.) */
     {
-        std::lock_guard<std::mutex> lock(priv->osd_state_mu);
         auto shadow_it = priv->osd_disabled_by_stream.find(stream_id);
         if (shadow_it != priv->osd_disabled_by_stream.end() && !shadow_it->second.empty())
         {

@@ -329,8 +329,10 @@ static int hailo15_osd_add_image(void *codec_ctx, const HalOsdImageOverlay *over
         }
         config_stream_osd_t &osd = stream_it->second.osd;
         const std::string id(adjusted.base.id);
-        if (find_overlay_slot(osd, id) != OsdSlot::None ||
-            ctx.priv->osd_disabled_by_stream[ctx.stream_id].count(id) != 0U)
+        const auto shadow_it = ctx.priv->osd_disabled_by_stream.find(ctx.stream_id);
+        const bool in_shadow = (shadow_it != ctx.priv->osd_disabled_by_stream.end() &&
+                                shadow_it->second.count(id) != 0U);
+        if (find_overlay_slot(osd, id) != OsdSlot::None || in_shadow)
         {
             HAL_LOG_ERROR("Hailo15 OSD: add image '%s' failed: id already exists", id.c_str());
             return HAL_ERR_INVALID_STATE;
@@ -402,8 +404,10 @@ static int hailo15_osd_add_text(void *codec_ctx, const HalOsdTextOverlay *overla
         }
         config_stream_osd_t &osd = stream_it->second.osd;
         const std::string id(adjusted.base.id);
-        if (find_overlay_slot(osd, id) != OsdSlot::None ||
-            ctx.priv->osd_disabled_by_stream[ctx.stream_id].count(id) != 0U)
+        const auto shadow_it = ctx.priv->osd_disabled_by_stream.find(ctx.stream_id);
+        const bool in_shadow = (shadow_it != ctx.priv->osd_disabled_by_stream.end() &&
+                                shadow_it->second.count(id) != 0U);
+        if (find_overlay_slot(osd, id) != OsdSlot::None || in_shadow)
         {
             HAL_LOG_ERROR("Hailo15 OSD: add text '%s' failed: id already exists", id.c_str());
             return HAL_ERR_INVALID_STATE;
@@ -475,8 +479,10 @@ static int hailo15_osd_add_datetime(void *codec_ctx, const HalOsdDateTimeOverlay
         }
         config_stream_osd_t &osd = stream_it->second.osd;
         const std::string id(adjusted.text.base.id);
-        if (find_overlay_slot(osd, id) != OsdSlot::None ||
-            ctx.priv->osd_disabled_by_stream[ctx.stream_id].count(id) != 0U)
+        const auto shadow_it = ctx.priv->osd_disabled_by_stream.find(ctx.stream_id);
+        const bool in_shadow = (shadow_it != ctx.priv->osd_disabled_by_stream.end() &&
+                                shadow_it->second.count(id) != 0U);
+        if (find_overlay_slot(osd, id) != OsdSlot::None || in_shadow)
         {
             HAL_LOG_ERROR("Hailo15 OSD: add datetime '%s' failed: id already exists", id.c_str());
             return HAL_ERR_INVALID_STATE;
@@ -535,6 +541,12 @@ const char *hal_snapshot_id(const HalOsdOverlay &s)
     }
 }
 
+/** Replace one overlay (matched by id) with the caller's definition.
+ *  NB: unlike add_*, set_* does NOT consult base.enabled — a blended overlay
+ *  stays blended, a shadowed (disabled) snapshot stays hidden. Toggling
+ *  visibility is set_enabled()'s job; set only rewrites geometry/content.
+ *  An id that is blended gets replaced in place (one profile apply); an id in
+ *  the shadow gets its snapshot updated without applying; unknown -> NOT_FOUND. */
 template <typename HalOverlayT, typename ToMl, typename ToSnap>
 static int osd_set_by_type(void *codec_ctx, const HalOverlayT *overlay, ToMl to_ml, ToSnap to_snap,
                            const char *kind)
@@ -696,8 +708,14 @@ static int hailo15_osd_remove(void *codec_ctx, const char *overlay_id)
         }
         const std::string id(overlay_id);
         const bool in_profile = erase_overlay_by_id(stream_it->second.osd, id);
-        const size_t removed_shadow = ctx.priv->osd_disabled_by_stream[ctx.stream_id].erase(id);
-        if (!in_profile && removed_shadow == 0U)
+        /* find()-based erase: no empty-entry materialization on a miss. */
+        bool removed_shadow = false;
+        auto shadow_it = ctx.priv->osd_disabled_by_stream.find(ctx.stream_id);
+        if (shadow_it != ctx.priv->osd_disabled_by_stream.end())
+        {
+            removed_shadow = (shadow_it->second.erase(id) != 0U);
+        }
+        if (!in_profile && !removed_shadow)
         {
             return HAL_ERR_NOT_FOUND;
         }
@@ -812,7 +830,11 @@ static int hailo15_osd_get_overlays(void *codec_ctx, HalOsdOverlay *overlays, ui
         }
 
         const config_stream_osd_t &osd = stream_it->second.osd;
-        const auto &shadow = ctx.priv->osd_disabled_by_stream[ctx.stream_id];
+        /* find(), not operator[]: reads must not materialize empty shadow entries. */
+        static const std::map<std::string, HalOsdOverlay> kNoShadow{};
+        const auto shadow_it = ctx.priv->osd_disabled_by_stream.find(ctx.stream_id);
+        const auto &shadow = (shadow_it != ctx.priv->osd_disabled_by_stream.end()) ? shadow_it->second
+                                                                                    : kNoShadow;
         const uint32_t n_image = static_cast<uint32_t>(osd.image_overlays.size());
         const uint32_t n_text = static_cast<uint32_t>(osd.text_overlays.size());
         const uint32_t n_datetime = static_cast<uint32_t>(osd.datetime_overlays.size());
@@ -912,12 +934,16 @@ static int hailo15_osd_get_overlay(void *codec_ctx, const char *overlay_id, HalO
             return HAL_OK;
         }
 
-        const auto &shadow = ctx.priv->osd_disabled_by_stream[ctx.stream_id];
-        auto sh_it = shadow.find(id);
-        if (sh_it != shadow.end())
+        /* find(), not operator[]: read path must not materialize an empty entry. */
+        const auto shadow_it = ctx.priv->osd_disabled_by_stream.find(ctx.stream_id);
+        if (shadow_it != ctx.priv->osd_disabled_by_stream.end())
         {
-            *overlay = sh_it->second; /* snapshot carries enabled=false + type */
-            return HAL_OK;
+            auto id_it = shadow_it->second.find(id);
+            if (id_it != shadow_it->second.end())
+            {
+                *overlay = id_it->second; /* snapshot carries enabled=false + type */
+                return HAL_OK;
+            }
         }
 
         return HAL_ERR_NOT_FOUND;

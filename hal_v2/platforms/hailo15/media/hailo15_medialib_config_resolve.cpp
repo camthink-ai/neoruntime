@@ -56,8 +56,20 @@ static void merge_osd_into_encoder_json(const Hailo15HalCodecPrivExt *ext, std::
     {
         osd_json = ext->osd_config_json;
     }
-    else if (!(ext->osd_config_path && ext->osd_config_path[0] &&
-               read_file_all(ext->osd_config_path, &osd_json)))
+    else if (ext->osd_config_path && ext->osd_config_path[0])
+    {
+        if (!read_file_all(ext->osd_config_path, &osd_json))
+        {
+            /* Old behaviour failed the whole codec init here; surfacing the
+             * misconfiguration loudly (but not fatally) beats a silently
+             * OSD-less stream. */
+            HAL_LOG_WARNING("hailo15 cfg: osd_config_path '%s' is not readable; "
+                            "encoder will start without OSD",
+                            ext->osd_config_path);
+            return;
+        }
+    }
+    else
     {
         return;
     }
@@ -91,6 +103,11 @@ static void merge_osd_into_encoder_json(const Hailo15HalCodecPrivExt *ext, std::
     if (merged)
     {
         *raw = j.dump();
+    }
+    else
+    {
+        HAL_LOG_WARNING("hailo15 cfg: osd config has none of the recognized keys "
+                        "(osd / privacy_mask / masking); nothing merged");
     }
 }
 
