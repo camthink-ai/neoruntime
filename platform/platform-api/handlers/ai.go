@@ -653,11 +653,9 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 	// Same custom-variant guardrail as UpdateModel: a stored blob that the
 	// plugin will reject makes the model unloadable from the moment it is
 	// registered, so validate at entry.
-	if model.ResolveModelType(req.ModelType) == "detection" {
-		if err := validateDetectionVariant(req.Variant); err != nil {
-			Resp(c).FailMsg(CodeInvalidRequest, "Invalid model_variant: "+err.Error())
-			return
-		}
+	if err := validateVariantJSON(req.ModelType, req.Variant); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid model_variant: "+err.Error())
+		return
 	}
 
 	if h.aiModelRepo != nil {
@@ -678,6 +676,15 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 			merged[k] = v
 		}
 		if err := validatePostprocessProfile(req.ModelType, outputMode, merged); err != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, err.Error())
+			return
+		}
+		// Schema-validate the merged config before persisting: an invalid
+		// value would otherwise be stored verbatim and only silently
+		// reinterpreted at load time (omitted from the composed blob /
+		// defaulted by the decoder) — the write boundary must answer for
+		// what the pipeline will actually honor.
+		if err := model.ValidateModelConfig(req.ModelType, merged); err != nil {
 			Resp(c).FailMsg(CodeInvalidRequest, err.Error())
 			return
 		}
@@ -834,8 +841,8 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 	// Custom `{…}` variant JSON is the advanced escape hatch into the vendor
 	// plugin's schema — reject incomplete or unsupported blobs here rather
 	// than at load time, where the plugin answers with a bare "required".
-	if req.Variant != nil && model.ResolveModelType(newModelType) == "detection" {
-		if err := validateDetectionVariant(*req.Variant); err != nil {
+	if req.Variant != nil {
+		if err := validateVariantJSON(newModelType, *req.Variant); err != nil {
 			Resp(c).FailMsg(CodeInvalidRequest, "Invalid model_variant: "+err.Error())
 			return
 		}
@@ -902,6 +909,12 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 			Resp(c).FailMsg(CodeInvalidRequest, err.Error())
 			return
 		}
+		// Same write-boundary contract as RegisterModel: refuse config
+		// values the pipeline would silently reinterpret at load time.
+		if err := model.ValidateModelConfig(newModelType, merged); err != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, err.Error())
+			return
+		}
 		configJSON, _ := json.Marshal(merged)
 		staged.Config = string(configJSON)
 
@@ -919,27 +932,40 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 
 	// Reload when anything the runtime consumes changes: the file, the type,
 	// the output mode (platform ⇄ raw rewrites the whole gRPC payload), or
-	// the variant the runtime would receive. detectionVariantJSON is
+	// the variant the runtime would receive. The VariantJSON composers are
 	// side-effect-free (the materialized runtime path is only touched on an
-	// actual reload), so comparing it here cannot leave stray runtime/
+	// actual reload), so comparing them here cannot leave stray runtime/
 	// copies behind for models that stay put. Raw mode sends neither type
 	// nor variant, so variant edits under raw mode don't reach the runtime
 	// and don't warrant a reload. Advanced `{…}` variants pass through
 	// verbatim, so for those the config-vs-JSON split is explicit: no
-	// variant change, no reload.
+	// variant change, no reload. Keypoint rows compose from the profile,
+	// config thresholds and (create-only) network dims, so a config-only
+	// edit that changes the composed blob reloads — and staged.InputWidth/
+	// InputHeight changes flow through the same comparison.
 	oldVariant, newVariant := dbModel.Variant, staged.Variant
 	needsReload := fileChanged || newModelType != dbModel.ModelType ||
 		newOutputMode != dbModel.OutputMode
-	if newOutputMode == model.OutputModePlatform && model.ResolveModelType(newModelType) == "detection" {
-		oldVariant, oldErr := modelload.DetectionVariantJSON(dbModel)
-		newVariant, newErr := modelload.DetectionVariantJSON(&staged)
-		// A variant that can no longer be composed (e.g. the row's
-		// postprocess_profile names an unknown profile) forces a reload
-		// instead of being treated as "unchanged": the reload fails fast with
-		// the audit-visible error, or succeeds when this very update repairs
-		// the config. Without this a broken row would keep the NPU serving
-		// the stale registration while the DB diverges from it.
-		needsReload = needsReload || oldErr != nil || newErr != nil || newVariant != oldVariant
+	if newOutputMode == model.OutputModePlatform {
+		switch model.ResolveModelType(newModelType) {
+		case "detection":
+			oldV, oldErr := modelload.DetectionVariantJSON(dbModel)
+			newV, newErr := modelload.DetectionVariantJSON(&staged)
+			// A variant that can no longer be composed (e.g. the row's
+			// postprocess_profile names an unknown profile) forces a reload
+			// instead of being treated as "unchanged": the reload fails fast
+			// with the audit-visible error, or succeeds when this very update
+			// repairs the config. Without this a broken row would keep the NPU
+			// serving the stale registration while the DB diverges from it.
+			needsReload = needsReload || oldErr != nil || newErr != nil || newV != oldV
+		case "keypoint":
+			oldV, oldErr := modelload.KeypointVariantJSON(dbModel)
+			newV, newErr := modelload.KeypointVariantJSON(&staged)
+			// Same error-forces-reload contract as detection.
+			needsReload = needsReload || oldErr != nil || newErr != nil || newV != oldV
+		default:
+			needsReload = needsReload || newVariant != oldVariant
+		}
 	} else {
 		needsReload = needsReload || newVariant != oldVariant
 	}
@@ -1107,11 +1133,9 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 		modelType = resolved
 	}
 	variant := c.PostForm("variant")
-	if modelType == "detection" {
-		if err := validateDetectionVariant(variant); err != nil {
-			Resp(c).FailMsg(CodeInvalidRequest, "Invalid variant: "+err.Error())
-			return
-		}
+	if err := validateVariantJSON(modelType, variant); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid variant: "+err.Error())
+		return
 	}
 	thresholdStr := c.PostForm("threshold")
 	threshold := float32(0.25)

@@ -523,8 +523,16 @@ int ModelManager::init_post_process(const std::string& model_id,
     // copies what it needs into merged_vendor_json.
     std::string detection_cfg_json;
     if (pp_cfg.type == HAL_POST_TYPE_DETECTION && !variant.empty()) {
-        if (variant.front() == '{') {
-            detection_cfg_json = variant;
+        // Trim before the shape decision, mirroring the keypoint branch: a
+        // blob with leading whitespace would otherwise take the bare-name
+        // path and get wrapped in a default config — the exact
+        // validated-but-ineffective class of failure this routing exists
+        // to prevent (the gRPC validator trims, this consumer must too).
+        std::string v_det = variant;
+        v_det.erase(0, v_det.find_first_not_of(" \t\r\n"));
+        v_det.erase(v_det.find_last_not_of(" \t\r\n") + 1);
+        if (!v_det.empty() && v_det.front() == '{') {
+            detection_cfg_json = v_det;
         } else {
             // Compose a FULL schema-valid blob around the bare backend_function
             // name. The legacy stub {"backend_function":"<name>"} is rejected by
@@ -545,7 +553,7 @@ int ModelManager::init_post_process(const std::string& model_id,
                      "\"max_boxes\":%u,"
                      "\"labels\":[\"unlabeled\",\"person\",\"vehicle\","
                      "\"face\",\"license_plate\"]}",
-                     variant.c_str(),
+                     v_det.c_str(),
                      pp_cfg.config.detection.nms_threshold,
                      pp_cfg.config.detection.confidence_threshold,
                      pp_cfg.config.detection.max_detections);
@@ -554,7 +562,7 @@ int ModelManager::init_post_process(const std::string& model_id,
                      "name — injecting a full default config_json around it "
                      "(detection_threshold=%.2f iou_threshold=%.2f "
                      "max_boxes=%u).",
-                     variant.c_str(),
+                     v_det.c_str(),
                      pp_cfg.config.detection.confidence_threshold,
                      pp_cfg.config.detection.nms_threshold,
                      pp_cfg.config.detection.max_detections);
@@ -577,14 +585,22 @@ int ModelManager::init_post_process(const std::string& model_id,
     // therefore MUST pass a JSON blob as the variant for pose models.
     std::string keypoint_cfg_json;
     if (pp_cfg.type == HAL_POST_TYPE_KEYPOINT && !variant.empty()) {
-        if (variant.front() == '{') {
-            keypoint_cfg_json = variant;
+        // Detect the blob on the TRIMMED spelling: the gRPC validator trims
+        // before its '{' check, so a hand-written blob with leading
+        // whitespace clears validation — judging it a bare name on the raw
+        // front() here would silently drop config_json and keep the
+        // facial-landmarks default. The trimmed blob is what HAL receives.
+        std::string v = variant;
+        v.erase(0, v.find_first_not_of(" \t\r\n"));
+        v.erase(v.find_last_not_of(" \t\r\n") + 1);
+        if (!v.empty() && v.front() == '{') {
+            keypoint_cfg_json = v;
         } else {
             LOG_WARN("init_post_process: keypoint variant='%s' is a bare name — "
                      "native_yolov8_pose cannot be set without a full config_json "
                      "blob; facial_landmarks_nv12 default will be used (fails on "
                      "COCO-17 pose HEFs). Pass a JSON blob instead.",
-                     variant.c_str());
+                     v.c_str());
         }
         if (!keypoint_cfg_json.empty())
             pp_cfg.config.keypoint.config_json = keypoint_cfg_json.c_str();

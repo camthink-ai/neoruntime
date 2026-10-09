@@ -25,6 +25,8 @@ watchdog:
   scan_interval_ms: 100
   frame_timeout_ms: 5000
   warn_threshold_ms: 3000
+  # Hard cap for hw-in-use frames (FRAME_IN_USE declarations); 0 disables
+  in_use_timeout_ms: 30000
 
 rtsp:
   enabled: true

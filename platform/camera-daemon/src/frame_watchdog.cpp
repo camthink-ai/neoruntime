@@ -51,6 +51,20 @@ void FrameWatchdog::untrack(uint64_t frame_id) {
     tracked_.erase(frame_id);
 }
 
+bool FrameWatchdog::mark_in_use(uint64_t frame_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = tracked_.find(frame_id);
+    if (it == tracked_.end()) return false;
+    it->second.in_use++;
+    return true;
+}
+
+void FrameWatchdog::clear_in_use(uint64_t frame_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = tracked_.find(frame_id);
+    if (it != tracked_.end() && it->second.in_use > 0) it->second.in_use--;
+}
+
 WatchdogStats FrameWatchdog::get_stats() const {
     return stats_;
 }
@@ -68,13 +82,25 @@ void FrameWatchdog::scan_loop() {
                 auto elapsed = std::chrono::duration_cast<
                     std::chrono::milliseconds>(now - tf.lend_time);
 
-                if (elapsed >= config_.frame_timeout) {
-                    HAL_LOG_ERROR("Watchdog: Frame %lu held %ldms, force reclaim",
-                                 fid, elapsed.count());
+                /* In-use frames carry the buffer of an unfinished async
+                 * device job: their deadline is the (much longer) hard cap,
+                 * not the normal frame timeout — unless the exemption is
+                 * disabled, in which case they age like any other frame. */
+                const bool in_use_capped =
+                    tf.in_use > 0 && config_.in_use_timeout.count() > 0;
+                const auto deadline = in_use_capped ? config_.in_use_timeout
+                                                    : config_.frame_timeout;
+
+                if (elapsed >= deadline) {
+                    HAL_LOG_ERROR("Watchdog: Frame %lu held %ldms%s, force reclaim",
+                                 fid, elapsed.count(),
+                                 in_use_capped ? " (hw-in-use cap)" : "");
                     to_reclaim.push_back(fid);
+                    if (in_use_capped) stats_.total_in_use_reclaimed++;
                 } else if (elapsed >= config_.warn_threshold) {
-                    HAL_LOG_WARNING("Watchdog: Frame %lu held %ldms",
-                                   fid, elapsed.count());
+                    HAL_LOG_WARNING("Watchdog: Frame %lu held %ldms%s",
+                                   fid, elapsed.count(),
+                                   tf.in_use > 0 ? " (hw-in-use)" : "");
                     stats_.total_warnings++;
                 }
             }

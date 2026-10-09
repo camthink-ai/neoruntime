@@ -541,6 +541,7 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     wdcfg.scan_interval = std::chrono::milliseconds(config_.watchdog_scan_ms);
     wdcfg.frame_timeout = std::chrono::milliseconds(config_.watchdog_timeout_ms);
     wdcfg.warn_threshold = std::chrono::milliseconds(config_.watchdog_warn_ms);
+    wdcfg.in_use_timeout = std::chrono::milliseconds(config_.watchdog_in_use_timeout_ms);
 
     watchdog_ = std::make_unique<FrameWatchdog>(wdcfg);
     frame_router_ = std::make_unique<FrameRouter>(video_source_.get(),
@@ -644,61 +645,8 @@ bool CameraDaemon::init(const DaemonConfig& config) {
         }
     }
 
-    // Reapply persisted active profile. Placed LATE in init — after init_rtsp()
-    // and the encoded/FD publishers are up (switch_profile tears down + rebuilds
-    // those consumers), and before start_grpc_server so no RPC can race the
-    // replay. GUARDED: read the HAL's current profile and only switch when the
-    // persisted name differs, so a clean boot whose YAML/default profile already
-    // matches does NOT rebuild the pipeline (avoids startup churn). A failed
-    // replay is logged + swallowed: the running default profile is still valid.
-    {
-        std::string persisted_profile;
-        if (load_profile_config(&persisted_profile)) {
-            // Pre-per-lens images persisted the shared IR entry name. Map it
-            // to this lens's effective entry so the guard and the replay use
-            // the same name the daemon would switch to (and so the guard
-            // still recognizes it as an infrared profile to force day on
-            // boot, instead of replaying the other lens's IQ tuning).
-            if (persisted_profile == "Infrared_Basic" &&
-                config_.infrared.infrared_profile == "Infrared_Basic_FG2009") {
-                HAL_LOG_INFO("CameraDaemon: mapping persisted IR profile '%s' -> '%s' (per-lens)",
-                             persisted_profile.c_str(),
-                             config_.infrared.infrared_profile.c_str());
-                persisted_profile = config_.infrared.infrared_profile;
-            }
-            std::string current = get_current_profile();
-            const bool force_day_on_boot = config_.infrared.enabled &&
-                config_.infrared.default_mode != "infrared";
-            const bool persisted_infrared_profile =
-                persisted_profile == config_.infrared.infrared_profile;
-            if (force_day_on_boot && persisted_infrared_profile) {
-                // Infrared is an operating mode, not a boot profile. Do not
-                // restore a stale night profile when product policy is Day.
-                HAL_LOG_INFO("CameraDaemon: ignoring persisted infrared profile '%s'; default_mode=day",
-                             persisted_profile.c_str());
-                if (current == config_.infrared.infrared_profile) {
-                    std::string msg;
-                    if (!switch_profile("Daylight_Basic", &msg)) {
-                        HAL_LOG_ERROR("CameraDaemon: failed to restore Daylight_Basic from infrared profile: %s",
-                                      msg.c_str());
-                    }
-                    current = get_current_profile();
-                }
-                persist_profile_config(current);
-            } else if (!persisted_profile.empty() && persisted_profile != current) {
-                HAL_LOG_INFO("CameraDaemon: applying persisted profile '%s' (current '%s')",
-                             persisted_profile.c_str(), current.c_str());
-                std::string msg;
-                if (!switch_profile(persisted_profile, &msg)) {
-                    HAL_LOG_WARNING("CameraDaemon: replay profile switch to '%s' failed: %s; continuing with '%s'",
-                                    persisted_profile.c_str(), msg.c_str(), current.c_str());
-                }
-            } else {
-                HAL_LOG_INFO("CameraDaemon: persisted profile '%s' already active; no replay switch",
-                             persisted_profile.c_str());
-            }
-        }
-    }
+    // NOTE: the persisted-profile replay deliberately runs in run(), AFTER
+    // media_ops->start() brings the pipeline RUNNING — see the comment there.
 
 #ifdef HAS_GRPC
     start_grpc_server();
@@ -763,6 +711,138 @@ void CameraDaemon::run() {
             encoder_mgr_->start(ec.stream_name);
         }
     }
+
+    // Reapply persisted active profile. Must run AFTER media_ops->start():
+    // switch_profile's post-switch frame verify requires a RUNNING pipeline.
+    // Earlier in boot (inside init()) the pipeline is built but NOT started —
+    // a switch there is a config-only swap that leaves the pipeline STOPPED
+    // (HAL switch_profile preserves the stopped state), so the verify gate can
+    // never see frames and every boot rolled the persisted profile back
+    // (observed on two devices: replay AND rollback both logged "no frames
+    // within 15s"). After start, the replay is an ordinary warm switch: the
+    // HAL does stop+start, frames flow, and the verify+rollback safety net
+    // actually protects the boot.
+    // The encoded/FD publishers are up by now (switch_profile tears down +
+    // rebuilds those consumers). gRPC is already serving here — the replay
+    // window has the same RPC visibility as any runtime profile switch, which
+    // the switch path's throttle/serialization already handles.
+    // GUARDED: read the HAL's current profile and only switch when the persisted
+    // name differs, so a clean boot whose YAML/default profile already matches
+    // does NOT rebuild the pipeline (avoids startup churn). A failed replay is
+    // logged + swallowed: the running default profile is still valid.
+    {
+        // A cold AI-ISP profile start (model load + DSP init) routinely takes
+        // longer than the 5s warm-switch budget; replaying a persisted profile
+        // with that budget rolls back to the default profile on every boot.
+        constexpr uint64_t kBootReplayVerifyBudgetMs = 15000;
+        std::string persisted_profile;
+        if (load_profile_config(&persisted_profile)) {
+            // Pre-per-lens images persisted the shared IR entry name. Map it
+            // to this lens's effective entry so the guard and the replay use
+            // the same name the daemon would switch to (and so the guard
+            // still recognizes it as an infrared profile to force day on
+            // boot, instead of replaying the other lens's IQ tuning).
+            if (persisted_profile == "Infrared_Basic" &&
+                config_.infrared.infrared_profile == "Infrared_Basic_FG2009") {
+                HAL_LOG_INFO("CameraDaemon: mapping persisted IR profile '%s' -> '%s' (per-lens)",
+                             persisted_profile.c_str(),
+                             config_.infrared.infrared_profile.c_str());
+                persisted_profile = config_.infrared.infrared_profile;
+            }
+            std::string current = get_current_profile();
+            const bool force_day_on_boot = config_.infrared.enabled &&
+                config_.infrared.default_mode != "infrared";
+            const bool persisted_infrared_profile =
+                persisted_profile == config_.infrared.infrared_profile;
+            // The replay switch must not race the fresh pipeline's first
+            // frames. Tearing the ISP input device down before it has
+            // delivered anything makes the vendor medialib's next start fail
+            // ("Failed to start ISP input device stream" -> -2815), and that
+            // failed start leaks a GStreamer bus watch which also kills the
+            // rollback switch (observed: forward AND rollback both dead
+            // ~25ms after start_pipeline OK). Once the initial pipeline is
+            // delivering frames the same switch is a routine warm switch
+            // (verified on-device: warm switch to the identical profile
+            // succeeds with ~4.5s interrupt).
+            const bool day_policy_ir_persisted =
+                force_day_on_boot && persisted_infrared_profile;
+            const bool will_replay_switch =
+                (day_policy_ir_persisted &&
+                 current == config_.infrared.infrared_profile) ||
+                (!day_policy_ir_persisted && !persisted_profile.empty() &&
+                 persisted_profile != current);
+            if (will_replay_switch &&
+                !verify_primary_stream_frames(10000)) {
+                // Skip the replay; do not push through. A switch before the
+                // pipeline's first coded frame recreates the -2815
+                // black-pipeline failure described above (and the leaked bus
+                // watch kills the rollback switch too). Staying on the
+                // running default profile is recoverable; the wedge is not.
+                HAL_LOG_ERROR("CameraDaemon: initial pipeline not delivering frames; "
+                              "skipping boot profile replay");
+            } else {
+                // The verify wait is unlocked and can last up to 10s, and
+                // gRPC has been serving since init(): a live SwitchProfile
+                // may have switched AND persisted a newer profile inside
+                // that window. Replaying the pre-wait snapshot would
+                // silently reverse that successful request (and re-persist
+                // the stale name), so stand down if the persisted profile
+                // moved during the gate.
+                std::string persisted_now;
+                if (load_profile_config(&persisted_now) &&
+                    persisted_now != persisted_profile) {
+                    HAL_LOG_INFO("CameraDaemon: persisted profile changed during the boot "
+                                 "replay gate ('%s' -> '%s'); leaving it in place",
+                                 persisted_profile.c_str(),
+                                 persisted_now.c_str());
+                } else {
+                    current = get_current_profile();
+                    if (force_day_on_boot && persisted_infrared_profile) {
+                        // Infrared is an operating mode, not a boot profile. Do not
+                        // restore a stale night profile when product policy is Day.
+                        HAL_LOG_INFO("CameraDaemon: ignoring persisted infrared profile '%s'; default_mode=day",
+                                     persisted_profile.c_str());
+                        if (current == config_.infrared.infrared_profile) {
+                            std::string msg;
+                            if (!switch_profile("Daylight_Basic", &msg, kBootReplayVerifyBudgetMs)) {
+                                HAL_LOG_ERROR("CameraDaemon: failed to restore Daylight_Basic from infrared profile: %s",
+                                              msg.c_str());
+                            }
+                            current = get_current_profile();
+                        }
+                        persist_profile_config(current);
+                    } else if (!persisted_profile.empty() && persisted_profile != current) {
+                        HAL_LOG_INFO("CameraDaemon: applying persisted profile '%s' (current '%s')",
+                                     persisted_profile.c_str(), current.c_str());
+                        std::string msg;
+                        if (!switch_profile(persisted_profile, &msg, kBootReplayVerifyBudgetMs)) {
+                            HAL_LOG_WARNING("CameraDaemon: replay profile switch to '%s' failed: %s; continuing with '%s'",
+                                            persisted_profile.c_str(), msg.c_str(), current.c_str());
+                        }
+                    } else {
+                        HAL_LOG_INFO("CameraDaemon: persisted profile '%s' already active; no replay switch",
+                                     persisted_profile.c_str());
+                    }
+                }
+            }
+        }
+    }
+
+#ifdef HAS_GRPC
+    // Re-replay the persisted ISP config AFTER the pipeline start (and any boot
+    // profile switch above). The init()-time replay seeds the HAL + cache before
+    // the pipeline runs, but media start and switch_profile each rebuild the ISP
+    // firmware state from the profile's iq_settings — re-enabling the firmware
+    // auto algorithms (ACproc/AE/AWdrv) and resetting the manual picture controls —
+    // so the early replay is silently wiped (observed on-device: boot applies
+    // manual B/C/S, seconds later the kernel shows the ACproc auto fingerprint
+    // again and isp_cproc_enable back at its firmware default). Same ordering rule
+    // as the profile replay above: state that must survive a reboot is pushed
+    // after the last pipeline rebuild of the boot. Goes through the guarded
+    // reapply helper (ctx-liveness check vs a concurrent switch_profile rebuild);
+    // idempotent — the snapshot is re-persisted unchanged.
+    reapply_isp_config_after_pipeline_rebuild("boot: after pipeline start");
+#endif
 
     HAL_LOG_INFO("CameraDaemon: Running, streams active");
 
@@ -6178,7 +6258,9 @@ bool CameraDaemon::get_device_hardware_status(aipc::camera::DeviceHardwareStatus
         auto* led_ops = hal_loader_->led();
         uint8_t duty = 0;
         if (led_ops->led_get_duty) {
-            if (led_ops->led_get_duty(ctx, 0, &duty) == HAL_OK) {
+            // white2 (dedicated white channel) — the same MCU LED the
+            // SetWhiteLight write path drives; 0 is the near-IR fill light.
+            if (led_ops->led_get_duty(ctx, 2, &duty) == HAL_OK) {
                 status.set_white_light_duty(duty);
             }
             if (led_ops->led_get_duty(ctx, 1, &duty) == HAL_OK) {
@@ -7253,13 +7335,15 @@ bool CameraDaemon::backup_profile(const std::string& path) {
     return true;
 }
 
-bool CameraDaemon::switch_profile(const std::string& profile_name, std::string* message) {
-    return switch_profile_internal(profile_name, true, message);
+bool CameraDaemon::switch_profile(const std::string& profile_name, std::string* message,
+                                  uint64_t verify_budget_ms) {
+    return switch_profile_internal(profile_name, true, message, verify_budget_ms);
 }
 
 bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
                                            bool restart_af,
-                                           std::string* message) {
+                                           std::string* message,
+                                           uint64_t verify_budget_ms) {
     // Throttle gate 1/3 — reject a switch while another is already in flight.
     // op_mu_ is intentionally released around the blocking HAL switch and through
     // the verify/rollback windows below; without this guard a second concurrent
@@ -7406,7 +7490,7 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
         // A failed forward switch whose rollback is ALSO black leaves the user on a
         // dead pipeline — verify and surface it. get_stream_status() reports the
         // truth independently; this log is the operator-facing signal.
-        if (!prev_profile.empty() && !verify_primary_stream_frames(5000)) {
+        if (!prev_profile.empty() && !verify_primary_stream_frames(verify_budget_ms)) {
             HAL_LOG_ERROR("CameraDaemon: rollback to '%s' after forward-switch failure "
                           "produces no frames — pipeline degraded; manual restart may be needed",
                           prev_profile.c_str());
@@ -7710,7 +7794,7 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
     // frozen black screen. op_mu_ is NOT held here (released above), matching
     // the existing HAL-call windows — no AB-BA with on_packet.
     {
-        constexpr uint64_t kVerifyBudgetMs = 5000;  // total time we wait for a frame
+        const uint64_t kVerifyBudgetMs = verify_budget_ms;  // total time we wait for a frame
 
         std::string primary_stream;
         bool verified = verify_primary_stream_frames(kVerifyBudgetMs, &primary_stream);

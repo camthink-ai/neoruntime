@@ -4,7 +4,8 @@
   proto-inference proto-device proto-event proto-camera proto-app proto-lens proto-discovery \
   hal-v2 platform ai-runtime device-control event-bus app-manager platform-api \
   device-discovery os-updater onvif-device camera-daemon web aipc-cli tools mcu-firmware pack pack-release \
-  ensure-mcu-toolchain docker-pack-release _pack-stage _pack-internal fmt lint help
+  ensure-mcu-toolchain docker-pack-release _pack-stage _pack-internal fmt lint help \
+  postprocess-schema postprocess-schema-check
 
 -include Makefile.local
 
@@ -561,6 +562,18 @@ test-unit: proto
 
 test-basic:
 	./scripts/run_basic_tests.sh
+
+# Regenerate the checked-in postprocess schema artifacts (JSON + C++ header)
+# from the single-source registry in platform/postprocess.
+postprocess-schema:
+	$(GO) generate ./platform/postprocess
+
+# CI/local guard: fail when the checked-in artifacts no longer match the
+# registry (hand edit, or a registry change committed without regenerating).
+# -check renders in memory and byte-compares — it never writes, so it cannot
+# flag a legitimate uncommitted regen as drift nor restore-discard it.
+postprocess-schema-check:
+	$(GO) run ./platform/postprocess/gen -check
 
 test-smoke:
 	./scripts/test_all.sh

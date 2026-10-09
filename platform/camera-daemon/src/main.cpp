@@ -530,6 +530,7 @@ static DaemonConfig load_config(const std::string& path) {
     cfg.watchdog_scan_ms = 100;
     cfg.watchdog_timeout_ms = 5000;
     cfg.watchdog_warn_ms = 3000;
+    cfg.watchdog_in_use_timeout_ms = 30000;
     cfg.log_level = "info";
 
     // FG2009 open-loop geometry: bench-calibrated bootstrap offsets
@@ -631,6 +632,8 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.watchdog_timeout_ms = parse_u32_config(val, "watchdog.frame_timeout_ms");
             else if (trimmed.find("warn_threshold_ms:") != std::string::npos)
                 cfg.watchdog_warn_ms = parse_u32_config(val, "watchdog.warn_threshold_ms");
+            else if (trimmed.find("in_use_timeout_ms:") != std::string::npos)
+                cfg.watchdog_in_use_timeout_ms = parse_u32_config(val, "watchdog.in_use_timeout_ms");
         } else if (section == "dsp") {
             // P2: DspServiceConfig knobs (defaults live in dsp_service.h).
             // Quota and retained-resource caps are per process incarnation.

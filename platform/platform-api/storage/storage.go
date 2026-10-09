@@ -34,11 +34,17 @@ type ModelStorage struct {
 
 // HEFInfo holds metadata extracted from a HEF file via hailortcli.
 type HEFInfo struct {
-	NetworkName string   `json:"network_name"`
-	RawOutput   string   `json:"raw_output"`
-	VStreams    []string `json:"vstreams,omitempty"`
-	InputWidth  int      `json:"input_width"`  // Extracted from input vstream shape
-	InputHeight int      `json:"input_height"` // Extracted from input vstream shape
+	NetworkName string `json:"network_name"`
+	RawOutput   string `json:"raw_output"`
+	// VStreams is the legacy direction-blind line list (section headers and
+	// input streams included) — kept verbatim for compatibility.
+	VStreams []string `json:"vstreams,omitempty"`
+	// OutputVStreams lists only output-section stream rows (no headers, no
+	// input streams): the raw-output preview card renders these, and showing
+	// input rows there mislabels them as outputs (review 2026-09-21).
+	OutputVStreams []string `json:"output_vstreams,omitempty"`
+	InputWidth     int      `json:"input_width"`  // Extracted from input vstream shape
+	InputHeight    int      `json:"input_height"` // Extracted from input vstream shape
 }
 
 // NewModelStorage creates a ModelStorage backed by the given blob directory.
@@ -331,6 +337,11 @@ func parseHEFInfo(output string) *HEFInfo {
 
 		if isVStreamLine(line) {
 			info.VStreams = append(info.VStreams, line)
+			// OutputVStreams keeps only rows under the output section,
+			// skipping the section headers themselves (they end with ':').
+			if section == "output" && !strings.HasSuffix(line, ":") {
+				info.OutputVStreams = append(info.OutputVStreams, line)
+			}
 		}
 
 		if info.InputWidth == 0 && shouldParseInputDimensions(line, section) {

@@ -494,6 +494,104 @@ void test_validate_model_variant_table() {
         // keypoint/other blobs pass through (HAL/plugin validates content)
         {"keypoint", R"({"native_yolov8_pose":true})", true, ""},
         {"segmentation", R"({"any":"content"})", true, ""},
+        // keypoint dialect: OPEN (opaque channel, HAL validates content) —
+        // the vendor example blob and unknown future keys pass; only the
+        // loader control keys the postprocess layer dlopens from are refused
+        // (mirrors the REST validator's blacklist).
+        {"keypoint",
+         R"({"native_yolov8_pose":true,"score_threshold":0.6,)"
+         R"("keypoint_threshold":0.5,"yolov8_pose_network_width":640,)"
+         R"("yolov8_pose_network_height":640})",
+         true, ""},
+        {"keypoint", R"({"native_yolov8_pose":true,"future_key":7})", true, ""},
+        {"keypoint", "  {\"native_yolov8_pose\":true}", true, ""},
+        {"keypoint",
+         R"({"native_yolov8_pose":true,"backend_lib_path":"/evil.so"})",
+         false, "is never accepted"},
+        {"keypoint",
+         R"({"native_yolov8_pose":true,"backend_config_path":"/evil.json"})",
+         false, "is never accepted"},
+        // The blacklist is depth-independent: HAL substring-searches the raw
+        // JSON for these keys, so a nesting wrapper must not smuggle one
+        // past the gRPC validator (review 2026-09-21 P0).
+        {"keypoint",
+         R"({"extra":{"backend_lib_path":"/evil.so"}})",
+         false, "'backend_lib_path' is never accepted"},
+        {"keypoint",
+         R"({"presets":[{"backend_config_path":"/evil.json"}]})",
+         false, "'backend_config_path' is never accepted"},
+        {"keypoint",
+         R"({"a":{"b":{"c":{"backend_lib_path":"/evil.so"}}}})",
+         false, "'backend_lib_path' is never accepted"},
+        // The key spelling inside a STRING value stays escaped in the raw
+        // text and cannot collide with HAL's search — not a vector, must pass.
+        {"keypoint",
+         R"({"note":"set backend_lib_path yourself"})", true, ""},
+        // ── other families: the same any-depth loader-key refusal (review
+        // 2026-09-24 P0 — the pass-through let loader keys through for types
+        // with no schema at this boundary; REST already refused them). ──
+        {"segmentation",
+         R"({"backend_lib_path":"/evil.so"})", false,
+         "'backend_lib_path' is never accepted"},
+        {"classification",
+         R"({"extra":{"backend_lib_path":"/evil.so"}})", false,
+         "'backend_lib_path' is never accepted"},
+        {"clip",
+         R"({"presets":[{"backend_config_path":"/evil.json"}]})", false,
+         "'backend_config_path' is never accepted"},
+        {"embedding",
+         R"({"deep":{"a":{"backend_lib_path":"/e.so"}}})", false,
+         "'backend_lib_path' is never accepted"},
+        {"depth",
+         R"({"backend_config_path":"/evil.json"})", false,
+         "'backend_config_path' is never accepted"},
+        {"monocular_depth",
+         R"({"a":{"b":{"c":{"backend_lib_path":"/e.so"}}}})", false,
+         "'backend_lib_path' is never accepted"},
+        {"scdepth",
+         R"({"backend_lib_path":"/e.so"})", false,
+         "'backend_lib_path' is never accepted"},
+        {"ocr_detection",
+         R"({"nested":{"backend_config_path":"/e.json"}})", false,
+         "'backend_config_path' is never accepted"},
+        {"ocr_recognition",
+         R"({"backend_lib_path":"/e.so"})", false,
+         "'backend_lib_path' is never accepted"},
+        // Ordinary blobs, string-value mentions, and bare names still pass —
+        // these types have no dialect here beyond the loader-key refusal.
+        {"clip", R"({"threshold":0.3,"prompts":["a cat"]})", true, ""},
+        {"ocr_detection", "some_decoder", true, ""},
+        {"scdepth", R"({"note":"set backend_lib_path yourself"})", true, ""},
+        // Fail-closed on malformed `{`-prefixed blobs, matching REST's
+        // validateLoaderKeysOnly.
+        {"clip", R"({"threshold":)", false,
+         "not a valid flat JSON object"},
+        // Detection value shapes: the closed key set alone does not close the
+        // same vector — labels is a legal KEY whose object/array-of-non-
+        // strings value smuggles structure the raw search can hit.
+        {"detection",
+         R"({"backend_function":"hailo_yolov8s","iou_threshold":0.45,)"
+         R"("detection_threshold":0.25,"output_activation":"none",)"
+         R"("label_offset":1,"max_boxes":64,)"
+         R"("labels":{"backend_lib_path":"/evil.so"}})",
+         false, "'labels' must be an array of strings"},
+        {"detection",
+         R"({"backend_function":"hailo_yolov8s","iou_threshold":0.45,)"
+         R"("detection_threshold":0.25,"output_activation":"none",)"
+         R"("label_offset":1,"max_boxes":64,"labels":["ok",7]})",
+         false, "'labels' must be an array of strings"},
+        {"detection",
+         R"({"backend_function":"hailo_yolov8s","iou_threshold":0.45,)"
+         R"("detection_threshold":"0.25","output_activation":"none",)"
+         R"("label_offset":1,"max_boxes":64,"labels":[]})",
+         false, "'detection_threshold' must be a number"},
+        {"detection",
+         R"({"backend_function":"hailo_yolov8s","iou_threshold":0.45,)"
+         R"("detection_threshold":0.25,"output_activation":"none",)"
+         R"("label_offset":1,"max_boxes":64.5,"labels":[]})",
+         false, "'max_boxes' must be an integer"},
+        {"keypoint", R"({"native_yolov8_pose":)", false,
+         "not a valid flat JSON object"},
         // ── refused: whitelist ──
         {"detection", "hailo_yolov9x", false, "Invalid model_variant"},
         {"detection", "wrong-lib", false, "Invalid model_variant"},
@@ -511,7 +609,12 @@ void test_validate_model_variant_table() {
         {"detection", R"({"backend_function":"hailo_yolov8s})", false,
          "not a valid flat JSON object"},                       // unterminated string
         {"detection", R"({"backend_function":5})", false,
-         "not a valid flat JSON object"},                       // non-string backend
+         "missing required key 'iou_threshold'"},           // non-string backend + missing
+        {"detection",
+         R"({"backend_function":5,"iou_threshold":0.45,)"
+         R"("detection_threshold":0.25,"output_activation":"none",)"
+         R"("label_offset":1,"max_boxes":64,"labels":[]})",
+         false, "'backend_function' must be a string"},     // full blob, non-string backend
         {"detection", R"({"iou_threshold":0.4,"iou_threshold":0.5})", false,
          "not a valid flat JSON object"},                       // duplicate key
         {"detection", full_blob + "x", false,
@@ -557,6 +660,117 @@ void test_validate_model_variant_table() {
     ASSERT_FALSE(is_known_detection_backend("hailo_yolov8x"), "yolov8x not whitelisted");
     ASSERT_FALSE(is_known_detection_backend("backend_function"),
                  "a key name is not a backend function");
+
+    PASS();
+}
+
+// ─── Test: keypoint variant is trimmed before blob detection ─────────────────
+// init_post_process's keypoint branch used to test variant.front()=='{' on the
+// RAW string — a hand-written blob with leading whitespace passed validation
+// (which trims) but was misjudged a bare name at the model_manager layer,
+// silently dropped from config_json, leaving the facial-landmarks default
+// active: validation-green, pose decoder never engaged. The blob must be
+// detected on the trimmed spelling and forwarded without the whitespace.
+namespace {
+static std::string g_last_keypoint_cfg_json;
+static std::string g_last_detection_cfg_json;
+
+static HalPostprocessSession* mock_post_create_record(const HalPostprocessConfig* cfg) {
+    if (cfg && cfg->type == HAL_POST_TYPE_KEYPOINT)
+        g_last_keypoint_cfg_json =
+            cfg->config.keypoint.config_json ? cfg->config.keypoint.config_json : "";
+    if (cfg && cfg->type == HAL_POST_TYPE_DETECTION)
+        g_last_detection_cfg_json =
+            cfg->config.detection.config_json ? cfg->config.detection.config_json : "";
+    static int session_storage;  // unique, valid, never dereferenced by ops
+    return reinterpret_cast<HalPostprocessSession*>(&session_storage);
+}
+static void mock_post_destroy_noop(HalPostprocessSession*) {}
+static int mock_post_run_not_sup(HalPostprocessSession*, const HalTensor*, int,
+                                 HalPostprocessResult*) { return -1; }
+static void mock_post_free_result_noop(HalPostprocessResult*) {}
+}  // namespace
+
+void test_keypoint_variant_trimmed_passthrough() {
+    TEST(keypoint_variant_trimmed_passthrough);
+
+    HalInferenceOps infer_ops = make_mock_infer_ops();
+    HalPostprocessOps post_ops{};
+    post_ops.create      = mock_post_create_record;
+    post_ops.destroy     = mock_post_destroy_noop;
+    post_ops.run         = mock_post_run_not_sup;
+    post_ops.free_result = mock_post_free_result_noop;
+
+    ModelManager mgr(&infer_ops, &post_ops, nullptr, nullptr);
+    ASSERT_EQ(mgr.register_model("pose_ws", "/fake/pose.hef", "app-a"), 0,
+              "register_model failed");
+
+    const std::string padded_blob =
+        "  \t{\"native_yolov8_pose\":true,\"score_threshold\":0.6}  ";
+    int rc = mgr.init_post_process("pose_ws", "keypoint", padded_blob);
+    ASSERT_EQ(rc, 0, "init_post_process must accept a whitespace-padded blob");
+
+    // The stub-side recording must see the blob with the padding stripped —
+    // HAL's create-time native_yolov8_pose check reads this exact string.
+    ASSERT_EQ(g_last_keypoint_cfg_json,
+              "{\"native_yolov8_pose\":true,\"score_threshold\":0.6}",
+              "config_json must be the trimmed blob, not the padded original "
+              "(and never empty)");
+
+    // Control: a genuinely bare name still routes no config_json (the facial
+    // default stays), and the warn path is taken rather than a crash.
+    rc = mgr.init_post_process("pose_ws", "keypoint", "  native_yolov8_pose  ");
+    ASSERT_EQ(rc, 0, "bare name keeps the facial default without failing");
+    ASSERT_TRUE(g_last_keypoint_cfg_json.empty(),
+                "bare name must not smuggle a config_json through");
+
+    ASSERT_EQ(mgr.unregister_model("pose_ws", "app-a"), 0, "cleanup unregister");
+
+    PASS();
+}
+
+// ─── Test: detection variant is trimmed before blob detection ────────────────
+// Mirror of the keypoint trim fix for the detection branch (review 2026-09-21
+// P2): a padded full blob must pass through verbatim-minus-padding, and a
+// padded BARE backend name must be composed around the trimmed name (not
+// wrapped as a "{...}"-looking failure or logged with the padding).
+void test_detection_variant_trimmed_passthrough() {
+    TEST(detection_variant_trimmed_passthrough);
+
+    HalInferenceOps infer_ops = make_mock_infer_ops();
+    HalPostprocessOps post_ops{};
+    post_ops.create      = mock_post_create_record;
+    post_ops.destroy     = mock_post_destroy_noop;
+    post_ops.run         = mock_post_run_not_sup;
+    post_ops.free_result = mock_post_free_result_noop;
+
+    ModelManager mgr(&infer_ops, &post_ops, nullptr, nullptr);
+    ASSERT_EQ(mgr.register_model("det_ws", "/fake/det.hef", "app-a"), 0,
+              "register_model failed");
+
+    const std::string det_blob =
+        R"({"backend_function":"hailo_yolov8s","iou_threshold":0.45,)"
+        R"("detection_threshold":0.25,"output_activation":"none",)"
+        R"("label_offset":1,"max_boxes":64,)"
+        R"("labels":["unlabeled","person","vehicle","face","license_plate"]})";
+    const std::string padded = " \t" + det_blob + " \n";
+    int rc = mgr.init_post_process("det_ws", "detection", padded);
+    ASSERT_EQ(rc, 0, "init_post_process must accept a whitespace-padded blob");
+    ASSERT_EQ(g_last_detection_cfg_json, det_blob,
+              "config_json must be the trimmed blob, not the padded original");
+
+    // A padded bare name is composed around the TRIMMED name — the first
+    // composed field proves the snprintf got the bare spelling.
+    g_last_detection_cfg_json.clear();
+    rc = mgr.init_post_process("det_ws", "detection", "  hailo_yolov8m  ");
+    ASSERT_EQ(rc, 0, "bare name composition must succeed");
+    ASSERT_TRUE(g_last_detection_cfg_json.find("\"backend_function\":\"hailo_yolov8m\"") ==
+                    1,
+                ("composed blob must open with the trimmed bare name, got: " +
+                 g_last_detection_cfg_json)
+                    .c_str());
+
+    ASSERT_EQ(mgr.unregister_model("det_ws", "app-a"), 0, "cleanup unregister");
 
     PASS();
 }
@@ -2174,6 +2388,8 @@ int main() {
     test_postprocess_create_failure_keeps_model_registered();
     test_note_post_failure_cadence();
     test_validate_model_variant_table();
+    test_keypoint_variant_trimmed_passthrough();
+    test_detection_variant_trimmed_passthrough();
     test_owner_scoped_unregister();
     test_force_unregister_all_is_atomic_when_busy();
     test_model_alias_refcount();

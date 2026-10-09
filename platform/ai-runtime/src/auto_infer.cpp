@@ -1,5 +1,6 @@
 #include "auto_infer.h"
 #include "log.h"
+#include "stream_infer_utils.h"
 
 #include <chrono>
 #include <cstring>
@@ -241,8 +242,14 @@ struct AutoInferRequestResources {
     FrameDelivery delivery;
     std::shared_ptr<FdGroup> fd_group;
     std::unique_ptr<void, FreeBuffer> input;
+    /* Zero-copy arm: holds the session-bound DMA tensor (borrowed frame
+     * fds). Destroying it frees the tensor; both arms keep delivery until
+     * on_complete so the daemon's hw-in-use exemption covers the whole
+     * async NPU read. */
+    std::shared_ptr<StreamDmaInputLease> dma_lease;
 
     void release_source() noexcept {
+        dma_lease.reset();
         delivery.acknowledge();
         input.reset();
         fd_group.reset();
@@ -923,42 +930,83 @@ void AutoInfer::pipeline_loop(
 
         // ── Input Preparation ─────────────────────────────────────────────
 
-        // Map NV12 DMA-BUF planes into user-space (RAII: auto-unmaps on scope exit)
-        MappedNV12Frame mapped = MappedNV12Frame::from_frame(frame);
-        if (!mapped) {
-            LOG_ERROR("AutoInfer: DMA-BUF mmap failed for model=%s stream=%s",
-                      pipe.model_id.c_str(), pipe.stream_id.c_str());
-            frame.delivery.acknowledge();
-            continue;
-        }
-
+        // Zero-copy fast path: single-input NV12 model whose trusted input
+        // geometry matches the frame exactly — bind the frame's dma-buf fds
+        // to the session and declare hw-in-use (confirmed by the daemon)
+        // so the watchdog exempts the buffer until on_complete acks the
+        // delivery. Anything unconfirmed or off-contract (padded stride,
+        // geometry mismatch, old daemon) falls back to the CPU prep below,
+        // which copies/resize-packs into a private buffer.
+        std::shared_ptr<StreamDmaInputLease> dma_lease;
         PreparedInput input;
-        if (is_clip) {
-            input = prepare_clip_input(mapped, frame, model_target_w, model_target_h);
-        } else if (snap->model_info.num_inputs == 1) {
-            input = prepare_nv12_input(mapped, frame, model_target_w, model_target_h);
+        {
+            const auto& mi0 = snap->model_info.inputs[0];
+            const bool nv12_direct_candidate =
+                !is_clip && snap->model_info.num_inputs == 1 && mi0.is_nv12 &&
+                mi0.ndim >= 4 && mi0.shape[1] > 0 && mi0.shape[2] > 0 &&
+                static_cast<uint64_t>(static_cast<uint64_t>(mi0.shape[2]) *
+                                      static_cast<uint64_t>(mi0.shape[1]) *
+                                      3 / 2) ==
+                    static_cast<uint64_t>(mi0.byte_size) &&
+                frame.width == static_cast<uint32_t>(mi0.shape[2]) &&
+                frame.height == static_cast<uint32_t>(mi0.shape[1]);
+
+            if (nv12_direct_candidate) {
+                int bind_status = HAL_ERR_INVALID_ARG;
+                dma_lease = bind_stream_nv12_input(
+                    snap->infer_session, model_mgr_->infer_ops(), frame,
+                    &bind_status);
+                // bind_stream_nv12_input itself enforces the layout
+                // contract (tight strides, NV12, sane fd groups); an
+                // unconfirmed hw-in-use declaration means NO protection —
+                // never submit DMA on the shared buffer then.
+                if (dma_lease &&
+                    !fd_receiver_->declare_frame_hw_in_use(frame.frame_id)) {
+                    dma_lease.reset();
+                }
+            }
         }
 
-        // mapped is no longer needed after prepare — destructor will unmap
+        if (!dma_lease) {
+            // Map NV12 DMA-BUF planes into user-space (RAII: auto-unmaps on scope exit)
+            MappedNV12Frame mapped = MappedNV12Frame::from_frame(frame);
+            if (!mapped) {
+                LOG_ERROR("AutoInfer: DMA-BUF mmap failed for model=%s stream=%s",
+                          pipe.model_id.c_str(), pipe.stream_id.c_str());
+                frame.delivery.acknowledge();
+                continue;
+            }
 
-        if (!input) {
-            LOG_ERROR("AutoInfer: failed to prepare input for model=%s", pipe.model_id.c_str());
-            frame.delivery.acknowledge();
-            continue;
+            if (is_clip) {
+                input = prepare_clip_input(mapped, frame, model_target_w, model_target_h);
+            } else if (snap->model_info.num_inputs == 1) {
+                input = prepare_nv12_input(mapped, frame, model_target_w, model_target_h);
+            }
+
+            // mapped is no longer needed after prepare — destructor will unmap
+
+            if (!input) {
+                LOG_ERROR("AutoInfer: failed to prepare input for model=%s", pipe.model_id.c_str());
+                frame.delivery.acknowledge();
+                continue;
+            }
         }
 
         int num_inputs = 1;
 
-        LOG_DEBUG("AutoInfer: frame seq=%lu %ux%u planes=%u num_inputs=%d",
+        LOG_DEBUG("AutoInfer: frame seq=%lu %ux%u planes=%u num_inputs=%d%s",
                   frame.sequence, frame.width, frame.height,
-                  frame.num_planes, num_inputs);
+                  frame.num_planes, num_inputs, dma_lease ? " (dma)" : "");
 
         // ── Submit to Scheduler ───────────────────────────────────────────
 
         auto request_resources = std::make_shared<AutoInferRequestResources>();
         request_resources->delivery = frame.delivery;
         request_resources->fd_group = frame.fd_group;
-        request_resources->input.reset(input.release_buffer());
+        request_resources->dma_lease = dma_lease;
+        if (!dma_lease) {
+            request_resources->input.reset(input.release_buffer());
+        }
         auto ticket = std::make_shared<AutoInferInFlightTicket>(
             in_flight, outstanding_work_);
 
@@ -966,8 +1014,12 @@ void AutoInfer::pipeline_loop(
         inf_req->model_id   = pipe.model_id;
         inf_req->session_id = session_id;
         inf_req->num_inputs = num_inputs;
-        inf_req->inputs[0]  = input.tensor;
-        inf_req->inputs[0].data = request_resources->input.get();
+        if (dma_lease) {
+            inf_req->inputs[0] = dma_lease->tensor();
+        } else {
+            inf_req->inputs[0] = input.tensor;
+            inf_req->inputs[0].data = request_resources->input.get();
+        }
         inf_req->timeout_ms = 1000;
         inf_req->resource_holder = request_resources;
         inf_req->owns_outputs = true;

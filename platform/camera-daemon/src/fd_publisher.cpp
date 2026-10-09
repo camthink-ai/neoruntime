@@ -533,6 +533,18 @@ void FdPublisher::client_recv_loop(ClientState* client) {
             break;
         }
 
+        case FD_PUB_MSG_FRAME_IN_USE: {
+            if (payload_size != sizeof(FdPubFrameInUseMsg) - sizeof(hdr)) break;
+
+            char buf[sizeof(FdPubFrameInUseMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) break;
+
+            handle_frame_in_use(client, buf);
+            break;
+        }
+
         case FD_PUB_MSG_UNSUBSCRIBE: {
             // subscribed/stream_name are read on the dispatch thread under
             // clients_mu_ — flip the flag under the same lock.
@@ -612,6 +624,7 @@ void FdPublisher::handle_release(ClientState* client, const void* msg_data) {
     uint64_t frame_id = msg->frame_id;
 
     ManagedFrame* mf = nullptr;
+    bool clear_in_use = false;
     {
         std::lock_guard<std::mutex> lock(client->outstanding_mu);
         auto it = client->outstanding.find(frame_id);
@@ -621,13 +634,149 @@ void FdPublisher::handle_release(ClientState* client, const void* msg_data) {
             return;
         }
         mf = it->second.mf;
+        if (it->second.hw_in_use) {
+            // Drop this client's hardware-in-use reference: if other
+            // declarers remain the exemption holds, otherwise the frame
+            // reverts to the normal watchdog deadline. Without this, a
+            // released-but-still-held-by-others frame would keep the long
+            // in-use cap and pin the pool.
+            clear_in_use = true;
+            if (client->in_use_count > 0) client->in_use_count--;
+        }
         client->outstanding.erase(it);
+    }
+
+    if (clear_in_use && router_) {
+        router_->clear_frame_in_use(frame_id);
     }
 
     // Release the ref we retained for this client
     if (mf && router_) {
         router_->release(mf);
     }
+}
+
+void FdPublisher::handle_frame_in_use(ClientState* client, const void* msg_data) {
+    auto* msg = static_cast<const FdPubFrameInUseMsg*>(msg_data);
+    const uint64_t frame_id = msg->frame_id;
+
+    FdPubResponseMsg resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.hdr.type = FD_PUB_MSG_ERROR;
+    resp.hdr.size = sizeof(resp);
+
+    // code: 0 = protection granted (or already declared), -1 = unknown/
+    // gone/reclaimed, -2 = declarer cap exceeded. need_grant: a live,
+    // unclaimed entry was found and the watchdog reference must be taken.
+    int code = -1;
+    bool need_grant = false;
+
+    /* Phase 1 — fast path: the sender itself holds the frame. The handler
+     * runs on the sender's own recv thread, so `client` cannot be
+     * disconnecting concurrently. */
+    {
+        std::lock_guard<std::mutex> olock(client->outstanding_mu);
+        auto it = client->outstanding.find(frame_id);
+        if (it != client->outstanding.end() && it->second.mf &&
+            !it->second.mf->reclaimed.load(std::memory_order_acquire)) {
+            if (it->second.hw_in_use) code = 0;  // idempotent re-declare
+            else need_grant = true;
+        }
+    }
+
+    /* Phase 2 — cross-connection resolve: declarations arrive on a
+     * dedicated control connection while the frame sits on a stream
+     * connection of the same process. Discovery only; Phase 3 re-validates
+     * everything under a fresh clients_mu_ hold. */
+    if (code == -1 && !need_grant) {
+        std::lock_guard<std::mutex> clock(clients_mu_);
+        for (auto& [fd, cs] : clients_) {
+            if (cs == client) continue;
+            // Cross-CONNECTION, not cross-PROCESS: frame_id is global and
+            // every subscriber holds the same id, so an unrestricted scan
+            // could resolve (and later flag) ANOTHER process's entry whose
+            // normal RELEASE would drop this declarer's exemption
+            // mid-read. Resolve only against connections of the declaring
+            // peer (SO_PEERCRED identity); an unreadable identity fails
+            // closed — the caller falls back to a private copy.
+            if (client->identity.empty() || cs->identity != client->identity)
+                continue;
+            std::lock_guard<std::mutex> olock(cs->outstanding_mu);
+            auto it = cs->outstanding.find(frame_id);
+            if (it != cs->outstanding.end() && it->second.mf &&
+                !it->second.mf->reclaimed.load(std::memory_order_acquire)) {
+                if (it->second.hw_in_use) code = 0;
+                else need_grant = true;
+                break;
+            }
+        }
+    }
+
+    /* Phase 3 — uniform grant under clients_mu_ (owner cannot be torn down
+     * mid-grant; inner locks are taken one at a time, never nested).
+     * mark_frame_in_use is the atomic decision point: it only succeeds on
+     * a still-tracked frame, so a declaration racing the watchdog scan
+     * either lands before the reclaim decision or fails outright — it can
+     * never be "accepted" against an already-queued reclaim. */
+    if (need_grant) {
+        std::lock_guard<std::mutex> clock(clients_mu_);
+        if (!router_ || !router_->mark_frame_in_use(frame_id)) {
+            code = -1;
+        } else {
+            // Flag and charge the OWNING entry — a connection of the
+            // DECLARING process. The declaring control connection never
+            // holds frames, so charging it would strand the quota: its
+            // RELEASE hits "unknown frame_id" and only a disconnect would
+            // ever zero the counter (three grants would cap the declarer
+            // for the process lifetime). Charging the flagged owner makes
+            // its RELEASE — or its connection teardown — converge BOTH
+            // the watchdog reference and the cap counter. If no entry
+            // survives the re-scan the frame was released concurrently
+            // and untrack already dropped our reference: report failure,
+            // never success.
+            bool flagged = false;
+            bool capped = false;
+            for (auto& [fd2, cs2] : clients_) {
+                if (cs2->identity != client->identity) continue;
+                std::lock_guard<std::mutex> olock(cs2->outstanding_mu);
+                auto it = cs2->outstanding.find(frame_id);
+                if (it == cs2->outstanding.end()) continue;
+                if (cs2->in_use_count >= config_.max_outstanding_per_client) {
+                    capped = true;
+                    break;
+                }
+                it->second.hw_in_use = true;
+                cs2->in_use_count++;
+                flagged = true;
+                break;
+            }
+            if (capped) {
+                router_->clear_frame_in_use(frame_id);  // undo the grant
+                code = -2;
+            } else if (!flagged) {
+                router_->clear_frame_in_use(frame_id);
+                code = -1;
+            } else {
+                code = 0;
+            }
+        }
+    }
+
+    resp.code = code;
+    if (code == 0) resp.hdr.type = FD_PUB_MSG_OK;
+
+    {
+        std::lock_guard<std::mutex> lock(stats_mu_);
+        if (code == 0) stats_.frames_in_use_marked++;
+        else stats_.frames_in_use_rejected++;
+    }
+
+    if (code != 0) {
+        HAL_LOG_WARNING("FdPublisher: FRAME_IN_USE frame_id=%lu from fd=%d "
+                        "not applied (code=%d)", frame_id, client->fd, code);
+    }
+
+    send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
 }
 
 void FdPublisher::handle_dsp_alloc(ClientState* client, const void* msg_data) {
@@ -866,19 +1015,34 @@ void FdPublisher::disconnect_client(int client_fd) {
 }
 
 void FdPublisher::release_all_outstanding(ClientState* client) {
-    std::lock_guard<std::mutex> lock(client->outstanding_mu);
+    // Collect the frames this connection declared hw-in-use first (the
+    // watchdog references must drop even though we hold outstanding_mu
+    // while doing it — clear_frame_in_use takes only the watchdog's leaf
+    // lock, so the ordering is safe).
+    std::vector<uint64_t> in_use_frames;
+    {
+        std::lock_guard<std::mutex> lock(client->outstanding_mu);
 
-    if (!client->outstanding.empty()) {
-        HAL_LOG_WARNING("FdPublisher: Releasing %zu outstanding frames for fd=%d",
-                       client->outstanding.size(), client->fd);
-    }
-
-    for (auto& [frame_id, entry] : client->outstanding) {
-        if (entry.mf && router_) {
-            router_->release(entry.mf);
+        if (!client->outstanding.empty()) {
+            HAL_LOG_WARNING("FdPublisher: Releasing %zu outstanding frames for fd=%d",
+                           client->outstanding.size(), client->fd);
         }
+
+        for (auto& [frame_id, entry] : client->outstanding) {
+            if (entry.hw_in_use) in_use_frames.push_back(frame_id);
+            if (entry.mf && router_) {
+                router_->release(entry.mf);
+            }
+        }
+        client->in_use_count = 0;
+        client->outstanding.clear();
     }
-    client->outstanding.clear();
+
+    // hw-in-use references die with the connection; remaining holders (or
+    // the watchdog untrack on the final ref drop) finish the cleanup.
+    for (uint64_t frame_id : in_use_frames) {
+        if (router_) router_->clear_frame_in_use(frame_id);
+    }
 }
 
 void FdPublisher::erase_outstanding(ClientState* client, uint64_t frame_id) {

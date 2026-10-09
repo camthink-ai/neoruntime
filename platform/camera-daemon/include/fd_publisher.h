@@ -116,6 +116,8 @@ public:
         uint64_t send_errors = 0;
         uint64_t frames_quota_rejected = 0;  // Refused: client at max_outstanding
         uint64_t frames_lease_rejected = 0;  // Refused: client over the lease
+        uint64_t frames_in_use_marked = 0;   // FRAME_IN_USE accepted (hw lease)
+        uint64_t frames_in_use_rejected = 0; // FRAME_IN_USE refused (unknown/cap)
         uint64_t clients_connected = 0;
         uint64_t clients_disconnected = 0;
     };
@@ -133,12 +135,18 @@ private:
         // Outstanding frames: frame_id → (frame, when it was lent).
         // lend timestamps drive the lease check at dispatch time; the
         // frame itself is only revoked by RELEASE/disconnect/watchdog.
+        // hw_in_use entries additionally carry the watchdog exemption
+        // taken via FD_PUB_MSG_FRAME_IN_USE (bounded by in_use_count,
+        // capped at max_outstanding_per_client so one buggy client
+        // cannot pin the pool).
         struct OutstandingEntry {
             ManagedFrame* mf;
             std::chrono::steady_clock::time_point lend;
+            bool hw_in_use = false;
         };
         std::mutex  outstanding_mu;
         std::unordered_map<uint64_t, OutstandingEntry> outstanding;
+        size_t      in_use_count = 0;    // guarded by outstanding_mu
         std::chrono::steady_clock::time_point last_reject_warn{};  // rate-limit 1/s
     };
 
@@ -177,6 +185,11 @@ private:
      * Called on the client's recv thread; the lookup reply carries fds. */
     void handle_dsp_lookup(ClientState* client, const void* msg_data);
     void handle_dsp_lookup_release(ClientState* client, const void* msg_data);
+    /* Hardware-in-use declaration (FRAME_IN_USE): mark the outstanding
+     * frame hw-in-use and exempt it from the normal watchdog timeout.
+     * Fire-and-forget (no reply): unknown frames / per-client cap
+     * exceeded are logged + counted, the frame keeps default protection. */
+    void handle_frame_in_use(ClientState* client, const void* msg_data);
     void disconnect_client(int client_fd);
     void release_all_outstanding(ClientState* client);
     /** Remove one outstanding entry (used to undo a tracked-but-unsent frame). */

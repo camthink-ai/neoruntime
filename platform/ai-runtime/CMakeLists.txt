@@ -259,6 +259,7 @@ add_executable(ai-runtime-test
     src/inference_scheduler.cpp
     src/postprocess_pool.cpp
     src/fd_receiver.cpp
+    src/stream_infer_utils.cpp
     src/auto_infer.cpp
     src/event_bus_client.cpp
     src/config.cpp

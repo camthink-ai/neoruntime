@@ -956,7 +956,9 @@ bool DpmWorker::run_detector(DetectorSession& ds, std::vector<uint8_t>& mask,
                              uint32_t fw, uint32_t fh) {
     // Inference runs on the session's captured CLEAN input buffer (ds.read_idx),
     // already resized by offer_frame() from the pre-bake frame. tensor_from_frame
-    // packs that buffer into the model's expected input blob.
+    // binds that buffer zero-copy via its DMA fast path (compact dual-fd NV12 →
+    // HalDmaFrameDesc); it only falls back to a host memcpy blob for off-contract
+    // layouts (padded stride / non-NV12 / no fds).
     HalFrameBuffer* in_fb = ds.input_fb[ds.read_idx];
     if (!in_fb) return false;
 
@@ -966,9 +968,8 @@ bool DpmWorker::run_detector(DetectorSession& ds, std::vector<uint8_t>& mask,
     HalTensor outs[HAL_MAX_TENSORS];
     std::memset(outs, 0, sizeof(outs));
     int run_rc = infer_ops_->run(ds.session, &in, 1, outs, ds.num_outputs);
-    // tensor_from_frame allocates a host buffer (TensorPriv holding a shared_ptr
-    // to the memcpy'd model input blob); run() has now copied it to the NPU, so free it
-    // on every path.
+    // run() is synchronous, so the input tensor (DMA descriptor or host blob)
+    // can be freed on every path right after it returns.
     infer_ops_->free_tensor(&in);
     if (run_rc != 0) {
         HAL_LOG_WARNING("DPM[%s]: infer run rc=%d", ds.spec.name.c_str(), run_rc);

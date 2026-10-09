@@ -236,6 +236,14 @@ void FrameRouter::force_reclaim(uint64_t frame_id) {
     }
 }
 
+bool FrameRouter::mark_frame_in_use(uint64_t frame_id) {
+    return watchdog_ ? watchdog_->mark_in_use(frame_id) : false;
+}
+
+void FrameRouter::clear_frame_in_use(uint64_t frame_id) {
+    if (watchdog_) watchdog_->clear_in_use(frame_id);
+}
+
 RouterStreamStats FrameRouter::get_stats(const std::string& stream_name) const {
     std::lock_guard<std::mutex> lock(stats_mu_);
     auto it = stats_.find(stream_name);

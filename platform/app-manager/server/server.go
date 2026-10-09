@@ -3001,7 +3001,7 @@ func (s *AppManagerServer) extractImageModels(ctx context.Context, appID string,
 			fail("registering unpacked model at %s failed: %s", hefPath, regResp.Status.Message)
 			continue
 		}
-		if reg.ModelType == "detection" {
+		if model.LoadProbeWorthy(reg.ModelType) {
 			if smokeErr := s.probeFreshRegistration(ctx, client, appID, p.id, reg.ModelType != ""); smokeErr != nil {
 				fail("postprocess smoke test failed (%v); registration rolled back", smokeErr)
 				// The registration is gone; drop the unpacked files too so a
@@ -3288,7 +3288,7 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 			// the HEF and sidecar are kept either way (the next start retries;
 			// only reinstall rewrites them), but a known-broken registration
 			// is not left behind for the app to infer against.
-			if !preexisting[modelID] && reg.ModelType == "detection" {
+			if !preexisting[modelID] && model.LoadProbeWorthy(reg.ModelType) {
 				if err := s.probeFreshRegistration(ctx, client, appID, modelID, reg.ModelType != ""); err != nil {
 					recordFailure(modelID, fmt.Sprintf("restored bundled model %s for app %s failed its postprocess smoke test: %v", modelID, appID, err))
 				}
@@ -3337,7 +3337,7 @@ func (s *AppManagerServer) preloadPlatformModel(ctx context.Context, client infe
 	}
 	logger.Info("Preloaded model %s (path: %s, type: %s) for app %s", modelID, path, grpcType, appID)
 
-	if !fresh || model.ResolveModelType(meta.ModelType) != "detection" {
+	if !fresh || !model.LoadProbeWorthy(meta.ModelType) {
 		return nil
 	}
 	// The stored file stays (the platform row owns it); only this freshly

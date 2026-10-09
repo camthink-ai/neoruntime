@@ -92,10 +92,10 @@ ensure_node() {
         return
     fi
 
-    info "Installing Node.js 22..."
+    info "Installing Node.js 24..."
     case "$PKG_MGR" in
         apt)
-            curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+            curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
             install_apt nodejs
             ;;
         brew)

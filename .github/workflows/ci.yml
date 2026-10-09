@@ -43,6 +43,8 @@ jobs:
         run: make build-native
       - name: Basic checks
         run: make test-basic
+      - name: Postprocess schema drift check
+        run: make postprocess-schema-check
       - name: Unit tests
         run: make test-unit
 

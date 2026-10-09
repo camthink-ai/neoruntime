@@ -101,12 +101,20 @@ func unpackBundledPackage(binPath, aliasDir, modelID string) (*bundledRegistrati
 		Config:     string(configJSON),
 	}
 	// Column lift, mirroring RegisterModel: DetectionVariantJSON composes from
-	// the Threshold/MaxDetections columns, not from Config.
+	// the Threshold/MaxDetections columns, not from Config. The network
+	// dimensions feed the keypoint pose blob's create-only size keys; every
+	// other type ignores them.
 	if v, ok := merged["threshold"].(float64); ok {
 		synth.Threshold = float32(v)
 	}
 	if v, ok := merged["max_detections"].(float64); ok {
 		synth.MaxDetections = int(v)
+	}
+	if meta.Network.InputWidth > 0 {
+		synth.InputWidth = meta.Network.InputWidth
+	}
+	if meta.Network.InputHeight > 0 {
+		synth.InputHeight = meta.Network.InputHeight
 	}
 
 	base, err := bundledHEFBasename(synth, meta, modelID)
@@ -469,7 +477,7 @@ func (tx *bundledModelTransaction) Publish(ctx context.Context) error {
 		req := item.request
 		tx.registered = append(tx.registered, req.ModelId)
 		failure := registerRequest(ctx, client, req)
-		if failure == nil && req.ModelType == "detection" {
+		if failure == nil && model.LoadProbeWorthy(req.ModelType) {
 			failure = tx.s.probeFreshRegistration(ctx, client, tx.appID, req.ModelId, req.ModelType != "")
 		}
 		if failure == nil {

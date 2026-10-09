@@ -1,6 +1,10 @@
 package model
 
-import "strings"
+import (
+	"strings"
+
+	"aipc/platform/postprocess"
+)
 
 // FieldType defines the UI input type for a model configuration field.
 type FieldType string
@@ -24,24 +28,41 @@ type FieldOption struct {
 
 // ModelFieldDef describes a single configuration field for a model type.
 // The frontend renders these dynamically — no hardcoded form fields needed.
+//
+// Effect (empty = postprocess.EffectConsumed) tells the UI whether filling
+// the field changes decoder behavior: advisory fields render a "no effect"
+// badge, metadata fields a "recorded only" one. Profiles, when non-empty,
+// restricts the field to rows whose postprocess_profile is in the list — the
+// schema stays one table but inactive-profile knobs neither render nor
+// validate.
 type ModelFieldDef struct {
-	Key      string        `json:"key"`
-	Type     FieldType     `json:"type"`
-	Required bool          `json:"required"`
-	Default  interface{}   `json:"default"`
-	Min      *float64      `json:"min,omitempty"`
-	Max      *float64      `json:"max,omitempty"`
-	Step     *float64      `json:"step,omitempty"`
-	Options  []FieldOption `json:"options,omitempty"`
+	Key      string             `json:"key"`
+	Type     FieldType          `json:"type"`
+	Required bool               `json:"required"`
+	Default  interface{}        `json:"default"`
+	Min      *float64           `json:"min,omitempty"`
+	Max      *float64           `json:"max,omitempty"`
+	Step     *float64           `json:"step,omitempty"`
+	Options  []FieldOption      `json:"options,omitempty"`
+	Effect   postprocess.Effect `json:"effect,omitempty"`
+	Profiles []string           `json:"profiles,omitempty"`
 }
 
 // ModelTypeDef describes a supported model postprocess type.
 // Mirrors HAL enum HalPostprocessType in hal_v2/include/model/hal_postprocess.h.
+//
+// ProfileParamEffects (multi-decoder types only) overrides the Fields'
+// Effect per postprocess_profile value, keyed by the profile's select
+// value and the FIELD key (the registry's blob-dialect key is bridged;
+// see applyRegistryParamEffects). It is what lets the page say "under
+// yolov5m_vehicles this threshold does nothing" without a second
+// hand-maintained effect table.
 type ModelTypeDef struct {
-	ID      string          `json:"id"`
-	Label   string          `json:"label"`
-	Fields  []ModelFieldDef `json:"fields"`
-	Aliases []string        `json:"aliases,omitempty"`
+	ID                  string                                   `json:"id"`
+	Label               string                                   `json:"label"`
+	Fields              []ModelFieldDef                          `json:"fields"`
+	Aliases             []string                                 `json:"aliases,omitempty"`
+	ProfileParamEffects map[string]map[string]postprocess.Effect `json:"profile_param_effects,omitempty"`
 }
 
 // FileFormat describes a supported model file format.
@@ -84,6 +105,20 @@ func textField(key string, def string) ModelFieldDef {
 	}
 }
 
+// profiledNumField is a numField visible only under the listed
+// postprocess_profile values (see ModelFieldDef.Profiles).
+func profiledNumField(key string, def, min, max, step float64, profiles ...string) ModelFieldDef {
+	f := numField(key, def, min, max, step)
+	f.Profiles = profiles
+	return f
+}
+
+// withEffect overrides a constructor's default effect annotation.
+func withEffect(f ModelFieldDef, effect postprocess.Effect) ModelFieldDef {
+	f.Effect = effect
+	return f
+}
+
 // DetectionPostprocessProfile couples a HEF basename the vendor postprocess
 // plugin (libyolo_hailortpp_post.so) recognizes with the backend function it
 // maps to. HAL rewrites the NMS tensor name to <HEF basename>/yolov8_nms_postprocess
@@ -104,25 +139,37 @@ const DefaultDetectionProfile = "hailo_yolov8n_384_640"
 // DetectionPostprocessProfiles lists the basenames verified against the
 // vendor plugin. Other compiled-in names map to generic single-argument
 // functions with a hardcoded 0.4 threshold and are deliberately excluded.
-// The backend_function set below (4 entries) is mirrored by the gRPC
-// RegisterModel validator in
-// platform/ai-runtime/src/model_variant_validation.cpp — extend both sides
-// together.
-var DetectionPostprocessProfiles = []DetectionPostprocessProfile{
-	{Basename: "hailo_yolov8n_384_640", BackendFunction: "hailo_yolov8n", Label: "YOLOv8n 384x640 (default)"},
-	{Basename: "hailo_yolov8s_384_640", BackendFunction: "hailo_yolov8s", Label: "YOLOv8s 384x640"},
-	{Basename: "hailo_yolov8m_384_640", BackendFunction: "hailo_yolov8m", Label: "YOLOv8m 384x640"},
-	// Customer-trained parking-lot model: RGB888 1920x1080 in, one class.
-	// Unlike the yolov8 profiles its NMS tensor is named
-	// yolov5m_vehicles/yolov5_nms_postprocess, so only the composed
-	// variant's backend_function routes it — the plugin's default selection
-	// never matches (fire-smoke signature). Device-verified 2026-09-02:
-	// output decodes exactly like the hand-decoded NMS blob, but the label
-	// table is baked ("car") and ignores the JSON labels.
-	// Custom: the wizard suggests it from the parsed vstream info and the
-	// dropdown only surfaces it then (or when updating such a row) — it is
-	// invisible to users without this deployment's HEF.
-	{Basename: "yolov5m_vehicles", BackendFunction: "yolov5m_vehicles", Label: "YOLOv5m Vehicles 1920x1080", Custom: true},
+// Derived from the postprocess registry (platform/postprocess) — the single
+// source of truth; the gRPC-side mirror is the generated
+// ai-runtime/include/postprocess_schema.h. Extend the registry and
+// regenerate, never this table.
+//
+// The Custom entry (yolov5m_vehicles) is a customer-trained parking-lot
+// model: RGB888 1920x1080 in, one class. Unlike the yolov8 profiles its NMS
+// tensor is named yolov5m_vehicles/yolov5_nms_postprocess, so only the
+// composed variant's backend_function routes it — the plugin's default
+// selection never matches (fire-smoke signature). Device-verified
+// 2026-09-02: output decodes exactly like the hand-decoded NMS blob, but
+// the label table is baked ("car") and ignores the JSON labels. Custom: the
+// wizard suggests it from the parsed vstream info and the dropdown only
+// surfaces it then (or when updating such a row) — it is invisible to users
+// without this deployment's HEF.
+var DetectionPostprocessProfiles = detectionProfilesFromRegistry()
+
+func detectionProfilesFromRegistry() []DetectionPostprocessProfile {
+	decoders := postprocess.DecodersForType("detection")
+	out := make([]DetectionPostprocessProfile, 0, len(decoders))
+	for _, d := range decoders {
+		// Registry order == the hand-maintained order above it: parameterized
+		// n/s/m first, the custom fixed-name entry last.
+		out = append(out, DetectionPostprocessProfile{
+			Basename:        d.Basename,
+			BackendFunction: d.Decoder,
+			Label:           d.Label,
+			Custom:          d.Custom,
+		})
+	}
+	return out
 }
 
 // LookupDetectionProfile returns the profile for a basename; ok is false for
@@ -157,6 +204,67 @@ func detectionProfileOptions() []FieldOption {
 	return opts
 }
 
+// KeypointPostprocessProfile couples a postprocess_profile value with the
+// HAL decoder it activates. Unlike detection, keypoint decoders are selected
+// inside the variant blob (empty blob = facial default; the create-time
+// native_yolov8_pose flag = built-in pose decoder), so the profile mainly
+// tells modelload which blob to compose and the wizard which knobs exist.
+type KeypointPostprocessProfile struct {
+	Value   string // postprocess_profile select value
+	Decoder string // HAL decoder id (registry Decoder)
+	Label   string // human-readable label for the wizard dropdown
+}
+
+const (
+	// KeypointProfileFacial is the zero-config default: libmediapipe facial
+	// landmarks, selected by an empty variant blob — identical to keypoint
+	// rows stored before profiles existed (missing key == this value).
+	KeypointProfileFacial = "facial_landmarks"
+	// KeypointProfilePose activates HAL's built-in YOLOv8 pose decoder via a
+	// create-time variant blob (native_yolov8_pose:true + thresholds).
+	KeypointProfilePose = "yolov8_pose"
+)
+
+// DefaultKeypointProfile matches the pre-profile behavior byte-for-byte: no
+// variant blob, mediapipe facial decoder.
+const DefaultKeypointProfile = KeypointProfileFacial
+
+// KeypointPostprocessProfiles is derived from the postprocess registry —
+// same single-source rule as the detection table.
+var KeypointPostprocessProfiles = keypointProfilesFromRegistry()
+
+func keypointProfilesFromRegistry() []KeypointPostprocessProfile {
+	decoders := postprocess.DecodersForType("keypoint")
+	out := make([]KeypointPostprocessProfile, 0, len(decoders))
+	for _, d := range decoders {
+		out = append(out, KeypointPostprocessProfile{
+			Value:   d.SelectValue,
+			Decoder: d.Decoder,
+			Label:   d.Label,
+		})
+	}
+	return out
+}
+
+// LookupKeypointProfile returns the profile a postprocess_profile value
+// points at; ok is false for values outside the two verified decoders.
+func LookupKeypointProfile(value string) (KeypointPostprocessProfile, bool) {
+	for _, p := range KeypointPostprocessProfiles {
+		if p.Value == value {
+			return p, true
+		}
+	}
+	return KeypointPostprocessProfile{}, false
+}
+
+func keypointProfileOptions() []FieldOption {
+	opts := make([]FieldOption, 0, len(KeypointPostprocessProfiles))
+	for _, p := range KeypointPostprocessProfiles {
+		opts = append(opts, FieldOption{Value: p.Value, Label: p.Label})
+	}
+	return opts
+}
+
 // SupportedModelTypes is the canonical list of model types.
 // Single source of truth for Go layer, derived from HAL HalPostprocessType enum.
 var SupportedModelTypes = []ModelTypeDef{
@@ -166,13 +274,18 @@ var SupportedModelTypes = []ModelTypeDef{
 		Fields: []ModelFieldDef{
 			reqNumField("threshold", 0.25, 0, 1, 0.01),
 			reqNumField("max_detections", 64, 1, 999, 1),
-			numField("nms_threshold", 0.45, 0, 1, 0.01),
+			// Advisory: it composes into the blob's iou_threshold, but the
+			// parameterized plugin functions never read it (device-verified
+			// 2026-09-02; registry rows agree).
+			withEffect(numField("nms_threshold", 0.45, 0, 1, 0.01), postprocess.EffectAdvisory),
 			// Drives the runtime materialization basename and the composed
 			// variant's backend_function (see handlers/ai_postprocess.go).
 			selectField("postprocess_profile", DefaultDetectionProfile, detectionProfileOptions()),
-			// Metadata only: the plugin's label table is compiled in and cannot
-			// be changed via JSON. Consumers map output class_id N (1-based)
-			// to labels[N-1]; list classes in training order, no background.
+			// Consumed by the parameterized decoders (hailo_yolov8n/s/m):
+			// device A/B 2026-09-20 — relabeling live post_result output.
+			// The fixed-name entries (yolov5m_vehicles) bake their table and
+			// ignore it; that per-decoder split lives in the registry rows
+			// (labelsConsumed), not this coarse single-value annotation.
 			textField("labels", ""),
 		},
 	},
@@ -190,12 +303,24 @@ var SupportedModelTypes = []ModelTypeDef{
 		},
 	},
 	{
+		// Two decoders with disjoint knob sets: mediapipe facial landmarks
+		// (default, zero configuration — 468 points, presence 0.5, 192x192
+		// all compile-time fixed) and HAL's built-in YOLOv8 pose (COCO-17
+		// hardcoded; thresholds live-update, network size is create-only).
+		// num_keypoints is deliberately absent from the schema: both decoders
+		// hardcode their topology and the key has no effect on either.
 		ID: "keypoint", Label: "Keypoint Detection",
 		Aliases: []string{"landmarks", "landmark"},
 		Fields: []ModelFieldDef{
-			numField("threshold", 0.25, 0, 1, 0.01),
-			numField("keypoint_threshold", 0.25, 0, 1, 0.01),
-			numField("num_keypoints", 0, 0, 200, 1),
+			// Missing key == facial_landmarks: existing rows keep their exact
+			// pre-profile behavior (empty variant blob, mediapipe decoder).
+			selectField("postprocess_profile", DefaultKeypointProfile, keypointProfileOptions()),
+			// Pose-only (composes into the blob's score_threshold). Min 0.01:
+			// HAL treats score_threshold < 1e-6 as unset and silently falls
+			// back to 0.6 — the form must not offer values that read as "let
+			// HAL decide".
+			profiledNumField("threshold", 0.25, 0.01, 1, 0.01, KeypointProfilePose),
+			profiledNumField("keypoint_threshold", 0.25, 0, 1, 0.01, KeypointProfilePose),
 		},
 	},
 	{
@@ -227,8 +352,12 @@ var SupportedModelTypes = []ModelTypeDef{
 		Fields: []ModelFieldDef{},
 	},
 	{
+		// monocular_depth/scdepth are the runtime's separate known-type
+		// spellings (registry RuntimeTypes); for the wizard they are the
+		// same knob-free depth family.
 		ID: "depth", Label: "Depth Estimation",
-		Fields: []ModelFieldDef{},
+		Aliases: []string{"monocular_depth", "scdepth"},
+		Fields:  []ModelFieldDef{},
 	},
 	{
 		ID: "genai", Label: "Generative AI",
@@ -339,17 +468,43 @@ func GetFieldDefaults(typeID string) map[string]interface{} {
 	return defaults
 }
 
+// LoadProbeWorthy reports whether a model type follows the platform
+// postprocess path whose failure modes are only observable through
+// post_result — the load-time smoke probe (one zero-input infer, expect a
+// non-empty post_result) exists for exactly these types. It replaces the
+// hardcoded `== "detection"` checks at the probe call sites so keypoint
+// models get the same fail-loud guarantee.
+func LoadProbeWorthy(typeID string) bool {
+	switch ResolveModelType(typeID) {
+	case "detection", "keypoint":
+		return true
+	}
+	return false
+}
+
 // GuessModelType attempts to infer model type from network name heuristics.
 func GuessModelType(networkName string) string {
 	n := strings.ToLower(networkName)
 	switch {
-	// Specific patterns first (before generic "det")
+	// Specific patterns first (before generic "yolo"/"det") — pose networks
+	// ship as yolov8*_pose, so keypoint identity must outrank the yolo prefix
+	// or the wizard suggests detection for a pose HEF. "face" is NOT part of
+	// the hoisted set: face_detection/face_detector are detection networks,
+	// and a bare face token outranking det sends them at the facial-landmarks
+	// decoder (review 2026-09-21). "clip" joins the hoisted set for the same
+	// reason against a generic token: CLIP encoders ship as clip_vit_b_32_*,
+	// and the "vit" token in the classification case below would otherwise
+	// swallow every ViT-named CLIP network (found on-device 2026-09-26).
 	case strings.Contains(n, "ocr_det"):
 		return "ocr_detection"
 	case strings.Contains(n, "ocr_rec") || strings.Contains(n, "recognition"):
 		return "ocr_recognition"
 	case strings.Contains(n, "lprnet") || strings.Contains(n, "license_plate"):
 		return "ocr_recognition"
+	case strings.Contains(n, "pose") || strings.Contains(n, "keypoint") || strings.Contains(n, "landmark"):
+		return "keypoint"
+	case strings.Contains(n, "clip"):
+		return "clip"
 	// Generic patterns
 	case strings.Contains(n, "yolo") || strings.Contains(n, "det"):
 		return "detection"
@@ -357,10 +512,12 @@ func GuessModelType(networkName string) string {
 		return "classification"
 	case strings.Contains(n, "seg") || strings.Contains(n, "linknet"):
 		return "segmentation"
-	case strings.Contains(n, "pose") || strings.Contains(n, "keypoint") || strings.Contains(n, "landmark") || strings.Contains(n, "face"):
+	// "face" stays late (its pre-hoist position): by the time a name reaches
+	// this case it carries no det/yolo token, so face_mesh and unnamed
+	// mediapipe-style face networks still suggest keypoint while
+	// face_detection already matched detection above.
+	case strings.Contains(n, "face"):
 		return "keypoint"
-	case strings.Contains(n, "clip"):
-		return "clip"
 	case strings.Contains(n, "embed"):
 		return "embedding"
 	case strings.Contains(n, "depth") || strings.Contains(n, "scdepth"):
@@ -370,4 +527,84 @@ func GuessModelType(networkName string) string {
 	default:
 		return "detection"
 	}
+}
+
+// paramKeyToFieldKey bridges the registry's variant-blob dialect to the
+// config field dialect for effect projection ONLY (presentation). The two
+// namespaces spell the same knob differently; validation walks each
+// namespace independently and never consults this table.
+var paramKeyToFieldKey = map[string]map[string]string{
+	"detection": {
+		"detection_threshold": "threshold",
+		"max_boxes":           "max_detections",
+		"iou_threshold":       "nms_threshold",
+		"labels":              "labels",
+	},
+	"keypoint": {
+		"score_threshold":    "threshold",
+		"keypoint_threshold": "keypoint_threshold",
+	},
+}
+
+// applyRegistryParamEffects projects the decoder registry's per-decoder
+// effect truth onto the wizard schema, so a page badge answers "does THIS
+// knob do anything under the SELECTED decoder" instead of a single
+// worst-case annotation:
+//   - single-decoder types: the decoder's params ARE the type's effect
+//     truth — field effects are overwritten from the registry (that is how
+//     segmentation/clip/ocr knobs carry their advisory truth, which the
+//     hand-written field table predates).
+//   - multi-decoder types (detection's four plugin entries, keypoint's
+//     facial/pose pair): per-profile overrides land in ProfileParamEffects
+//     keyed by profile select value; the field-level annotation stays as
+//     the default profile's truth.
+//
+// Runs once at package init; the registry is immutable after load.
+func applyRegistryParamEffects() {
+	for i := range SupportedModelTypes {
+		td := &SupportedModelTypes[i]
+		decoders := postprocess.DecodersForType(td.ID)
+		if len(decoders) == 0 {
+			continue
+		}
+		bridge := paramKeyToFieldKey[td.ID]
+		fieldKey := func(paramKey string) string {
+			if k, ok := bridge[paramKey]; ok {
+				return k
+			}
+			return paramKey
+		}
+		if len(decoders) == 1 {
+			for _, p := range decoders[0].Params {
+				fk := fieldKey(p.Key)
+				for j := range td.Fields {
+					if td.Fields[j].Key == fk {
+						td.Fields[j].Effect = p.Effect
+					}
+				}
+			}
+			continue
+		}
+		overrides := map[string]map[string]postprocess.Effect{}
+		for _, d := range decoders {
+			profileKey := d.SelectValue
+			if profileKey == "" {
+				profileKey = d.Decoder
+			}
+			m := map[string]postprocess.Effect{}
+			for _, p := range d.Params {
+				m[fieldKey(p.Key)] = p.Effect
+			}
+			if len(m) > 0 {
+				overrides[profileKey] = m
+			}
+		}
+		if len(overrides) > 0 {
+			td.ProfileParamEffects = overrides
+		}
+	}
+}
+
+func init() {
+	applyRegistryParamEffects()
 }

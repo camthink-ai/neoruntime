@@ -1,6 +1,9 @@
 package storage
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func TestParseInputDimensions(t *testing.T) {
 	tests := []struct {
@@ -140,5 +143,43 @@ Input VStream infos:
 	info := parseHEFInfo(output)
 	if info.InputWidth != 480 || info.InputHeight != 640 {
 		t.Fatalf("input dimensions = %dx%d, want 480x640", info.InputWidth, info.InputHeight)
+	}
+}
+
+// OutputVStreams must list output-section stream rows only: the raw-output
+// preview renders them, and a direction-blind list mislabels input streams
+// and section headers as outputs (review 2026-09-21). Both parse-hef layouts
+// — section headers and inline Input/Output columns — are covered.
+func TestParseHEFInfoCollectsOnlyOutputVStreams(t *testing.T) {
+	sectionLayout := `Network group name: yolov8n, Single Context
+Output VStream infos:
+    output_boxes (HailoStream) FLOAT32 [1, 8400, 84]
+Input VStream infos:
+    images (HailoStream) UINT8, NHWC(1x720x1280x3)
+`
+	info := parseHEFInfo(sectionLayout)
+	want := []string{"output_boxes (HailoStream) FLOAT32 [1, 8400, 84]"}
+	if !slices.Equal(info.OutputVStreams, want) {
+		t.Fatalf("OutputVStreams (section layout) = %q, want %q", info.OutputVStreams, want)
+	}
+
+	columnLayout := `Network group name: hailo_yolov8n_384_640, Multi Context - Number of contexts: 2
+    Network name: hailo_yolov8n_384_640/hailo_yolov8n_384_640
+        VStream infos:
+            Input  hailo_yolov8n_384_640/input_layer1 UINT8, NV12(192x640x3)
+            Output hailo_yolov8n_384_640/yolov8_nms_postprocess FLOAT32, HAILO NMS BY CLASS(number of classes: 4, maximum bounding boxes per class: 100, maximum frame size: 8016)
+`
+	info = parseHEFInfo(columnLayout)
+	want = []string{
+		"Output hailo_yolov8n_384_640/yolov8_nms_postprocess FLOAT32, HAILO NMS BY CLASS(number of classes: 4, maximum bounding boxes per class: 100, maximum frame size: 8016)",
+	}
+	if !slices.Equal(info.OutputVStreams, want) {
+		t.Fatalf("OutputVStreams (column layout) = %q, want %q", info.OutputVStreams, want)
+	}
+
+	// No output section at all: the field stays empty rather than guessing.
+	info = parseHEFInfo("Network group name: detector\nInput VStream infos:\n    images (HailoStream) UINT8, NHWC(1x720x1280x3)\n")
+	if len(info.OutputVStreams) != 0 {
+		t.Fatalf("OutputVStreams (input-only) = %q, want empty", info.OutputVStreams)
 	}
 }

@@ -20,7 +20,13 @@ export default {
     ],
     'type-case': [2, 'always', 'lower-case'],
     'type-empty': [2, 'never'],
-    'subject-case': [2, 'always', 'lower-case'],
+    // Subjects start lowercase but may embed acronyms (ISP, LED, MCU,
+    // ...); only fully-capitalized formats are rejected (2026-10-09).
+    'subject-case': [
+      2,
+      'never',
+      ['sentence-case', 'start-case', 'pascal-case', 'upper-case'],
+    ],
     'subject-empty': [2, 'never'],
     'subject-full-stop': [2, 'never', '.'],
     'header-max-length': [2, 'always', 72],

@@ -3,20 +3,33 @@ import type { ModelFieldDef } from '@/hooks/useModels';
 import {
   backendFunctionForProfile,
   buildRegisterPreview,
+  buildVariantTemplate,
   checkCustomVariant,
+  checkKeypointVariant,
   classifyOutputFormat,
+  diffRegisterPreview,
+  effectivePostprocess,
   fieldDefaultToState,
+  fieldKeyToPoseVariantKey,
+  fieldKeyToVariantKey,
+  filterFieldsByProfile,
   formatFileSize,
   mergeConfigOnTypeSwitch,
   modelFormIssueText,
   MODEL_ID_PATTERN,
+  outputVStreamRows,
+  parseVStreamTable,
   partitionFields,
   prefillUpdateForm,
+  reloadRelevantChange,
   sanitizeModelId,
+  suggestKeypointProfile,
   suggestModelId,
   suggestPostprocessProfile,
   validateModelForm,
   variantFormIssue,
+  withReplacementFileFacts,
+  variantOverridesProfile,
   visibleSelectOptions,
   type ModelImportFormState,
   type ValidateModelFormCtx,
@@ -146,7 +159,15 @@ describe('MODEL_ID_PATTERN', () => {
 describe('mergeConfigOnTypeSwitch', () => {
   const poseFields: ModelFieldDef[] = [
     { key: 'name', type: 'text', required: true },
-    { key: 'postprocess_profile', type: 'select', default: 'yolov8n_pose' },
+    {
+      key: 'postprocess_profile',
+      type: 'select',
+      default: 'yolov8_pose',
+      options: [
+        { value: 'facial_landmarks', label: 'facial' },
+        { value: 'yolov8_pose', label: 'pose' },
+      ],
+    },
     { key: 'threshold', type: 'number', default: 0.5 },
     { key: 'max_detections', type: 'number', default: 64 },
     { key: 'keypoint_threshold', type: 'number', default: 0.3 },
@@ -174,6 +195,24 @@ describe('mergeConfigOnTypeSwitch', () => {
   it('does not leak keys absent from the new schema even without defaults', () => {
     const merged = mergeConfigOnTypeSwitch({ stale_key: 1 }, poseFields);
     expect(merged).not.toHaveProperty('stale_key');
+  });
+
+  it('drops select values the new type does not offer', () => {
+    // Profile keys are type-local: a detection basename carried into the
+    // keypoint select would prefill a value its own dropdown cannot show.
+    const merged = mergeConfigOnTypeSwitch(
+      { postprocess_profile: 'hailo_yolov8n_384_640' },
+      poseFields
+    );
+    expect(merged.postprocess_profile).toBe('yolov8_pose'); // new default
+  });
+
+  it('keeps select values the new type also offers', () => {
+    const merged = mergeConfigOnTypeSwitch(
+      { postprocess_profile: 'facial_landmarks' },
+      poseFields
+    );
+    expect(merged.postprocess_profile).toBe('facial_landmarks');
   });
 });
 
@@ -241,19 +280,209 @@ describe('checkCustomVariant', () => {
 
 describe('variantFormIssue', () => {
   it('maps each variant issue onto the advanced section', () => {
-    expect(variantFormIssue('')).toBeNull();
-    expect(variantFormIssue('{bad')).toMatchObject({
+    expect(variantFormIssue('', 'detection')).toBeNull();
+    expect(variantFormIssue('{bad', 'detection')).toMatchObject({
       field: 'variant',
       section: 'advanced',
       reason: 'variant_invalid_json',
     });
-    const missing = variantFormIssue('{"backend_function":"hailo_yolov8n"}');
+    const missing = variantFormIssue(
+      '{"backend_function":"hailo_yolov8n"}',
+      'detection'
+    );
     expect(missing).toMatchObject({
       field: 'variant',
       section: 'advanced',
       reason: 'variant_missing_keys',
     });
     expect(missing?.params?.keys).toContain('iou_threshold');
+  });
+
+  it('dispatches by model type like the REST validator (review 2026-09-21)', () => {
+    // Detection's closed schema rejects the official pose blob…
+    expect(
+      variantFormIssue('{"native_yolov8_pose":true}', 'detection')
+    ).toMatchObject({ reason: 'variant_missing_keys' });
+    // …while keypoint accepts it (open dialect)…
+    expect(
+      variantFormIssue('{"native_yolov8_pose":true}', 'keypoint')
+    ).toBeNull();
+    // …rejects loader control keys…
+    expect(
+      variantFormIssue('{"backend_lib_path":"/x.so"}', 'keypoint')
+    ).toMatchObject({
+      field: 'variant',
+      reason: 'variant_forbidden_keys',
+      params: { keys: 'backend_lib_path' },
+    });
+    // …and rejects bare names.
+    expect(variantFormIssue('yolov8s_pose', 'keypoint')).toMatchObject({
+      field: 'variant',
+      reason: 'variant_bare_name',
+    });
+    // Other model types have no variant surface: anything passes.
+    expect(variantFormIssue('whatever', 'classification')).toBeNull();
+    expect(variantFormIssue('{bad', 'classification')).toBeNull();
+  });
+});
+
+describe('checkKeypointVariant', () => {
+  it('passes empty values and flat JSON objects through', () => {
+    expect(checkKeypointVariant('')).toBeNull();
+    expect(checkKeypointVariant('   ')).toBeNull();
+    // The official pose blob passes verbatim (open dialect, review F1).
+    expect(
+      checkKeypointVariant('{"native_yolov8_pose":true,"score_threshold":0.5}')
+    ).toBeNull();
+    // Unknown keys pass — the channel is opaque, content is HAL's to check.
+    expect(checkKeypointVariant('{"anything":1}')).toBeNull();
+  });
+  it('rejects malformed or non-object JSON', () => {
+    expect(checkKeypointVariant('{not json')).toEqual({ kind: 'invalid-json' });
+    // A JSON array/scalar does not start with '{', so it lands on the
+    // bare-name branch — exactly what the REST validator does with it.
+    expect(checkKeypointVariant('["array"]')).toEqual({ kind: 'bare-name' });
+  });
+  it('rejects bare names and loader control keys', () => {
+    expect(checkKeypointVariant('yolov8s_pose')).toEqual({ kind: 'bare-name' });
+    const issue = checkKeypointVariant(
+      '{"backend_lib_path":"/x.so","backend_config_path":"/y.json"}'
+    );
+    expect(issue).toEqual({
+      kind: 'forbidden-keys',
+      keys: ['backend_lib_path', 'backend_config_path'],
+    });
+  });
+});
+
+describe('buildVariantTemplate', () => {
+  it('composes the closed seven-key detection template from the form', () => {
+    const template = buildVariantTemplate({
+      modelType: 'detection',
+      config: {
+        postprocess_profile: 'hailo_yolov8s_384_640',
+        nms_threshold: 0.3,
+        threshold: 0.4,
+        max_detections: 32,
+        labels: 'person, face',
+      },
+    });
+    expect(JSON.parse(template ?? '')).toEqual({
+      backend_function: 'hailo_yolov8s',
+      iou_threshold: 0.3,
+      detection_threshold: 0.4,
+      output_activation: 'none',
+      label_offset: 1,
+      max_boxes: 32,
+      labels: ['unlabeled', 'person', 'face'],
+    });
+  });
+
+  it('composes the keypoint pose blob exactly like the load-time composer', () => {
+    const template = buildVariantTemplate({
+      modelType: 'keypoint',
+      config: {
+        postprocess_profile: 'yolov8_pose',
+        threshold: 0.6,
+        keypoint_threshold: 0.35,
+      },
+      inputWidth: 640,
+      inputHeight: 640,
+    });
+    expect(JSON.parse(template ?? '')).toEqual({
+      native_yolov8_pose: true,
+      score_threshold: 0.6,
+      keypoint_threshold: 0.35,
+      yolov8_pose_network_width: 640,
+      yolov8_pose_network_height: 640,
+    });
+  });
+
+  it('omits out-of-window keypoint values and absent network dims', () => {
+    // score_threshold floor is 0.01 (HAL falls back to 0.6 below 1e-6);
+    // keypoint_threshold window is [0, 1]; no parsed dims → no dim keys.
+    const template = buildVariantTemplate({
+      modelType: 'keypoint',
+      config: {
+        postprocess_profile: 'yolov8_pose',
+        threshold: 0,
+        keypoint_threshold: 2,
+      },
+    });
+    expect(JSON.parse(template ?? '')).toEqual({
+      native_yolov8_pose: true,
+    });
+    // Absent config thresholds fall back to the composer's 0.25 defaults.
+    const defaults = buildVariantTemplate({
+      modelType: 'keypoint',
+      config: { postprocess_profile: 'yolov8_pose' },
+    });
+    expect(JSON.parse(defaults ?? '')).toEqual({
+      native_yolov8_pose: true,
+      score_threshold: 0.25,
+      keypoint_threshold: 0.25,
+    });
+  });
+
+  it('returns null for model types without a variant surface', () => {
+    expect(
+      buildVariantTemplate({ modelType: 'classification', config: {} })
+    ).toBeNull();
+  });
+
+  it('preserves a legal 0 detection threshold instead of re-pinning the default', () => {
+    // Schema min is 0 — "detect everything" is a legitimate setting; the
+    // template must carry it, not silently substitute 0.25.
+    const template = buildVariantTemplate({
+      modelType: 'detection',
+      config: { threshold: 0, nms_threshold: 0 },
+    });
+    const blob = JSON.parse(template ?? '');
+    expect(blob.detection_threshold).toBe(0);
+    expect(blob.iou_threshold).toBe(0);
+    // max_detections 0 is NOT legal (schema min 1) — the default applies.
+    const zeroBoxes = buildVariantTemplate({
+      modelType: 'detection',
+      config: { max_detections: 0 },
+    });
+    expect(JSON.parse(zeroBoxes ?? '').max_boxes).toBe(64);
+  });
+
+  it('returns null for the keypoint facial profile (nothing composes)', () => {
+    // A pose blob inserted under facial would WIN over the profile at load
+    // time and switch decoders outright — there must be no template to insert.
+    expect(
+      buildVariantTemplate({
+        modelType: 'keypoint',
+        config: { postprocess_profile: 'facial_landmarks', threshold: 0.5 },
+      })
+    ).toBeNull();
+  });
+
+  it('treats an absent keypoint profile as facial (legacy rows)', () => {
+    // Legacy keypoint rows predate postprocess_profile; the field filter and
+    // the loader's compatibility behavior both read "missing" as facial, so
+    // the template must not compose a pose blob for them either.
+    expect(
+      buildVariantTemplate({
+        modelType: 'keypoint',
+        config: { threshold: 0.6 },
+        inputWidth: 640,
+        inputHeight: 640,
+      })
+    ).toBeNull();
+  });
+});
+
+describe('variantOverridesProfile', () => {
+  it.each([
+    ['{"native_yolov8_pose":true}', true],
+    ['  \n{"backend_function":"hailo_yolov8n"}', true], // leading whitespace
+    ['hailo_yolov8n', false],
+    ['', false],
+    ['   ', false],
+  ])('variantOverridesProfile(%j) → %s', (input, expected) => {
+    expect(variantOverridesProfile(input)).toBe(expected);
   });
 });
 
@@ -548,12 +777,36 @@ describe('validateModelForm', () => {
   });
 
   it('emits issues in a stable order: id, type, variant, output mode, fields', () => {
-    const issues = validateModelForm(
+    // With no type selected the variant is not checked at all — the
+    // dispatcher mirrors the REST validator, which only validates variant
+    // surfaces for detection/keypoint.
+    const untyped = validateModelForm(
       {
         modelId: '',
         modelType: '',
         outputMode: 'platform',
         variant: '{oops',
+        config: { threshold: 5 },
+      },
+      {
+        ...baseCtx,
+        platformModeDisabled: true,
+        fields: [{ key: 'threshold', type: 'number', required: true }],
+      }
+    );
+    expect(untyped.map(i => i.field)).toEqual([
+      'modelId',
+      'modelType',
+      'outputMode',
+      'config_threshold',
+    ]);
+
+    const issues = validateModelForm(
+      {
+        ...baseForm,
+        modelId: '',
+        variant: '{oops',
+        outputMode: 'platform',
         config: { threshold: 5 },
       },
       // only threshold in scope so the ordering assertion sees one field issue
@@ -565,7 +818,6 @@ describe('validateModelForm', () => {
     );
     expect(issues.map(i => i.field)).toEqual([
       'modelId',
-      'modelType',
       'variant',
       'outputMode',
       'config_threshold',
@@ -711,5 +963,455 @@ describe('prefillUpdateForm', () => {
       detectionFields
     );
     expect(raw.outputMode).toBe('raw');
+  });
+});
+
+// Keypoint form schema as the backend capability endpoint ships it after the
+// profile work: the profile select (always visible) plus two numeric
+// controls restricted to the pose profile via ModelFieldDef.profiles.
+const keypointFields: ModelFieldDef[] = [
+  {
+    key: 'postprocess_profile',
+    type: 'select',
+    required: true,
+    default: 'facial_landmarks',
+    options: [
+      { value: 'facial_landmarks', label: 'Face landmarks' },
+      { value: 'yolov8_pose', label: 'YOLOv8 pose' },
+    ],
+  },
+  {
+    key: 'threshold',
+    type: 'number',
+    default: 0.25,
+    min: 0.01,
+    max: 1,
+    step: 0.01,
+    profiles: ['yolov8_pose'],
+  },
+  {
+    key: 'keypoint_threshold',
+    type: 'number',
+    default: 0.25,
+    min: 0,
+    max: 1,
+    step: 0.01,
+    profiles: ['yolov8_pose'],
+  },
+];
+
+describe('filterFieldsByProfile', () => {
+  it('hides profile-restricted fields when another profile is active', () => {
+    const facial = filterFieldsByProfile(keypointFields, 'facial_landmarks');
+    expect(facial.map(f => f.key)).toEqual(['postprocess_profile']);
+  });
+
+  it('shows profile-restricted fields when their profile is active', () => {
+    const pose = filterFieldsByProfile(keypointFields, 'yolov8_pose');
+    expect(pose.map(f => f.key)).toEqual([
+      'postprocess_profile',
+      'threshold',
+      'keypoint_threshold',
+    ]);
+  });
+
+  it('treats a missing profile as the facial default (legacy rows)', () => {
+    expect(
+      filterFieldsByProfile(keypointFields, undefined).map(f => f.key)
+    ).toEqual(['postprocess_profile']);
+    expect(filterFieldsByProfile(keypointFields, null).map(f => f.key)).toEqual(
+      ['postprocess_profile']
+    );
+    expect(filterFieldsByProfile(keypointFields, '').map(f => f.key)).toEqual([
+      'postprocess_profile',
+    ]);
+  });
+
+  it('keeps profile-less fields for every type (detection is unaffected)', () => {
+    for (const profile of [undefined, 'facial_landmarks', 'yolov8_pose']) {
+      const keys = filterFieldsByProfile(detectionFields, profile).map(
+        f => f.key
+      );
+      expect(keys).toEqual(detectionFields.map(f => f.key));
+    }
+  });
+});
+
+describe('suggestKeypointProfile', () => {
+  it('maps pose-shaped vstreams to the pose decoder', () => {
+    expect(
+      suggestKeypointProfile('yolov8s_pose/conv21, yolov8s_pose/conv28')
+    ).toBe('yolov8_pose');
+  });
+
+  it('maps face-shaped network names to the facial default', () => {
+    expect(suggestKeypointProfile('', 'face_landmarks_lite')).toBe(
+      'facial_landmarks'
+    );
+    expect(suggestKeypointProfile('landmarks/1: out')).toBe('facial_landmarks');
+  });
+
+  it('yields no opinion for identity-free or empty input', () => {
+    expect(suggestKeypointProfile('', '')).toBeNull();
+    expect(suggestKeypointProfile(undefined, undefined)).toBeNull();
+    expect(
+      suggestKeypointProfile('featurenet/1: out', 'featurenet')
+    ).toBeNull();
+  });
+});
+
+describe('parseVStreamTable', () => {
+  const fixture = JSON.stringify({
+    network_name: 'yolov8s_pose',
+    vstreams: ['yolov8s_pose/conv21', 'yolov8s_pose/conv28'],
+    input_width: 640,
+    input_height: 640,
+  });
+
+  it('parses the HEF-info JSON into vstream rows', () => {
+    const table = parseVStreamTable(fixture);
+    expect(table).not.toBeNull();
+    expect(table?.networkName).toBe('yolov8s_pose');
+    expect(table?.vstreams).toEqual([
+      'yolov8s_pose/conv21',
+      'yolov8s_pose/conv28',
+    ]);
+  });
+
+  it('falls back to raw_output lines when no vstreams array is present', () => {
+    const table = parseVStreamTable(
+      JSON.stringify({ network_name: 'x', raw_output: 'a/1\n\nb/2\n' })
+    );
+    expect(table?.vstreams).toEqual(['a/1', 'b/2']);
+  });
+
+  it('prefers the server-parsed output_vstreams array verbatim', () => {
+    const table = parseVStreamTable(
+      JSON.stringify({
+        network_name: 'yolov8n',
+        output_vstreams: ['yolov8n/conv21 (HailoStream) FLOAT32'],
+        vstreams: ['Input VStream infos:', 'images (HailoStream) UINT8'],
+      })
+    );
+    expect(table?.vstreams).toEqual(['yolov8n/conv21 (HailoStream) FLOAT32']);
+  });
+
+  it('direction-filters legacy vstreams arrays: inputs and headers never render as outputs (review 2026-09-21)', () => {
+    const table = parseVStreamTable(
+      JSON.stringify({
+        network_name: 'yolov8n',
+        vstreams: [
+          'Output VStream infos:',
+          'output_boxes (HailoStream) FLOAT32 [1, 8400, 84]',
+          'Input VStream infos:',
+          'images (HailoStream) UINT8, NHWC(1x720x1280x3)',
+        ],
+      })
+    );
+    expect(table?.vstreams).toEqual([
+      'output_boxes (HailoStream) FLOAT32 [1, 8400, 84]',
+    ]);
+  });
+
+  it('yields null when a legacy array carries no output rows at all', () => {
+    const table = parseVStreamTable(
+      JSON.stringify({
+        network_name: 'x',
+        vstreams: ['Input VStream infos:', 'images (HailoStream) UINT8'],
+      })
+    );
+    expect(table).toBeNull();
+  });
+
+  it('yields null for empty, malformed, or shapeless input', () => {
+    expect(parseVStreamTable('')).toBeNull();
+    expect(parseVStreamTable(undefined)).toBeNull();
+    expect(parseVStreamTable('not json at all')).toBeNull();
+    expect(parseVStreamTable('[1,2,3]')).toBeNull();
+    expect(parseVStreamTable(JSON.stringify({ network_name: 'x' }))).toBeNull();
+    expect(parseVStreamTable(JSON.stringify({ vstreams: [] }))).toBeNull();
+    expect(
+      parseVStreamTable(JSON.stringify({ vstreams: [42, null] }))
+    ).toBeNull();
+  });
+});
+
+describe('outputVStreamRows', () => {
+  it('extracts output rows from the inline Input/Output column layout', () => {
+    const rows = outputVStreamRows([
+      'VStream infos:',
+      'Input  hailo_yolov8n_384_640/input_layer1 UINT8, NV12(192x640x3)',
+      'Output hailo_yolov8n_384_640/yolov8_nms_postprocess FLOAT32, HAILO NMS BY CLASS(number of classes: 4)',
+    ]);
+    expect(rows).toEqual([
+      'Output hailo_yolov8n_384_640/yolov8_nms_postprocess FLOAT32, HAILO NMS BY CLASS(number of classes: 4)',
+    ]);
+  });
+
+  it('falls back to every non-empty line when no direction markers exist', () => {
+    expect(outputVStreamRows(['a/1', '', 'b/2'])).toEqual(['a/1', 'b/2']);
+  });
+});
+
+describe('effectivePostprocess', () => {
+  it('raw delivery carries no postprocess payload, even with a blob variant', () => {
+    expect(
+      effectivePostprocess({
+        modelType: 'detection',
+        outputMode: 'raw',
+        variant: '{"max_boxes":8}',
+        config: { threshold: 0.5 },
+      })
+    ).toEqual({ source: 'none-raw', blob: null });
+  });
+
+  it('a custom blob wins verbatim over the composed config', () => {
+    const out = effectivePostprocess({
+      modelType: 'detection',
+      outputMode: 'platform',
+      variant: '  {"max_boxes": 8}',
+      config: { threshold: 0.9, max_detections: 64 },
+    });
+    // Leading whitespace still counts as an override (load-time trim rule).
+    expect(out.source).toBe('custom-blob');
+    expect(out.blob).toEqual({ max_boxes: 8 });
+    expect(out.rawVariant).toBe('{"max_boxes": 8}');
+  });
+
+  it('a corrupt stored blob reports custom-blob with a null blob', () => {
+    const out = effectivePostprocess({
+      modelType: 'keypoint',
+      outputMode: 'platform',
+      variant: '{"native_yolov8_pose":',
+      config: {},
+    });
+    expect(out.source).toBe('custom-blob');
+    expect(out.blob).toBeNull();
+  });
+
+  it('a bare detection name composes the blob the loader will submit', () => {
+    // The loader's DetectionVariantJSON replaces every non-JSON detection
+    // variant with the full composed blob (profile + stored thresholds), so
+    // the panel shows the composed payload, not verbatim routing.
+    const out = effectivePostprocess({
+      modelType: 'detection',
+      outputMode: 'platform',
+      variant: 'hailo_yolov8n',
+      config: { threshold: 0.5 },
+    });
+    expect(out.source).toBe('composed');
+    expect(out.rawVariant).toBe('hailo_yolov8n');
+    expect(out.blob).toMatchObject({ detection_threshold: 0.5 });
+  });
+
+  it('a bare non-detection name passes through as the routing name', () => {
+    // Registration passes non-detection variants through unchanged —
+    // only detection variants are rewritten by the loader.
+    expect(
+      effectivePostprocess({
+        modelType: 'keypoint',
+        outputMode: 'platform',
+        variant: 'face_landmarks_custom',
+        config: {},
+      })
+    ).toEqual({
+      source: 'passthrough-name',
+      blob: null,
+      rawVariant: 'face_landmarks_custom',
+    });
+  });
+
+  it('an empty variant composes from config + profile', () => {
+    const out = effectivePostprocess({
+      modelType: 'detection',
+      outputMode: 'platform',
+      variant: '',
+      config: { threshold: 0.4, max_detections: 32 },
+    });
+    expect(out.source).toBe('composed');
+    expect(out.blob).toMatchObject({
+      detection_threshold: 0.4,
+      max_boxes: 32,
+    });
+  });
+
+  it('keypoint composes the pose blob, and facial composes nothing', () => {
+    const pose = effectivePostprocess({
+      modelType: 'keypoint',
+      outputMode: 'platform',
+      variant: '',
+      config: { postprocess_profile: 'yolov8_pose', threshold: 0.6 },
+      inputWidth: 640,
+      inputHeight: 640,
+    });
+    expect(pose.source).toBe('composed');
+    expect(pose.blob).toEqual({
+      native_yolov8_pose: true,
+      score_threshold: 0.6,
+      keypoint_threshold: 0.25,
+      yolov8_pose_network_width: 640,
+      yolov8_pose_network_height: 640,
+    });
+    expect(
+      effectivePostprocess({
+        modelType: 'keypoint',
+        outputMode: 'platform',
+        variant: '',
+        config: { postprocess_profile: 'facial_landmarks' },
+      })
+    ).toEqual({ source: 'none', blob: null });
+  });
+});
+
+describe('withReplacementFileFacts', () => {
+  it('returns the preview untouched without a replacement file', () => {
+    const preview = buildRegisterPreview({
+      modelId: 'm1',
+      modelType: 'detection',
+      outputMode: 'platform',
+      variant: '',
+      config: {},
+    });
+    expect(withReplacementFileFacts(preview, null)).toBe(preview);
+    expect(withReplacementFileFacts(preview, undefined)).toBe(preview);
+  });
+
+  it('adds only defined file facts (diff rows vs the persisted payload)', () => {
+    const preview = { model_id: 'm1' };
+    expect(
+      withReplacementFileFacts(preview, {
+        file_hash: 'abc',
+        file_size: 1024,
+        network_name: 'yolov8n',
+        vstream_info: '{}',
+        // absent input dims must NOT surface (UpdateModel: explicit 0 = clear)
+      })
+    ).toEqual({
+      model_id: 'm1',
+      file_hash: 'abc',
+      file_size: 1024,
+      network_name: 'yolov8n',
+      vstream_info: '{}',
+    });
+  });
+});
+
+describe('reloadRelevantChange', () => {
+  const initial: ModelImportFormState = { ...baseForm };
+
+  it('returns false without a snapshot (create mode)', () => {
+    expect(reloadRelevantChange(null, baseForm)).toBe(false);
+  });
+
+  it('returns false when nothing reload-relevant moved', () => {
+    expect(
+      reloadRelevantChange(initial, {
+        ...baseForm,
+        config: { ...baseForm.config },
+      })
+    ).toBe(false);
+    // A display-name edit never reaches the composed variant — no reload.
+    expect(
+      reloadRelevantChange(initial, {
+        ...baseForm,
+        config: { ...baseForm.config, name: 'renamed' },
+      })
+    ).toBe(false);
+  });
+
+  it('flags type, output-mode and variant changes', () => {
+    expect(
+      reloadRelevantChange(initial, { ...baseForm, modelType: 'keypoint' })
+    ).toBe(true);
+    expect(
+      reloadRelevantChange(initial, { ...baseForm, outputMode: 'raw' })
+    ).toBe(true);
+    expect(
+      reloadRelevantChange(initial, { ...baseForm, variant: 'hailo_yolov8n' })
+    ).toBe(true);
+  });
+
+  it('flags config edits that change the composed template', () => {
+    expect(
+      reloadRelevantChange(initial, {
+        ...baseForm,
+        config: { ...baseForm.config, threshold: 0.9 },
+      })
+    ).toBe(true);
+    expect(
+      reloadRelevantChange(initial, {
+        ...baseForm,
+        config: {
+          ...baseForm.config,
+          postprocess_profile: 'hailo_yolov8s_384_640',
+        },
+      })
+    ).toBe(true);
+  });
+});
+
+describe('diffRegisterPreview', () => {
+  it('flattens config rows and reports added/removed/changed keys', () => {
+    const before = buildRegisterPreview(baseForm);
+    const after = buildRegisterPreview({
+      ...baseForm,
+      modelId: 'yolov8n-demo-v2',
+      config: {
+        ...baseForm.config,
+        threshold: 0.9,
+        labels: 'person, face',
+        max_detections: undefined,
+      },
+    });
+    const rows = diffRegisterPreview(before, after);
+    expect(rows).toContainEqual({
+      key: 'model_id',
+      before: 'yolov8n-demo',
+      after: 'yolov8n-demo-v2',
+    });
+    expect(rows).toContainEqual({
+      key: 'config.threshold',
+      before: 0.5,
+      after: 0.9,
+    });
+    expect(rows).toContainEqual({
+      key: 'config.labels',
+      before: 'person',
+      after: 'person, face',
+    });
+    // Removed key: after value undefined.
+    expect(rows).toContainEqual({
+      key: 'config.max_detections',
+      before: 64,
+      after: undefined,
+    });
+    // Unchanged keys never appear.
+    expect(rows.find(r => r.key === 'model_type')).toBeUndefined();
+    expect(rows.find(r => r.key === 'config.nms_threshold')).toBeUndefined();
+  });
+
+  it('returns an empty diff for identical payloads', () => {
+    expect(
+      diffRegisterPreview(
+        buildRegisterPreview(baseForm),
+        buildRegisterPreview(baseForm)
+      )
+    ).toEqual([]);
+  });
+});
+
+describe('field-dialect bridges', () => {
+  it('maps detection field keys onto the plugin blob dialect', () => {
+    expect(fieldKeyToVariantKey.threshold).toBe('detection_threshold');
+    expect(fieldKeyToVariantKey.max_detections).toBe('max_boxes');
+    expect(fieldKeyToVariantKey.nms_threshold).toBe('iou_threshold');
+    expect(fieldKeyToVariantKey.labels).toBe('labels');
+  });
+
+  it('maps keypoint field keys onto the pose blob dialect', () => {
+    expect(fieldKeyToPoseVariantKey.threshold).toBe('score_threshold');
+    expect(fieldKeyToPoseVariantKey.keypoint_threshold).toBe(
+      'keypoint_threshold'
+    );
   });
 });

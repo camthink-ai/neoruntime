@@ -2798,7 +2798,7 @@ int main(int argc, char **argv)
             std::printf(
                 "Usage: %s --media <json> --profile <name_or_idx> --model <hef> [--detector-model <hef>] --udp <host:port> [--post-type <t>] [--post-file <path>] [--post-json <json>] [--dpm ...] [--dpm-attach] [--clip-text-default | --clip-text-hef ...] [--verbose]\n"
                 "  --post-type  auto|detection|classification|clip|segmentation|keypoint|embedding|depth|ocr|none\n"
-                "               (ocr: --post-file/--post-json with backend_lib_path, backend_function, backend_config_path)\n"
+                "               (ocr: --post-file with backend_lib_path, backend_function, backend_config_path; inline --post-json refuses the backend_* loader keys)\n"
                 "  --preprocess-color  auto|none|nv12_to_rgb|nv12_to_bgr\n"
                 "               (Used by HAL_INFERENCE_OPS.tensor_from_frame() for single-input models; default auto picks NV12->RGB when needed.)\n"
                 "  --classification-labels-json <path>  Torchvision-style imagenet_class_index.json (optional; fills classification labels)\n"
