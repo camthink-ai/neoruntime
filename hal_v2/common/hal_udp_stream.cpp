@@ -6,6 +6,7 @@
 #include "common/hal_log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <arpa/inet.h>
 #include <cstdio>
 #include <chrono>
@@ -45,6 +46,55 @@ uint64_t steady_now_ns()
 {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+}
+
+/* --------------------------------------------------------------------
+ * Cross-instance RTP continuity.
+ *
+ * A rotation/flip change takes the HAL through a full medialib reinit which
+ * destroys the encoder pipeline and the UDP pusher with it; the caller then
+ * re-arms a NEW HalUdpStream on the same port/SSRC. Two restart hazards for
+ * already-connected RTP clients (ffmpeg/ffplay/VLC):
+ *   - the new pipeline's media clock restarts from a lower base -> RTP
+ *     timestamps regress; ffmpeg keeps the per-SSRC max timestamp and drops
+ *     every "older" packet forever ("dropping old packet received too late")
+ *     until the client is manually restarted;
+ *   - the sequence counter restarts near 0 -> a large backward jump reads as
+ *     reordering.
+ * Both are fixed process-globally: timestamps are clamped to a strictly
+ * increasing floor shared by all pushers (their frame clocks come from the
+ * same medialib instance, so mutual clamping is a no-op in steady state), and
+ * sequence blocks are handed out monotonically so every restart looks like
+ * ordinary forward packet loss.
+ * -------------------------------------------------------------------- */
+constexpr uint32_t kRtpFrameTick90k = 3003; /* ~33.4ms: nominal one video frame at 90kHz */
+
+std::atomic<uint32_t> g_rtp_ts_floor{0};
+std::atomic<bool> g_rtp_ts_floor_valid{false};
+
+/** Monotonic clamp applied per access unit (all NALs of one AU share the ts). */
+uint32_t clamp_rtp_ts_monotonic(uint32_t raw_ts)
+{
+    uint32_t ts = raw_ts;
+    const uint32_t floor = g_rtp_ts_floor.load(std::memory_order_relaxed);
+    if (g_rtp_ts_floor_valid.load(std::memory_order_relaxed) &&
+        static_cast<int32_t>(ts - floor) <= 0)
+    {
+        ts = floor + kRtpFrameTick90k;
+    }
+    g_rtp_ts_floor.store(ts, std::memory_order_relaxed);
+    g_rtp_ts_floor_valid.store(true, std::memory_order_relaxed);
+    return ts;
+}
+
+/** Sequence blocks allocated forward across pusher (re)creations. */
+std::atomic<uint32_t> g_rtp_seq_alloc{0x6D2BU};
+
+uint16_t alloc_rtp_seq_start()
+{
+    /* Leave a forward gap per allocation: a restart looks like bounded packet
+     * loss instead of a backward jump. Wraps naturally (16-bit seq arithmetic). */
+    return static_cast<uint16_t>(g_rtp_seq_alloc.fetch_add(0x1000U, std::memory_order_relaxed) & 0xFFFFU);
 }
 
 void build_rtp_header(uint8_t *out, uint16_t seq, uint32_t ts, uint32_t ssrc, uint8_t payload_type, bool marker)
@@ -268,6 +318,7 @@ struct HalUdpStream::Impl
     {
         RtpState rtp{};
         rtp.ssrc = cfg.rtp_ssrc;
+        rtp.seq = static_cast<uint16_t>((alloc_rtp_seq_start() - 1U) & 0xFFFFU); /* first ++seq = block start */
         sockaddr *addr = reinterpret_cast<sockaddr *>(&peer);
 
         while (running.load(std::memory_order_acquire) || !queue.empty())
@@ -301,7 +352,7 @@ struct HalUdpStream::Impl
             {
                 ts_ns = steady_now_ns();
             }
-            const uint32_t rtp_ts = ns_to_rtp_ts90k(ts_ns);
+            const uint32_t rtp_ts = clamp_rtp_ts_monotonic(ns_to_rtp_ts90k(ts_ns));
             const bool h265 = (cfg.mode == HalUdpStreamMode::RtpH265AnnexB);
             for (size_t k = 0; k < nals.size(); k++)
             {

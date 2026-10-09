@@ -239,10 +239,22 @@ deploy_remote() {
     if [[ ${#v1_mono[@]} -gt 0 ]]; then
         echo "Syncing monolithic HAL to v1 path ${V1_LIB} (for camera-daemon rpath)..."
         run_ssh "$TARGET" "mkdir -p ${V1_LIB}"
-        run_scp "${BUILD_DIR}"/libaipc_hal.so* "${TARGET}:${V1_LIB}/"
+        run_scp "${BUILD_DIR}"/libaipc_hal.so* "${TARGET}:${V1_LIB}/" || true
         run_ssh "$TARGET" "rm -f ${V1_LIB}/libaipc_hal.so.*.new"
         fix_hal_symlinks_remote "$V1_LIB"
         run_ssh "$TARGET" "ldconfig"
+        # Guard against the silent-stale case: a process holding the lib through its
+        # rpath ($ORIGIN/../lib/hal beats the ldconfig cache) makes scp fail with
+        # "Text file busy" while the rest of the deploy succeeds — every later launch
+        # then keeps loading the OLD library from this path. Verify the copy took.
+        local want_md5 v1_md5
+        want_md5="$(md5sum "${BUILD_DIR}/libaipc_hal.so.2.0.0" 2>/dev/null | awk '{print $1}')"
+        v1_md5="$(run_ssh "$TARGET" "md5sum ${V1_LIB}/libaipc_hal.so.2.0.0 2>/dev/null" | awk '{print $1}')"
+        if [[ -n "$want_md5" && "$want_md5" != "$v1_md5" ]]; then
+            echo "WARNING: ${V1_LIB}/libaipc_hal.so.2.0.0 is stale (want ${want_md5}, have ${v1_md5:-missing})." >&2
+            echo "         A running process is holding the old library; stop it (systemctl stop camera-daemon /" >&2
+            echo "         kill hal-* tests) and re-deploy, or apps will keep loading the stale lib via rpath." >&2
+        fi
     fi
 
     if run_ssh "$TARGET" "ldconfig -p 2>/dev/null | grep -q hal_v2"; then
