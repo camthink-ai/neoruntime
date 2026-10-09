@@ -68,8 +68,33 @@ int resolve_osd_context(void *codec_ctx, OsdContext *out)
         return HAL_ERR_NOT_INITIALIZED;
     }
 
+    std::string stream_id(cc->codec_name);
+
+    /* Defense-in-depth against a stale codec context: a rotation/flip reinit
+     * (HAL_REINIT_PERFORMED from dynamic_change_image_config) FREES the old
+     * contexts and builds new ones — a caller that keeps using the old pointer
+     * is undefined behaviour. Validate this exact ctx is still the current one
+     * for its stream (identity check against codec_by_stream, which
+     * destroy_contexts clears / build_contexts repopulates under ctx_list_mu).
+     * Leaf lock, taken before any MediaLibrary call, never nests with
+     * osd_state_mu or priv->mutex. If the freed chunk has already been
+     * overwritten this check itself is UB — the contract fix is always the
+     * caller re-attaching after REINIT; this only converts the common
+     * use-after-free into a clean error instead of a segfault. */
+    {
+        std::lock_guard<std::mutex> guard(priv->ctx_list_mu);
+        auto cur_it = priv->codec_by_stream.find(stream_id);
+        if (cur_it == priv->codec_by_stream.end() || cur_it->second != cc)
+        {
+            HAL_LOG_ERROR("Hailo15 OSD: codec context for '%s' is stale (freed by a rotation/"
+                          "flip reinit); caller must re-attach contexts after HAL_REINIT_PERFORMED",
+                          stream_id.c_str());
+            return HAL_ERR_INVALID_STATE;
+        }
+    }
+
     out->priv = priv;
-    out->stream_id = std::string(cc->codec_name);
+    out->stream_id = std::move(stream_id);
     return HAL_OK;
 }
 

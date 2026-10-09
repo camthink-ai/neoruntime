@@ -1958,14 +1958,34 @@ static void dispatch_line(int argc, char **av, const char *udp_host_def, uint16_
         return;
     }
 
-    auto apply_image = [](const char *tag) {
+    auto apply_image = [udp_host_def, udp_port_def](const char *tag) {
         if (!g_media_ctx)
         {
             std::printf("no media\n");
             return;
         }
+        /* Stop the RTP pusher while the codec contexts are still valid: a
+         * rotation/flip change may take the HAL_REINIT_PERFORMED path, which
+         * FREES every codec/video context (destroy_contexts) and builds
+         * brand-new ones. udp_stop_internal() unsubscribes through the codec
+         * ctx — doing that after the reinit would dereference freed memory. */
+        const bool had_udp = (g_udp != nullptr);
+        const int prev_idx = g_udp_codec_index;
+        udp_stop_internal();
         int rc = HAL_MEDIA_OPS.dynamic_change_image_config(g_media_ctx, &g_image_cfg);
         std::printf("%s ret=%d\n", tag, rc);
+        if (rc == HAL_REINIT_PERFORMED)
+        {
+            /* Drop our stale g_codec_list/g_video_list pointers and re-attach,
+             * or the next codec/OSD op would dereference freed memory. */
+            (void)refresh_stream_lists();
+        }
+        if ((rc == HAL_OK || rc == HAL_REINIT_PERFORMED) && had_udp && g_codec_count > 0)
+        {
+            int ni = prev_idx < static_cast<int>(g_codec_count) ? prev_idx : 0;
+            int u = udp_start_for_index(ni, udp_host_def, udp_port_def);
+            std::printf("udp auto-restart ret=%d idx=%d\n", u, ni);
+        }
         std::fflush(stdout);
     };
 
