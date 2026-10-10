@@ -245,6 +245,12 @@ static void dpm_video_cb(void * /*video_ctx*/, HalFrameBuffer *frame, void * /*u
 }
 
 HalUdpStream *g_udp = nullptr;
+/** Destination of the last successful udp_start: auto-restarts after a profile
+ *  switch or rotation/flip reinit must reuse the ACTIVE destination, not the
+ *  process defaults — otherwise a client that started RTP with a custom
+ *  host/port silently stops receiving. */
+std::string g_udp_active_host;
+uint16_t g_udp_active_port{0};
 int g_udp_codec_index = -1;
 void (*g_udp_cb)(void *, HalPacketBuffer *, void *) = nullptr;
 
@@ -584,6 +590,8 @@ int udp_start_for_index(int idx, const char *host, uint16_t port)
         return rc;
     }
     g_udp_codec_index = idx;
+    g_udp_active_host = host;
+    g_udp_active_port = port;
     std::printf("UDP RTP -> %s:%u using codec[%d] %s (%s)\n", host, static_cast<unsigned>(port), idx, cc->codec_name,
                 packet_type_str(cc->config.packet_type));
     std::fflush(stdout);
@@ -1685,8 +1693,10 @@ static void dispatch_line(int argc, char **av, const char *udp_host_def, uint16_
         if (rc == HAL_OK && had_udp && prev_idx >= 0 && g_codec_count > 0)
         {
             int ni = prev_idx < static_cast<int>(g_codec_count) ? prev_idx : 0;
-            int u = udp_start_for_index(ni, udp_host_def, udp_port_def);
-            std::printf("udp auto-restart ret=%d idx=%d\n", u, ni);
+            const char *rh = !g_udp_active_host.empty() ? g_udp_active_host.c_str() : udp_host_def;
+            uint16_t rp = (g_udp_active_port != 0U) ? g_udp_active_port : udp_port_def;
+            int u = udp_start_for_index(ni, rh, rp);
+            std::printf("udp auto-restart ret=%d idx=%d -> %s:%u\n", u, ni, rh, static_cast<unsigned>(rp));
         }
         std::fflush(stdout);
         return;
@@ -1983,8 +1993,12 @@ static void dispatch_line(int argc, char **av, const char *udp_host_def, uint16_
         if ((rc == HAL_OK || rc == HAL_REINIT_PERFORMED) && had_udp && g_codec_count > 0)
         {
             int ni = prev_idx < static_cast<int>(g_codec_count) ? prev_idx : 0;
-            int u = udp_start_for_index(ni, udp_host_def, udp_port_def);
-            std::printf("udp auto-restart ret=%d idx=%d\n", u, ni);
+            /* Re-arm on the ACTIVE destination (a custom udp_start host/port),
+             * falling back to the process defaults only before any start. */
+            const char *rh = !g_udp_active_host.empty() ? g_udp_active_host.c_str() : udp_host_def;
+            uint16_t rp = (g_udp_active_port != 0U) ? g_udp_active_port : udp_port_def;
+            int u = udp_start_for_index(ni, rh, rp);
+            std::printf("udp auto-restart ret=%d idx=%d -> %s:%u\n", u, ni, rh, static_cast<unsigned>(rp));
         }
         std::fflush(stdout);
     };

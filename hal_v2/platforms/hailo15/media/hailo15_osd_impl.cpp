@@ -571,7 +571,7 @@ static int osd_set_by_type(void *codec_ctx, const HalOverlayT *overlay, ToMl to_
             return HAL_ERR_NOT_FOUND;
         }
         config_stream_osd_t &osd = stream_it->second.osd;
-        const HalOsdOverlay snap = to_snap(*overlay);
+        HalOsdOverlay snap = to_snap(*overlay);
         const std::string id(hal_snapshot_id(snap));
 
         /* Replace in place if currently blended. */
@@ -584,11 +584,28 @@ static int osd_set_by_type(void *codec_ctx, const HalOverlayT *overlay, ToMl to_
         }
 
         /* Not blended: update the shadow snapshot only (stays hidden). The snapshot
-         * takes the caller's overlay and type wholesale. */
+         * takes the caller's overlay and type wholesale — except `enabled`, which
+         * is forced false: a shadowed overlay is by definition invisible, and the
+         * bundled osd_set_* commands default base.enabled to true. */
         auto &shadow = ctx.priv->osd_disabled_by_stream[ctx.stream_id];
         auto sh_it = shadow.find(id);
         if (sh_it != shadow.end())
         {
+            switch (snap.type)
+            {
+                case HAL_OSD_OVERLAY_IMAGE:
+                    snap.data.image.base.enabled = false;
+                    break;
+                case HAL_OSD_OVERLAY_TEXT:
+                    snap.data.text.base.enabled = false;
+                    break;
+                case HAL_OSD_OVERLAY_DATETIME:
+                    snap.data.datetime.text.base.enabled = false;
+                    break;
+                case HAL_OSD_OVERLAY_CUSTOM:
+                default:
+                    break;
+            }
             sh_it->second = snap;
             return HAL_OK;
         }
@@ -786,8 +803,17 @@ static int hailo15_osd_set_enabled(void *codec_ctx, const char *overlay_id, bool
             return HAL_ERR_NOT_SUPPORTED;
         }
         push_hal_overlay(osd, sh_it->second);
-        shadow.erase(sh_it);
-        return apply_profile_locked(ctx.priv, prof);
+        const int r = apply_profile_locked(ctx.priv, prof);
+        if (r == HAL_OK)
+        {
+            /* Drop the snapshot only after the profile took the change: on a
+             * failed apply the overlay is in neither the live profile nor
+             * (supposedly) the shadow — leaving callers with a permanent
+             * NOT_FOUND. On failure the shadow survives and the overlay stays
+             * disabled, which is the pre-op state. */
+            shadow.erase(sh_it);
+        }
+        return r;
     }
     catch (const std::exception &e)
     {

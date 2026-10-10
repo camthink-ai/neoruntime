@@ -78,48 +78,74 @@ uint64_t steady_now_ns()
  * identifies the logical stream: re-arming the same port resumes the state
  * (restart continuity), different ports never interact.
  * -------------------------------------------------------------------- */
-struct RtpTsState
+struct RtpStreamContState
 {
-    uint32_t last_emitted{0};
-    uint32_t last_raw{0};
-    bool seen{false};
+    uint32_t last_emitted_ts{0};
+    uint32_t last_raw_ts{0};
+    uint16_t last_seq{0};
+    bool ts_seen{false};
+    bool seq_seen{false};
 };
 std::mutex g_rtp_ts_mu;
-std::unordered_map<uint64_t, RtpTsState> g_rtp_ts_by_stream;
+std::unordered_map<uint64_t, RtpStreamContState> g_rtp_ts_by_stream;
 
 uint32_t clamp_rtp_ts_monotonic(uint32_t ssrc, uint16_t port, uint32_t raw)
 {
     const std::lock_guard<std::mutex> lock(g_rtp_ts_mu);
     const uint64_t key = (static_cast<uint64_t>(ssrc) << 16) | port;
-    RtpTsState &st = g_rtp_ts_by_stream[key];
+    RtpStreamContState &st = g_rtp_ts_by_stream[key];
     uint32_t emitted = raw;
-    if (st.seen && static_cast<int32_t>(raw - st.last_emitted) < 0)
+    if (st.ts_seen && static_cast<int32_t>(raw - st.last_emitted_ts) < 0)
     {
-        const int32_t d_raw = static_cast<int32_t>(raw - st.last_raw);
-        emitted = (d_raw > 0) ? static_cast<uint32_t>(static_cast<int64_t>(st.last_emitted) + d_raw)
-                              : st.last_emitted + 1U;
+        const int32_t d_raw = static_cast<int32_t>(raw - st.last_raw_ts);
+        emitted = (d_raw > 0) ? static_cast<uint32_t>(static_cast<int64_t>(st.last_emitted_ts) + d_raw)
+                              : st.last_emitted_ts + 1U;
         static std::atomic<uint32_t> rebase_logs{0};
         if (rebase_logs.fetch_add(1, std::memory_order_relaxed) < 16)
         {
             HAL_LOG_WARNING("hal_udp_stream: rtp ts rebase ssrc=0x%08x port=%u raw=%u last_raw=%u "
                             "last_emitted=%u -> emitted=%u",
-                            ssrc, port, raw, st.last_raw, st.last_emitted, emitted);
+                            ssrc, port, raw, st.last_raw_ts, st.last_emitted_ts, emitted);
         }
     }
-    st.seen = true;
-    st.last_emitted = emitted;
-    st.last_raw = raw;
+    st.ts_seen = true;
+    st.last_emitted_ts = emitted;
+    st.last_raw_ts = raw;
     return emitted;
 }
 
-/** Sequence blocks allocated forward across pusher (re)creations. */
+/** Randomized base counter for FIRST-EVER streams only (RFC 3550 advises a
+ *  non-zero start); continuation uses the stream's own emitted history. */
 std::atomic<uint32_t> g_rtp_seq_alloc{0x6D2BU};
 
-uint16_t alloc_rtp_seq_start()
+/** First sequence number of a (re)created pusher: resume from the stream's
+ *  actually-emitted tail + a small forward gap (reads as bounded packet loss).
+ *  A fixed-size allocation block drifts below the old tail once a pusher
+ *  emitted more packets than the block size — high-bitrate streams pass 4096
+ *  packets within seconds, which would turn every restart into a large
+ *  backward jump (stale/reordered classification at the receiver). */
+uint16_t rtp_seq_start(uint32_t ssrc, uint16_t port)
 {
-    /* Leave a forward gap per allocation: a restart looks like bounded packet
-     * loss instead of a backward jump. Wraps naturally (16-bit seq arithmetic). */
+    const std::lock_guard<std::mutex> lock(g_rtp_ts_mu);
+    const uint64_t key = (static_cast<uint64_t>(ssrc) << 16) | port;
+    auto it = g_rtp_ts_by_stream.find(key);
+    if (it != g_rtp_ts_by_stream.end() && it->second.seq_seen)
+    {
+        return static_cast<uint16_t>(it->second.last_seq + 16U);
+    }
     return static_cast<uint16_t>(g_rtp_seq_alloc.fetch_add(0x1000U, std::memory_order_relaxed) & 0xFFFFU);
+}
+
+/** Record the last emitted sequence number of the logical stream (called once
+ *  per access unit; restarts only ever happen between AUs, after the queue
+ *  drains, so AU granularity is sufficient). */
+void note_emitted_seq(uint32_t ssrc, uint16_t port, uint16_t seq)
+{
+    const std::lock_guard<std::mutex> lock(g_rtp_ts_mu);
+    const uint64_t key = (static_cast<uint64_t>(ssrc) << 16) | port;
+    RtpStreamContState &st = g_rtp_ts_by_stream[key];
+    st.last_seq = seq;
+    st.seq_seen = true;
 }
 
 void build_rtp_header(uint8_t *out, uint16_t seq, uint32_t ts, uint32_t ssrc, uint8_t payload_type, bool marker)
@@ -343,7 +369,7 @@ struct HalUdpStream::Impl
     {
         RtpState rtp{};
         rtp.ssrc = cfg.rtp_ssrc;
-        rtp.seq = static_cast<uint16_t>((alloc_rtp_seq_start() - 1U) & 0xFFFFU); /* first ++seq = block start */
+        rtp.seq = static_cast<uint16_t>((rtp_seq_start(rtp.ssrc, cfg.port) - 1U) & 0xFFFFU); /* first ++seq = start */
         sockaddr *addr = reinterpret_cast<sockaddr *>(&peer);
 
         while (running.load(std::memory_order_acquire) || !queue.empty())
@@ -398,6 +424,7 @@ struct HalUdpStream::Impl
                     HAL_LOG_ERROR("hal_udp_stream: sendto failed (rtp)");
                 }
             }
+            note_emitted_seq(rtp.ssrc, cfg.port, rtp.seq);
         }
     }
 };

@@ -691,6 +691,15 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
     uint32_t old_w = old_state.width;
     uint32_t old_h = old_state.height;
 
+    /* Shadow-disabled overlays are snapshots of the OLD geometry — drop them on
+     * every layout-change call, BEFORE the no-change skip below: a full rotation
+     * reinit pre-refreshes osd_layout_by_encoder (refresh_osd_layout_from_profile
+     * runs in build_contexts paths), which makes the skip branch fire while stale
+     * snapshots would otherwise survive and later re-enable at wrong geometry —
+     * exactly the DSP-bounds hazard this exists to prevent. erase-by-key is a
+     * no-op when absent; HAL-local state, needs no profile apply. */
+    priv->osd_disabled_by_stream.erase(stream_id);
+
     /* 3. Caller already provides new_w/new_h with portrait swap applied. */
 
     /* 4. Skip if nothing changed (same dimensions and same portrait/landscape). */
@@ -738,17 +747,8 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
         modified = true;
     }
 
-    /* Shadow-disabled overlays are snapshots of the old geometry; drop them so a
-     * later osd_enable can't resurrect an overlay with stale absolute fields.
-     * (Caller holds osd_state_mu — plain access, no nested lock.) */
-    {
-        auto shadow_it = priv->osd_disabled_by_stream.find(stream_id);
-        if (shadow_it != priv->osd_disabled_by_stream.end() && !shadow_it->second.empty())
-        {
-            priv->osd_disabled_by_stream.erase(shadow_it);
-            modified = true;
-        }
-    }
+    /* Shadow-disabled overlays were already dropped above (before the no-change
+     * skip), covering both the light path and the pre-refreshed rotation reinit. */
 
     if (old_w > 0 && new_w > 0 && old_w != new_w)
     {
