@@ -5029,6 +5029,13 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
 
     /* 13. Apply non-rotation image settings (flip, zoom, dewarp, etc.) via set_override_parameters. */
     {
+        /* Single read-modify-write under osd_state_mu (leaf lock, OSD-ops
+         * discipline from hailo15_osd_impl.cpp; priv->mutex is never held
+         * here): fetch -> mutate -> recalc OSD per stream -> ONE apply.
+         * Applying a pre-recalc profile copy afterwards would resurrect the
+         * overlays recalc just cleared; the single-cycle lock also orders
+         * this against concurrent OSD ops. */
+        std::lock_guard<std::mutex> osd_lock(priv->osd_state_mu);
         auto prof_exp = priv->media_lib->get_current_profile();
         if (prof_exp)
         {
@@ -5055,14 +5062,15 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
             }
             p.iq_settings.grayscale.enabled = cfg->grayscale || intrinsic_gray;
 
-            /* Recalculate OSD for new dimensions. */
+            /* Recalculate OSD for new dimensions (clears overlays that no
+             * longer fit the new geometry, in the same profile copy). */
             HalRotationAngle new_rot = cfg->rotation_angle;
             for (auto &kv : p.encoded_output_streams)
             {
                 uint32_t ew = 0, eh = 0;
                 std::visit([&](const auto &enc) { ew = enc.input_stream.width; eh = enc.input_stream.height; },
                            kv.second.encoding);
-                hailo15::osd_ml::recalculate_osd_on_layout_change(priv, kv.first, ew, eh, new_rot);
+                hailo15::osd_ml::recalculate_osd_in_profile(priv, p, kv.first, ew, eh, new_rot);
             }
 
             media_library_return r = priv->media_lib->set_override_parameters(p);
@@ -5167,70 +5175,115 @@ static int hailo15_media_dynamic_change_image_config(void *media_ctx, const HalM
         return rotation_full_reinit(media_ctx, hm, priv, cfg);
     }
 
-    p.application_settings.rotation.enabled = (cfg->rotation_angle != HAL_ROTATION_ANGLE_0);
-    p.application_settings.rotation.angle = static_cast<rotation_angle_t>(cfg->rotation_angle);
-
-    p.application_settings.flip.enabled = (cfg->flip_direction != HAL_FLIP_DIRECTION_NONE);
-    p.application_settings.flip.direction = static_cast<flip_direction_t>(cfg->flip_direction);
-
-    p.application_settings.digital_zoom.enabled = cfg->digital_zoom;
-    if (cfg->digital_zoom)
+    /* Light in-place path: single profile RMW under osd_state_mu (leaf lock,
+     * OSD-ops discipline from hailo15_osd_impl.cpp; priv->mutex is never held
+     * here). The fetch above only served the rotation-dispatch decision —
+     * refetch under the lock so a concurrent OSD op's changes cannot be
+     * clobbered by a stale copy, and so the per-stream OSD recalcs below are
+     * applied by exactly ONE set_override_parameters. (Previously each recalc
+     * applied its own profile and the stale pre-recalc copy was written back
+     * afterwards, which could resurrect overlays the recalc had just cleared.)
+     * The BUFFER_ALLOCATION_ERROR fallback below re-enters the lock via
+     * rotation_full_reinit and therefore MUST stay outside this scope. */
+    media_library_return r = MEDIA_LIBRARY_SUCCESS;
+    bool rotation_moved = false;
     {
-        p.application_settings.digital_zoom.mode = DIGITAL_ZOOM_MODE_MAGNIFICATION;
-        p.application_settings.digital_zoom.magnification = static_cast<float>(cfg->digital_zoom_value);
-        clear_encoder_privacy_masks(p);
-    }
-
-    p.iq_settings.dewarp.enabled = cfg->dewarp;
-    p.stabilizer_settings.dis.enabled = cfg->dis;
-    p.stabilizer_settings.eis.enabled = cfg->eis;
-    /* A profile authored monochrome (the Infrared family) must keep
-     * grayscale ON; the transform toggle may only ADD grayscale, never disable an
-     * authored one. Otherwise flipping / resolution-switching in IR mode
-     * clobbers the B&W output into a purple color cast (IR-cut at night + IR LEDs +
-     * AWB on a color path). NOTE: the live profile value must not be OR-ed here —
-     * set_override_parameters() writes toggled values back into the stored profile,
-     * so after one gray=1 toggle the live value stays true until reboot and the
-     * toggle can never turn grayscale off again (the grayscale ratchet). The
-     * init-time authored snapshot (profile_authored_grayscale) is the only
-     * contamination-free source. */
-    const bool intrinsic_gray = profile_authored_grayscale(priv, p.name);
-    if (intrinsic_gray && !cfg->grayscale)
-    {
-        HAL_LOG_INFO("hailo15_media: grayscale toggle-off ignored - '%s' is authored "
-                     "monochrome",
-                     p.name.c_str());
-    }
-    p.iq_settings.grayscale.enabled = cfg->grayscale || intrinsic_gray;
-
-    if (cfg->privacy_mask && !cfg->digital_zoom)
-    {
-        apply_hal_privacy_to_profile(p, priv, cfg);
-    }
-    else if (!cfg->privacy_mask)
-    {
-        clear_encoder_privacy_masks(p);
-    }
-
-    /* Rotation / resolution changes require OSD overlay coordinate recalculation.
-     * Rescale font sizes proportionally to new encoder width (webserver-aligned behaviour). */
-    {
-        HalRotationAngle new_rot = cfg->rotation_angle;
-        for (auto &kv : p.encoded_output_streams)
+        std::lock_guard<std::mutex> osd_lock(priv->osd_state_mu);
+        auto rmw_exp = priv->media_lib->get_current_profile();
+        if (!rmw_exp)
         {
-            uint32_t ew = 0;
-            uint32_t eh = 0;
-            std::visit([&](const auto &enc) { ew = enc.input_stream.width; eh = enc.input_stream.height; },
-                       kv.second.encoding);
-            hailo15::osd_ml::recalculate_osd_on_layout_change(priv, kv.first, ew, eh, new_rot);
+            return HAL_ERROR;
+        }
+        p = rmw_exp.value();
+
+
+        /* Re-check rotation under the lock: a concurrent rotation_full_reinit
+         * may have changed it since the dispatch fetch above. Routing a real
+         * rotation delta through this light path risks the wedge-prone
+         * in-place pipeline restart (see the dispatch comment above); reroute
+         * to the full reinit after the lock is released (it re-enters
+         * osd_state_mu itself). */
+        if (p.application_settings.rotation.effective_value() !=
+            static_cast<rotation_angle_t>(cfg->rotation_angle))
+        {
+            rotation_moved = true;
+        }
+
+        if (!rotation_moved)
+        {
+            p.application_settings.rotation.enabled = (cfg->rotation_angle != HAL_ROTATION_ANGLE_0);
+            p.application_settings.rotation.angle = static_cast<rotation_angle_t>(cfg->rotation_angle);
+
+            p.application_settings.flip.enabled = (cfg->flip_direction != HAL_FLIP_DIRECTION_NONE);
+            p.application_settings.flip.direction = static_cast<flip_direction_t>(cfg->flip_direction);
+
+            p.application_settings.digital_zoom.enabled = cfg->digital_zoom;
+            if (cfg->digital_zoom)
+            {
+                p.application_settings.digital_zoom.mode = DIGITAL_ZOOM_MODE_MAGNIFICATION;
+                p.application_settings.digital_zoom.magnification = static_cast<float>(cfg->digital_zoom_value);
+                clear_encoder_privacy_masks(p);
+            }
+
+            p.iq_settings.dewarp.enabled = cfg->dewarp;
+            p.stabilizer_settings.dis.enabled = cfg->dis;
+            p.stabilizer_settings.eis.enabled = cfg->eis;
+            /* A profile authored monochrome (the Infrared family) must keep
+             * grayscale ON; the transform toggle may only ADD grayscale, never disable an
+             * authored one. Otherwise flipping / resolution-switching in IR mode
+             * clobbers the B&W output into a purple color cast (IR-cut at night + IR LEDs +
+             * AWB on a color path). NOTE: the live profile value must not be OR-ed here —
+             * set_override_parameters() writes toggled values back into the stored profile,
+             * so after one gray=1 toggle the live value stays true until reboot and the
+             * toggle can never turn grayscale off again (the grayscale ratchet). The
+             * init-time authored snapshot (profile_authored_grayscale) is the only
+             * contamination-free source. */
+            const bool intrinsic_gray = profile_authored_grayscale(priv, p.name);
+            if (intrinsic_gray && !cfg->grayscale)
+            {
+                HAL_LOG_INFO("hailo15_media: grayscale toggle-off ignored - '%s' is authored "
+                             "monochrome",
+                             p.name.c_str());
+            }
+            p.iq_settings.grayscale.enabled = cfg->grayscale || intrinsic_gray;
+
+            if (cfg->privacy_mask && !cfg->digital_zoom)
+            {
+                apply_hal_privacy_to_profile(p, priv, cfg);
+            }
+            else if (!cfg->privacy_mask)
+            {
+                clear_encoder_privacy_masks(p);
+            }
+
+            /* Rotation / resolution changes require OSD overlay recalculation:
+             * clear overlays that no longer fit the new stream geometry, in the
+             * same profile copy the single apply below ships (webserver-aligned
+             * behaviour). */
+            {
+                HalRotationAngle new_rot = cfg->rotation_angle;
+                for (auto &kv : p.encoded_output_streams)
+                {
+                    uint32_t ew = 0;
+                    uint32_t eh = 0;
+                    std::visit([&](const auto &enc) { ew = enc.input_stream.width; eh = enc.input_stream.height; },
+                               kv.second.encoding);
+                    hailo15::osd_ml::recalculate_osd_in_profile(priv, p, kv.first, ew, eh, new_rot);
+                }
+            }
+
+            const auto transform_t0 = std::chrono::steady_clock::now();
+            r = priv->media_lib->set_override_parameters(p);
+            HAL_LOG_INFO("[TIMING] set_transform: set_override_parameters=%lldms (in-place rotation/flip path)",
+                         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - transform_t0).count()));
         }
     }
-
-    const auto transform_t0 = std::chrono::steady_clock::now();
-    media_library_return r = priv->media_lib->set_override_parameters(p);
-    HAL_LOG_INFO("[TIMING] set_transform: set_override_parameters=%lldms (in-place rotation/flip path)",
-                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - transform_t0).count());
+    if (rotation_moved)
+    {
+        HAL_LOG_INFO("hailo15_media: rotation changed concurrently; rerouting to rotation_full_reinit");
+        return rotation_full_reinit(media_ctx, hm, priv, cfg);
+    }
     if (r == MEDIA_LIBRARY_BUFFER_ALLOCATION_ERROR)
     {
         /* Large-res transform (flip/dewarp) OOM'd on a fragmented CMA — the

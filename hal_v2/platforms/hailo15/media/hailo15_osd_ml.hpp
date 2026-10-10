@@ -641,43 +641,40 @@ inline void clear_encoder_osd(config_profile_t &p, const std::string *stream_id)
 }
 
 /* ====================================================================
- * recalculate_osd_on_layout_change
+ * recalculate_osd_in_profile
  *
- * When encoder resolution or rotation changes, rescale OSD font sizes
- * proportionally to the new width.  This matches the webserver
- * OsdResource::update_osds() behaviour.
+ * When encoder resolution or rotation changes, prepare the stream's OSD in
+ * the caller's profile copy.  This mirrors the webserver
+ * OsdResource::update_osds() behaviour (delete all overlay ids on layout
+ * change — overlays may not fit the new geometry).
  * ==================================================================== */
 
 /**
- * Recalculate OSD overlays for a specific encoder stream when resolution
- * or rotation changes.
+ * Recalculate OSD overlays for a specific encoder stream, in a caller-owned
+ * profile copy, when resolution or rotation changes.
  *
- * Serialized under priv->osd_state_mu for the WHOLE fetch -> mutate ->
- * set_override_parameters cycle, exactly like the OSD ops in
- * hailo15_osd_impl.cpp: a concurrent OSD op running its own cycle on a
- * pre-clear profile copy would otherwise re-apply cleared overlays (lost
- * update). Callers must NOT hold priv->mutex (same discipline as OSD ops —
- * verified for both call sites in hailo15_media_impl.cpp: the
- * rotation_full_reinit step-13 loop and set_transform's light path). NB: the
- * callers apply their own earlier-fetched profile copy afterwards
- * (set_override_parameters(p) in dynamic_change/rotation paths) OUTSIDE this
- * lock — a pre-existing residual race, unchanged by this serialization.
+ * Pure in-memory: never calls MediaLibrary. The caller owns the profile
+ * lifecycle and must run the WHOLE cycle — get_current_profile() fetch,
+ * field mutations, this function per stream, then exactly ONE
+ * set_override_parameters(p) — under priv->osd_state_mu, the same discipline
+ * as the OSD ops in hailo15_osd_impl.cpp (fetch -> mutate -> apply is atomic
+ * against concurrent OSD ops). Callers must NOT hold priv->mutex.
  *
- * @param priv          Hailo15MediaPriv (for media_lib access and osd_layout_by_encoder).
+ * @param priv          Hailo15MediaPriv (osd_layout_by_encoder, shadow state).
+ * @param p             Caller-fetched profile copy; mutated in place.
  * @param stream_id     Encoder stream id (e.g. "sink0").
  * @param new_w         New encoder input width after change.
  * @param new_h         New encoder input height after change.
  * @param new_rotation  New rotation angle after change.
  */
-inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
-                                              const std::string &stream_id,
-                                              uint32_t new_w, uint32_t new_h,
-                                              HalRotationAngle new_rotation)
+inline void recalculate_osd_in_profile(Hailo15MediaPriv *priv,
+                                       config_profile_t &p,
+                                       const std::string &stream_id,
+                                       uint32_t new_w, uint32_t new_h,
+                                       HalRotationAngle new_rotation)
 {
-    if (!priv || !priv->media_lib)
+    if (!priv)
         return;
-
-    std::lock_guard<std::mutex> osd_lock(priv->osd_state_mu);
 
     /* 1. Look up old state. If not found, just save current and return. */
     auto layout_it = priv->osd_layout_by_encoder.find(stream_id);
@@ -700,9 +697,9 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
      * no-op when absent; HAL-local state, needs no profile apply. */
     priv->osd_disabled_by_stream.erase(stream_id);
 
-    /* 3. Caller already provides new_w/new_h with portrait swap applied. */
+    /* 2. Caller already provides new_w/new_h with portrait swap applied. */
 
-    /* 4. Skip if nothing changed (same dimensions and same portrait/landscape). */
+    /* 3. Skip if nothing changed (same dimensions and same portrait/landscape). */
     bool old_portrait = is_portrait_rotation(static_cast<HalRotationAngle>(old_state.rotation));
     bool new_portrait = is_portrait_rotation(new_rotation);
     if (old_w == new_w && old_h == new_h && old_portrait == new_portrait)
@@ -711,45 +708,33 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
         return;
     }
 
-    /* 5-6. Get the current profile and find the stream's OSD config. */
-    auto prof_exp = priv->media_lib->get_current_profile();
-    if (!prof_exp)
-    {
-        old_state = OsdLayoutState{new_w, new_h, static_cast<int>(new_rotation)};
-        return;
-    }
-    config_profile_t prof = prof_exp.value();
-
-    auto stream_it = prof.encoded_output_streams.find(stream_id);
-    if (stream_it == prof.encoded_output_streams.end())
+    /* 4. Find the stream's OSD config in the caller's profile copy. */
+    auto stream_it = p.encoded_output_streams.find(stream_id);
+    if (stream_it == p.encoded_output_streams.end())
     {
         old_state = OsdLayoutState{new_w, new_h, static_cast<int>(new_rotation)};
         return;
     }
 
-    /* Webserver behaviour:
-     * - On resolution/rotation changes, it re-emits OSD config and deletes existing overlay IDs
-     *   because previous overlays may not fit the new stream geometry.
-     * - It also rescales font sizes proportionally to width.
-     *
-     * In HAL we mirror the safety aspect: clear existing overlays for this stream in the profile
-     * so that the next OSD configure/add recreates them cleanly (avoids DSP verify failures). */
-    bool modified = false;
+    /* Webserver behaviour on layout change: it re-emits OSD config and deletes
+     * existing overlay ids because previous overlays may not fit the new stream
+     * geometry. In the declarative model clearing the profile config is the
+     * whole story — there is no separate blender state to purge. */
     config_stream_osd_t &osd = stream_it->second.osd;
 
-    /* Clear overlays for this stream: safest alignment with webserver's "delete all ids" on layout changes.
-     * The declarative model has no separate blender state to purge — clearing the profile config is enough. */
     if (!osd.image_overlays.empty() || !osd.text_overlays.empty() || !osd.datetime_overlays.empty())
     {
         osd.image_overlays.clear();
         osd.text_overlays.clear();
         osd.datetime_overlays.clear();
-        modified = true;
     }
 
     /* Shadow-disabled overlays were already dropped above (before the no-change
      * skip), covering both the light path and the pre-refreshed rotation reinit. */
 
+    /* Font rescale per webserver parity: proportional to new encoder width.
+     * Currently unreachable (the clear above empties the vectors) — kept so a
+     * future rescale-without-clear policy only has to touch this site. */
     if (old_w > 0 && new_w > 0 && old_w != new_w)
     {
         for (auto &text_ptr : osd.text_overlays)
@@ -758,7 +743,6 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
             {
                 float old_font = text_ptr->font_size;
                 text_ptr->font_size = (old_font / static_cast<float>(old_w)) * static_cast<float>(new_w);
-                modified = true;
             }
         }
         for (auto &dt_ptr : osd.datetime_overlays)
@@ -767,18 +751,11 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
             {
                 float old_font = dt_ptr->font_size;
                 dt_ptr->font_size = (old_font / static_cast<float>(old_w)) * static_cast<float>(new_w);
-                modified = true;
             }
         }
     }
 
-    /* 8. Apply the modified profile via set_override_parameters. */
-    if (modified)
-    {
-        priv->media_lib->set_override_parameters(prof);
-    }
-
-    /* 9. Update the layout state. */
+    /* 5. Update the layout state. */
     old_state = OsdLayoutState{new_w, new_h, static_cast<int>(new_rotation)};
 }
 
