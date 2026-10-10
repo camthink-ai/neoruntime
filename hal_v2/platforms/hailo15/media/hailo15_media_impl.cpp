@@ -5062,6 +5062,20 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
             }
             p.iq_settings.grayscale.enabled = cfg->grayscale || intrinsic_gray;
 
+            /* Privacy must survive a full reinit: the rebuilt instance comes
+             * from the profile files, which never carried the runtime
+             * override (persistent overrides are instance-scoped and die
+             * with the torn-down medialib). Re-apply from cfg with the same
+             * apply/clear semantics as the light path below. */
+            if (cfg->privacy_mask && !cfg->digital_zoom)
+            {
+                apply_hal_privacy_to_profile(p, priv, cfg);
+            }
+            else if (!cfg->privacy_mask)
+            {
+                clear_encoder_privacy_masks(p);
+            }
+
             /* Recalculate OSD for new dimensions (clears overlays that no
              * longer fit the new geometry, in the same profile copy). */
             HalRotationAngle new_rot = cfg->rotation_angle;
