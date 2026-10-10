@@ -59,6 +59,16 @@ jobs:
           VERSION="${VERSION_INPUT:-${GITHUB_REF_NAME}}"
           AIPC_MIN_OS_VERSION="${AIPC_MIN_OS_VERSION_INPUT:-1.13.0}"
           AIPC_MAX_OS_VERSION="${AIPC_MAX_OS_VERSION_INPUT:-1.13.0}"
+          # Firmware is linked against medialib 1.13 and cannot load on an
+          # older OS; dispatch inputs may raise the floor (e.g. for a future
+          # sdk bump) but must not lower it below the mounted sdk requirement.
+          # app-manifest.json carries the range verbatim and the device-side
+          # compat check trusts it, so a lowered floor ships a broken install.
+          MIN_SDK_OS_VERSION=1.13.0
+          if [ "$(printf '%s\n' "$AIPC_MIN_OS_VERSION" "$MIN_SDK_OS_VERSION" | sort -V | head -1)" != "$MIN_SDK_OS_VERSION" ]; then
+            echo "ERROR: min_os_version ($AIPC_MIN_OS_VERSION) is below the SDK requirement ($MIN_SDK_OS_VERSION, medialib 1.13)."
+            exit 1
+          fi
           BUILD_MCU_FW=1
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$BUILD_MCU_FW_INPUT" != "true" ]; then
             BUILD_MCU_FW=0
