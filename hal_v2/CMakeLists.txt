@@ -74,57 +74,57 @@ else()
 endif()
 
 if(HAL_PLATFORM STREQUAL "hailo15")
-    if(NOT CMAKE_CROSSCOMPILING AND DEFINED ENV{OECORE_TARGET_SYSROOT})
-        set(CMAKE_SYSROOT $ENV{OECORE_TARGET_SYSROOT} CACHE PATH "cross sysroot" FORCE)
+    # --- Sysroot: single source of truth ------------------------------------
+    # The target sysroot must resolve from exactly one place: HAILO_SDK_PATH
+    # (-D or env, relayed through the toolchain file when one is used), or the
+    # sourced Yocto environment for direct-cmake developer shells. There is
+    # deliberately NO hardcoded /opt/poky probing: with multiple SDK versions
+    # installed side by side that silently built 1.12 headers against the 1.13
+    # library (undefined symbols only surfaced as dlopen failures on device).
+    if(NOT DEFINED HAILO_SDK_PATH AND DEFINED ENV{HAILO_SDK_PATH})
+        set(HAILO_SDK_PATH "$ENV{HAILO_SDK_PATH}")
     endif()
-    # Fallback for developer environments: when OECORE_TARGET_SYSROOT isn't exported, try local SDK sysroots.
-    # (keeps `build-hailo15` buildable on host machines).
-    # Primary: /opt/poky/4.0.23/ (system SDK install)
-    # Fallback: repo-adjacent sdk_4.0.23/ or ../../sdk_4.0.23/
-    set(_LOCAL_SDK_SYSROOT "/opt/poky/4.0.23/sysroots/armv8a-poky-linux")
-    set(_LOCAL_SDK_SYSROOT2 "${CMAKE_CURRENT_SOURCE_DIR}/../sdk_4.0.23/sysroots/armv8a-poky-linux")
-    set(_LOCAL_SDK_SYSROOT3 "${CMAKE_CURRENT_SOURCE_DIR}/../../sdk_4.0.23/sysroots/armv8a-poky-linux")
-    if(NOT CMAKE_SYSROOT OR CMAKE_SYSROOT STREQUAL "")
-        if(EXISTS "${_LOCAL_SDK_SYSROOT}/usr/include/hailo/media_library/media_library.hpp")
-            set(CMAKE_SYSROOT "${_LOCAL_SDK_SYSROOT}" CACHE PATH "cross sysroot" FORCE)
-            message(STATUS "Using local SDK sysroot: ${CMAKE_SYSROOT}")
-        elseif(EXISTS "${_LOCAL_SDK_SYSROOT2}/usr/include/hailo/media_library/media_library.hpp")
-            set(CMAKE_SYSROOT "${_LOCAL_SDK_SYSROOT2}" CACHE PATH "cross sysroot" FORCE)
-            message(STATUS "Using local SDK sysroot: ${CMAKE_SYSROOT}")
-        elseif(EXISTS "${_LOCAL_SDK_SYSROOT3}/usr/include/hailo/media_library/media_library.hpp")
-            set(CMAKE_SYSROOT "${_LOCAL_SDK_SYSROOT3}" CACHE PATH "cross sysroot" FORCE)
-            message(STATUS "Using local SDK sysroot: ${CMAKE_SYSROOT}")
-        endif()
+    if(HAILO_SDK_PATH)
+        # Cache it (also from env) so the top-level Makefile's SDK-change cache
+        # invalidation (grep ^HAILO_SDK_PATH: CMakeCache.txt) works for every flow.
+        set(HAILO_SDK_PATH "${HAILO_SDK_PATH}" CACHE PATH "Hailo Poky SDK root" FORCE)
     endif()
+    if(NOT DEFINED HAILO_TARGET_SYSROOT_NAME)
+        set(HAILO_TARGET_SYSROOT_NAME "armv8a-poky-linux")
+    endif()
+    set(_HAL_EXPECTED_SYSROOT "")
+    if(HAILO_SDK_PATH)
+        set(_HAL_EXPECTED_SYSROOT "${HAILO_SDK_PATH}/sysroots/${HAILO_TARGET_SYSROOT_NAME}")
+    elseif(NOT CMAKE_CROSSCOMPILING AND DEFINED ENV{OECORE_TARGET_SYSROOT})
+        # Developer shell with the SDK environment sourced and no toolchain file.
+        set(_HAL_EXPECTED_SYSROOT "$ENV{OECORE_TARGET_SYSROOT}")
+    endif()
+    if(NOT _HAL_EXPECTED_SYSROOT)
+        message(FATAL_ERROR
+            "hailo15: no SDK sysroot resolved. Pass -DHAILO_SDK_PATH=<poky-sdk-dir> (or "
+            "export HAILO_SDK_PATH), or source the SDK environment (OECORE_TARGET_SYSROOT).")
+    endif()
+    if(NOT EXISTS "${_HAL_EXPECTED_SYSROOT}/usr/include/hailo/media_library/media_library.hpp")
+        message(FATAL_ERROR
+            "hailo15: no medialib headers in ${_HAL_EXPECTED_SYSROOT} "
+            "(missing usr/include/hailo/media_library/media_library.hpp) - not a Hailo SDK sysroot?")
+    endif()
+    if(CMAKE_SYSROOT AND NOT CMAKE_SYSROOT STREQUAL "${_HAL_EXPECTED_SYSROOT}")
+        message(FATAL_ERROR
+            "hailo15: CMAKE_SYSROOT (${CMAKE_SYSROOT}) does not match the sysroot derived from "
+            "HAILO_SDK_PATH (${_HAL_EXPECTED_SYSROOT}). Pick ONE SDK and reconfigure; a reused "
+            "build dir keeps the old cache (rm CMakeCache.txt or let 'make hal-v2' clear it).")
+    endif()
+    if(NOT CMAKE_SYSROOT)
+        set(CMAKE_SYSROOT "${_HAL_EXPECTED_SYSROOT}" CACHE PATH "Hailo target sysroot (derived from HAILO_SDK_PATH)" FORCE)
+    endif()
+    message(STATUS "HAL hailo15 sysroot: ${CMAKE_SYSROOT}")
 
-    # Include search roots for the Hailo SDK.
-    # NOTE: Some cross toolchains provide --sysroot via compiler flags but do not populate CMAKE_SYSROOT.
-    # We therefore always prefer a repo-local SDK include path when present, and only then fall back to
-    # ${CMAKE_SYSROOT} roots.
-    # Prefer repo-adjacent SDK sysroots when present.
-    set(HAILO_ML_INC "")
-    if(EXISTS "${_LOCAL_SDK_SYSROOT}/usr/include/hailo/media_library/media_library.hpp")
-        list(APPEND HAILO_ML_INC
-            "${_LOCAL_SDK_SYSROOT}/usr/include/hailo"
-            "${_LOCAL_SDK_SYSROOT}/usr/include"
-        )
-    elseif(EXISTS "${_LOCAL_SDK_SYSROOT2}/usr/include/hailo/media_library/media_library.hpp")
-        list(APPEND HAILO_ML_INC
-            "${_LOCAL_SDK_SYSROOT2}/usr/include/hailo"
-            "${_LOCAL_SDK_SYSROOT2}/usr/include"
-        )
-    elseif(EXISTS "${_LOCAL_SDK_SYSROOT3}/usr/include/hailo/media_library/media_library.hpp")
-        list(APPEND HAILO_ML_INC
-            "${_LOCAL_SDK_SYSROOT3}/usr/include/hailo"
-            "${_LOCAL_SDK_SYSROOT3}/usr/include"
-        )
-    endif()
-    if(DEFINED CMAKE_SYSROOT AND NOT CMAKE_SYSROOT STREQUAL "")
-        list(APPEND HAILO_ML_INC
-            "${CMAKE_SYSROOT}/usr/include/hailo"
-            "${CMAKE_SYSROOT}/usr/include"
-        )
-    endif()
+    # Include search roots for the Hailo SDK: target sysroot only.
+    set(HAILO_ML_INC
+        "${CMAKE_SYSROOT}/usr/include/hailo"
+        "${CMAKE_SYSROOT}/usr/include"
+    )
 
     # Optional: HailoRT (inference) headers + library.
     find_path(HAILORT_INC_DIR
@@ -157,16 +157,47 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         PATHS ${HAILO_ML_INC}
         NO_DEFAULT_PATH
     )
-    find_library(HAILO_MEDIALIB_LIB
-        NAMES medialib
-        PATHS ${CMAKE_SYSROOT}/usr/lib ${CMAKE_SYSROOT}/usr/lib64 ${CMAKE_SYSROOT}/lib ${CMAKE_SYSROOT}/lib64
-        NO_DEFAULT_PATH
-    )
+    # medialib lib: resolve the highest installed version directly. Poky SDKs
+    # ship the real file only as libmedialib.so.<x.y.z> (+ soname chain); the
+    # unversioned dev link has been missing in the field, so plain find_library
+    # is not reliable here. Linking the versioned file still records the proper
+    # SONAME (libmedialib.so.1) in NEEDED.
+    set(HAILO_MEDIALIB_LIB "")
+    set(_HAL_MEDIALIB_VER "0.0.0")
+    file(GLOB _HAL_MEDIALIB_SOFILES "${CMAKE_SYSROOT}/usr/lib/libmedialib.so.[0-9]*.[0-9]*.[0-9]*")
+    foreach(_f IN LISTS _HAL_MEDIALIB_SOFILES)
+        if(_f MATCHES "libmedialib\\.so\\.([0-9]+\\.[0-9]+\\.[0-9]+)$")
+            if(CMAKE_MATCH_1 VERSION_GREATER _HAL_MEDIALIB_VER)
+                set(_HAL_MEDIALIB_VER "${CMAKE_MATCH_1}")
+                set(HAILO_MEDIALIB_LIB "${_f}")
+            endif()
+        endif()
+    endforeach()
     set(HAVE_HAILO_MEDIALIB OFF)
     if(HAILO_MEDIALIB_INC_DIR AND HAILO_MEDIALIB_LIB
        AND EXISTS "${HAILO_MEDIALIB_INC_DIR}/media_library/media_library.hpp"
        AND EXISTS "${HAILO_MEDIALIB_INC_DIR}/media_library/buffer_pool.hpp")
         set(HAVE_HAILO_MEDIALIB ON)
+    endif()
+
+    # --- medialib version guards (v1.13 profile-based API) ------------------
+    # hal_v2's OSD/privacy path is written against the v1.13.0 declarative
+    # blending model (per-buffer attached profile; get_osd_blender() is gone
+    # from the public API). Reject SDKs that predate it instead of failing at
+    # link time or on device dlopen.
+    if(EXISTS "${CMAKE_SYSROOT}/usr/include/hailo/osd.hpp")
+        message(FATAL_ERROR
+            "hailo15: ${CMAKE_SYSROOT}/usr/include/hailo/osd.hpp exists -> medialib <=1.12 SDK. "
+            "hal_v2 requires the v1.13.0 profile-based OSD API; point HAILO_SDK_PATH at a 1.13.0 "
+            "SDK (e.g. /opt/poky/4.0.23-1.13.0).")
+    endif()
+    if(HAILO_MEDIALIB_LIB AND _HAL_MEDIALIB_VER VERSION_LESS "1.13.0")
+        message(FATAL_ERROR
+            "hailo15: libmedialib ${_HAL_MEDIALIB_VER} found (${HAILO_MEDIALIB_LIB}), but hal_v2 "
+            "requires >= 1.13.0. Point HAILO_SDK_PATH at the 1.13.0 SDK.")
+    endif()
+    if(HAILO_MEDIALIB_LIB)
+        message(STATUS "medialib: ${HAILO_MEDIALIB_LIB} (version ${_HAL_MEDIALIB_VER})")
     endif()
 
     # NOTE: this helper intentionally accepts a variable number of source files.
@@ -457,11 +488,7 @@ if(HAL_PLATFORM STREQUAL "hailo15")
     if(HAVE_HAILO_POSTPROCESS_TOOLS AND HAL_DRAW_BACKEND STREQUAL "hailo15")
         set(_HAL_DRAW_OPENCV_INCLUDE "")
         set(_HAL_DRAW_OPENCV_LIBS opencv_core opencv_imgproc)
-        if(DEFINED ENV{OECORE_TARGET_SYSROOT})
-            set(_HAL_DRAW_OPENCV_INCLUDE "$ENV{OECORE_TARGET_SYSROOT}/usr/include/opencv4")
-        elseif(CMAKE_SYSROOT AND NOT CMAKE_SYSROOT STREQUAL "")
-            set(_HAL_DRAW_OPENCV_INCLUDE "${CMAKE_SYSROOT}/usr/include/opencv4")
-        endif()
+        set(_HAL_DRAW_OPENCV_INCLUDE "${CMAKE_SYSROOT}/usr/include/opencv4")
         if(HAL_V2_BUILD_MONOLITHIC)
             target_include_directories(hal PRIVATE ${_HAL_DRAW_OPENCV_INCLUDE})
             target_link_libraries(hal PRIVATE ${_HAL_DRAW_OPENCV_LIBS})
@@ -724,33 +751,12 @@ if(HAL_PLATFORM STREQUAL "hailo15")
             PATHS ${HAILO_ML_INC}
             NO_DEFAULT_PATH
         )
-        set(_TOKENIZERS_LIB_PATHS "")
-        if(EXISTS "${_LOCAL_SDK_SYSROOT}/usr/include/hailo/media_library/media_library.hpp")
-            list(APPEND _TOKENIZERS_LIB_PATHS
-                "${_LOCAL_SDK_SYSROOT}/usr/lib"
-                "${_LOCAL_SDK_SYSROOT}/usr/lib64"
-            )
-        endif()
-        if(EXISTS "${_LOCAL_SDK_SYSROOT2}/usr/include/hailo/media_library/media_library.hpp")
-            list(APPEND _TOKENIZERS_LIB_PATHS
-                "${_LOCAL_SDK_SYSROOT2}/usr/lib"
-                "${_LOCAL_SDK_SYSROOT2}/usr/lib64"
-            )
-        endif()
-        if(EXISTS "${_LOCAL_SDK_SYSROOT3}/usr/include/hailo/media_library/media_library.hpp")
-            list(APPEND _TOKENIZERS_LIB_PATHS
-                "${_LOCAL_SDK_SYSROOT3}/usr/lib"
-                "${_LOCAL_SDK_SYSROOT3}/usr/lib64"
-            )
-        endif()
-        if(DEFINED CMAKE_SYSROOT AND NOT CMAKE_SYSROOT STREQUAL "")
-            list(APPEND _TOKENIZERS_LIB_PATHS
-                "${CMAKE_SYSROOT}/usr/lib"
-                "${CMAKE_SYSROOT}/usr/lib64"
-                "${CMAKE_SYSROOT}/lib"
-                "${CMAKE_SYSROOT}/lib64"
-            )
-        endif()
+        set(_TOKENIZERS_LIB_PATHS
+            "${CMAKE_SYSROOT}/usr/lib"
+            "${CMAKE_SYSROOT}/usr/lib64"
+            "${CMAKE_SYSROOT}/lib"
+            "${CMAKE_SYSROOT}/lib64"
+        )
         set(_SAVE_TOK_LIB_SUFFIXES "${CMAKE_FIND_LIBRARY_SUFFIXES}")
         set(CMAKE_FIND_LIBRARY_SUFFIXES ".a" ".so")
         find_library(TOKENIZERS_CPP_LIB
