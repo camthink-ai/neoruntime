@@ -104,10 +104,26 @@ if(HAL_PLATFORM STREQUAL "hailo15")
             "hailo15: no SDK sysroot resolved. Pass -DHAILO_SDK_PATH=<poky-sdk-dir> (or "
             "export HAILO_SDK_PATH), or source the SDK environment (OECORE_TARGET_SYSROOT).")
     endif()
-    if(NOT EXISTS "${_HAL_EXPECTED_SYSROOT}/usr/include/hailo/media_library/media_library.hpp")
+    # Sysroot sanity is medialib-independent: a Poky SDK without the medialib
+    # dev package must still configure (non-media targets only, via
+    # HAVE_HAILO_MEDIALIB=OFF below). What we CAN require unconditionally is
+    # the Poky SDK layout itself, so a wrong HAILO_SDK_PATH still fails loudly.
+    set(_HAL_SYSROOT_IS_POKY ON)
+    if(NOT IS_DIRECTORY "${_HAL_EXPECTED_SYSROOT}")
+        set(_HAL_SYSROOT_IS_POKY OFF)
+    elseif(HAILO_SDK_PATH AND NOT IS_DIRECTORY "${HAILO_SDK_PATH}/sysroots/x86_64-pokysdk-linux")
+        set(_HAL_SYSROOT_IS_POKY OFF)
+    endif()
+    if(NOT _HAL_SYSROOT_IS_POKY)
         message(FATAL_ERROR
-            "hailo15: no medialib headers in ${_HAL_EXPECTED_SYSROOT} "
-            "(missing usr/include/hailo/media_library/media_library.hpp) - not a Hailo SDK sysroot?")
+            "hailo15: ${_HAL_EXPECTED_SYSROOT} does not look like a Hailo Poky SDK sysroot "
+            "(missing target sysroot dir or host toolchain sysroot sysroots/x86_64-pokysdk-linux). "
+            "Check HAILO_SDK_PATH / OECORE_TARGET_SYSROOT.")
+    endif()
+    if(NOT EXISTS "${_HAL_EXPECTED_SYSROOT}/usr/include/hailo/media_library/media_library.hpp")
+        message(WARNING
+            "hailo15: medialib headers not found in ${_HAL_EXPECTED_SYSROOT} - "
+            "media/video/codec/ISP/OSD targets will be skipped (HAVE_HAILO_MEDIALIB=OFF).")
     endif()
     if(CMAKE_SYSROOT AND NOT CMAKE_SYSROOT STREQUAL "${_HAL_EXPECTED_SYSROOT}")
         message(FATAL_ERROR
@@ -184,8 +200,9 @@ if(HAL_PLATFORM STREQUAL "hailo15")
     # hal_v2's OSD/privacy path is written against the v1.13.0 declarative
     # blending model (per-buffer attached profile; get_osd_blender() is gone
     # from the public API). Reject SDKs that predate it instead of failing at
-    # link time or on device dlopen.
-    if(EXISTS "${CMAKE_SYSROOT}/usr/include/hailo/osd.hpp")
+    # link time or on device dlopen. Only enforced when medialib is actually
+    # used (HAVE_HAILO_MEDIALIB): medialib-less non-media builds are SDK-agnostic.
+    if(HAVE_HAILO_MEDIALIB AND EXISTS "${CMAKE_SYSROOT}/usr/include/hailo/osd.hpp")
         message(FATAL_ERROR
             "hailo15: ${CMAKE_SYSROOT}/usr/include/hailo/osd.hpp exists -> medialib <=1.12 SDK. "
             "hal_v2 requires the v1.13.0 profile-based OSD API; point HAILO_SDK_PATH at a 1.13.0 "
