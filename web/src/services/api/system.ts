@@ -22,6 +22,16 @@ export interface OTAParseResponse {
   compatibility?: OTACompatibilityReport;
 }
 
+export interface AppCompatStatus {
+  valid: boolean;
+  error_code?: string;
+  message?: string;
+  os_version?: string;
+  app_version?: string;
+  app_min_os_version?: string;
+  app_max_os_version?: string;
+}
+
 export interface OTAStatusResponse {
   job_id?: string;
   status: string;
@@ -130,6 +140,13 @@ export const systemApi = {
 
   // 健康检查
   healthCheck: (config?: Record<string, unknown>) => request.get('/api/v1/system/health', config),
+
+  // Installed-app compatibility verdict backing the global banner. Public and
+  // silent: the degraded state it reports is exactly when login/session may
+  // be unavailable, and polling failures must not toast.
+  appCompatStatus: () => request.get<AppCompatStatus>('/api/v1/system/app-compat', {
+    silent: true,
+  } as any),
 
   // 更改系统密码：新旧密码均经设备 RSA 公钥加密后传输，附 unix 秒 timestamp 防重放
   updatePassword: async (data: {

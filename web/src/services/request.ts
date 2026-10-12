@@ -98,6 +98,7 @@ const NETWORK_ERROR_SUPPRESS_URL_PATTERNS = [
   '/api/v1/system/restart',
   '/api/v1/system/ota/',
   '/api/v1/system/os-upgrade/',
+  '/api/v1/system/app-compat', // banner poll on a degraded device must not toast
   '/api/v1/system/clone/import', // platform-api self-restarts after clone apply
 ];
 

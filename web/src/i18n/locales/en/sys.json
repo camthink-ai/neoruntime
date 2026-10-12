@@ -1,5 +1,13 @@
 {
   "sys": {
+    "compatibility": {
+      "banner_title": "The installed app is incompatible with the device OS; services are held down",
+      "banner_desc": "App {{app}} supports OS {{min}}–{{max}}; this device is running OS {{os}}. Install a compatible app package to restore full functionality.",
+      "app_version_label": "App version",
+      "supported_os_label": "Supported OS range",
+      "current_os_label": "Current device OS",
+      "firmware_upgrade_action": "Firmware Upgrade"
+    },
     "common": {
       "unknown": "Unknown",
       "actions": "Actions",

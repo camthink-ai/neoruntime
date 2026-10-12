@@ -190,4 +190,64 @@ grep -q 'persistent app manifest has incomplete compatibility metadata' "$TMP/le
     exit 1
 }
 
+# An OS upgrade can land the device on an app built for a different OS range.
+# The installer must not abort on that verdict: unit promotion, aipc-restore
+# (network config recovery) and the warn-only rescue channel all have to stay
+# alive; incompatible services are held down by their own ExecStartPre gates
+# (see docs/deployment/os-upgrade.md).
+cat >"$DATA/app-manifest.json" <<'EOF'
+{
+  "app_version": "test",
+  "machine": "hailo15-ne503",
+  "product": "ne503",
+  "min_os_version": "1.12.0",
+  "max_os_version": "1.12.0",
+  "supported_data_schema": [1],
+  "target_data_schema": 1
+}
+EOF
+cat >"$ROOTFS/etc/aipc-os-release" <<'EOF'
+OS_VERSION=1.13.0
+MACHINE=hailo15-ne503
+PRODUCT=ne503
+EOF
+printf '[Unit]\nDescription=Test\n[Install]\nWantedBy=multi-user.target\n' \
+    >"$DATA/systemd/aipc-restore.service"
+: >"$SYSTEMCTL_LOG"
+if SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+   AIPC_INSTALL_ROOT="$DATA" \
+   AIPC_ROOTFS_PREFIX="$ROOTFS" \
+   AIPC_TEST_COMPAT_GATE_WITH_ROOTFS_PREFIX=1 \
+   AIPC_TEST_ACTIVATE_WITH_ROOTFS_PREFIX=1 \
+   AIPC_SYSTEMCTL="$FAKE_BIN/systemctl" \
+   AIPC_SYSCTL=/bin/true \
+   AIPC_LDCONFIG=/bin/true \
+   "$INSTALLER" >"$TMP/incompat.out" 2>"$TMP/incompat.err"; then
+    :
+else
+    echo "installer aborted on an out-of-range OS verdict" >&2
+    cat "$TMP/incompat.err" >&2
+    exit 1
+fi
+grep -q 'APP_OS_VERSION_UNSUPPORTED' "$TMP/incompat.err" || {
+    echo "installer did not surface the out-of-range verdict" >&2
+    cat "$TMP/incompat.err" >&2
+    exit 1
+}
+grep -q 'rescue channel stays up' "$TMP/incompat.err" || {
+    echo "installer did not log the warn-only continuation" >&2
+    cat "$TMP/incompat.err" >&2
+    exit 1
+}
+grep -qx 'enable aipc-restore.service' "$SYSTEMCTL_LOG" || {
+    echo "installer skipped unit promotion after the warn-only verdict" >&2
+    cat "$SYSTEMCTL_LOG" >&2
+    exit 1
+}
+grep -q '^start --no-block aipc-restore.service' "$SYSTEMCTL_LOG" || {
+    echo "installer did not queue aipc-restore after the warn-only verdict" >&2
+    cat "$SYSTEMCTL_LOG" >&2
+    exit 1
+}
+
 echo "test_aipc_current_root_installer: OK"

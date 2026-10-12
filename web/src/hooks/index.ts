@@ -47,3 +47,4 @@ export {
 } from './useEvents';
 export { useSystemLogs, useServiceLogs } from './useLogs';
 export { useLogout } from './useLogout';
+export { useAppCompat } from './useAppCompat';

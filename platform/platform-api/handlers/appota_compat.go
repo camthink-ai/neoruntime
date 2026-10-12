@@ -18,6 +18,7 @@ type AppPackageCompatibility struct {
 	ErrorCode       string `json:"error_code,omitempty"`
 	Message         string `json:"message,omitempty"`
 	OSVersion       string `json:"os_version,omitempty"`
+	AppVersion      string `json:"app_version,omitempty"`
 	AppMinOSVersion string `json:"app_min_os_version,omitempty"`
 	AppMaxOSVersion string `json:"app_max_os_version,omitempty"`
 }

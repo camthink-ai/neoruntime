@@ -5,7 +5,12 @@ import PCMenu from './pc/menu';
 import MobileMenuDrawer from './mobile/menu-drawer';
 import MobileHeader from './mobile/mobile-header';
 
-import { enableAuth, hasValidAuthToken, isLoginPath, useAuthStore } from '@/store/auth';
+import {
+  enableAuth,
+  hasValidAuthToken,
+  isLoginPath,
+  useAuthStore,
+} from '@/store/auth';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { cn } from '@/lib/utils';
 import Loading from '@/components/loading';
@@ -27,7 +32,7 @@ export default function Layout() {
   useEffect(() => {
     if (navigation.state === 'idle') setBootstrapped(true);
   }, [navigation.state]);
-  const showInitialLoading =    !bootstrapped && navigation.state === 'loading';
+  const showInitialLoading = !bootstrapped && navigation.state === 'loading';
 
   if (enableAuth && !isLoginPage && !hasValidAuthToken()) {
     return <Navigate to="/login" replace />;
@@ -58,8 +63,8 @@ export default function Layout() {
         <main
           className={cn(
             'flex-1 overflow-auto w-full relative bg-background',
-            showMobileChrome
-              && 'mt-[calc(3.5rem+env(safe-area-inset-top,0px))] h-[calc(100dvh-(3.5rem+env(safe-area-inset-top,0px)))]'
+            showMobileChrome &&
+              'mt-[calc(3.5rem+env(safe-area-inset-top,0px))] h-[calc(100dvh-(3.5rem+env(safe-area-inset-top,0px)))]'
           )}
         >
           {showInitialLoading ? <Loading fullHeight /> : <Outlet />}

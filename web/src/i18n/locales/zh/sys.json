@@ -1,5 +1,13 @@
 {
   "sys": {
+    "compatibility": {
+      "banner_title": "当前应用与设备 OS 不兼容，业务功能已停用",
+      "banner_desc": "应用 {{app}} 支持的 OS 范围为 {{min}}–{{max}}，当前设备 OS 为 {{os}}。请安装兼容的应用包以恢复全部功能。",
+      "app_version_label": "应用版本",
+      "supported_os_label": "支持 OS 范围",
+      "current_os_label": "当前设备 OS",
+      "firmware_upgrade_action": "固件升级"
+    },
     "common": {
       "unknown": "未知",
       "actions": "操作",
