@@ -719,9 +719,6 @@ export function OsUpgradeDialog({ open, onOpenChange }: OsUpgradeDialogProps) {
       <Dialog open={open} onOpenChange={handleOpenChange}>
         <DialogContent
           className="max-w-md max-h-[85vh] flex flex-col gap-0 bg-card border-border shadow-xl p-0"
-          // 升级流程敏感，禁止点击遮罩/四周关闭，避免误触中断
-          onInteractOutside={e => e.preventDefault()}
-          onPointerDownOutside={e => e.preventDefault()}
         >
           <DialogHeader className="p-6 pb-4">
             <DialogTitle className="flex items-center gap-2 text-lg font-bold">

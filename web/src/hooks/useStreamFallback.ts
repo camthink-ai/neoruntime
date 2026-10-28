@@ -1,6 +1,24 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { isHevcSupported } from '@/lib/videoStream/hevcSupport';
+import { getItem, setItem } from '@/utils/storage';
 import type { MediaStreamStatus } from '@/hooks/useMediaStatus';
+
+const HEVC_NOTICE_DISMISSED_KEY = 'hevcNoticeDismissed';
+
+/**
+ * "浏览器不支持 H.265"提示条的手动关闭状态，持久化到 localStorage，
+ * 媒体页/图像页/仪表盘预览三个入口共享：任一处关闭后其它入口也不再显示。
+ */
+export function useHevcNoticeDismissal(): [boolean, () => void] {
+  const [dismissed, setDismissed] = useState(
+    () => getItem<boolean>(HEVC_NOTICE_DISMISSED_KEY) === true
+  );
+  const dismiss = useCallback(() => {
+    setItem(HEVC_NOTICE_DISMISSED_KEY, true);
+    setDismissed(true);
+  }, []);
+  return [dismissed, dismiss];
+}
 
 /** Pick the best H.264 stream to fall back to when HEVC can't be decoded. */
 export function findH264Fallback(
@@ -42,6 +60,9 @@ export interface UseStreamFallbackResult {
  * - Probes HEVC MSE support once (`isHevcSupported`); when the browser can't
  *   decode H.265 we proactively play an H.264 stream instead of letting the
  *   player fail with codecMismatch.
+ * - In a browser without HEVC support the notice is persistent: it stays up
+ *   even when the stream is (or has been switched to) H.264, explaining why
+ *   the H265 option is disabled in the encoder config.
  * - Reactive safety net: if the real codec probe (pickMimeCodec, using the
  *   actual SPS) fails after connect (window `wv_error` with
  *   `detail.type === 'codec_mismatch'`), fall back to an H.264 stream.
@@ -86,11 +107,15 @@ export function useStreamFallback({
       };
     }
 
-    if (hevcSupported || selectedCodec !== 'h265') {
+    if (selectedCodec !== 'h265') {
       return {
         effectiveStreamId: activeStream,
         effectiveStreamInfo: selected,
-        codecNotice: null,
+        // 不支持 HEVC 的浏览器持续提示（即使当前码流已是 H264/已自动切回），
+        // 与编码配置中禁用的 H265 选项相呼应；不影响播放。
+        codecNotice: hevcSupported
+          ? null
+          : ('hevc_unsupported_fallback' as CodecNotice),
       };
     }
 

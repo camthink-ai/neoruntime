@@ -1,4 +1,5 @@
 import { Skeleton } from '@/components/ui/skeleton';
+import { Card } from '@/components/ui/card';
 
 export function DeviceInfoSkeleton() {
   return (
@@ -11,29 +12,30 @@ export function DeviceInfoSkeleton() {
             <Skeleton className="h-6 w-24" />
           </div>
 
-          <div className="bg-card rounded-lg shadow-sm overflow-hidden">
-            {/* Row 1 */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3">
-              {[1, 2, 3].map(i => (
-                <div key={i} className="p-4 border-b border-r border-border/50">
-                  <Skeleton className="h-4 w-16 mb-2" />
-                  <Skeleton className="h-5 w-32" />
+          <Card className="overflow-hidden gap-0 p-0 shadow-sm">
+            {/* Mobile: compact label | value table */}
+            <div className="flex flex-col gap-3 p-4 md:hidden">
+              {[1, 2, 3, 4, 5, 6].map(i => (
+                <div key={i} className="flex items-center gap-3">
+                  <Skeleton className="h-4 w-[30%]" />
+                  <Skeleton className="h-5 w-28" />
                 </div>
               ))}
             </div>
-            {/* Row 2 */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3">
-              {[4, 5, 6].map(i => (
-                <div
-                  key={i}
-                  className="p-4 border-b border-r border-border/50 last:border-r-0"
-                >
-                  <Skeleton className="h-4 w-16 mb-2" />
-                  <Skeleton className="h-5 w-32" />
+
+            {/* md+: grid cards */}
+            <div className="hidden md:grid md:grid-cols-3 md:gap-x-6 md:gap-y-4 md:p-4 lg:p-6">
+              {[1, 2, 3, 4, 5, 6].map(i => (
+                <div key={i} className="flex flex-col gap-1">
+                  <Skeleton className="h-4 w-16" />
+                  <div className="flex min-h-8 items-center gap-2">
+                    <Skeleton className="h-5 w-24" />
+                    {i === 1 && <Skeleton className="h-6 w-6 rounded-md" />}
+                  </div>
                 </div>
               ))}
             </div>
-          </div>
+          </Card>
         </section>
 
         {/* Section: 固件与硬件 */}
@@ -43,27 +45,30 @@ export function DeviceInfoSkeleton() {
             <Skeleton className="h-6 w-28" />
           </div>
 
-          <div className="bg-card rounded-lg shadow-sm flex flex-col overflow-hidden">
-            {[1, 2, 3, 4, 5].map(i => (
+          <Card className="py-2 flex flex-col overflow-hidden gap-0 shadow-sm">
+            {[1, 2, 3, 4, 5, 6].map(i => (
               <div
                 key={i}
-                className="flex items-center gap-4 p-4 border-b border-border/50 last:border-b-0"
+                className="flex flex-col gap-3 p-4 md:flex-row md:items-center md:justify-between md:gap-4 md:p-6"
               >
-                <Skeleton className="w-5 h-5 shrink-0" />
-                <div className="flex-1 min-w-0">
-                  <Skeleton className="h-4 w-24 mb-2" />
-                  <Skeleton className="h-4 w-40" />
+                <div className="flex min-w-0 items-center gap-4">
+                  <Skeleton className="h-11 w-11 shrink-0 rounded-lg" />
+                  <div className="flex min-w-0 flex-col gap-1">
+                    <Skeleton className="h-4 w-24" />
+                    <Skeleton className="h-4 w-40" />
+                  </div>
                 </div>
+                {i <= 2 && <Skeleton className="hidden h-9 w-24 md:block" />}
               </div>
             ))}
-          </div>
+          </Card>
         </section>
 
-        {/* Section: Bottom Actions */}
-        <div className="flex flex-wrap gap-4 pt-2">
-          {[1, 2, 3].map(i => (
-            <Skeleton key={i} className="h-11 w-28 rounded-md" />
-          ))}
+        {/* Section: Bottom Actions — mobile: stacked full-width, md+: right-aligned */}
+        <div className="flex flex-col gap-4 pb-6 md:flex-row md:flex-wrap md:justify-end md:gap-4">
+          <Skeleton className="h-11 w-full md:hidden" />
+          <Skeleton className="h-11 w-full md:w-36" />
+          <Skeleton className="h-11 w-full md:w-32" />
         </div>
       </div>
     </div>

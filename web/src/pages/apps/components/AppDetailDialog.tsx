@@ -13,12 +13,14 @@ import {
   RotateCw,
   Trash2,
   ExternalLink,
+  Loader2,
   Video,
   Brain,
   Radio,
   Lightbulb,
   Wifi,
 } from 'lucide-react';
+import { toast } from 'sonner';
 import type { AppTemplate, AppPermissions } from '@/services/types';
 import {
   useInstallApp,
@@ -29,6 +31,7 @@ import {
   useAppPermissions,
 } from '@/hooks';
 import { getAppWebUrl } from '../lib/appWebUrl';
+import { apiErrorText } from '../lib/apiErrorText';
 import { uniqueVideoStreamIds, videoStreamLabelKey } from '../lib/permissionLabels';
 
 function PermissionsPanel({ permissions }: { permissions: AppPermissions }) {
@@ -191,20 +194,40 @@ export default function AppDetailDialog({
 
   if (!app) return null;
 
+  // Mutations fail silently otherwise — the global interceptor stays quiet
+  // on HTTP 500, so every action toasts its own outcome with the backend
+  // detail (mirrors the handlers on the apps page).
+  const notifyError = (message: string, error: unknown) => {
+    const detail = apiErrorText(error);
+    toast.error(message, detail ? { description: detail } : undefined);
+  };
+
   const handleInstall = () => {
-    installMutation.mutate(String(app.id));
+    installMutation.mutate(String(app.id), {
+      onSuccess: () => toast.success(t('sys.apps.message.install_success', '应用安装成功')),
+      onError: error => notifyError(t('sys.apps.message.install_failed', '应用安装失败'), error),
+    });
   };
 
   const handleStart = () => {
-    startMutation.mutate(String(app.id));
+    startMutation.mutate(String(app.id), {
+      onSuccess: () => toast.success(t('sys.apps.message.start_success', '应用启动成功')),
+      onError: error => notifyError(t('sys.apps.message.start_failed', '应用启动失败'), error),
+    });
   };
 
   const handleStop = () => {
-    stopMutation.mutate(String(app.id));
+    stopMutation.mutate(String(app.id), {
+      onSuccess: () => toast.success(t('sys.apps.message.stop_success', '应用停止成功')),
+      onError: error => notifyError(t('sys.apps.message.stop_failed', '应用停止失败'), error),
+    });
   };
 
   const handleRestart = () => {
-    restartMutation.mutate(String(app.id));
+    restartMutation.mutate(String(app.id), {
+      onSuccess: () => toast.success(t('sys.apps.message.restart_success', '应用重启成功')),
+      onError: error => notifyError(t('sys.apps.message.restart_failed', '应用重启失败'), error),
+    });
   };
 
   const handleUninstall = () => {
@@ -237,7 +260,7 @@ export default function AppDetailDialog({
         <DialogHeader className="px-6 pt-6 pb-4 shrink-0">
           <DialogTitle className="sr-only">{displayName}</DialogTitle>
         </DialogHeader>
-        <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-6">
+        <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-4">
           {/* Header */}
           <div className="flex items-start justify-between mb-6">
             <div className="flex gap-4">
@@ -332,70 +355,80 @@ export default function AppDetailDialog({
           {isInstalled && permissions && (
             <PermissionsPanel permissions={permissions} />
           )}
+        </div>
 
-          {/* Actions */}
-          <div className="flex items-center gap-2 pt-4 border-t">
-            {!isInstalled ? (
+        {/* Actions — mirrors the models detail dialog footer: pinned outside
+            the scroll area, right-aligned, Loader2 while an action is pending */}
+        <div className="flex items-center justify-end gap-2 shrink-0 px-6 pb-6">
+          {!isInstalled ? (
+            <Button
+              onClick={handleInstall}
+              disabled={installMutation.isPending}
+            >
+              {installMutation.isPending ? (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              ) : (
+                <Download className="w-4 h-4 mr-2" />
+              )}
+              {installMutation.isPending
+                ? t('sys.apps.action.installing', 'Installing...')
+                : t('sys.apps.action.install', 'Install')}
+            </Button>
+          ) : (
+            <>
               <Button
-                className="bg-primary hover:bg-primary/90 text-primary-foreground"
-                onClick={handleInstall}
-                disabled={installMutation.isPending}
+                variant="outline"
+                onClick={isRunning ? handleStop : handleStart}
+                disabled={startMutation.isPending || stopMutation.isPending}
               >
-                <Download className="h-4 w-4" />
-                {installMutation.isPending
-                  ? t('sys.apps.action.installing', 'Installing...')
-                  : t('sys.apps.action.install', 'Install')}
+                {startMutation.isPending || stopMutation.isPending ? (
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                ) : isRunning ? (
+                  <Square className="w-4 h-4 mr-2" />
+                ) : (
+                  <Play className="w-4 h-4 mr-2" />
+                )}
+                {isRunning
+                  ? t('sys.apps.action.stop', '停止')
+                  : t('sys.apps.action.start', '启动')}
               </Button>
-            ) : (
-              <>
+              {isRunning && (
                 <Button
                   variant="outline"
-                  onClick={isRunning ? handleStop : handleStart}
-                  disabled={startMutation.isPending || stopMutation.isPending}
+                  onClick={handleRestart}
+                  disabled={restartMutation.isPending}
                 >
-                  {isRunning ? (
-                    <>
-                      <Square className="h-4 w-4" />
-                      {t('sys.apps.action.stop', '停止')}
-                    </>
+                  {restartMutation.isPending ? (
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
                   ) : (
-                    <>
-                      <Play className="h-4 w-4" />
-                      {t('sys.apps.action.start', '启动')}
-                    </>
+                    <RotateCw className="w-4 h-4 mr-2" />
                   )}
+                  {t('sys.apps.action.restart', '重启')}
                 </Button>
-                {isRunning && (
-                  <Button
-                    variant="outline"
-                    onClick={handleRestart}
-                    disabled={restartMutation.isPending}
-                  >
-                    <RotateCw className="h-4 w-4" />
-                    {t('sys.apps.action.restart', '重启')}
-                  </Button>
-                )}
-                {isRunning && getAppWebUrl(app) && (
-                  <Button
-                    variant="outline"
-                    onClick={() => window.open(getAppWebUrl(app)!, '_blank')}
-                  >
-                    <ExternalLink className="h-4 w-4" />
-                    {t('sys.apps.action.visit', '访问应用')}
-                  </Button>
-                )}
+              )}
+              {isRunning && getAppWebUrl(app) && (
                 <Button
-                  variant="destructive"
-                  onClick={handleUninstall}
-                  disabled={isUninstalling}
-                  className="ml-auto"
+                  variant="outline"
+                  onClick={() => window.open(getAppWebUrl(app)!, '_blank')}
                 >
-                  <Trash2 className="h-4 w-4" />
-                  {t('sys.apps.action.uninstall', '卸载')}
+                  <ExternalLink className="w-4 h-4 mr-2" />
+                  {t('sys.apps.action.visit', '访问应用')}
                 </Button>
-              </>
-            )}
-          </div>
+              )}
+              <Button
+                variant="outline"
+                onClick={handleUninstall}
+                disabled={isUninstalling}
+              >
+                {isUninstalling ? (
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                ) : (
+                  <Trash2 className="w-4 h-4 mr-2" />
+                )}
+                {t('sys.apps.action.uninstall', '卸载')}
+              </Button>
+            </>
+          )}
         </div>
       </DialogContent>
     </Dialog>

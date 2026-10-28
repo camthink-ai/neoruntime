@@ -4,10 +4,11 @@ import {
   AlertTriangle,
   ExternalLink,
   MonitorPlay,
+  X,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useMediaStatus } from '@/hooks/useMediaStatus';
-import { useStreamFallback } from '@/hooks/useStreamFallback';
+import { useStreamFallback, useHevcNoticeDismissal } from '@/hooks/useStreamFallback';
 import { getItem } from '@/utils/storage';
 import { useState, useRef, useEffect, useCallback } from 'react';
 import Player from '@/components/player/player';
@@ -29,6 +30,8 @@ export default function StreamPreview() {
   const codecFallbackPendingRef = useRef(false);
   const [status, setStatus] = useState<StreamStatus>('loading');
   const [videoUrl, setVideoUrl] = useState('');
+  // 用户手动关闭"浏览器不支持 H.265"提示条（localStorage 持久化，全局共享）
+  const [noticeDismissed, dismissNotice] = useHevcNoticeDismissal();
 
   const { data: mediaStatus, isLoading, error } = useMediaStatus();
   const streams = mediaStatus?.streams ?? [];
@@ -155,15 +158,27 @@ export default function StreamPreview() {
         </Button>
       </div>
 
-      <div className="flex-1 min-h-0 min-w-0 relative bg-secondary/20 rounded-lg overflow-hidden">
-        {codecNotice === 'hevc_unsupported_fallback' && (
-          <div className="absolute left-2 right-2 top-2 z-10 rounded bg-black/60 px-2 py-1 text-[11px] text-white/80">
+      {codecNotice && !noticeDismissed && (
+        <div className="mb-2 flex shrink-0 items-center gap-1.5 rounded-md bg-amber-500/10 px-3 py-1.5 text-xs text-amber-600 dark:text-amber-400">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span className="flex-1">
             {t(
               'sys.monitoring.hevc_unsupported_fallback',
-              'H.265 is unsupported; switched to H.264 playback'
+              '当前浏览器不支持 H.265，请切换到 Chrome 或 Safari 浏览器'
             )}
-          </div>
-        )}
+          </span>
+          <button
+            type="button"
+            className="shrink-0 rounded p-0.5 transition-colors hover:bg-amber-500/20"
+            onClick={() => dismissNotice()}
+            aria-label={t('common.close', '关闭')}
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
+      <div className="flex-1 min-h-0 min-w-0 relative bg-secondary/20 rounded-lg overflow-hidden">
         {isLoading ? (
           <div className="absolute inset-0 flex items-center justify-center">
             <Loading fullHeight={false} size="sm" />
