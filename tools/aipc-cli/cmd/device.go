@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 
 	devicepb "aipc/platform/device-control/proto"
 )
@@ -57,13 +58,13 @@ var deviceStatusCmd = &cobra.Command{
 		printer.Printf("\nLighting:\n")
 		printer.Printf("  White Light:  %d%%\n", status.WhiteLightLevel)
 		printer.Printf("  IR LED:       %d%%\n", status.IrLedLevel)
-	printer.Printf("  IR-Cut:       %s\n", formatIrCutMode(status.IrcutMode))
-	printer.Printf("\nLens:\n")
-	printer.Printf("  Zoom:         %d\n", status.ZoomPos)
-	printer.Printf("  Focus:        %d\n", status.FocusPos)
-	printer.Printf("  Autofocus:    %s\n", formatBool(status.AutofocusEnabled))
-	printer.Printf("\nMCU:\n")
-	printer.Printf("  Version:      %s\n", status.McuVersion)
+		printer.Printf("  IR-Cut:       %s\n", formatIrCutMode(status.IrcutMode))
+		printer.Printf("\nLens:\n")
+		printer.Printf("  Zoom:         %d\n", status.ZoomPos)
+		printer.Printf("  Focus:        %d\n", status.FocusPos)
+		printer.Printf("  Autofocus:    %s\n", formatBool(status.AutofocusEnabled))
+		printer.Printf("\nMCU:\n")
+		printer.Printf("  Version:      %s\n", status.McuVersion)
 		return nil
 	},
 }
@@ -571,6 +572,9 @@ Examples:
 		if err != nil {
 			return err
 		}
+		if token := viper.GetString("auth.token"); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
 		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("platform API unreachable at %s: %w", deviceAPIBase, err)
@@ -586,12 +590,19 @@ Examples:
 				DriftSeconds int64  `json:"drift_seconds"`
 				Plausible    bool   `json:"plausible"`
 			} `json:"data"`
+			Error struct {
+				Detail string `json:"detail"`
+			} `json:"error"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
 			return fmt.Errorf("invalid response from platform API: %w", err)
 		}
 		if envelope.Code != 0 {
-			return fmt.Errorf("MCU RTC read failed: %s", envelope.Message)
+			detail := envelope.Message
+			if envelope.Error.Detail != "" {
+				detail = fmt.Sprintf("%s (%s)", envelope.Message, envelope.Error.Detail)
+			}
+			return fmt.Errorf("MCU RTC read failed: %s", detail)
 		}
 
 		if outputFmt == "json" || outputFmt == "yaml" {

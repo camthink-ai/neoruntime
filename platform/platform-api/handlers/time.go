@@ -841,6 +841,16 @@ type McuRtcTime struct {
 	Plausible    bool   `json:"plausible"`
 }
 
+// mcuRTCTimeFromPayload decodes the 7-byte host_link_rtc_tm_t BIN payload
+// (year 0-99 / 2000-based, month, day, weekday byte ignored, hh, mm, ss)
+// into a UTC time — the mirror of the SET payload built by
+// mcuRTCPayloadFromTime. Callers must check the length first.
+func mcuRTCTimeFromPayload(payload []byte) time.Time {
+	return time.Date(
+		2000+int(payload[0]), time.Month(payload[1]), int(payload[2]),
+		int(payload[4]), int(payload[5]), int(payload[6]), 0, time.UTC)
+}
+
 // GetMcuRtcTime reads the MCU RTC back over the raw host-link path. The boot
 // flow only ever pushes time host→MCU (boot_prep and the post-set syncs), so
 // this readback is the only way to verify the sync landed and to spot a dead
@@ -878,12 +888,7 @@ func (h *TimeHandler) GetMcuRtcTime(c *gin.Context) {
 		return
 	}
 
-	// host_link_rtc_tm_t: BIN year 0-99 (2000-based), month 1-12, day 1-31,
-	// weekday 1-7, 24h time — the mirror of the SET payload built in
-	// mcuRTCPayloadFromTime. The RTC itself runs in UTC.
-	mcuTime := time.Date(
-		2000+int(payload[0]), time.Month(payload[1]), int(payload[2]),
-		int(payload[4]), int(payload[5]), int(payload[6]), 0, time.UTC)
+	mcuTime := mcuRTCTimeFromPayload(payload)
 	hostNow := time.Now().UTC()
 	drift := hostNow.Unix() - mcuTime.Unix()
 	if drift < 0 {
