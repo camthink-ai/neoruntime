@@ -166,6 +166,30 @@ const otaStatus = (patch: Record<string, unknown>) => ({
   ...patch,
 });
 
+beforeEach(() => localStorage.clear());
+
+describe('firmware OTA recovery', () => {
+  it('resumes polling for a recent saved job and ignores another job’s terminal status', () => {
+    vi.clearAllMocks();
+    localStorage.setItem('aipc.firmware-ota.active', JSON.stringify({ jobId: 'saved-job', savedAt: Date.now() }));
+    render(<FirmwareUpdateDialog open={false} onOpenChange={vi.fn()} />);
+    expect(mocks.startPolling).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('system-mask')).toHaveTextContent('正在写入固件');
+    act(() => {
+      expect(mocks.polling.onSuccess({ status: otaStatus({ job_id: 'other-job' }) })).toBe(false);
+    });
+    expect(localStorage.getItem('aipc.firmware-ota.active')).not.toBeNull();
+  });
+
+  it('discards expired recovery records', () => {
+    vi.clearAllMocks();
+    localStorage.setItem('aipc.firmware-ota.active', JSON.stringify({ jobId: 'old-job', savedAt: Date.now() - 3 * 60 * 60 * 1000 }));
+    render(<FirmwareUpdateDialog open={false} onOpenChange={vi.fn()} />);
+    expect(mocks.startPolling).not.toHaveBeenCalled();
+    expect(localStorage.getItem('aipc.firmware-ota.active')).toBeNull();
+  });
+});
+
 describe('FirmwareUpdateDialog OTA reboot polling', () => {
   beforeEach(() => {
     vi.clearAllMocks();
