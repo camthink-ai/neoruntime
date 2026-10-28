@@ -502,6 +502,16 @@ paths:
                   type: integer
                 input_height:
                   type: integer
+                estimated_tops:
+                  type: number
+                  format: float
+                  minimum: 0
+                  description: Replaces the file's estimate (TOPS); 0 clears the stored value.
+                estimated_memory:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  description: Replaces the file's estimate (MiB); 0 clears the stored value.
       responses:
         '200':
           description: Model updated
@@ -7209,7 +7219,7 @@ components:
           description: Optional precomputed compiler/package estimate in TOPS; 0 means unavailable.
         estimated_memory:
           type: integer
-          format: uint32
+          format: int32
           minimum: 0
           description: Optional compiler/package memory estimate in MiB; 0 means unavailable.
         load_timestamp:

@@ -1284,7 +1284,9 @@ describe('withReplacementFileFacts', () => {
         file_size: 1024,
         network_name: 'yolov8n',
         vstream_info: '{}',
-        // absent input dims must NOT surface (UpdateModel: explicit 0 = clear)
+        // absent input dims must NOT surface (UpdateModel: explicit 0 = clear);
+        // absent estimates MUST surface as 0 — they belong to the replaced
+        // file, so keeping the old values would lie about the new one.
       })
     ).toEqual({
       model_id: 'm1',
@@ -1292,7 +1294,20 @@ describe('withReplacementFileFacts', () => {
       file_size: 1024,
       network_name: 'yolov8n',
       vstream_info: '{}',
+      estimated_tops: 0,
+      estimated_memory: 0,
     });
+  });
+
+  it('passes parsed estimates through untouched', () => {
+    const preview = { model_id: 'm1' };
+    expect(
+      withReplacementFileFacts(preview, {
+        file_hash: 'abc',
+        estimated_tops: 1.75,
+        estimated_memory: 96,
+      })
+    ).toMatchObject({ estimated_tops: 1.75, estimated_memory: 96 });
   });
 });
 

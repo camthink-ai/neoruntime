@@ -471,12 +471,11 @@ export default function ImportModelDialog({
                 ...(parseResult.input_height != null && {
                   input_height: parseResult.input_height,
                 }),
-                ...(parseResult.estimated_tops != null && {
-                  estimated_tops: parseResult.estimated_tops,
-                }),
-                ...(parseResult.estimated_memory != null && {
-                  estimated_memory: parseResult.estimated_memory,
-                }),
+                // The estimates belong to the replaced file: when the new
+                // package carries none, an explicit 0 clears the previous
+                // file's values instead of silently keeping them.
+                estimated_tops: parseResult.estimated_tops ?? 0,
+                estimated_memory: parseResult.estimated_memory ?? 0,
               }
             : {}),
         },

@@ -908,6 +908,13 @@ export function withReplacementFileFacts(
     const value = facts[key];
     if (value !== undefined && value !== null) merged[key] = value;
   }
+  // The estimates describe the replaced file, not the form: when the new
+  // package carries none, an explicit 0 clears the previous values so the
+  // diff (and the update built from it) cannot silently keep them.
+  if (merged.file_hash != null) {
+    if (facts.estimated_tops == null) merged.estimated_tops = 0;
+    if (facts.estimated_memory == null) merged.estimated_memory = 0;
+  }
   return merged;
 }
 
