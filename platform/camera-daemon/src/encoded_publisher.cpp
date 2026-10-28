@@ -608,13 +608,9 @@ void EncodedPublisher::check_client_control(StreamState& ss, ClientInfo& c) {
         if (ctrl == CTRL_REQUEST_KEYFRAME && keyframe_request_fn_) {
             // HAL_LOG_INFO("EncodedPublisher [%s]: Keyframe request from client fd=%d",
             //            ss.config.name.c_str(), c.fd);
-            try {
-                keyframe_request_fn_(ss.config.name);
-            } catch (const std::exception& e) {
-                HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed: %s", e.what());
-            } catch (...) {
-                HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed (unknown)");
-            }
+            // Rate-limited (1/s, like the send path): without it a client
+            // toggling this control floods the encoder with IDR requests.
+            maybe_request_keyframe(ss);
         }
     }
 }

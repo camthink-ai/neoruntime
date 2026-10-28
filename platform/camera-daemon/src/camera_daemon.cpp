@@ -1124,6 +1124,28 @@ bool CameraDaemon::get_transform_config(aipc::camera::TransformConfig& config) {
     return true;
 }
 
+// RAII wrapper for EncoderManager's rebuild gate (HIGH-2): while set,
+// force_keyframe() returns -1 instead of touching FROM_MEDIA codec contexts
+// that MediaLibrary may be freeing during a pipeline stop->reinit->start
+// window. release() drops the gate once resync repopulated the contexts.
+class RebuildGateGuard {
+public:
+    explicit RebuildGateGuard(EncoderManager* mgr) : mgr_(mgr) {
+        if (mgr_) mgr_->set_rebuild_active(true);
+    }
+    ~RebuildGateGuard() { release(); }
+    RebuildGateGuard(const RebuildGateGuard&) = delete;
+    RebuildGateGuard& operator=(const RebuildGateGuard&) = delete;
+    void release() {
+        if (mgr_) {
+            mgr_->set_rebuild_active(false);
+            mgr_ = nullptr;
+        }
+    }
+private:
+    EncoderManager* mgr_;
+};
+
 bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& config,
                                         bool* persisted_ok) {
     // Out-param starts false so every early-return path below reads as "not
@@ -1242,6 +1264,9 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
     // are stopped, so no callbacks fire (mirrors switch_profile).
     lock.unlock();
 
+    // Gate force_keyframe() across the medialib reinit this call may
+    // perform (rotation / flip fallback frees borrowed codec contexts).
+    RebuildGateGuard rebuild_gate(encoder_mgr_.get());
     int ret = media_ops->dynamic_change_image_config(media_ctx_, &ic);
     const bool full_reinit = (ret == HAL_REINIT_PERFORMED);
 
@@ -1309,6 +1334,7 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
         // (read) — they run with op_mu_ released (consumers stopped), matching
         // switch_profile.
         resync_encoders_from_media_pipeline();
+        rebuild_gate.release();  // contexts repopulated after full reinit
 #ifdef HAS_GRPC
         reapply_osd_config_after_pipeline_rebuild("transform reinit");
         reapply_isp_config_after_pipeline_rebuild("transform reinit");
@@ -2571,6 +2597,11 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
             }
         };
 
+        // Gate force_keyframe() across the stop->override->start window below:
+        // MediaLibrary frees the borrowed FROM_MEDIA codec contexts while
+        // EncoderManager still points at them. RAII clears the gate on every
+        // exit path; released right after resync repopulates the contexts.
+        RebuildGateGuard rebuild_gate(encoder_mgr_.get());
         if (need_pipeline_restart && media_ops->stop) {
             HAL_LOG_INFO("CameraDaemon: Stopping pipeline for encoder reconfigure (dimension/fps/codec change)");
             int stop_ret = media_ops->stop(media_ctx_);
@@ -2627,6 +2658,10 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
                     autofocus_controller_->update_video_context(video_source_->video_ctx());
                     autofocus_controller_->start();
                 }
+                // Re-enable auto feed: the gate set "before encoder reconfigure" would
+                // otherwise stay latched forever on this failure path (mirrors the
+                // success path's "after ISP replay" re-enable).
+                set_auto_feed_after_reconfigure(true, "after failed pipeline restart");
                 response.set_success(false);
                 response.set_message("Pipeline restart failed: " + std::to_string(sr));
                 response.set_interrupt_ms(interrupt_ms);
@@ -2655,6 +2690,7 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
             const bool video_source_rebound =
                 resync_video_source_from_media_pipeline("encoder reconfigure restart");
             resync_encoders_from_media_pipeline();
+            rebuild_gate.release();  // codec contexts repopulated
             reapply_isp_config_after_pipeline_rebuild("encoder reconfigure restart");
             reapply_osd_config_after_pipeline_rebuild("encoder reconfigure restart");
 
@@ -2695,6 +2731,19 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
             if (request.fps() > 0) ec.fps = request.fps();
             if (request.gop() > 0) ec.gop = request.gop();
             break;
+        }
+        // A codec switch leaves the encoded publisher advertising the old codec:
+        // new socket clients gate on a keyframe flagged for the old codec and
+        // starve (e.g. H.264 -> H.265). add_stream() is idempotent - it replaces
+        // the existing entry (socket + clients), like init_encoded_publisher.
+        if (!request.codec().empty() && request.codec() != target_before.codec && encoded_pub_) {
+            const auto& ec = config_.encoders[target_idx];
+            EncodedPublisher::StreamConfig sc;
+            sc.name = ec.stream_name;
+            sc.codec = ec.codec;
+            sc.width = ec.width;
+            sc.height = ec.height;
+            encoded_pub_->add_stream(sc, config_.encoded_pub_dir);
         }
         lock.unlock();
 
@@ -2745,6 +2794,19 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
     if (request.bitrate_bps() > 0) config_.encoders[target_idx].bitrate = request.bitrate_bps();
     if (request.fps() > 0) config_.encoders[target_idx].fps = request.fps();
     if (request.gop() > 0) config_.encoders[target_idx].gop = request.gop();
+    // A codec switch leaves the encoded publisher advertising the old codec:
+    // new socket clients gate on a keyframe flagged for the old codec and
+    // starve (e.g. H.264 -> H.265). add_stream() is idempotent - it replaces
+    // the existing entry (socket + clients), like init_encoded_publisher.
+    if (!request.codec().empty() && request.codec() != target_before.codec && encoded_pub_) {
+        const auto& ec = config_.encoders[target_idx];
+        EncodedPublisher::StreamConfig sc;
+        sc.name = ec.stream_name;
+        sc.codec = ec.codec;
+        sc.width = ec.width;
+        sc.height = ec.height;
+        encoded_pub_->add_stream(sc, config_.encoded_pub_dir);
+    }
 
     HAL_LOG_INFO("CameraDaemon: Reconfigured encoder %s (interrupt: %ums)",
                  stream_name.c_str(), interrupt_ms);
@@ -5032,7 +5094,10 @@ bool CameraDaemon::init_encoders() {
             auto* cc = static_cast<HalCodecContext*>(clist[i]);
             std::string media_name(cc->codec_name);
             if (media_name.empty()) { i++; continue; }
+            {
+                std::lock_guard<std::mutex> enc_lk(enc_name_mu_);
             encoder_name_map_[media_name] = config_.encoders[enc_idx].stream_name;
+            }
 
             // Override YAML encoder params with pipeline actual values
             auto& ec = config_.encoders[enc_idx];
@@ -5344,8 +5409,15 @@ bool CameraDaemon::init_encoded_publisher() {
     if (encoder_mgr_) {
         encoded_pub_->set_keyframe_request_cb(
             [this](const std::string& stream_name) {
+                // Snapshot under enc_name_mu_: stream add/remove/reconfigure can
+                // rehash the map concurrently (this callback runs without op_mu_).
+                std::unordered_map<std::string, std::string> enc_names;
+                {
+                    std::lock_guard<std::mutex> lk(enc_name_mu_);
+                    enc_names = encoder_name_map_;
+                }
                 std::string enc_name = stream_name;
-                for (auto& [mn, cn] : encoder_name_map_) {
+                for (auto& [mn, cn] : enc_names) {
                     if (cn == stream_name) { enc_name = mn; break; }
                 }
                 //HAL_LOG_DEBUG("CameraDaemon: Plugin requested keyframe for %s", stream_name.c_str());
@@ -5398,8 +5470,15 @@ bool CameraDaemon::init_rtsp() {
     rtsp_server_->set_keyframe_request_cb(
         [this](const std::string& stream_name) {
             if (encoder_mgr_) {
+                // Snapshot under enc_name_mu_: stream add/remove/reconfigure can
+                // rehash the map concurrently (this callback runs without op_mu_).
+                std::unordered_map<std::string, std::string> enc_names;
+                {
+                    std::lock_guard<std::mutex> lk(enc_name_mu_);
+                    enc_names = encoder_name_map_;
+                }
                 std::string enc_name = stream_name;
-                for (auto& [mn, cn] : encoder_name_map_) {
+                for (auto& [mn, cn] : enc_names) {
                     if (cn == stream_name) { enc_name = mn; break; }
                 }
                 HAL_LOG_INFO("RTSP: Requesting keyframe for %s", stream_name.c_str());
@@ -6749,7 +6828,10 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
                     << "\"width\":" << ec.width << ","
                     << "\"height\":" << ec.height << ","
                     << "\"framerate\":" << ec.fps << "}";
+                {
+                    std::lock_guard<std::mutex> enc_lk(enc_name_mu_);
                 encoder_name_map_[sink_name] = stream_id;
+                }
             }
             oss << "]";
 
@@ -6843,7 +6925,10 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
                 auto* cc = static_cast<HalCodecContext*>(static_cast<void**>(codec_list)[i]);
                 std::string media_name(cc->codec_name);
                 if (!media_name.empty()) {
+                    {
+                        std::lock_guard<std::mutex> enc_lk(enc_name_mu_);
                     encoder_name_map_[media_name] = config_.encoders[enc_idx].stream_name;
+                    }
                     auto& e = config_.encoders[enc_idx];
                     e.width = cc->config.width;
                     e.height = cc->config.height;
@@ -7128,7 +7213,10 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
 
         // Reacquire lock for config_ / encoder_name_map_ mutations
         lock.lock();
+        {
+            std::lock_guard<std::mutex> enc_lk(enc_name_mu_);
         encoder_name_map_[media_name] = stream_id;
+        }
         HAL_LOG_INFO("CameraDaemon: encoder_name_map[%s] = %s", media_name.c_str(), stream_id.c_str());
 
         // Update config
@@ -7566,6 +7654,7 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
     // by a different stream, relabeling that stream.
     {
         std::unique_lock<std::shared_mutex> map_lock(op_mu_);
+        std::lock_guard<std::mutex> enc_lk(enc_name_mu_);
         for (auto it = encoder_name_map_.begin(); it != encoder_name_map_.end(); ++it) {
             if (it->second == stream_name) {
                 video_name_map_.erase(it->first);
@@ -7761,6 +7850,9 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
     // 2. Switch profile (MediaLibrary handles pipeline restart internally).
     // force_recycle=false: normal switch — let same-layout take the fast path; the frame verify below
     // catches the 0-frame case and the rollback there uses force_recycle=true.
+    // Profile switch rebuilds the media pipeline: gate force_keyframe()
+    // while the borrowed codec contexts are freed and re-created.
+    RebuildGateGuard rebuild_gate(encoder_mgr_.get());
     int ret = media_ops->switch_profile(media_ctx_, profile_name.c_str(), false);
     if (ret < 0) {
         HAL_LOG_ERROR("CameraDaemon: switch_profile to '%s' failed: %d, rolling back to '%s'",
@@ -8058,6 +8150,7 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
     lock.unlock();
 
     resync_encoders_from_media_pipeline();
+    rebuild_gate.release();  // new codec contexts registered
 #ifdef HAS_GRPC
     reapply_osd_config_after_pipeline_rebuild("profile switch");
     reapply_isp_config_after_pipeline_rebuild("profile switch");
@@ -8154,6 +8247,8 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
                 // emits 0 frames (that's why we're here). The same-layout fast path would only reconnect
                 // bridges and NOT reset the wedged graph — forcing the full stop/start recycle is what
                 // turns a double-black into self-healing instead of requiring a reboot.
+                // Rollback re-switches profiles: same freed-context window.
+                RebuildGateGuard rollback_gate(encoder_mgr_.get());
                 int rb = media_ops->switch_profile(media_ctx_, prev_profile.c_str(), true);
                 if (rb < 0) {
                     HAL_LOG_ERROR("CameraDaemon: rollback to '%s' after verify-fail also failed: %d",
@@ -8165,6 +8260,7 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
                     // (The ret<0 path skips this: a failed forward switch may not
                     // have touched the pipeline, so old contexts can stay valid.)
                     resync_encoders_from_media_pipeline();
+                    rollback_gate.release();  // rolled-back codec contexts registered
 #ifdef HAS_GRPC
                     reapply_osd_config_after_pipeline_rebuild("profile switch rollback");
                     reapply_isp_config_after_pipeline_rebuild("profile switch rollback");
@@ -8476,6 +8572,10 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
 
     // 3. Reconfigure pipeline (~2s)
     auto start_time = std::chrono::steady_clock::now();
+    // HAL reconfigure_pipeline rebuilds the media pipeline; gate
+    // force_keyframe() while the borrowed codec contexts are freed
+    // and re-created.
+    RebuildGateGuard rebuild_gate(encoder_mgr_.get());
     int ret = media_ops->reconfigure_pipeline(media_ctx_, &hal_reconfig);
     auto end_time = std::chrono::steady_clock::now();
     uint32_t interrupt_ms = static_cast<uint32_t>(
@@ -8625,7 +8725,11 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
             // encoder_name_map_ instead of assigned by list index. Otherwise
             // removing "sub" would relabel third's codec as "sub" (resurrecting
             // the removed stream in config while third silently disappears).
-            const auto old_encoder_names = encoder_name_map_;
+            std::unordered_map<std::string, std::string> old_encoder_names;
+            {
+                std::lock_guard<std::mutex> enc_lk(enc_name_mu_);
+                old_encoder_names = encoder_name_map_;
+            }
             std::unordered_map<std::string, EncoderCfg> old_encoders;
             for (const auto& e : config_.encoders) {
                 if (old_encoders.count(e.stream_name)) {
@@ -8637,7 +8741,10 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
             }
 
             config_.encoders.clear();
-            encoder_name_map_.clear();
+            {
+                std::lock_guard<std::mutex> enc_lk(enc_name_mu_);
+                encoder_name_map_.clear();
+            }
             void** clist = static_cast<void**>(codec_list);
             const char* kCanonicalEncNames[] = {"main", "sub", "third"};
             bool enc_canonical_used[3] = {false, false, false};
@@ -8720,7 +8827,10 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
                 }
                 config_.encoders.push_back(ec);
 
+                {
+                    std::lock_guard<std::mutex> enc_lk(enc_name_mu_);
                 encoder_name_map_[pipeline_name] = display_name;
+                }
             }
 
             // Config entries whose encoder is gone from the pipeline are NOT
@@ -8745,6 +8855,7 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
     lock.unlock();
 
     resync_encoders_from_media_pipeline();
+    rebuild_gate.release();  // rebuilt codec contexts registered
     restore_image_config_if_cached();
     reapply_osd_config_after_pipeline_rebuild("pipeline reconfigure");
     reapply_isp_config_after_pipeline_rebuild("pipeline reconfigure");

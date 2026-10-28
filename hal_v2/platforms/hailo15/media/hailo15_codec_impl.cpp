@@ -1401,6 +1401,10 @@ static int hailo15_codec_force_idr(void *codec_ctx)
     {
         return HAL_ERR_INVALID_ARG;
     }
+    /* Hold priv->mutex across the lookup and the call: media reinit can free
+       the borrowed encoder between them (same protection hw_codec_force_idr
+       takes via hp->mutex on the HW path). */
+    std::lock_guard<std::recursive_mutex> lock(priv->mutex);
     MediaLibraryEncoderPtr enc = from_media_encoder(priv, cc);
     if (!enc)
     {

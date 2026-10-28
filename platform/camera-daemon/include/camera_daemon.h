@@ -770,6 +770,10 @@ private:
     // e.g. "sink0" → "main", "sink1" → "sub"
     std::unordered_map<std::string, std::string> video_name_map_;
     std::unordered_map<std::string, std::string> encoder_name_map_;
+    // Guards encoder_name_map_: keyframe callbacks (publisher/RTSP threads,
+    // no op_mu_) snapshot the map under this lock; mutators take it inside
+    // their op_mu_ scope so a concurrent rehash cannot race them.
+    std::mutex enc_name_mu_;
     bool has_media_pipeline() const {
         return media_ctx_ != nullptr;
     }

@@ -11,6 +11,7 @@
 #include <string>
 #include <unordered_map>
 #include <functional>
+#include <atomic>
 #include <mutex>
 #include <chrono>
 #include <cstdint>
@@ -49,6 +50,16 @@ public:
 
     void destroy(const std::string& stream_name);
     void destroy_all();
+
+    /**
+     * Gate keyframe requests during pipeline rebuilds. MediaLibrary frees
+     * borrowed FROM_MEDIA contexts on reinit while encoders_ still maps the
+     * stale pointers (cleared later by resync/discard_from_media); callers
+     * must set this across every stop->start media reinit window so
+     * force_keyframe() returns -1 instead of touching freed contexts.
+     */
+    void set_rebuild_active(bool active) { rebuild_active_.store(active); }
+    bool is_rebuild_active() const { return rebuild_active_.load(); }
 
     /**
      * Forget locally registered FROM_MEDIA contexts without calling HAL.
@@ -123,6 +134,7 @@ private:
     };
 
     HalCodecOps* ops_;
+    std::atomic<bool> rebuild_active_{false};
 
     bool subscribe_output(void* ctx, const std::string& stream_name);
     mutable std::mutex mu_;

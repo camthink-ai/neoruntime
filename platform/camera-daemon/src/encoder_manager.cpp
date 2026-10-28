@@ -161,15 +161,16 @@ int EncoderManager::set_gop(const std::string& stream_name, uint32_t gop) {
 }
 
 int EncoderManager::force_keyframe(const std::string& stream_name) {
-    void* ctx = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        auto it = encoders_.find(stream_name);
-        if (it == encoders_.end()) return -1;
-        ctx = it->second.codec_ctx;
-    }
+    // During media reinit the borrowed FROM_MEDIA ctx is freed while
+    // encoders_ still maps the stale pointer; the gate keeps us out.
+    if (is_rebuild_active()) return -1;
     if (!ops_ || !ops_->force_idr) return -1;
-    return ops_->force_idr(ctx);
+    // Hold mu_ across the HAL call: without it, destroy() on another thread
+    // can erase and deinit/free the ctx between our lookup and force_idr.
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = encoders_.find(stream_name);
+    if (it == encoders_.end()) return -1;
+    return ops_->force_idr(it->second.codec_ctx);
 }
 
 int EncoderManager::reconfigure(const std::string& stream_name,

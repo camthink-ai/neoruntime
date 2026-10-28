@@ -65,8 +65,23 @@ int main() {
     std::strncpy(address.sun_path, socket_path.c_str(), sizeof(address.sun_path) - 1);
     assert(::connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
 
-    // Give the accept loop time to install the new client before publishing.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Wait (bounded poll) for the accept loop to install the new client
+    // before publishing - a fixed sleep flakes under scheduler load.
+    {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(2);
+        EncodedPublisher::StreamDropStats stats{};
+        bool client_installed = false;
+        while (!client_installed &&
+               std::chrono::steady_clock::now() < deadline) {
+            client_installed =
+                publisher.get_stream_stats("main", &stats) && stats.clients == 1;
+            if (!client_installed) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        assert(client_installed);
+    }
 
     const uint8_t p_frame[] = {0x00, 0x00, 0x00, 0x01, 0x41, 0x01};
     publish(publisher, p_frame, sizeof(p_frame));
