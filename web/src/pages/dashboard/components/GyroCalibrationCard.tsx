@@ -78,12 +78,9 @@ const DIR_LABEL_DEFS = [
   { key: 'sys.gyro.left', fallback: '左倾', pos: [0, -2.3, 0] },
 ] as const;
 
-// 胶囊底取主题卡片/边框色（与 HUD 角标同款），保证文字在网格线/薄板
-// 上有对比度；画布按文字实际宽度定尺寸，长文案（如 "Front tilt"）不裁切
+// 画布按文字实际宽度定尺寸，长文案（如 "Front tilt"）不裁切。
 interface DirLabelTheme {
   fg: string;
-  bg: string;
-  border: string;
 }
 
 const DIR_LABEL_HEIGHT = 0.36;
@@ -108,22 +105,6 @@ function drawDirLabelTexture(text: string, theme: DirLabelTheme) {
   cvs.width = W;
   cvs.height = H;
   const ctx = cvs.getContext('2d')!;
-  // 胶囊描边计入内边距，避免贴边裁切
-  const lw = 4;
-  const m = lw / 2 + 2;
-  const r = (H - m * 2) / 2;
-  ctx.beginPath();
-  ctx.moveTo(m + r, m);
-  ctx.arcTo(W - m, m, W - m, H - m, r);
-  ctx.arcTo(W - m, H - m, m, H - m, r);
-  ctx.arcTo(m, H - m, m, m, r);
-  ctx.arcTo(m, m, W - m, m, r);
-  ctx.closePath();
-  ctx.fillStyle = theme.bg;
-  ctx.fill();
-  ctx.lineWidth = lw;
-  ctx.strokeStyle = theme.border;
-  ctx.stroke();
   ctx.fillStyle = theme.fg;
   ctx.font = font;
   ctx.textAlign = 'center';
@@ -219,8 +200,6 @@ export default function GyroCalibrationCard() {
   const dirLabelsRef = useRef<Sprite[]>([]);
   const dirLabelThemeRef = useRef<DirLabelTheme>({
     fg: 'rgba(255,255,255,0.92)',
-    bg: '#1f1f1f',
-    border: '#3a3634',
   });
 
   useEffect(() => {
@@ -367,11 +346,9 @@ export default function GyroCalibrationCard() {
       }),
     );
     scene.add(refGrid);
-    // 前后/左右四向倾角标：胶囊底/文字统一取主题变量（跟随明暗主题）
+    // 前后/左右四向倾角标的文字跟随主题。
     const labelTheme: DirLabelTheme = {
       fg: themeColor('--foreground', 'rgba(255,255,255,0.92)'),
-      bg: themeColor('--card', '#1f1f1f'),
-      border: themeColor('--border', '#3a3634'),
     };
     dirLabelThemeRef.current = labelTheme;
     const dirLabels = DIR_LABEL_DEFS.map((d) => {
@@ -509,18 +486,30 @@ export default function GyroCalibrationCard() {
     };
   }, []);
 
-  // 语言切换后重绘四向倾角标纹理（精灵纹理在初始化 effect 中生成，不会随重渲染变化）；
-  // 新文案宽度不同，精灵宽高比需同步更新
+  // 语言或主题变化时重绘纹理，并同步文字宽度。
   useEffect(() => {
-    DIR_LABEL_DEFS.forEach((d, i) => {
-      const sp = dirLabelsRef.current[i];
-      if (!sp) return;
-      const prev = sp.material.map;
-      sp.material.map = drawDirLabelTexture(t(d.key, d.fallback), dirLabelThemeRef.current);
-      sp.material.needsUpdate = true;
-      applyDirLabelScale(sp);
-      prev?.dispose();
+    const updateLabels = () => {
+      const theme: DirLabelTheme = {
+        fg: themeColor('--foreground', 'rgba(255,255,255,0.92)'),
+      };
+      dirLabelThemeRef.current = theme;
+      DIR_LABEL_DEFS.forEach((d, i) => {
+        const sp = dirLabelsRef.current[i];
+        if (!sp) return;
+        const prev = sp.material.map;
+        sp.material.map = drawDirLabelTexture(t(d.key, d.fallback), theme);
+        sp.material.needsUpdate = true;
+        applyDirLabelScale(sp);
+        prev?.dispose();
+      });
+    };
+    updateLabels();
+    const observer = new MutationObserver(updateLabels);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class', 'data-theme', 'data-color-theme', 'style'],
     });
+    return () => observer.disconnect();
   }, [t]);
 
   return (
