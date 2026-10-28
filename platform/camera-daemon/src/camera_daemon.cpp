@@ -7452,11 +7452,34 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
     auto* media_ops = hal_loader_ ? hal_loader_->media() : nullptr;
     lock.unlock();
 
-    if (media_ops && media_ctx_) {
-        // Disable auto-feed before removing, so no frames are delivered during teardown
-        if (encoder_auto_feed_enabled_.load() && media_ops->set_encoder_auto_feed_for_stream) {
-            media_ops->set_encoder_auto_feed_for_stream(media_ctx_, enc_name.c_str(), false);
+    // Removing one stream rebuilds the complete MediaLibrary pipeline (the
+    // HAL remove call routes to a full ML destroy+recreate that also restarts
+    // the pipeline), so every REMAINING encoder receives a new frontend
+    // generation too. Hold encoder input while the rebuilt contexts are
+    // rebound and the persisted ISP/OSD state is replayed. Otherwise resync
+    // re-subscribes mid-GOP of the restarted encoders and still-connected
+    // clients' first packets are P-frames referencing an IDR they never saw
+    // — a brief corruption flash on the surviving stream. Mirrors the
+    // add_stream gating.
+    const bool can_gate_layout_feed =
+        encoder_auto_feed_enabled_.load() && media_ops && media_ops->set_encoder_auto_feed;
+    bool layout_feed_gated = false;
+    auto set_layout_auto_feed = [&](bool enable, const char* phase) {
+        if (!can_gate_layout_feed) return;
+        const int ar = media_ops->set_encoder_auto_feed(media_ctx_, enable);
+        if (ar < 0) {
+            HAL_LOG_WARNING("CameraDaemon: set_encoder_auto_feed(%s) %s failed: %d",
+                            enable ? "true" : "false", phase, ar);
+            return;
         }
+        layout_feed_gated = !enable;
+        HAL_LOG_INFO("CameraDaemon: encoder auto-feed %s %s",
+                     enable ? "resumed" : "gated", phase);
+    };
+
+    set_layout_auto_feed(false, "before stream removal");
+
+    if (media_ops && media_ctx_) {
 
         // Destroy ALL local encoder entries first — their codec_ctx pointers
         // will be invalidated by the pipeline reconfig below.
@@ -7500,6 +7523,12 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
         // Non-FROM_MEDIA path: just destroy the one encoder
         encoder_mgr_->destroy(enc_name);
     }
+
+    // A full MediaLibrary reinit restores the HAL's default feed state and
+    // has already started the pipeline inside the removal call. Close that
+    // window before the rebuilt encoder subscriptions go live and before
+    // replaying the tuned image state.
+    set_layout_auto_feed(false, "before stream-removal state replay");
 
     // Update video_source_ contexts — remove_streams_batch may have rebuilt
     // the pipeline and freed old video contexts, leaving stale pointers.
@@ -7551,6 +7580,29 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
     restore_image_config_if_cached();
     reapply_osd_config_after_pipeline_rebuild("stream removal");
     reapply_isp_config_after_pipeline_rebuild("stream removal");
+
+    // Arm every surviving encoder for a clean first frame while feeding is
+    // still gated. The first frontend buffer released below is therefore
+    // encoded as an IDR from the replayed, stable pipeline state.
+    if (encoder_mgr_ && layout_feed_gated) {
+        std::vector<std::string> surviving_encoder_ids;
+        {
+            std::shared_lock<std::shared_mutex> map_lock(op_mu_);
+            surviving_encoder_ids.reserve(encoder_name_map_.size());
+            for (const auto& [media_id, config_name] : encoder_name_map_) {
+                (void)config_name;
+                surviving_encoder_ids.push_back(media_id);
+            }
+        }
+        for (const auto& media_id : surviving_encoder_ids) {
+            const int kf = encoder_mgr_->force_keyframe(media_id);
+            if (kf < 0) {
+                HAL_LOG_WARNING("CameraDaemon: force keyframe for %s after stream removal failed: %d",
+                                media_id.c_str(), kf);
+            }
+        }
+    }
+    set_layout_auto_feed(true, "after stream-removal state replay");
 
     // EncodedPublisher: close UDS socket and remove stream entry.
     if (encoded_pub_)

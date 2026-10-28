@@ -148,6 +148,7 @@ private:
         std::atomic<uint64_t> client_send_failures{0};
         std::atomic<uint64_t> client_disconnects{0};
         std::atomic<uint64_t> last_packet_seq{0};
+        std::atomic<uint64_t> last_pts_ns{0};      // last valid pts (invalid-ts replacement)
         std::atomic<int64_t> last_keyframe_req_ms{0};  // steady-clock ms, IDR rate limit
         std::atomic<bool>    encoder_health_alarm_latched{false};  // one-shot, see check_encoder_health
     };

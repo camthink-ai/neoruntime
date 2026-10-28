@@ -374,8 +374,27 @@ void EncodedPublisher::on_packet(const std::string& stream_name, const HalPacket
     // All parsing (keyframe detection) and framing happens in dispatch_loop.
     auto qp = std::make_unique<QueuedPacket>();
     qp->stream_name = stream_name;
-    qp->timestamp_ns = packet->timestamp_ns;
-    qp->dts_ns = packet->timestamp_ns;
+
+    // Replace invalid encoder timestamps ((uint64_t)-1 on parameter-set
+    // buffers, 0 on unstamped ones) with the stream's last valid pts. The
+    // platform-api bridge divides this field into a 90 kHz uint32 — an
+    // unmapped -1 truncates to garbage. Nothing else is rewritten: the
+    // browser players consume the encoder's native (burst-shuffled) pts
+    // timeline fine in steady state; sanitizing regressions or synthesizing
+    // frame steps changes the statistics those players pace by and made
+    // playback visibly worse (stall / spring artifacts).
+    {
+        auto& st = *it->second;
+        uint64_t pts = packet->timestamp_ns;
+        if (pts == UINT64_MAX || pts == 0) {
+            pts = st.last_pts_ns.load(std::memory_order_relaxed);
+        }
+        if (pts != 0) {
+            st.last_pts_ns.store(pts, std::memory_order_relaxed);
+        }
+        qp->timestamp_ns = pts;
+        qp->dts_ns = pts;
+    }
     qp->raw_size = packet->size;
     qp->raw_data.assign(packet->data, packet->data + packet->size);
 

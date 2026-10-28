@@ -809,6 +809,7 @@ export default class H264Player {
         data: {
           data: frameData,
           codec: '',
+          pts90kHz,
         },
       });
       return;
