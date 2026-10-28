@@ -369,8 +369,14 @@ public:
 
     /**
      * @brief Update ISP settings using HAL v2 ISP ops
+     *
+     * @param force_apply bypass the same-value dedup: replay callers (boot,
+     *        profile switch, pipeline rebuild) re-push a persisted snapshot
+     *        onto hardware the rebuild just reset to profile defaults, so
+     *        cache equality there says nothing about the hardware state.
      */
-    bool update_isp_settings(const aipc::camera::ISPUpdateRequest& request);
+    bool update_isp_settings(const aipc::camera::ISPUpdateRequest& request,
+                             bool force_apply = false);
 
     /**
      * @brief Get current ISP configuration

@@ -507,7 +507,9 @@ bool CameraDaemon::init(const DaemonConfig& config) {
                          persisted.auto_exposure() ? 1 : 0,
                          persisted.noise_reduction(), persisted.wdr_value(),
                          persisted.powerline_freq(), persisted.awb_index());
-            update_isp_settings(persisted);
+            // force_apply: the persisted snapshot typically equals the boot
+            // cache, and hardware here still carries profile defaults.
+            update_isp_settings(persisted, /*force_apply=*/true);
         }
     }
 #endif
@@ -926,7 +928,8 @@ static bool isp_image_group_changed(const aipc::camera::ISPUpdateRequest& reques
     return false;
 }
 
-bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& request) {
+bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& request,
+                                       bool force_apply) {
     auto* isp_ops = hal_loader_ ? hal_loader_->isp() : nullptr;
     if (!isp_ops) {
         HAL_LOG_WARNING("CameraDaemon: ISP ops not available");
@@ -946,8 +949,8 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
     // This correctly handles value=0 (e.g., brightness=0) as a valid setting
     const bool manual_requested = request.has_manual_mode() || request.has_brightness()
         || request.has_contrast() || request.has_saturation() || request.has_sharpness();
-    const bool manual_changed =
-        manual_requested && isp_manual_group_changed(request, cached_isp_state_.manual_config);
+    const bool manual_changed = manual_requested
+        && (force_apply || isp_manual_group_changed(request, cached_isp_state_.manual_config));
     if (manual_changed) {
         HalIspManualConfig mc = cached_isp_state_.manual_config;
         if (request.has_manual_mode())  mc.manual_state = request.manual_mode();
@@ -970,8 +973,8 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
     // Apply exposure config
     const bool exposure_requested = request.has_auto_exposure() || request.has_backlight()
         || request.has_exposure_time_us() || request.has_gain();
-    const bool exposure_changed =
-        exposure_requested && isp_exposure_group_changed(request, cached_isp_state_.exposure_config);
+    const bool exposure_changed = exposure_requested
+        && (force_apply || isp_exposure_group_changed(request, cached_isp_state_.exposure_config));
     if (exposure_changed) {
         HalIspExposureConfig ec = cached_isp_state_.exposure_config;
         if (request.has_auto_exposure())    ec.auto_exposure   = request.auto_exposure();
@@ -993,8 +996,8 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
     // Apply full image config (noise reduction, WDR, powerline freq, AWB)
     const bool image_requested = request.has_noise_reduction() || request.has_wdr_value()
         || request.has_powerline_freq() || request.has_awb_index();
-    const bool image_changed =
-        image_requested && isp_image_group_changed(request, cached_isp_state_);
+    const bool image_changed = image_requested
+        && (force_apply || isp_image_group_changed(request, cached_isp_state_));
     if (image_changed) {
         HalIspImageConfig ic = cached_isp_state_;
         if (request.has_noise_reduction()) ic.noise_reduction = request.noise_reduction();
@@ -1019,7 +1022,9 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
 
     // Pure no-op request: every requested value already matches the applied
     // state — nothing was sent to HAL, so there is nothing new to persist.
-    if (!manual_changed && !exposure_changed && !image_changed) {
+    // Never taken on force_apply replays: those re-push onto rebuilt hardware
+    // regardless of cache equality.
+    if (!force_apply && !manual_changed && !exposure_changed && !image_changed) {
         HAL_LOG_INFO("CameraDaemon: ISP update no-op (all requested values already applied)");
         return true;
     }
@@ -3219,7 +3224,9 @@ bool CameraDaemon::reapply_isp_config_after_pipeline_rebuild(const char* reason)
         return true;
     }
 
-    if (!update_isp_settings(persisted)) {
+    // force_apply: the rebuild reloaded profile defaults into the ISP while
+    // the cache (and this persisted snapshot) still hold the web-tuned values.
+    if (!update_isp_settings(persisted, /*force_apply=*/true)) {
         HAL_LOG_WARNING("CameraDaemon: ISP replay after %s failed",
                         reason ? reason : "pipeline rebuild");
         return false;
