@@ -53,6 +53,10 @@ type PlayerProps = {
 const STREAM_STATS_KEY = 'deviceToolStreamStatsVisible';
 const TRANSFORM_STREAM_RESUME_TIMEOUT = 15000;
 const FROZEN_FRAME_RELEASE_DELAY_MS = 500;
+// WebCodecs never presents frames through the <video> element, so the
+// rVFC-based release below can stay pending forever. Hard upper bound on how
+// long the frozen layer may cover the player.
+const FROZEN_FRAME_MAX_HOLD_MS = 2000;
 
 export default function Player({
   videoUrl,
@@ -143,6 +147,7 @@ export default function Player({
   const streamRestartingRef = useRef(streamRestarting);
   const pendingVideoFrameCallbackRef = useRef<number | null>(null);
   const frozenFrameReleaseTimerRef = useRef<number | null>(null);
+  const frozenFrameMaxHoldTimerRef = useRef<number | null>(null);
   const [videoDimensions, setVideoDimensions] = useState({
     width: streamWidth ?? 0,
     height: streamHeight ?? 0,
@@ -172,6 +177,31 @@ export default function Player({
 
     const video = videoRef.current;
     const canvas = frozenFrameRef.current;
+
+    // A second restart can land while the previous release (pending rVFC or
+    // release timer) is still armed. Cancel both so they can't fire against
+    // the new session, then re-arm the unconditional max-hold fallback.
+    if (
+      video
+      && pendingVideoFrameCallbackRef.current !== null
+      && typeof video.cancelVideoFrameCallback === 'function'
+    ) {
+      video.cancelVideoFrameCallback(pendingVideoFrameCallbackRef.current);
+    }
+    pendingVideoFrameCallbackRef.current = null;
+    if (frozenFrameReleaseTimerRef.current !== null) {
+      window.clearTimeout(frozenFrameReleaseTimerRef.current);
+      frozenFrameReleaseTimerRef.current = null;
+    }
+    if (frozenFrameMaxHoldTimerRef.current !== null) {
+      window.clearTimeout(frozenFrameMaxHoldTimerRef.current);
+      frozenFrameMaxHoldTimerRef.current = null;
+    }
+    frozenFrameMaxHoldTimerRef.current = window.setTimeout(() => {
+      frozenFrameMaxHoldTimerRef.current = null;
+      setFrozenFrame(false);
+    }, FROZEN_FRAME_MAX_HOLD_MS);
+
     if (!video || !canvas || video.videoWidth <= 0 || video.videoHeight <= 0) {
       return;
     }
@@ -200,6 +230,9 @@ export default function Player({
     }
     if (frozenFrameReleaseTimerRef.current !== null) {
       window.clearTimeout(frozenFrameReleaseTimerRef.current);
+    }
+    if (frozenFrameMaxHoldTimerRef.current !== null) {
+      window.clearTimeout(frozenFrameMaxHoldTimerRef.current);
     }
   }, []);
 
@@ -588,8 +621,10 @@ export default function Player({
             pendingVideoFrameCallbackRef.current = video.requestVideoFrameCallback(
               () => {
                 pendingVideoFrameCallbackRef.current = null;
+                if (streamRestartingRef.current) return;
                 frozenFrameReleaseTimerRef.current = window.setTimeout(() => {
                   frozenFrameReleaseTimerRef.current = null;
+                  if (streamRestartingRef.current) return;
                   setFrozenFrame(false);
                 }, FROZEN_FRAME_RELEASE_DELAY_MS);
               }
@@ -598,8 +633,10 @@ export default function Player({
             // requestVideoFrameCallback is available in the supported Chromium
             // browsers; this fallback still waits one paint before revealing.
             window.requestAnimationFrame(() => {
+              if (streamRestartingRef.current) return;
               frozenFrameReleaseTimerRef.current = window.setTimeout(() => {
                 frozenFrameReleaseTimerRef.current = null;
+                if (streamRestartingRef.current) return;
                 setFrozenFrame(false);
               }, FROZEN_FRAME_RELEASE_DELAY_MS);
             });
@@ -812,6 +849,7 @@ export default function Player({
         {!loading
           && !configuring
           && !isTransformUpdating
+          && !streamRestarting
           && connectionState === 'disconnected' && (
             <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-3">
               <WifiOff

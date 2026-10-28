@@ -200,15 +200,6 @@ export default function MediaSettings({
     onEncoderConfiguringChange,
   ]);
 
-  // Any encoder reconfiguration in flight (codec/resolution full reconfig, or
-  // bitrate/fps/gop hot reload). While true the codec & resolution dropdowns
-  // and the fps/bitrate/gop/dimension inputs stay disabled so a second change
-  // can't race the in-flight request — otherwise persistStreamConfig's
-  // early-return guard would silently drop an edit mid-save (UI shows the new
-  // value but it never reaches the device).
-  const isSavingEncoder = (
-    isPreparingPipelineRestart || isUpdatingEncoder || isReconfiguringEncoder
-  );
   const {
     mutate: enableStreamMutate,
     isPending: isEnablingStream,
@@ -219,6 +210,21 @@ export default function MediaSettings({
     isPending: isDisablingStream,
     variables: disablingStreamId,
   } = useDisableStream();
+
+  // Any encoder reconfiguration in flight (codec/resolution full reconfig,
+  // bitrate/fps/gop hot reload, or a stream enable/disable — those rebuild the
+  // same pipeline). While true the codec & resolution dropdowns and the
+  // fps/bitrate/gop/dimension inputs stay disabled so a second change can't
+  // race the in-flight request — otherwise persistStreamConfig's early-return
+  // guard would silently drop an edit mid-save (UI shows the new value but it
+  // never reaches the device).
+  const isSavingEncoder = (
+    isPreparingPipelineRestart
+    || isUpdatingEncoder
+    || isReconfiguringEncoder
+    || isEnablingStream
+    || isDisablingStream
+  );
 
   // Codec/resolution changes and stream enable/disable all rebuild the complete
   // MediaLibrary pipeline. The preparation flag is raised one animation frame
