@@ -160,6 +160,13 @@ int EncoderManager::set_gop(const std::string& stream_name, uint32_t gop) {
     return ops_->dynamic_change_config(ctx, &cfg);
 }
 
+namespace {
+// Bounded drain for in-flight force_keyframe() HAL calls before a context
+// is torn down. medialib's force_idr has no deadline of its own; past this
+// the teardown aborts rather than racing the call.
+constexpr int kKeyframeDrainTimeoutMs = 2000;
+}  // namespace
+
 int EncoderManager::force_keyframe(const std::string& stream_name) {
     // During media reinit the borrowed FROM_MEDIA ctx is freed while
     // encoders_ still maps the stale pointer; the gate keeps us out.
@@ -193,15 +200,17 @@ int EncoderManager::force_keyframe(const std::string& stream_name) {
     return rc;
 }
 
-void EncoderManager::wait_keyframe_calls_drained(int timeout_ms) {
+bool EncoderManager::wait_keyframe_calls_drained(int timeout_ms) {
     std::unique_lock<std::mutex> lock(mu_);
-    if (!keyframe_drained_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+    if (keyframe_drained_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
             [this] { return keyframes_in_flight_ == 0; })) {
-        HAL_LOG_ERROR("EncoderManager: force_idr still in flight after %dms "
-                      "(stalled encode pipeline?); proceeding — a borrowed ctx "
-                      "may be recycled under the call",
-                      timeout_ms);
+        return true;
     }
+    HAL_LOG_ERROR("EncoderManager: force_idr still in flight after %dms "
+                  "(stalled encode pipeline?); callers must abort the "
+                  "teardown — recycling the ctx now would race the call",
+                  timeout_ms);
+    return false;
 }
 
 int EncoderManager::reconfigure(const std::string& stream_name,
@@ -302,14 +311,18 @@ void EncoderManager::on_packet(void* codec_ctx, const HalPacketBuffer* packet) {
 // === Shared methods ===
 
 void EncoderManager::destroy(const std::string& stream_name) {
-    // An in-flight force_keyframe() captured the ctx pointer and may still
-    // be inside the HAL with it — wait (bounded) before erasing/deiniting.
-    wait_keyframe_calls_drained();
     void* ctx = nullptr;
     bool was_running = false;
     bool is_from_media = false;
+    bool drained = true;
     {
-        std::lock_guard<std::mutex> lock(mu_);
+        // Erase the slot FIRST, inside the same critical section in-flight
+        // force_keyframe() calls increment under: once the entry is gone no
+        // new call can capture the ctx, so one bounded wait right here
+        // closes the capture/free race completely. (Waiting in a separate
+        // step before the erase re-opened it — a call could enter between
+        // the wait and the erase.)
+        std::unique_lock<std::mutex> lock(mu_);
         auto it = encoders_.find(stream_name);
         if (it == encoders_.end()) return;
 
@@ -319,6 +332,22 @@ void EncoderManager::destroy(const std::string& stream_name) {
 
         handle_to_stream_.erase(ctx);
         encoders_.erase(it);
+        drained = keyframe_drained_cv_.wait_for(
+            lock, std::chrono::milliseconds(kKeyframeDrainTimeoutMs),
+            [this] { return keyframes_in_flight_ == 0; });
+    }
+
+    if (!drained) {
+        // A force_keyframe() call is still inside the HAL occupying this ctx.
+        // Stopping/freeing it now would race that call (use-after-free);
+        // leak the HAL context and fail loudly instead. Manager-side state
+        // is already consistent (slot erased); recovery is a daemon restart,
+        // which the publisher's health alarm escalates anyway.
+        HAL_LOG_ERROR("EncoderManager: destroy('%s') aborted before HAL "
+                      "teardown — force_idr still in flight after %dms; "
+                      "leaking the codec ctx rather than racing the call",
+                      stream_name.c_str(), kKeyframeDrainTimeoutMs);
+        return;
     }
 
     // FROM_MEDIA contexts are owned by media pipeline — skip start/stop/deinit

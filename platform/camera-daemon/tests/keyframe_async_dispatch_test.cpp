@@ -8,7 +8,13 @@
 //      CTRL/probe path — a blocked callback must not block stats/probe.
 //   2. EncoderManager::force_keyframe does not hold mu_ across the HAL
 //      call — has_encoder() stays responsive while force_idr is stuck.
-//   3. destroy() drains an in-flight call (bounded) before erasing.
+//   3. destroy() erases the slot and drains an in-flight call in ONE
+//      critical section: while a stuck call occupies the ctx, destroy is
+//      blocked, no new caller can capture the ctx, and once the call
+//      returns the teardown completes.
+//   4. When the drain times out, destroy() aborts the HAL teardown — it
+//      must NOT stop/unsubscribe/deinit a ctx the stuck call still occupies
+//      (use-after-free); the ctx leaks with an ERROR log instead.
 
 #include "encoded_publisher.h"
 #include "encoder_manager.h"
@@ -142,9 +148,61 @@ void test_manager_does_not_hold_mu_across_force_idr() {
     g_idr_release.store(true);
     caller.join();
 
-    // --- Part 3: destroy() drains an in-flight call before erasing ---
+    // --- Part 3: destroy() races a stuck in-flight call, atomically ---
+    // The drain-then-erase order let a new call capture the ctx between the
+    // wait and the erase; the erase now happens first (inside mu_), so the
+    // slot is gone the moment destroy enters its critical section.
     g_idr_release.store(false);
+    g_idr_in_calls.store(0);
     std::thread caller2([&] { mgr.force_keyframe("main"); });
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (g_idr_in_calls.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(g_idr_in_calls.load() > 0);  // call is inside the "HAL"
+    }
+    std::atomic<bool> destroy_done{false};
+    std::thread destroyer([&] {
+        mgr.destroy("main");
+        destroy_done.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    // destroy() must still be waiting in its bounded drain: the stuck call
+    // still occupies the ctx, and freeing it under the call is a UAF.
+    assert(!destroy_done.load());
+    // ...but the slot is already erased — a NEW caller cannot capture the
+    // ctx anymore (this is the atomicity the old order missed).
+    assert(!mgr.has_encoder("main"));
+    assert(mgr.force_keyframe("main") == -1);
+
+    g_idr_release.store(true);
+    caller2.join();
+    destroyer.join();
+    assert(destroy_done.load());
+    assert(!mgr.has_encoder("main"));
+}
+
+std::atomic<int> g_unsubscribes{0};
+
+int mock_unsubscribe(void*, HalCodecFrameCallback) {
+    ++g_unsubscribes;
+    return 0;
+}
+
+void test_destroy_aborts_hal_teardown_on_drain_timeout() {
+    // Contract 4: on drain timeout destroy() returns WITHOUT running the
+    // HAL teardown (stop/unsubscribe/deinit would race the stuck call).
+    HalCodecOps ops{};
+    ops.force_idr = mock_force_idr;
+    ops.unsubscribe = mock_unsubscribe;  // FROM_MEDIA destroy path would call this
+    EncoderManager mgr(&ops);
+    assert(mgr.create_from_context("aux", reinterpret_cast<void*>(0x5678)));
+
+    g_unsubscribes.store(0);
+    g_idr_in_calls.store(0);
+    g_idr_release.store(false);
+    std::thread caller([&] { mgr.force_keyframe("aux"); });
     {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (g_idr_in_calls.load() == 0 && std::chrono::steady_clock::now() < deadline) {
@@ -152,10 +210,14 @@ void test_manager_does_not_hold_mu_across_force_idr() {
         }
         assert(g_idr_in_calls.load() > 0);
     }
-    g_idr_release.store(true);  // let the call return; destroy() drains it
-    caller2.join();
-    mgr.destroy("main");
-    assert(!mgr.has_encoder("main"));
+
+    // Blocks ~2s in the drain, then aborts: no unsubscribe, slot still gone.
+    mgr.destroy("aux");
+    assert(g_unsubscribes.load() == 0);  // teardown aborted, not raced
+    assert(!mgr.has_encoder("aux"));
+
+    g_idr_release.store(true);  // let the stuck call return; ctx leaks by design
+    caller.join();
 }
 
 }  // namespace
@@ -163,5 +225,6 @@ void test_manager_does_not_hold_mu_across_force_idr() {
 int main() {
     test_publisher_ctrl_does_not_block_on_callback();
     test_manager_does_not_hold_mu_across_force_idr();
+    test_destroy_aborts_hal_teardown_on_drain_timeout();
     return 0;
 }

@@ -1140,7 +1140,7 @@ public:
             mgr_->set_rebuild_active(true);
             // Media reinit frees borrowed FROM_MEDIA ctxs without going
             // through destroy(): drain calls already inside the HAL first.
-            mgr_->wait_keyframe_calls_drained();
+            drained_ = mgr_->wait_keyframe_calls_drained();
         }
     }
     ~RebuildGateGuard() { release(); }
@@ -1152,8 +1152,15 @@ public:
             mgr_ = nullptr;
         }
     }
+    // False when the drain timed out: a force_keyframe() call is wedged
+    // inside the HAL still occupying a codec ctx, and the media reinit this
+    // guard was raised for MUST be aborted — proceeding would free the ctx
+    // mid-call (use-after-free), exactly what the gate exists to prevent.
+    // Every guard site checks this before touching the pipeline.
+    bool ok() const { return drained_; }
 private:
     EncoderManager* mgr_;
+    bool drained_ = true;
 };
 
 bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& config,
@@ -1277,6 +1284,17 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
     // Gate force_keyframe() across the medialib reinit this call may
     // perform (rotation / flip fallback frees borrowed codec contexts).
     RebuildGateGuard rebuild_gate(encoder_mgr_.get());
+    if (!rebuild_gate.ok()) {
+        // A wedged force_idr still occupies a borrowed codec ctx; the
+        // reinit below would free it mid-call. Mirror the ret<0 rejection
+        // (restore pm coordinates, restart pre-stopped consumers).
+        remap_privacy_mask_flip(&cached_pm_items_, new_flip, old_flip);
+        HAL_LOG_ERROR("CameraDaemon: transform change aborted — keyframe call wedged in HAL");
+        if (rotation_changed) {
+            restart_data_consumers();
+        }
+        return false;
+    }
     int ret = media_ops->dynamic_change_image_config(media_ctx_, &ic);
     const bool full_reinit = (ret == HAL_REINIT_PERFORMED);
 
@@ -2612,6 +2630,14 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
         // EncoderManager still points at them. RAII clears the gate on every
         // exit path; released right after resync repopulates the contexts.
         RebuildGateGuard rebuild_gate(encoder_mgr_.get());
+        if (!rebuild_gate.ok()) {
+            // Nothing has been mutated yet (pipeline stop comes next);
+            // refusing here leaves the encoder exactly as it was.
+            HAL_LOG_ERROR("CameraDaemon: encoder reconfigure aborted — keyframe call wedged in HAL");
+            response.set_success(false);
+            response.set_message("Encoder keyframe request is wedged; reconfigure aborted, retry after the encoder recovers");
+            return false;
+        }
         if (need_pipeline_restart && media_ops->stop) {
             HAL_LOG_INFO("CameraDaemon: Stopping pipeline for encoder reconfigure (dimension/fps/codec change)");
             int stop_ret = media_ops->stop(media_ctx_);
@@ -7868,6 +7894,17 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
     // Profile switch rebuilds the media pipeline: gate force_keyframe()
     // while the borrowed codec contexts are freed and re-created.
     RebuildGateGuard rebuild_gate(encoder_mgr_.get());
+    if (!rebuild_gate.ok()) {
+        // The forward switch never ran — the pipeline (and prev_profile) is
+        // untouched, so refuse before touching medialib and let the RPC
+        // surface a retryable cause.
+        HAL_LOG_ERROR("CameraDaemon: profile switch to '%s' aborted — keyframe call wedged in HAL",
+                      profile_name.c_str());
+        if (message) {
+            *message = "keyframe request wedged in the encoder; profile switch aborted, retry after recovery";
+        }
+        return false;
+    }
     int ret = media_ops->switch_profile(media_ctx_, profile_name.c_str(), false);
     if (ret < 0) {
         HAL_LOG_ERROR("CameraDaemon: switch_profile to '%s' failed: %d, rolling back to '%s'",
@@ -8264,8 +8301,18 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
                 // turns a double-black into self-healing instead of requiring a reboot.
                 // Rollback re-switches profiles: same freed-context window.
                 RebuildGateGuard rollback_gate(encoder_mgr_.get());
-                int rb = media_ops->switch_profile(media_ctx_, prev_profile.c_str(), true);
-                if (rb < 0) {
+                const bool rollback_clear_to_run = rollback_gate.ok();
+                int rb = rollback_clear_to_run
+                    ? media_ops->switch_profile(media_ctx_, prev_profile.c_str(), true)
+                    : -1;
+                if (!rollback_clear_to_run) {
+                    // A wedged force_idr still occupies a codec ctx of the
+                    // current (verify-failed) graph; the forced recycle would
+                    // free it mid-call. Stay on the new profile and report
+                    // honestly below (rolled_back stays false).
+                    HAL_LOG_ERROR("CameraDaemon: rollback to '%s' aborted — keyframe call wedged in HAL",
+                                  prev_profile.c_str());
+                } else if (rb < 0) {
                     HAL_LOG_ERROR("CameraDaemon: rollback to '%s' after verify-fail also failed: %d",
                                   prev_profile.c_str(), rb);
                 } else {
@@ -8591,6 +8638,16 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
     // force_keyframe() while the borrowed codec contexts are freed
     // and re-created.
     RebuildGateGuard rebuild_gate(encoder_mgr_.get());
+    if (!rebuild_gate.ok()) {
+        // Consumers were stopped in section 2 — bring them back before
+        // refusing, mirroring the ret<0 path below.
+        HAL_LOG_ERROR("CameraDaemon: pipeline reconfigure aborted — keyframe call wedged in HAL");
+        response.set_success(false);
+        response.set_message("Encoder keyframe request is wedged; reconfigure aborted, retry after the encoder recovers");
+        response.set_interrupt_ms(0);
+        restart_consumers_after_failure();
+        return false;
+    }
     int ret = media_ops->reconfigure_pipeline(media_ctx_, &hal_reconfig);
     auto end_time = std::chrono::steady_clock::now();
     uint32_t interrupt_ms = static_cast<uint32_t>(

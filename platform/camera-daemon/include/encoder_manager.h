@@ -66,10 +66,12 @@ public:
      * Bounded wait for in-flight force_keyframe() HAL calls to return.
      * Teardown paths that recycle borrowed FROM_MEDIA contexts (rebuild
      * windows, destroy) drain first so a call that already captured the ctx
-     * pointer is not still inside the HAL when the ctx goes away. On timeout
-     * logs ERROR and proceeds — medialib's force_idr has no deadline.
+     * pointer is not still inside the HAL when the ctx goes away. Returns
+     * false on timeout — the caller MUST abort the teardown it was about to
+     * run: medialib's force_idr has no deadline, and recycling a ctx the
+     * call still occupies is a use-after-free, not an acceptable fallback.
      */
-    void wait_keyframe_calls_drained(int timeout_ms = 2000);
+    bool wait_keyframe_calls_drained(int timeout_ms = 2000);
 
     /**
      * Forget locally registered FROM_MEDIA contexts without calling HAL.
