@@ -22,6 +22,12 @@
 //   6. Creating a same-name encoder while a teardown is parked is rejected
 //      (it would overwrite and permanently leak the old ctx); after the
 //      tombstone is reclaimed, creation works again.
+//   7. A parked/claimed teardown is owned by exactly ONE destroy() call:
+//      a concurrent destroy() of the same name refuses (false) instead of
+//      running stop/unsubscribe/deinit a second time on the same ctx.
+//   8. Two concurrent same-name creates produce exactly one registration:
+//      the loser fails at name reservation BEFORE touching the HAL, so no
+//      subscription or ctx is leaked by the overwrite.
 
 #include "encoded_publisher.h"
 #include "encoder_manager.h"
@@ -199,6 +205,13 @@ int mock_unsubscribe(void*, HalCodecFrameCallback) {
     return 0;
 }
 
+std::atomic<int> g_subscribes{0};
+
+int mock_subscribe(void*, HalCodecFrameCallback, void*) {
+    ++g_subscribes;
+    return 0;
+}
+
 std::atomic<int> g_releases{0};
 
 int mock_release_packet(void*, HalPacketBuffer*) {
@@ -297,6 +310,93 @@ void test_closing_packets_released_and_create_gated() {
     assert(mgr.has_encoder("aux"));
 }
 
+void test_concurrent_destroy_claims_tombstone_once() {
+    // Contract 7: while one destroy() owns a parked teardown, a concurrent
+    // destroy() of the same name must refuse — double stop/unsubscribe/
+    // deinit on one ctx is a double-free for standalone encoders.
+    HalCodecOps ops{};
+    ops.force_idr = mock_force_idr;
+    ops.unsubscribe = mock_unsubscribe;
+    EncoderManager mgr(&ops);
+    assert(mgr.create_from_context("aux", reinterpret_cast<void*>(0xC0DE)));
+
+    g_unsubscribes.store(0);
+    g_idr_in_calls.store(0);
+    g_idr_release.store(false);
+    std::thread caller([&] { mgr.force_keyframe("aux"); });
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (g_idr_in_calls.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(g_idr_in_calls.load() > 0);
+    }
+
+    // First destroy parks the slot (claimed) and blocks in the bounded drain.
+    std::atomic<bool> destroy_done{false};
+    std::atomic<bool> destroy_ok{false};
+    std::thread destroyer([&] {
+        destroy_ok.store(mgr.destroy("aux"));
+        destroy_done.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    assert(!destroy_done.load());  // parked and draining, teardown owned
+
+    // The concurrent destroy must refuse promptly (claim observed), NOT
+    // spend its own 2s drain or run a second teardown after a timeout.
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool second = mgr.destroy("aux");
+    const auto refused_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+    assert(!second);
+    assert(refused_ms < 500);
+    assert(!destroy_done.load());  // first destroy still owns the teardown
+
+    g_idr_release.store(true);
+    caller.join();
+    destroyer.join();
+    assert(destroy_ok.load());             // owner completed the teardown
+    assert(g_unsubscribes.load() == 1);    // exactly ONE teardown ran
+    assert(!mgr.has_encoder("aux"));
+}
+
+void test_concurrent_same_name_create_single_winner() {
+    // Contract 8: two concurrent create_from_context() calls for one name
+    // must produce exactly one registration; the loser fails at the name
+    // reservation BEFORE touching the HAL (no orphan subscription).
+    HalCodecOps ops{};
+    ops.subscribe = mock_subscribe;
+    ops.force_idr = mock_force_idr;
+    ops.unsubscribe = mock_unsubscribe;
+    EncoderManager mgr(&ops);
+
+    g_subscribes.store(0);
+    g_unsubscribes.store(0);
+    std::atomic<int> wins{0};
+    auto make = [&](void* ctx) {
+        if (mgr.create_from_context("aux", ctx)) wins.fetch_add(1);
+    };
+    std::thread a([&] { make(reinterpret_cast<void*>(0xAAAA)); });
+    std::thread b([&] { make(reinterpret_cast<void*>(0xBBBB)); });
+    a.join();
+    b.join();
+
+    // Exactly one HAL subscription ever happens, whichever way the race
+    // resolves: the reservation loser fails fast with false; a caller that
+    // only arrives AFTER the winner registered gets the pre-existing
+    // idempotent "already exists" == true. Both must end with exactly one
+    // destroyable registration and no orphan subscription.
+    assert(wins.load() >= 1);
+    assert(g_subscribes.load() == 1);   // never two subscribes for one name
+    assert(mgr.has_encoder("aux"));
+
+    // The winner's teardown is clean and unambiguous.
+    assert(mgr.destroy("aux"));
+    assert(g_unsubscribes.load() == 1);
+    assert(!mgr.has_encoder("aux"));
+}
+
 }  // namespace
 
 int main() {
@@ -304,5 +404,7 @@ int main() {
     test_manager_does_not_hold_mu_across_force_idr();
     test_destroy_aborts_hal_teardown_on_drain_timeout();
     test_closing_packets_released_and_create_gated();
+    test_concurrent_destroy_claims_tombstone_once();
+    test_concurrent_same_name_create_single_winner();
     return 0;
 }

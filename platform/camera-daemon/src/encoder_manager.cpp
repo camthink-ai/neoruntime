@@ -42,6 +42,14 @@ bool EncoderManager::create(const std::string& stream_name,
         // ctx — reclaim it before registering a new one, or the next
         // destroy would silently overwrite (and permanently leak) it.
         needs_reclaim = closing_teardowns_.count(stream_name) > 0;
+        if (!needs_reclaim && !creating_names_.insert(stream_name).second) {
+            // Reserve the name across the unlocked HAL phase below: without
+            // it two concurrent creates both pass this check and the later
+            // insert overwrites (and leaks) the earlier ctx.
+            HAL_LOG_WARNING("EncoderManager: create('%s') lost a concurrent "
+                            "create race", stream_name.c_str());
+            return false;
+        }
     }
     if (needs_reclaim) {
         HAL_LOG_INFO("EncoderManager: create('%s') reclaiming parked teardown first",
@@ -52,12 +60,27 @@ bool EncoderManager::create(const std::string& stream_name,
                           stream_name.c_str());
             return false;
         }
+        {
+            // Re-reserve after the reclaim window: a concurrent create may
+            // have taken the name while mu_ was released around destroy().
+            std::lock_guard<std::mutex> lock(mu_);
+            if (encoders_.count(stream_name) ||
+                !creating_names_.insert(stream_name).second) {
+                HAL_LOG_WARNING("EncoderManager: create('%s') lost a concurrent "
+                                "create race during reclaim", stream_name.c_str());
+                return false;
+            }
+        }
     }
 
-    std::lock_guard<std::mutex> lock(mu_);
+    // HAL creation runs without mu_ — the reservation owns the name.
     void* ctx = nullptr;
     int ret = ops_->init(&config, &ctx);
     if (ret < 0 || !ctx) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            creating_names_.erase(stream_name);
+        }
         HAL_LOG_ERROR("EncoderManager: init failed for %s: %d",
                      stream_name.c_str(), ret);
         return false;
@@ -65,6 +88,10 @@ bool EncoderManager::create(const std::string& stream_name,
 
     if (!subscribe_output(ctx, stream_name)) {
         ops_->deinit(ctx);
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            creating_names_.erase(stream_name);
+        }
         return false;
     }
 
@@ -74,8 +101,12 @@ bool EncoderManager::create(const std::string& stream_name,
     slot.running = false;
     slot.created_at = std::chrono::steady_clock::now();
 
-    encoders_[stream_name] = slot;
-    handle_to_stream_[ctx] = stream_name;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        creating_names_.erase(stream_name);
+        encoders_[stream_name] = slot;
+        handle_to_stream_[ctx] = stream_name;
+    }
 
     HAL_LOG_INFO("EncoderManager: Created encoder for %s ctx=%p",
                  stream_name.c_str(), ctx);
@@ -93,8 +124,14 @@ bool EncoderManager::create_from_context(const std::string& stream_name, void* c
                            stream_name.c_str());
             return true;
         }
-        // See create(): never overwrite a teardown parked by a drain abort.
+        // See create(): never overwrite a teardown parked by a drain abort;
+        // reserve the name across the unlocked subscribe below.
         needs_reclaim = closing_teardowns_.count(stream_name) > 0;
+        if (!needs_reclaim && !creating_names_.insert(stream_name).second) {
+            HAL_LOG_WARNING("EncoderManager: create_from_context('%s') lost a "
+                            "concurrent create race", stream_name.c_str());
+            return false;
+        }
     }
     if (needs_reclaim) {
         if (!destroy(stream_name)) {
@@ -103,11 +140,24 @@ bool EncoderManager::create_from_context(const std::string& stream_name, void* c
                           stream_name.c_str());
             return false;
         }
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (encoders_.count(stream_name) ||
+                !creating_names_.insert(stream_name).second) {
+                HAL_LOG_WARNING("EncoderManager: create_from_context('%s') lost "
+                                "a concurrent create race during reclaim",
+                                stream_name.c_str());
+                return false;
+            }
+        }
     }
 
-    std::lock_guard<std::mutex> lock(mu_);
-
+    // HAL call without mu_ — the reservation owns the name.
     if (!subscribe_output(codec_ctx, stream_name)) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            creating_names_.erase(stream_name);
+        }
         return false;
     }
 
@@ -118,8 +168,12 @@ bool EncoderManager::create_from_context(const std::string& stream_name, void* c
     slot.from_media = true;
     slot.created_at = std::chrono::steady_clock::now();
 
-    encoders_[stream_name] = slot;
-    handle_to_stream_[codec_ctx] = stream_name;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        creating_names_.erase(stream_name);
+        encoders_[stream_name] = slot;
+        handle_to_stream_[codec_ctx] = stream_name;
+    }
 
     HAL_LOG_INFO("EncoderManager: Created FROM_MEDIA encoder for %s ctx=%p",
                  stream_name.c_str(), codec_ctx);
@@ -372,9 +426,13 @@ bool EncoderManager::destroy(const std::string& stream_name) {
         // section in-flight force_keyframe() calls increment under: once the
         // entry is gone no new call can capture the ctx, so one bounded wait
         // right here closes the capture/free race completely. On timeout the
-        // slot is parked in closing_teardowns_ instead of being torn down —
-        // freeing a ctx a wedged call still occupies is a use-after-free, so
-        // we leak it (loudly) and let a later destroy() retry the reclamation.
+        // slot stays parked in closing_teardowns_ — freeing a ctx a wedged
+        // call still occupies is a use-after-free, so we leak it (loudly)
+        // and let a later destroy() retry the reclamation. The parked entry
+        // carries an exclusive claim (teardown_in_progress): a concurrent
+        // destroy() of the same name must never run stop/unsubscribe/deinit
+        // on a ctx another thread is already tearing down — for standalone
+        // encoders that is a double-free.
         std::unique_lock<std::mutex> lock(mu_);
         auto it = encoders_.find(stream_name);
         if (it != encoders_.end()) {
@@ -383,7 +441,9 @@ bool EncoderManager::destroy(const std::string& stream_name) {
             is_from_media = it->second.from_media;
 
             handle_to_stream_.erase(ctx);
-            closing_teardowns_[stream_name] = it->second;
+            EncoderSlot parked = it->second;
+            parked.teardown_in_progress = true;  // this thread owns the teardown
+            closing_teardowns_[stream_name] = parked;
             closing_ctxs_.insert(ctx);
             encoders_.erase(it);
         } else {
@@ -391,8 +451,17 @@ bool EncoderManager::destroy(const std::string& stream_name) {
             if (cit == closing_teardowns_.end()) {
                 return true;  // nothing registered under this name
             }
+            if (cit->second.teardown_in_progress) {
+                // Another thread owns this tombstone's teardown; report
+                // not-torn-down instead of double-claiming the ctx.
+                HAL_LOG_WARNING("EncoderManager: destroy('%s') — teardown "
+                                "already owned by another call",
+                                stream_name.c_str());
+                return false;
+            }
             // Retry of an aborted teardown: the parked ctx may be reclaimable
             // now if the wedged call has since returned.
+            cit->second.teardown_in_progress = true;
             ctx = cit->second.codec_ctx;
             was_running = cit->second.running;
             is_from_media = cit->second.from_media;
@@ -403,6 +472,14 @@ bool EncoderManager::destroy(const std::string& stream_name) {
     }
 
     if (!drained) {
+        // Hand the claim back so a later retry can take over the tombstone.
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            auto cit = closing_teardowns_.find(stream_name);
+            if (cit != closing_teardowns_.end()) {
+                cit->second.teardown_in_progress = false;
+            }
+        }
         HAL_LOG_ERROR("EncoderManager: destroy('%s') aborted before HAL "
                       "teardown — force_idr still in flight after %dms; "
                       "ctx parked as closing tombstone (retry destroy to "

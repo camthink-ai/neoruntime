@@ -57,7 +57,9 @@ public:
      * call) and the slot is parked as a closing tombstone; callers must
      * abort the pipeline teardown they were about to perform and surface
      * the failure. A later destroy() of the same name retries the parked
-     * teardown and reclaims the ctx once the call finally returns.
+     * teardown and reclaims the ctx once the call finally returns — unless
+     * another thread already owns that retry (teardown_in_progress), in
+     * which case this call also returns false without touching the ctx.
      */
     bool destroy(const std::string& stream_name);
 
@@ -160,6 +162,12 @@ private:
         std::string stream_name;
         bool        running = false;
         bool        from_media = false;
+        // Closing-tombstone only: a thread exclusively owns this teardown
+        // (set atomically when the slot is parked or a retry claims it, so a
+        // concurrent destroy() cannot run stop/unsubscribe/deinit on the
+        // same ctx a second time — that is a double-free). Cleared when a
+        // drain timeout hands the tombstone back for a later retry.
+        bool        teardown_in_progress = false;
         // Frame-health signals (steady_clock — monotonic, immune to NTP jumps).
         std::chrono::steady_clock::time_point created_at;
         std::chrono::steady_clock::time_point last_packet_time;  // epoch == never received
@@ -181,6 +189,12 @@ private:
      *  on_packet() uses this set to drop-but-release their callbacks —
      *  every packet owns a shared buffer reference that must be returned. */
     std::unordered_set<void*> closing_ctxs_;
+    /** Names reserved by an in-flight create()/create_from_context() (mu_):
+     *  the existence check and the final insert are separate critical
+     *  sections around an unlocked HAL phase, so without the reservation two
+     *  concurrent creates of one name would both subscribe and the later
+     *  insert would overwrite (and leak) the earlier ctx. */
+    std::unordered_set<std::string> creating_names_;
     PacketOutputFn output_fn_;
 
     // Reverse map: codec_ctx → stream_name (for callback routing)

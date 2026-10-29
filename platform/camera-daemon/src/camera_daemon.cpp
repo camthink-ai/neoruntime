@@ -2596,6 +2596,23 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
         // and call output_fn_ which takes op_mu_ (read).  Same AB-BA deadlock
         // pattern as remove_stream / reconfigure_pipeline.
 
+        // Gate force_keyframe() and DRAIN BEFORE the AF stop below: on a
+        // wedged force_idr the bounded drain times out and this reconfigure
+        // refuses with NOTHING stopped — AF must still be running in that
+        // case. (The keyframe request callbacks take enc_name_mu_, not
+        // op_mu_, so waiting for the drain here under op_mu_ cannot starve
+        // it.) The gate then stays up across the stop->override->start
+        // window: MediaLibrary frees the borrowed FROM_MEDIA codec contexts
+        // while EncoderManager still points at them; RAII clears it on every
+        // exit path, released right after resync repopulates the contexts.
+        RebuildGateGuard rebuild_gate(encoder_mgr_.get());
+        if (!rebuild_gate.ok()) {
+            HAL_LOG_ERROR("CameraDaemon: encoder reconfigure aborted — keyframe call wedged in HAL");
+            response.set_success(false);
+            response.set_message("Encoder keyframe request is wedged; reconfigure aborted, retry after the encoder recovers");
+            return false;
+        }
+
         // Stop AF before pipeline restart — the video source goes away during
         // stop/start and any in-flight AF job would time out or read stale frames.
         if (need_pipeline_restart && autofocus_controller_) {
@@ -2627,19 +2644,8 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
             }
         };
 
-        // Gate force_keyframe() across the stop->override->start window below:
-        // MediaLibrary frees the borrowed FROM_MEDIA codec contexts while
-        // EncoderManager still points at them. RAII clears the gate on every
-        // exit path; released right after resync repopulates the contexts.
-        RebuildGateGuard rebuild_gate(encoder_mgr_.get());
-        if (!rebuild_gate.ok()) {
-            // Nothing has been mutated yet (pipeline stop comes next);
-            // refusing here leaves the encoder exactly as it was.
-            HAL_LOG_ERROR("CameraDaemon: encoder reconfigure aborted — keyframe call wedged in HAL");
-            response.set_success(false);
-            response.set_message("Encoder keyframe request is wedged; reconfigure aborted, retry after the encoder recovers");
-            return false;
-        }
+        // (rebuild gate raised + drained above, before the AF stop —
+        // see RebuildGateGuard rebuild_gate near the pipeline-restart check)
         if (need_pipeline_restart && media_ops->stop) {
             HAL_LOG_INFO("CameraDaemon: Stopping pipeline for encoder reconfigure (dimension/fps/codec change)");
             int stop_ret = media_ops->stop(media_ctx_);
@@ -7919,23 +7925,15 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
     HAL_LOG_INFO("CameraDaemon: Switching to profile '%s' (current: '%s')...",
                  profile_name.c_str(), prev_profile.c_str());
 
-#ifdef HAS_GRPC
-    if (restart_af && autofocus_controller_) {
-        autofocus_controller_->stop();
-        autofocus_controller_->invalidate_anchor("media profile changed");
-    }
-#endif
-
-    // Gate force_keyframe() and DRAIN BEFORE stopping consumers: the
-    // publisher's stop() joins the keyframe worker, and a worker blocked
-    // inside a wedged force_idr would hang that join forever — the bounded
-    // drain here is what turns the hang into a clean abort. The gate then
-    // stays up across the switch (borrowed codec contexts are freed and
-    // re-created by the rebuild).
+    // Gate force_keyframe() and DRAIN BEFORE the AF stop and the consumer
+    // stops below: the publisher's stop() joins the keyframe worker, and a
+    // worker blocked inside a wedged force_idr would hang that join forever —
+    // the bounded drain here is what turns the hang into a clean abort. On
+    // abort NOTHING has been stopped yet (AF included) — the RPC surfaces a
+    // retryable cause. The gate then stays up across the switch (borrowed
+    // codec contexts are freed and re-created by the rebuild).
     RebuildGateGuard rebuild_gate(encoder_mgr_.get());
     if (!rebuild_gate.ok()) {
-        // Nothing stopped, pipeline untouched — refuse the switch and let
-        // the RPC surface a retryable cause.
         HAL_LOG_ERROR("CameraDaemon: profile switch to '%s' aborted — keyframe call wedged in HAL",
                       profile_name.c_str());
         if (message) {
@@ -7943,6 +7941,13 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
         }
         return false;
     }
+
+#ifdef HAS_GRPC
+    if (restart_af && autofocus_controller_) {
+        autofocus_controller_->stop();
+        autofocus_controller_->invalidate_anchor("media profile changed");
+    }
+#endif
 
     // 1. Stop current data consumers
     if (encoded_pub_) encoded_pub_->stop();
@@ -8367,21 +8372,16 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
             }
 
             // Stop consumers before the rollback HAL switch, mirroring the
-            // forward flow: switch_profile restarts the pipeline internally and
-            // would race running consumer threads. restart_consumers_after_failure()
-            // below is NOT safe to call while they're already running
-            // (EncodedPublisher::start would leak epoll fds + spawn dup threads).
-#ifdef HAS_GRPC
-            if (autofocus_controller_) {
-                autofocus_controller_->stop();
-                autofocus_controller_->invalidate_anchor("post-switch verify rollback");
-            }
-#endif
-            // Gate+drain BEFORE the consumer stops: stop() joins the keyframe
-            // worker, which hangs forever if it is blocked inside a wedged
-            // force_idr. On timeout leave consumers running on the (failing)
-            // new profile and report honestly — a stopped-but-unrestartable
-            // pipeline is strictly worse.
+            // forward flow: switch_profile restarts the pipeline internally
+            // and would race running consumer threads, and the consumer
+            // restart below is NOT safe while they're already running
+            // (EncodedPublisher::start would leak epoll fds).
+            // Gate+drain BEFORE the AF stop and the consumer stops below:
+            // stop() joins the keyframe worker, which hangs forever if it is
+            // blocked inside a wedged force_idr. On timeout leave AF and the
+            // consumers running on the (failing) new profile and report
+            // honestly — a stopped-but-unrestartable pipeline is strictly
+            // worse.
             RebuildGateGuard rollback_gate(encoder_mgr_.get());
             const bool rollback_clear_to_run = rollback_gate.ok();
             if (!rollback_clear_to_run) {
@@ -8389,6 +8389,12 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
                               prev_profile.c_str());
             }
             if (rollback_clear_to_run) {
+#ifdef HAS_GRPC
+                if (autofocus_controller_) {
+                    autofocus_controller_->stop();
+                    autofocus_controller_->invalidate_anchor("post-switch verify rollback");
+                }
+#endif
                 if (encoded_pub_) encoded_pub_->stop();
                 if (rtsp_server_) rtsp_server_->stop();
                 if (fd_pub_) fd_pub_->stop();
@@ -9144,22 +9150,27 @@ void CameraDaemon::shutdown() {
     //    during forced cleanup.
 
     // Gate+drain BEFORE stopping the publisher: stop() joins the keyframe
-    // worker, which blocks forever inside a wedged force_idr. On drain
-    // failure skip the publisher join entirely (the worker thread leaks to
-    // process exit; the supervisor kill timeout is the backstop either way)
-    // and skip the encoder teardown below, which cannot succeed while the
-    // wedged call holds the in-flight slot.
+    // worker, which blocks forever inside a wedged force_idr. If the drain
+    // times out there is NO safe way to continue orderly shutdown: joining
+    // the worker hangs (publisher stop here AND its destructor later), and
+    // tearing down media / dlclose-ing the HAL would pull code out from
+    // under the still-running worker — a hang or a crash, not a shutdown.
+    // Force a process exit instead: no unwinding, no destructors, no
+    // dlclose; the supervisor restarts the daemon. This is the documented
+    // backstop for a wedged force_idr discovered at shutdown.
     RebuildGateGuard shutdown_gate(encoder_mgr_.get());
-    const bool encoder_calls_drained = shutdown_gate.ok();
+    if (!shutdown_gate.ok()) {
+        HAL_LOG_ERROR("CameraDaemon: shutdown with a keyframe call wedged in "
+                      "the HAL — forcing process exit for supervisor restart "
+                      "(orderly teardown would join the wedged worker or "
+                      "unload the HAL underneath it)");
+        std::fflush(nullptr);
+        std::_Exit(EXIT_FAILURE);
+    }
 
     // 3a. Stop encoded publisher (consumes encoder packets)
     if (encoded_pub_) {
-        if (encoder_calls_drained) {
-            encoded_pub_->stop();
-        } else {
-            HAL_LOG_WARNING("CameraDaemon: shutdown skips publisher join — "
-                            "keyframe worker wedged in HAL");
-        }
+        encoded_pub_->stop();
     }
 
     // 3b. Stop RTSP server (consumes encoded packets)
@@ -9168,16 +9179,12 @@ void CameraDaemon::shutdown() {
     }
 
     // 3c. Destroy encoders (release resize output buffers via from_media path)
-    if (encoder_mgr_ && encoder_calls_drained) {
-        if (!encoder_mgr_->destroy_all()) {
-            // Shutdown path: a wedged force_idr parks the ctx as a tombstone;
-            // process exit reclaims it. Logged for the post-mortem.
-            HAL_LOG_WARNING("CameraDaemon: shutdown encoder teardown incomplete "
-                            "(wedged keyframe call) — codec ctx leaked to process exit");
-        }
-    } else if (encoder_mgr_) {
-        HAL_LOG_WARNING("CameraDaemon: shutdown skips encoder teardown — wedged "
-                        "keyframe call; codec ctx leaked to process exit");
+    if (encoder_mgr_ && !encoder_mgr_->destroy_all()) {
+        // Belt-and-braces: the drain above succeeded and the gate is still
+        // up, so a timeout here is not expected; if it ever happens the
+        // tombstone simply outlives us into process exit.
+        HAL_LOG_WARNING("CameraDaemon: shutdown encoder teardown incomplete — "
+                        "codec ctx leaked to process exit");
     }
 
     // 3d. Stop FD publisher (releases DMA-BUF references)
