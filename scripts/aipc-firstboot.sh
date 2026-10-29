@@ -597,9 +597,9 @@ for ut_file in wtmp lastlog; do
         # with RemainAfterExit, so the merge runs at most once per boot.
         # lastlog is a sparse UID-indexed table that cannot be merged — the
         # persistent copy wins and this boot's lastlog entries are dropped.
-        # The -ef guard skips the merge on every boot after /etc/fstab has
-        # the bind entry: this service runs After=local-fs.target, so by
-        # then ut_dst is the bind-mounted ut_src (same inode). BusyBox cat
+        # The -ef guard skips the merge on every boot after the runtime bind
+        # below has landed: ut_dst is then the bind-mounted ut_src (same
+        # inode). BusyBox cat
         # lacks GNU cat's same-file rejection, so appending the file to
         # itself never reaches EOF, fills /data, and blocks every After=
         # service forever under TimeoutStartSec=0.
@@ -619,15 +619,20 @@ for ut_file in wtmp lastlog; do
         chown root:utmp "$ut_dst" 2>/dev/null || chown root:root "$ut_dst" 2>/dev/null || true
         chmod 664 "$ut_dst" 2>/dev/null || true
     fi
-    if ! grep -qE "^[[:space:]]*${ut_src}[[:space:]]+${ut_dst}[[:space:]]+" /etc/fstab 2>/dev/null; then
-        echo "${ut_src} ${ut_dst} none bind 0 0" >> /etc/fstab 2>/dev/null || \
-            warn "Failed to append ${ut_file} bind mount to /etc/fstab"
-    fi
     if ! findmnt --mountpoint "$ut_dst" >/dev/null 2>&1; then
         mount -o bind "$ut_src" "$ut_dst" 2>/dev/null || \
             warn "bind mount failed for $ut_dst (login history not persistent this boot)"
     fi
 done
+
+# Heal fstab bind entries earlier builds appended for these files: /var/log is
+# a symlink into the volatile tmpfs and empty when local-fs.target runs the
+# fstab mounts (this service runs After=local-fs.target), so the generated
+# var-volatile-log-{wtmp,lastlog}.mount units fail with ENOENT and pull the
+# boot into emergency mode. The runtime bind above already provides the
+# persistence; the fstab lines only ever broke the next boot.
+sed -i '\#^[[:space:]]*/data/aipc-data/log/\(wtmp\|lastlog\)[[:space:]]\+/var/log/#d' /etc/fstab 2>/dev/null || \
+    warn "Failed to clean stale wtmp/lastlog entries from /etc/fstab"
 log "Login records persisted: /data/aipc-data/log/{wtmp,lastlog} -> /var/log"
 
 # Ensure serial-getty is running on the kernel console device

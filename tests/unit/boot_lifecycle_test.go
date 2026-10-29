@@ -247,6 +247,23 @@ func TestFirstbootBindsLoginRecordsBeforeExposingGetty(t *testing.T) {
 	}
 }
 
+func TestFirstbootDoesNotPersistLoginRecordsThroughFstab(t *testing.T) {
+	raw, err := os.ReadFile("../../scripts/aipc-firstboot.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	// The journal bind may stay: it targets a directory, and systemd creates
+	// missing mountpoint directories before starting fstab mount units. The
+	// login records are files, which nothing creates before local-fs.target.
+	if strings.Contains(script, `echo "${ut_src} ${ut_dst} none bind 0 0"`) {
+		t.Fatal("firstboot must not append login-record file bind entries to /etc/fstab: /var/log is an empty tmpfs when local-fs.target runs the fstab mounts and systemd only auto-creates mountpoint directories, so file binds fail with ENOENT and the next boot lands in emergency mode; the runtime bind already provides the persistence")
+	}
+	if !strings.Contains(script, `/data/aipc-data/log/\(wtmp\|lastlog\)`) {
+		t.Fatal("firstboot must clean stale login-record fstab entries appended by earlier builds; without the heal, devices that took those builds keep failing local-fs.target after the runtime upgrade")
+	}
+}
+
 func TestRestoreValidationToleratesPreviousRuntimeRelease(t *testing.T) {
 	raw, err := os.ReadFile("../../scripts/aipc-restore.sh")
 	if err != nil {
