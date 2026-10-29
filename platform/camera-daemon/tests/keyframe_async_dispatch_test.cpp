@@ -28,6 +28,14 @@
 //   8. Two concurrent same-name creates produce exactly one registration:
 //      the loser fails at name reservation BEFORE touching the HAL, so no
 //      subscription or ctx is leaked by the overwrite.
+//   9. destroy() of a name whose creation is mid-HAL (reservation held,
+//      init/subscribe lock-free) waits bounded for the creator to publish,
+//      then tears the published encoder down — never "nothing registered".
+//  10. destroy_all() rejects creations arriving inside its window and
+//      waits out in-flight ones before reporting all-clear.
+//  11. A RUNNING FROM_MEDIA encoder delivering inside subscribe() — before
+//      the promotion critical section writes the routing maps — hits the
+//      release-only path: the packet is dropped but RELEASED, not leaked.
 
 #include "encoded_publisher.h"
 #include "encoder_manager.h"
@@ -208,6 +216,27 @@ int mock_unsubscribe(void*, HalCodecFrameCallback) {
 std::atomic<int> g_subscribes{0};
 
 int mock_subscribe(void*, HalCodecFrameCallback, void*) {
+    ++g_subscribes;
+    return 0;
+}
+
+std::atomic<bool> g_subscribe_release{false};
+std::atomic<int> g_subscribe_in{0};
+std::atomic<bool> g_subscribe_deliver{false};
+
+int mock_subscribe_gated(void* codec_ctx, HalCodecFrameCallback cb, void* ud) {
+    ++g_subscribe_in;
+    while (!g_subscribe_release.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (g_subscribe_deliver.load() && cb) {
+        // Simulate a running FROM_MEDIA encoder delivering the moment the
+        // subscription installs — BEFORE create_from_context() writes the
+        // routing maps. This is the pending-window packet.
+        HalPacketBuffer pkt{};
+        pkt.size = 4;
+        cb(codec_ctx, &pkt, ud);
+    }
     ++g_subscribes;
     return 0;
 }
@@ -397,6 +426,132 @@ void test_concurrent_same_name_create_single_winner() {
     assert(!mgr.has_encoder("aux"));
 }
 
+void test_destroy_waits_out_inflight_creation() {
+    // Contract 9: destroy() of a name whose creation is mid-HAL must not
+    // report "nothing registered" — it waits for the creator to publish,
+    // then tears the published encoder down.
+    HalCodecOps ops{};
+    ops.subscribe = mock_subscribe_gated;
+    ops.force_idr = mock_force_idr;
+    ops.unsubscribe = mock_unsubscribe;
+    EncoderManager mgr(&ops);
+    void* const aux_ctx = reinterpret_cast<void*>(0x7777);
+
+    g_unsubscribes.store(0);
+    g_subscribe_in.store(0);
+    g_subscribe_release.store(false);
+    g_subscribe_deliver.store(false);
+
+    std::thread creator([&] { assert(mgr.create_from_context("aux", aux_ctx)); });
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (g_subscribe_in.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(g_subscribe_in.load() > 0);  // creator blocked inside subscribe
+    }
+
+    std::atomic<bool> destroy_done{false};
+    std::atomic<bool> destroy_ok{false};
+    std::thread destroyer([&] {
+        destroy_ok.store(mgr.destroy("aux"));
+        destroy_done.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    assert(!destroy_done.load());  // waiting out the creation, not lying
+
+    g_subscribe_release.store(true);
+    creator.join();
+    destroyer.join();
+    assert(destroy_ok.load());             // found + tore down the published encoder
+    assert(g_unsubscribes.load() == 1);
+    assert(!mgr.has_encoder("aux"));
+}
+
+void test_destroy_all_bars_new_creates_and_waits() {
+    // Contract 10: destroy_all() rejects creations arriving inside its
+    // window and waits out in-flight ones before reporting all-clear.
+    HalCodecOps ops{};
+    ops.subscribe = mock_subscribe_gated;
+    ops.force_idr = mock_force_idr;
+    ops.unsubscribe = mock_unsubscribe;
+    ops.release_packet = mock_release_packet;
+    EncoderManager mgr(&ops);
+    void* const aux_ctx = reinterpret_cast<void*>(0x7777);
+
+    g_unsubscribes.store(0);
+    g_subscribe_in.store(0);
+    g_subscribe_release.store(false);
+    g_subscribe_deliver.store(false);
+
+    std::thread creator([&] { assert(mgr.create_from_context("aux", aux_ctx)); });
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (g_subscribe_in.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(g_subscribe_in.load() > 0);
+    }
+
+    std::atomic<bool> all_done{false};
+    std::atomic<bool> all_ok{false};
+    std::thread caller([&] {
+        all_ok.store(mgr.destroy_all());
+        all_done.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    assert(!all_done.load());  // waiting for the in-flight creation
+
+    // A creation arriving inside the window is rejected outright.
+    assert(!mgr.create_from_context("other", reinterpret_cast<void*>(0x8888)));
+    assert(!mgr.has_encoder("other"));
+
+    g_subscribe_release.store(true);
+    creator.join();
+    caller.join();
+    assert(all_ok.load());
+    assert(g_unsubscribes.load() == 1);    // the published aux got torn down
+    assert(!mgr.has_encoder("aux"));
+
+    // Window closed: creations work again.
+    assert(mgr.create_from_context("other", reinterpret_cast<void*>(0x8888)));
+    assert(mgr.has_encoder("other"));
+    assert(mgr.destroy_all());
+}
+
+void test_pending_creation_packets_released() {
+    // Contract 11: a FROM_MEDIA encoder delivering inside subscribe() —
+    // before the promotion critical section — hits the release-only path:
+    // dropped but RELEASED, not leaked.
+    HalCodecOps ops{};
+    ops.subscribe = mock_subscribe_gated;
+    ops.force_idr = mock_force_idr;
+    ops.unsubscribe = mock_unsubscribe;
+    ops.release_packet = mock_release_packet;
+    EncoderManager mgr(&ops);
+    void* const aux_ctx = reinterpret_cast<void*>(0x7777);
+
+    g_subscribes.store(0);
+    g_releases.store(0);
+    g_subscribe_in.store(0);
+    g_subscribe_release.store(true);   // no gating — deliver and return
+    g_subscribe_deliver.store(true);
+
+    assert(mgr.create_from_context("aux", aux_ctx));
+    assert(g_releases.load() == 1);    // pending-window packet was released
+
+    // Post-promotion packets route normally (released at the end of the
+    // normal path).
+    HalPacketBuffer pkt{};
+    pkt.size = 4;
+    mgr.on_packet(aux_ctx, &pkt);
+    assert(g_releases.load() == 2);
+    assert(mgr.has_encoder("aux"));
+
+    assert(mgr.destroy("aux"));
+    assert(!mgr.has_encoder("aux"));
+}
+
 }  // namespace
 
 int main() {
@@ -406,5 +561,8 @@ int main() {
     test_closing_packets_released_and_create_gated();
     test_concurrent_destroy_claims_tombstone_once();
     test_concurrent_same_name_create_single_winner();
+    test_destroy_waits_out_inflight_creation();
+    test_destroy_all_bars_new_creates_and_waits();
+    test_pending_creation_packets_released();
     return 0;
 }

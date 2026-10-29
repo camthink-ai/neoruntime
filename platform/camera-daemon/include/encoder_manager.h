@@ -185,16 +185,27 @@ private:
      *  Kept so a retry can reclaim the ctx once the wedged call returns; the
      *  entries are invisible to has_encoder()/force_keyframe()/create(). */
     std::unordered_map<std::string, EncoderSlot> closing_teardowns_;
-    /** ctx pointers parked above. Their HAL subscription is still live, so
-     *  on_packet() uses this set to drop-but-release their callbacks —
-     *  every packet owns a shared buffer reference that must be returned. */
-    std::unordered_set<void*> closing_ctxs_;
+    /** ctx pointers whose packets must be dropped-but-RELEASED: (a) parked
+     *  closing tombstones above (subscription still live after a drain
+     *  abort), and (b) pending creations — a running FROM_MEDIA encoder can
+     *  deliver the moment subscribe() installs the callback, before the
+     *  promotion critical section adds the routing maps. Every packet owns
+     *  a shared buffer reference that must be returned. */
+    std::unordered_set<void*> release_only_ctxs_;
     /** Names reserved by an in-flight create()/create_from_context() (mu_):
      *  the existence check and the final insert are separate critical
      *  sections around an unlocked HAL phase, so without the reservation two
      *  concurrent creates of one name would both subscribe and the later
-     *  insert would overwrite (and leak) the earlier ctx. */
+     *  insert would overwrite (and leak) the earlier ctx. destroy()/destroy_
+     *  all() wait on creating_cv_ for reservations to clear so they never
+     *  report "all gone" while a ctx is about to be published. */
     std::unordered_set<std::string> creating_names_;
+    /** Signaled when creating_names_ loses an entry (mu_ held). */
+    std::condition_variable creating_cv_;
+    /** True across destroy_all()'s snapshot+teardown window (mu_): new
+     *  create reservations are rejected so no ctx can be published right
+     *  after destroy_all() reported all-clear. */
+    bool destroy_all_active_ = false;
     PacketOutputFn output_fn_;
 
     // Reverse map: codec_ctx → stream_name (for callback routing)

@@ -1483,8 +1483,22 @@ int connect_encoders(Hailo15MediaPriv *p)
                                   eid.c_str(), packet_index, sz, pkt.size);
                 }
                 pkt.sequence = static_cast<uint32_t>(seq);
+                {
+                    /* Counted while the subscriber is definitely non-null:
+                     * unsubscribe() waits this back to zero so no copied
+                     * callback runs after it returns. */
+                    std::lock_guard<std::mutex> in_flight_lk(p->packet_cb_mu);
+                    ++p->packet_cb_in_flight;
+                }
                 cb(cctx, &pkt, cb_ud);
                 (void)buf->sync_end();
+                {
+                    std::lock_guard<std::mutex> in_flight_lk(p->packet_cb_mu);
+                    if (--p->packet_cb_in_flight == 0)
+                    {
+                        p->packet_cb_cv.notify_all();
+                    }
+                }
             });
         if (s != MEDIA_LIBRARY_SUCCESS)
         {

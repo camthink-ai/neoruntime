@@ -38,6 +38,14 @@ bool EncoderManager::create(const std::string& stream_name,
                            stream_name.c_str());
             return true;
         }
+        // destroy_all() may be mid-teardown: publishing a ctx right after
+        // it reported all-clear would be state drift (the caller believes
+        // the encoder set is empty and rebuilds the pipeline around it).
+        if (destroy_all_active_) {
+            HAL_LOG_ERROR("EncoderManager: create('%s') rejected — destroy_all "
+                          "in progress", stream_name.c_str());
+            return false;
+        }
         // A previous destroy() of this name timed out and parked the old
         // ctx — reclaim it before registering a new one, or the next
         // destroy would silently overwrite (and permanently leak) it.
@@ -64,7 +72,7 @@ bool EncoderManager::create(const std::string& stream_name,
             // Re-reserve after the reclaim window: a concurrent create may
             // have taken the name while mu_ was released around destroy().
             std::lock_guard<std::mutex> lock(mu_);
-            if (encoders_.count(stream_name) ||
+            if (destroy_all_active_ || encoders_.count(stream_name) ||
                 !creating_names_.insert(stream_name).second) {
                 HAL_LOG_WARNING("EncoderManager: create('%s') lost a concurrent "
                                 "create race during reclaim", stream_name.c_str());
@@ -80,17 +88,28 @@ bool EncoderManager::create(const std::string& stream_name,
         {
             std::lock_guard<std::mutex> lock(mu_);
             creating_names_.erase(stream_name);
+            creating_cv_.notify_all();
         }
         HAL_LOG_ERROR("EncoderManager: init failed for %s: %d",
                      stream_name.c_str(), ret);
         return false;
     }
 
+    // Packets can arrive from the moment subscribe installs the callback;
+    // until the promotion critical section below adds the routing maps,
+    // the ctx is release-only so on_packet() drops-but-releases instead of
+    // leaking the buffer reference.
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        release_only_ctxs_.insert(ctx);
+    }
     if (!subscribe_output(ctx, stream_name)) {
         ops_->deinit(ctx);
         {
             std::lock_guard<std::mutex> lock(mu_);
+            release_only_ctxs_.erase(ctx);
             creating_names_.erase(stream_name);
+            creating_cv_.notify_all();
         }
         return false;
     }
@@ -104,8 +123,10 @@ bool EncoderManager::create(const std::string& stream_name,
     {
         std::lock_guard<std::mutex> lock(mu_);
         creating_names_.erase(stream_name);
+        creating_cv_.notify_all();
         encoders_[stream_name] = slot;
         handle_to_stream_[ctx] = stream_name;
+        release_only_ctxs_.erase(ctx);  // promotion: routing maps live now
     }
 
     HAL_LOG_INFO("EncoderManager: Created encoder for %s ctx=%p",
@@ -124,8 +145,14 @@ bool EncoderManager::create_from_context(const std::string& stream_name, void* c
                            stream_name.c_str());
             return true;
         }
-        // See create(): never overwrite a teardown parked by a drain abort;
-        // reserve the name across the unlocked subscribe below.
+        // See create(): reject during destroy_all() and never overwrite a
+        // teardown parked by a drain abort; reserve the name across the
+        // unlocked subscribe below.
+        if (destroy_all_active_) {
+            HAL_LOG_ERROR("EncoderManager: create_from_context('%s') rejected — "
+                          "destroy_all in progress", stream_name.c_str());
+            return false;
+        }
         needs_reclaim = closing_teardowns_.count(stream_name) > 0;
         if (!needs_reclaim && !creating_names_.insert(stream_name).second) {
             HAL_LOG_WARNING("EncoderManager: create_from_context('%s') lost a "
@@ -142,7 +169,7 @@ bool EncoderManager::create_from_context(const std::string& stream_name, void* c
         }
         {
             std::lock_guard<std::mutex> lock(mu_);
-            if (encoders_.count(stream_name) ||
+            if (destroy_all_active_ || encoders_.count(stream_name) ||
                 !creating_names_.insert(stream_name).second) {
                 HAL_LOG_WARNING("EncoderManager: create_from_context('%s') lost "
                                 "a concurrent create race during reclaim",
@@ -152,11 +179,21 @@ bool EncoderManager::create_from_context(const std::string& stream_name, void* c
         }
     }
 
+    // A RUNNING FROM_MEDIA encoder can deliver the moment subscribe()
+    // installs the callback. Register the release-only guard FIRST so the
+    // pre-promotion window (subscribe returned, routing maps not yet
+    // written) drops-and-releases instead of leaking the buffer.
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        release_only_ctxs_.insert(codec_ctx);
+    }
     // HAL call without mu_ — the reservation owns the name.
     if (!subscribe_output(codec_ctx, stream_name)) {
         {
             std::lock_guard<std::mutex> lock(mu_);
+            release_only_ctxs_.erase(codec_ctx);
             creating_names_.erase(stream_name);
+            creating_cv_.notify_all();
         }
         return false;
     }
@@ -171,8 +208,10 @@ bool EncoderManager::create_from_context(const std::string& stream_name, void* c
     {
         std::lock_guard<std::mutex> lock(mu_);
         creating_names_.erase(stream_name);
+        creating_cv_.notify_all();
         encoders_[stream_name] = slot;
         handle_to_stream_[codec_ctx] = stream_name;
+        release_only_ctxs_.erase(codec_ctx);  // promotion: routing live now
     }
 
     HAL_LOG_INFO("EncoderManager: Created FROM_MEDIA encoder for %s ctx=%p",
@@ -252,6 +291,11 @@ namespace {
 // is torn down. medialib's force_idr has no deadline of its own; past this
 // the teardown aborts rather than racing the call.
 constexpr int kKeyframeDrainTimeoutMs = 2000;
+/* Bounded wait for a same-name creation to finish its unlocked HAL phase
+ * (encoder init/subscribe can take seconds). destroy()/destroy_all() wait
+ * on this rather than reporting "nothing registered" while a ctx is about
+ * to be published. */
+constexpr int kCreateDrainTimeoutMs = 10000;
 }  // namespace
 
 int EncoderManager::force_keyframe(const std::string& stream_name) {
@@ -371,15 +415,19 @@ void EncoderManager::on_packet(void* codec_ctx, const HalPacketBuffer* packet) {
         std::lock_guard<std::mutex> lock(mu_);
         auto hit = handle_to_stream_.find(codec_ctx);
         if (hit == handle_to_stream_.end()) {
-            // Parked closing ctx (destroy() in its drain window, or a
-            // timed-out tombstone whose subscription never got torn down):
-            // the subscription is still live, so this packet owns a shared
-            // buffer reference we MUST hand back — returning without
-            // release leaks the pool one packet at a time (starvation →
-            // black screen). ctxs dropped via discard_from_media() are NOT
-            // in the closing set and keep the plain return: their ctx may
-            // already be freed, and touching it would be the bigger bug.
-            if (closing_ctxs_.count(codec_ctx) && ops_ && ops_->release_packet) {
+            // Release-only ctx — either a parked closing tombstone (destroy()
+            // in its drain window, or a timed-out tombstone whose
+            // subscription never got torn down) or a PENDING creation (the
+            // running FROM_MEDIA encoder can deliver from the moment
+            // subscribe() installs the callback, before the promotion
+            // critical section adds the routing maps). The subscription is
+            // live either way, so this packet owns a shared buffer
+            // reference we MUST hand back — returning without release leaks
+            // the pool one packet at a time (starvation → black screen).
+            // ctxs dropped via discard_from_media() are NOT in the set and
+            // keep the plain return: their ctx may already be freed, and
+            // touching it would be the bigger bug.
+            if (release_only_ctxs_.count(codec_ctx) && ops_ && ops_->release_packet) {
                 ops_->release_packet(codec_ctx, const_cast<HalPacketBuffer*>(packet));
             }
             return;
@@ -434,6 +482,23 @@ bool EncoderManager::destroy(const std::string& stream_name) {
         // on a ctx another thread is already tearing down — for standalone
         // encoders that is a double-free.
         std::unique_lock<std::mutex> lock(mu_);
+        // A creation of this name may be mid-HAL (reservation held, init/
+        // subscribe running lock-free): returning "nothing registered"
+        // would be a lie — the creator is about to publish a ctx the
+        // caller believes is gone, re-introducing a dangling context into
+        // a pipeline it is rebuilding or destroying. Wait bounded for the
+        // reservation to clear, then re-look.
+        if (creating_names_.count(stream_name)) {
+            const bool creation_done = creating_cv_.wait_for(
+                lock, std::chrono::milliseconds(kCreateDrainTimeoutMs),
+                [&] { return creating_names_.find(stream_name) == creating_names_.end(); });
+            if (!creation_done) {
+                HAL_LOG_ERROR("EncoderManager: destroy('%s') aborted — creation "
+                              "still inside the HAL after %dms",
+                              stream_name.c_str(), kCreateDrainTimeoutMs);
+                return false;
+            }
+        }
         auto it = encoders_.find(stream_name);
         if (it != encoders_.end()) {
             ctx = it->second.codec_ctx;
@@ -444,7 +509,7 @@ bool EncoderManager::destroy(const std::string& stream_name) {
             EncoderSlot parked = it->second;
             parked.teardown_in_progress = true;  // this thread owns the teardown
             closing_teardowns_[stream_name] = parked;
-            closing_ctxs_.insert(ctx);
+            release_only_ctxs_.insert(ctx);
             encoders_.erase(it);
         } else {
             auto cit = closing_teardowns_.find(stream_name);
@@ -511,7 +576,7 @@ bool EncoderManager::destroy(const std::string& stream_name) {
     {
         std::lock_guard<std::mutex> lock(mu_);
         closing_teardowns_.erase(stream_name);
-        closing_ctxs_.erase(ctx);
+        release_only_ctxs_.erase(ctx);
     }
 
     HAL_LOG_INFO("EncoderManager: Destroyed encoder for %s (from_media=%d)",
@@ -522,7 +587,23 @@ bool EncoderManager::destroy(const std::string& stream_name) {
 bool EncoderManager::destroy_all() {
     std::vector<std::string> names;
     {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::unique_lock<std::mutex> lock(mu_);
+        // Barrier: reject new creations (create()/create_from_context()
+        // check destroy_all_active_) for the whole snapshot+teardown window
+        // and wait out in-flight ones — otherwise a create could publish a
+        // fresh ctx right after this pass reported all-clear, and the
+        // caller would tear the media pipeline down around a live encoder.
+        destroy_all_active_ = true;
+        const bool creations_drained = creating_cv_.wait_for(
+            lock, std::chrono::milliseconds(kCreateDrainTimeoutMs),
+            [this] { return creating_names_.empty(); });
+        if (!creations_drained) {
+            HAL_LOG_ERROR("EncoderManager: destroy_all() aborted — a creation "
+                          "is still inside the HAL after %dms",
+                          kCreateDrainTimeoutMs);
+            destroy_all_active_ = false;
+            return false;
+        }
         std::unordered_set<std::string> seen;
         for (auto& [name, _] : encoders_) {
             if (seen.insert(name).second) names.push_back(name);
@@ -538,6 +619,10 @@ bool EncoderManager::destroy_all() {
         if (!destroy(name)) {
             all_torn_down = false;
         }
+    }
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        destroy_all_active_ = false;
     }
     return all_torn_down;
 }

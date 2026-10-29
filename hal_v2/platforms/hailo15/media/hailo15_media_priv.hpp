@@ -93,6 +93,18 @@ struct Hailo15MediaPriv
     std::map<std::string, std::pair<HalVideoFrameCallback, void *>> video_subscribers;
     std::map<std::string, std::pair<HalCodecFrameCallback, void *>> codec_packet_subscribers;
 
+    /** FROM_MEDIA packet callbacks currently running. The dispatch lambda
+     *  copies the subscriber under `mutex` and invokes it AFTER unlocking,
+     *  so hailo15_codec_unsubscribe() must wait this count back to zero
+     *  before returning — a late callback would reach the manager after it
+     *  dropped the ctx's release-only bookkeeping and leak the packet
+     *  buffer. Guarded by packet_cb_mu; dispatchers nest mutex ->
+     *  packet_cb_mu, the unsubscribe waiter takes packet_cb_mu alone after
+     *  releasing `mutex`, so the orderings never conflict. */
+    int packet_cb_in_flight{0};
+    std::mutex packet_cb_mu;
+    std::condition_variable packet_cb_cv;
+
     /** Per-encoder OSD layout state for font-size rescaling on resolution/rotation changes. */
     std::map<std::string, OsdLayoutState> osd_layout_by_encoder;
 

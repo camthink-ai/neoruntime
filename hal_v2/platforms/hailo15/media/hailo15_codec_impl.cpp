@@ -1100,8 +1100,26 @@ static int hailo15_codec_unsubscribe(void *codec_ctx, HalCodecFrameCallback call
         return HAL_ERR_INVALID_ARG;
     }
     std::string eid = cc->codec_name;
-    std::lock_guard<std::recursive_mutex> lock(priv->mutex);
-    priv->codec_packet_subscribers.erase(eid);
+    {
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->codec_packet_subscribers.erase(eid);
+    }
+    /* The dispatch thread copies the subscriber under priv->mutex and
+     * invokes it AFTER unlocking, so erasing the map entry does not stop
+     * an already-copied callback. Wait for in-flight copies to finish
+     * before returning: the caller (EncoderManager::destroy) drops its
+     * release-only bookkeeping for this ctx once we return, and a late
+     * callback would take the unknown-ctx path and leak the packet buffer. */
+    {
+        std::unique_lock<std::mutex> in_flight_lk(priv->packet_cb_mu);
+        if (!priv->packet_cb_cv.wait_for(in_flight_lk, std::chrono::milliseconds(500),
+                                         [priv] { return priv->packet_cb_in_flight == 0; }))
+        {
+            HAL_LOG_ERROR("hailo15_media: unsubscribe('%s') left with a packet "
+                          "callback still in flight — a late callback may leak "
+                          "one packet buffer", eid.c_str());
+        }
+    }
     return HAL_OK;
 }
 
