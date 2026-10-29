@@ -91,6 +91,26 @@ func TestLoadModelHealsStaleLoadedRow(t *testing.T) {
 	}
 }
 
+func TestLoadModelForwardsResourceEstimates(t *testing.T) {
+	h, fake, store := newAIUpdateTestEnv(t)
+	blob := seedBlob(t, store, "estimate")
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "estimated_raw", Name: "estimated_raw", Status: "uploaded", Source: "web",
+		ModelType: "classification", OutputMode: model.OutputModeRaw,
+		FilePath: blob, FileHash: "estimate",
+		EstimatedTops: 1.25, EstimatedMemory: 80,
+	})
+
+	w := postModelAction(t, h, "load", "estimated_raw")
+	if respCode(t, w) != 0 {
+		t.Fatalf("load failed: %s", w.Body.String())
+	}
+	tops, memory := fake.registeredEstimates("estimated_raw")
+	if tops != 1.25 || memory != 80 {
+		t.Errorf("runtime registration estimates = %v TOPS/%d MiB, want 1.25/80", tops, memory)
+	}
+}
+
 // Runtime serving a model the DB calls "uploaded": load rejects with the
 // usual message but heals the row so the two views agree.
 func TestLoadModelRejectsButHealsWhenRuntimeServesIt(t *testing.T) {

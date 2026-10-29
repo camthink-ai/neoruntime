@@ -50,10 +50,12 @@ func loadModelRuntime(ctx context.Context, client inferencepb.InferenceServiceCl
 	}
 
 	resp, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-		ModelPath:    runtimePath,
-		ModelId:      dbModel.ModelID,
-		ModelType:    grpcModelType,
-		ModelVariant: runtimeVariant,
+		ModelPath:       runtimePath,
+		ModelId:         dbModel.ModelID,
+		ModelType:       grpcModelType,
+		ModelVariant:    runtimeVariant,
+		EstimatedTops:   dbModel.EstimatedTops,
+		EstimatedMemory: dbModel.EstimatedMemory,
 	})
 	if err != nil {
 		return fmt.Errorf("Failed to load model on NPU: %w", err)

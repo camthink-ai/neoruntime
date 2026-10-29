@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -37,6 +38,9 @@ func (h *APIHandlers) importModelPackage(file multipart.File, pkgSize int64) (*s
 		return nil, nil, err
 	}
 	meta := pr.Meta()
+	if math.IsNaN(float64(meta.EstimatedTops)) || math.IsInf(float64(meta.EstimatedTops), 0) || meta.EstimatedTops < 0 {
+		return nil, nil, fmt.Errorf("package estimated_tops must be a finite non-negative number")
+	}
 	if _, err := io.Copy(io.Discard, pr.HEF()); err != nil {
 		return nil, nil, fmt.Errorf("failed to read package HEF section: %w", err)
 	}
@@ -155,14 +159,16 @@ func (h *APIHandlers) ExportModel(c *gin.Context) {
 		return
 	}
 	meta := &storage.PackageMeta{
-		ModelID:      m.ModelID,
-		Name:         m.Name,
-		ModelType:    m.ModelType,
-		OutputMode:   outputMode,
-		Config:       exportCfg,
-		HEF:          storage.PackageHEF{Filename: filepath.Base(m.FilePath), SHA256: hex.EncodeToString(hasher.Sum(nil))},
-		Network:      storage.PackageNetwork{Name: m.NetworkName, InputWidth: m.InputWidth, InputHeight: m.InputHeight},
-		OutputFormat: model.ClassifyOutputFormat(m.VStreamInfo),
+		ModelID:         m.ModelID,
+		Name:            m.Name,
+		ModelType:       m.ModelType,
+		OutputMode:      outputMode,
+		EstimatedTops:   m.EstimatedTops,
+		EstimatedMemory: m.EstimatedMemory,
+		Config:          exportCfg,
+		HEF:             storage.PackageHEF{Filename: filepath.Base(m.FilePath), SHA256: hex.EncodeToString(hasher.Sum(nil))},
+		Network:         storage.PackageNetwork{Name: m.NetworkName, InputWidth: m.InputWidth, InputHeight: m.InputHeight},
+		OutputFormat:    model.ClassifyOutputFormat(m.VStreamInfo),
 	}
 
 	c.Header("Content-Disposition", `attachment; filename="`+url.PathEscape(modelID)+".bin"+`"`)

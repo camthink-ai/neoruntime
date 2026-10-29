@@ -95,6 +95,32 @@ func TestRegisterModelRawModeStoredOnRow(t *testing.T) {
 	}
 }
 
+func TestRegisterModelStoresResourceEstimates(t *testing.T) {
+	h, _, _ := newAIUpdateTestEnv(t)
+	w := postRegister(t, h, `{"model_id":"estimated_raw","model_path":"/x.hef","output_mode":"raw","estimated_tops":1.75,"estimated_memory":96}`)
+	if respCode(t, w) != 0 {
+		t.Fatalf("registration failed: %s", w.Body.String())
+	}
+	row, err := h.aiModelRepo.GetByModelID("estimated_raw")
+	if err != nil || row == nil {
+		t.Fatalf("row missing: %v", err)
+	}
+	if row.EstimatedTops != 1.75 || row.EstimatedMemory != 96 {
+		t.Errorf("estimates = %v TOPS/%d MiB, want 1.75/96", row.EstimatedTops, row.EstimatedMemory)
+	}
+}
+
+func TestRegisterModelRejectsNegativeTopsEstimate(t *testing.T) {
+	h, _, _ := newAIUpdateTestEnv(t)
+	w := postRegister(t, h, `{"model_id":"bad_estimate","model_path":"/x.hef","output_mode":"raw","estimated_tops":-1}`)
+	if respCode(t, w) != CodeInvalidRequest {
+		t.Fatalf("code = %d body=%s, want %d", respCode(t, w), w.Body.String(), CodeInvalidRequest)
+	}
+	if row, _ := h.aiModelRepo.GetByModelID("bad_estimate"); row != nil {
+		t.Errorf("rejected estimate must not be persisted, got %+v", row)
+	}
+}
+
 // UpdateModel applies the same cross-check against the post-update view: a
 // raw feature-map model cannot be flipped to platform delivery.
 func TestUpdateModelRejectsRawToPlatformOnFeatureMap(t *testing.T) {
@@ -197,6 +223,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 		VStreamInfo: nmsVstreamInfo,
 		FilePath:    hefPath, FileHash: contentHash,
 		Threshold: 0.4, MaxDetections: 32,
+		EstimatedTops: 2.25, EstimatedMemory: 128,
 		Config: `{"postprocess_profile":"hailo_yolov8s_384_640","nms_threshold":0.5}`,
 	})
 
@@ -249,6 +276,9 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 	if meta.OutputFormat != model.OutputFormatNMS {
 		t.Errorf("meta output_format = %q, want %q", meta.OutputFormat, model.OutputFormatNMS)
+	}
+	if meta.EstimatedTops != 2.25 || meta.EstimatedMemory != 128 {
+		t.Errorf("resource estimates = %v TOPS/%d MiB, want 2.25/128", meta.EstimatedTops, meta.EstimatedMemory)
 	}
 }
 

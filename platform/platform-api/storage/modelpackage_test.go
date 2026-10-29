@@ -11,14 +11,16 @@ import (
 
 func testMeta() *PackageMeta {
 	return &PackageMeta{
-		ModelID:      "fire_smoke_detector",
-		Name:         "Fire & Smoke Detector",
-		ModelType:    "detection",
-		OutputMode:   "platform",
-		Config:       json.RawMessage(`{"threshold":0.4,"max_detections":64,"labels":"fire,smoke"}`),
-		HEF:          PackageHEF{Filename: "fire_smoke.hef"},
-		Network:      PackageNetwork{Name: "yolov8n_fire_smoke", InputWidth: 640, InputHeight: 384},
-		OutputFormat: "nms",
+		ModelID:         "fire_smoke_detector",
+		Name:            "Fire & Smoke Detector",
+		ModelType:       "detection",
+		OutputMode:      "platform",
+		EstimatedTops:   1.5,
+		EstimatedMemory: 64,
+		Config:          json.RawMessage(`{"threshold":0.4,"max_detections":64,"labels":"fire,smoke"}`),
+		HEF:             PackageHEF{Filename: "fire_smoke.hef"},
+		Network:         PackageNetwork{Name: "yolov8n_fire_smoke", InputWidth: 640, InputHeight: 384},
+		OutputFormat:    "nms",
 	}
 }
 
@@ -42,6 +44,10 @@ func writePackage(t *testing.T, meta *PackageMeta, hef []byte) []byte {
 // writeRawPackage builds a package from arbitrary JSON/HEF sections so tests
 // can hand-craft malformed metadata that WritePackage would never emit.
 func writeRawPackage(t *testing.T, jsonBytes, hef []byte) []byte {
+	return writeRawPackageVersion(t, packageVersion, jsonBytes, hef)
+}
+
+func writeRawPackageVersion(t *testing.T, version uint16, jsonBytes, hef []byte) []byte {
 	t.Helper()
 	digest := sha256.New()
 	digest.Write(jsonBytes)
@@ -49,12 +55,45 @@ func writeRawPackage(t *testing.T, jsonBytes, hef []byte) []byte {
 
 	header := make([]byte, packageHeaderSize)
 	copy(header, packageMagic)
-	binary.BigEndian.PutUint16(header[4:6], packageVersion)
+	binary.BigEndian.PutUint16(header[4:6], version)
 	binary.BigEndian.PutUint32(header[8:12], uint32(len(jsonBytes)))
 	binary.BigEndian.PutUint64(header[12:20], uint64(len(hef)))
 	digest.Sum(header[20:20])
 
 	return append(append(header, jsonBytes...), hef...)
+}
+
+func TestPackageReaderAcceptsLegacyV1(t *testing.T) {
+	meta := testMeta()
+	meta.FormatVersion = 1
+	meta.EstimatedTops = 0
+	meta.EstimatedMemory = 0
+	jsonBytes, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := writeRawPackageVersion(t, 1, jsonBytes, testHEF())
+
+	got, err := openAndDrain(t, pkg)
+	if err != nil {
+		t.Fatalf("legacy v1 package rejected: %v", err)
+	}
+	if got.FormatVersion != 1 || got.EstimatedTops != 0 || got.EstimatedMemory != 0 {
+		t.Errorf("legacy metadata changed: %+v", got)
+	}
+}
+
+func TestPackageReaderRejectsV2EstimatesUnderV1Header(t *testing.T) {
+	meta := testMeta()
+	meta.FormatVersion = 1
+	jsonBytes, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := writeRawPackageVersion(t, 1, jsonBytes, testHEF())
+	if _, err := openAndDrain(t, pkg); err == nil {
+		t.Fatal("v1 package carrying v2 resource estimates must be rejected")
+	}
 }
 
 func openAndDrain(t *testing.T, pkg []byte) (*PackageMeta, error) {
@@ -121,7 +160,7 @@ func TestPackageTamperDetected(t *testing.T) {
 }
 
 func TestPackageUnknownJSONKeyRejected(t *testing.T) {
-	jsonBytes := []byte(`{"format_version":1,"model_id":"m","hef":{"filename":"a.hef"},"backend_lib_path":"/tmp/evil.so"}`)
+	jsonBytes := []byte(`{"format_version":2,"model_id":"m","hef":{"filename":"a.hef"},"backend_lib_path":"/tmp/evil.so"}`)
 	pkg := writeRawPackage(t, jsonBytes, testHEF())
 
 	if _, err := openAndDrain(t, pkg); err == nil {
@@ -130,7 +169,7 @@ func TestPackageUnknownJSONKeyRejected(t *testing.T) {
 }
 
 func TestPackageUnknownHEFKeyRejected(t *testing.T) {
-	jsonBytes := []byte(`{"format_version":1,"model_id":"m","hef":{"filename":"a.hef","backend_config_path":"/tmp/evil.json"}}`)
+	jsonBytes := []byte(`{"format_version":2,"model_id":"m","hef":{"filename":"a.hef","backend_config_path":"/tmp/evil.json"}}`)
 	pkg := writeRawPackage(t, jsonBytes, testHEF())
 
 	if _, err := openAndDrain(t, pkg); err == nil {
@@ -157,11 +196,11 @@ func TestPackageTruncatedHERejected(t *testing.T) {
 
 func TestPackageVersionRejected(t *testing.T) {
 	pkg := writePackage(t, testMeta(), testHEF())
-	binary.BigEndian.PutUint16(pkg[4:6], 2)
+	binary.BigEndian.PutUint16(pkg[4:6], packageVersion+1)
 	// The digest covers only json||hef, so patching version alone is enough.
 
 	if _, err := OpenPackage(bytes.NewReader(pkg)); err == nil {
-		t.Error("version 2 must be rejected")
+		t.Errorf("version %d must be rejected", packageVersion+1)
 	}
 }
 

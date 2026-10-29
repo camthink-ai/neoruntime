@@ -502,6 +502,16 @@ paths:
                   type: integer
                 input_height:
                   type: integer
+                estimated_tops:
+                  type: number
+                  format: float
+                  minimum: 0
+                  description: Replaces the file's estimate (TOPS); 0 clears the stored value.
+                estimated_memory:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  description: Replaces the file's estimate (MiB); 0 clears the stored value.
       responses:
         '200':
           description: Model updated
@@ -5326,6 +5336,40 @@ paths:
                           type: integer
                           format: int64
 
+  /system/time/mcu-rtc:
+    get:
+      tags: [System]
+      summary: Read the MCU RTC back over the host link
+      description: |
+        Diagnostic readback of the MCU real-time clock. The boot flow only
+        pushes time host-to-MCU, so this verifies the sync landed and flags
+        an implausible MCU clock (e.g. a dead RTC reporting year 2000).
+      operationId: getMcuRtcTime
+      responses:
+        '200':
+          description: MCU RTC time, host time and absolute drift
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        mcu_time:
+                          type: string
+                          format: date-time
+                        host_time:
+                          type: string
+                          format: date-time
+                        drift_seconds:
+                          type: integer
+                          format: int64
+                        plausible:
+                          type: boolean
+
   /system/time/set:
     post:
       tags: [System]
@@ -7170,8 +7214,14 @@ components:
             $ref: '#/components/schemas/TensorSpec'
         estimated_tops:
           type: number
+          format: float
+          minimum: 0
+          description: Optional precomputed compiler/package estimate in TOPS; 0 means unavailable.
         estimated_memory:
           type: integer
+          format: int32
+          minimum: 0
+          description: Optional compiler/package memory estimate in MiB; 0 means unavailable.
         load_timestamp:
           type: integer
           format: int64

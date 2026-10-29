@@ -101,6 +101,7 @@ func (f *fakeAIRuntime) RegisterModel(_ context.Context, in *inferencepb.ModelRe
 		}
 		entry := &inferencepb.ModelInfo{
 			ModelId: in.ModelId, ModelPath: in.ModelPath, OwnerId: owner,
+			EstimatedTops: in.EstimatedTops, EstimatedMemory: in.EstimatedMemory,
 		}
 		if f.smokeSpec != nil {
 			entry.Inputs = []*inferencepb.TensorSpec{f.smokeSpec}
@@ -125,6 +126,16 @@ func (f *fakeAIRuntime) registeredPath(modelID string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.regPaths[modelID]
+}
+
+func (f *fakeAIRuntime) registeredEstimates(modelID string) (float32, uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	info := f.liveInfos[modelID]
+	if info == nil {
+		return 0, 0
+	}
+	return info.EstimatedTops, info.EstimatedMemory
 }
 
 // ListModels reports the live set so handlers reconcile against a runtime

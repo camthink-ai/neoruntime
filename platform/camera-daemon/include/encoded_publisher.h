@@ -34,6 +34,7 @@
 #include <functional>
 #include <condition_variable>
 #include <deque>
+#include <shared_mutex>
 
 extern "C" {
     #include "hal_buffer.h"
@@ -148,6 +149,7 @@ private:
         std::atomic<uint64_t> client_send_failures{0};
         std::atomic<uint64_t> client_disconnects{0};
         std::atomic<uint64_t> last_packet_seq{0};
+        std::atomic<uint64_t> last_pts_ns{0};      // last valid pts (invalid-ts replacement)
         std::atomic<int64_t> last_keyframe_req_ms{0};  // steady-clock ms, IDR rate limit
         std::atomic<bool>    encoder_health_alarm_latched{false};  // one-shot, see check_encoder_health
     };
@@ -166,6 +168,11 @@ private:
     static constexpr size_t MAX_QUEUE_SIZE = 120;
 
     std::atomic<bool> running_{false};
+    // add_stream()/remove_stream() are runtime operations.  The accept and
+    // dispatch workers, encoder callbacks, and status RPCs all dereference
+    // StreamState entries concurrently, so the map (and the lifetime of each
+    // pointed-to StreamState) must be protected as one unit.
+    mutable std::shared_mutex streams_mu_;
     std::unordered_map<std::string, std::unique_ptr<StreamState>> streams_;
     int epoll_fd_ = -1;
     std::thread accept_thread_;
@@ -180,6 +187,20 @@ private:
     std::vector<LocalCallback> local_listeners_;
 
     KeyframeRequestFn keyframe_request_fn_;
+
+    // Async keyframe dispatch. The HAL force_idr behind keyframe_request_fn_
+    // can block indefinitely inside medialib when the encode pipeline is
+    // stalled (gst_pad_send_event waiting on pad locks). Calling it inline
+    // from the CTRL/probe/broadcast paths held ss.clients_mu across that
+    // block and deadlocked the accept/probe/status paths daemon-wide
+    // (field-verified 10-29). Requests are queued here and drained by a
+    // worker that holds no publisher locks; a stuck call wedges only that
+    // worker.
+    std::mutex kf_mu_;
+    std::condition_variable kf_cv_;
+    std::deque<std::string> kf_pending_;
+    bool kf_stopping_ = false;
+    std::thread keyframe_thread_;
 
     static constexpr uint8_t CTRL_REQUEST_KEYFRAME = 0x4B;
 
@@ -199,6 +220,12 @@ private:
     // Rate-limited (<=1/s per stream) encoder IDR request so a client that
     // lost frames can resync at the next keyframe.
     void maybe_request_keyframe(StreamState& ss);
+
+    // Queue one IDR request (deduped per stream) for async dispatch.
+    void enqueue_keyframe_request(const std::string& name);
+    // Drains kf_pending_ on a dedicated thread; never holds clients_mu_ or
+    // queue_mu_ across the callback.
+    void keyframe_dispatch_loop();
 
     // Fail-loud guard for the metadata-only syndrome: packets keep flowing
     // but no keyframe is ever coded. Latches ONE ERROR per stream (cleared on

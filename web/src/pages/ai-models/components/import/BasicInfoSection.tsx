@@ -10,6 +10,7 @@ import {
 } from '@/components/ui/select';
 import type { ModelFieldDef } from '@/hooks/useModels';
 import type { ModelImportFormState } from '../../lib/modelImportFlow';
+import FieldHelp from './FieldHelp';
 import ModelSchemaField from './ModelSchemaField';
 
 export interface BasicInfoSectionProps {
@@ -58,9 +59,12 @@ export default function BasicInfoSection({
       </h3>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <div className="grid content-start gap-2">
-          <Label htmlFor="modelId">
-            {t('sys.ai_models.form.model_id', 'Model ID')}
-          </Label>
+          <div className="flex items-center gap-1.5">
+            <Label htmlFor="modelId">
+              {t('sys.ai_models.form.model_id', 'Model ID')}
+            </Label>
+            <FieldHelp fieldKey="model_id" />
+          </div>
           <Input
             id="modelId"
             type="text"
@@ -86,9 +90,12 @@ export default function BasicInfoSection({
         </div>
 
         <div className="grid content-start gap-2">
-          <Label htmlFor="modelType">
-            {t('sys.ai_models.form.model_type', 'Model Type')}
-          </Label>
+          <div className="flex items-center gap-1.5">
+            <Label htmlFor="modelType">
+              {t('sys.ai_models.form.model_type', 'Model Type')}
+            </Label>
+            <FieldHelp fieldKey="model_type" />
+          </div>
           <Select
             value={form.modelType}
             onValueChange={onModelTypeChange}

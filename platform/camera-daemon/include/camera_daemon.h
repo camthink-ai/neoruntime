@@ -770,6 +770,10 @@ private:
     // e.g. "sink0" → "main", "sink1" → "sub"
     std::unordered_map<std::string, std::string> video_name_map_;
     std::unordered_map<std::string, std::string> encoder_name_map_;
+    // Guards encoder_name_map_: keyframe callbacks (publisher/RTSP threads,
+    // no op_mu_) snapshot the map under this lock; mutators take it inside
+    // their op_mu_ scope so a concurrent rehash cannot race them.
+    std::mutex enc_name_mu_;
     bool has_media_pipeline() const {
         return media_ctx_ != nullptr;
     }
@@ -1008,8 +1012,12 @@ private:
     bool init_rtsp();
     bool init_encoded_publisher();
     bool init_ai_overlay();
+    /** Rebind VideoSource after MediaLibrary replaces its borrowed video contexts. */
+    bool resync_video_source_from_media_pipeline(const char* reason);
     /** Re-register EncoderManager from get_codec_list after MediaLibrary reallocates codec contexts. */
-    void resync_encoders_from_media_pipeline();
+    bool resync_encoders_from_media_pipeline();
+    /** Finish a partially aborted encoder teardown and restore all live HAL registrations. */
+    bool recover_encoder_registrations_after_teardown_abort(const char* reason);
 
     /**
      * Post-change frame verify: poll the primary encoder stream for fresh encoded

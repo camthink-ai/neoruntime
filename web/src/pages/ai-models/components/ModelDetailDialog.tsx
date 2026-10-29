@@ -608,18 +608,28 @@ export default function ModelDetailDialog({
                     t('sys.ai_models.detail.load_time', '加载时间'),
                     formatTimestamp(mergedModel.load_timestamp)
                   )}
-                {hasNumber(mergedModel.estimated_tops)
-                  && item(
-                    HardDrive,
-                    t('sys.ai_models.detail.estimated_tops', '预估算力'),
-                    `${mergedModel.estimated_tops}`
-                  )}
-                {hasNumber(mergedModel.estimated_memory)
-                  && item(
-                    HardDrive,
-                    t('sys.ai_models.detail.estimated_memory', '预估内存'),
-                    `${mergedModel.estimated_memory}`
-                  )}
+                {item(
+                  HardDrive,
+                  t('sys.ai_models.detail.estimated_tops', '预估算力'),
+                  hasNumber(mergedModel.estimated_tops)
+                    && mergedModel.estimated_tops > 0
+                    ? `${mergedModel.estimated_tops} TOPS`
+                    : t(
+                        'sys.ai_models.detail.estimate_unavailable',
+                        '暂不支持'
+                      )
+                )}
+                {item(
+                  HardDrive,
+                  t('sys.ai_models.detail.estimated_memory', '预估内存'),
+                  hasNumber(mergedModel.estimated_memory)
+                    && mergedModel.estimated_memory > 0
+                    ? `${mergedModel.estimated_memory} MiB`
+                    : t(
+                        'sys.ai_models.detail.estimate_unavailable',
+                        '暂不支持'
+                      )
+                )}
               </>
             )}
 

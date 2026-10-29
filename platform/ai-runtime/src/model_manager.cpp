@@ -157,7 +157,9 @@ int ModelManager::register_model(const std::string& model_id,
                                  const std::string& variant,
                                  const std::string& model_type,
                                  std::string* why,
-                                 uint32_t batch_size) {
+                                 uint32_t batch_size,
+                                 float estimated_tops,
+                                 uint32_t estimated_memory) {
     std::unique_lock lock(mu_);
 
     if (models_.count(model_id)) {
@@ -229,6 +231,16 @@ int ModelManager::register_model(const std::string& model_id,
                      "transient=%d, keeping stored flag",
                      model_id.c_str(), transient, models_[model_id].transient);
         }
+        // Estimates are descriptive metadata, not part of the executable
+        // registration identity. Let a later owner fill a previously unknown
+        // value without rebuilding the shared HAL session; the first known
+        // estimate wins when callers disagree.
+        if (models_[model_id].estimated_tops <= 0.0f && estimated_tops > 0.0f) {
+            models_[model_id].estimated_tops = estimated_tops;
+        }
+        if (models_[model_id].estimated_memory == 0 && estimated_memory > 0) {
+            models_[model_id].estimated_memory = estimated_memory;
+        }
         if (!owner_id.empty()) {
             owners_[model_id].insert(owner_id);
             LOG_INFO("Model %s: added co-owner '%s' (total owners: %zu)",
@@ -274,6 +286,8 @@ int ModelManager::register_model(const std::string& model_id,
             alias.transient = transient;  // visibility is per-id, follows this registration
             alias.model_type = model_type; // decoding identity is per-id too: init_post_process
             alias.variant    = variant;    // gives the alias its own postprocess session
+            if (estimated_tops > 0.0f) alias.estimated_tops = estimated_tops;
+            if (estimated_memory > 0) alias.estimated_memory = estimated_memory;
             // The alias is a fresh registry entry: snapshot refcount starts at
             // 0 (the copy inherited the original's in-flight count). Shared
             // HAL session lifetimes are tracked separately by infer_refs_/
@@ -358,6 +372,8 @@ int ModelManager::register_model(const std::string& model_id,
     entry.model_type = model_type;
     entry.variant    = variant;
     entry.batch_size = infer_cfg.batch_size;
+    entry.estimated_tops = estimated_tops;
+    entry.estimated_memory = estimated_memory;
     entry.ref_count  = 0;
     entry.load_time  = std::time(nullptr);
 

@@ -196,6 +196,12 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
         resp->mutable_status()->set_message("model_id and model_path required");
         return grpc::Status::OK;
     }
+    if (!std::isfinite(req->estimated_tops()) || req->estimated_tops() < 0.0f) {
+        resp->mutable_status()->set_success(false);
+        resp->mutable_status()->set_message(
+            "estimated_tops must be a finite non-negative number");
+        return grpc::Status::OK;
+    }
 
     // App-bundled (transient) models have no platform.db metadata to supply a
     // postprocess type later — this registration is the only chance to get it.
@@ -259,7 +265,9 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
                                         owner_id, req->transient(),
                                         req->model_variant(),
                                         req->model_type(), &why,
-                                        req->batch_size());
+                                        req->batch_size(),
+                                        req->estimated_tops(),
+                                        req->estimated_memory());
     if (rc < 0) {
         resp->mutable_status()->set_success(false);
         resp->mutable_status()->set_message(
@@ -382,6 +390,8 @@ grpc::Status AIRuntimeServiceImpl::ListModels(
         info->set_load_timestamp(static_cast<uint64_t>(m.load_time));
         info->set_transient(m.transient);
         info->set_batch_size(m.batch_size);
+        info->set_estimated_tops(m.estimated_tops);
+        info->set_estimated_memory(m.estimated_memory);
         // Include first owner_id if available
         auto owners = model_mgr_->get_owners(m.id);
         if (!owners.empty()) {
@@ -411,6 +421,8 @@ grpc::Status AIRuntimeServiceImpl::GetModelInfo(
     resp->set_load_timestamp(static_cast<uint64_t>(m.load_time));
     resp->set_transient(m.transient);
     resp->set_batch_size(m.batch_size);
+    resp->set_estimated_tops(m.estimated_tops);
+    resp->set_estimated_memory(m.estimated_memory);
     fill_tensor_specs(m.model_info, resp);
 
     return grpc::Status::OK;

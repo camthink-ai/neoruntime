@@ -1,4 +1,10 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useCallback,
+} from 'react';
 import { VideoStreamPlayer } from '@/lib/videoStream';
 import { AudioPlayer } from '@/lib/audioStream/audioPlayer';
 import Loading from '@/components/loading';
@@ -14,6 +20,7 @@ import {
   resolvePlayerObjectFit,
   type PlayerObjectFit,
 } from './objectFit';
+import { resolveFrozenFrameSource } from './freezeFrame';
 
 type PlayerProps = {
   videoUrl: string;
@@ -32,6 +39,8 @@ type PlayerProps = {
   defaultStreamStatsVisible?: boolean;
   /** Show an encoder configuration progress state over the player */
   configuring?: boolean;
+  /** Preserve the last rendered frame while a full stream restart is running */
+  streamRestarting?: boolean;
   /** Actual decoded frame size, used by overlay layers to match the video. */
   onFrameSizeChange?: (size: { width: number; height: number }) => void;
   /**
@@ -44,6 +53,11 @@ type PlayerProps = {
 
 const STREAM_STATS_KEY = 'deviceToolStreamStatsVisible';
 const TRANSFORM_STREAM_RESUME_TIMEOUT = 15000;
+const FROZEN_FRAME_RELEASE_DELAY_MS = 500;
+// WebCodecs never presents frames through the <video> element, so the
+// rVFC-based release below can stay pending forever. Hard upper bound on how
+// long the frozen layer may cover the player.
+const FROZEN_FRAME_MAX_HOLD_MS = 2000;
 
 export default function Player({
   videoUrl,
@@ -56,6 +70,7 @@ export default function Player({
   enableAudio = true,
   defaultStreamStatsVisible,
   configuring = false,
+  streamRestarting = false,
   onFrameSizeChange,
   audioOverlay = false,
 }: PlayerProps) {
@@ -66,6 +81,7 @@ export default function Player({
   const [isShowPanel, setIsShowPanel] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const frozenFrameRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const idleTimerRef = useRef<number | null>(null);
   const audioPlayerRef = useRef<AudioPlayer | null>(null);
@@ -127,6 +143,12 @@ export default function Player({
     'connecting' | 'connected' | 'disconnected'
   >('connecting');
   const [videoVisible, setVideoVisible] = useState(false);
+  const [frozenFrameVisible, setFrozenFrameVisible] = useState(false);
+  const frozenFrameVisibleRef = useRef(false);
+  const streamRestartingRef = useRef(streamRestarting);
+  const pendingVideoFrameCallbackRef = useRef<number | null>(null);
+  const frozenFrameReleaseTimerRef = useRef<number | null>(null);
+  const frozenFrameMaxHoldTimerRef = useRef<number | null>(null);
   const [videoDimensions, setVideoDimensions] = useState({
     width: streamWidth ?? 0,
     height: streamHeight ?? 0,
@@ -140,6 +162,80 @@ export default function Player({
   // recreated on every store update.
   const audioSettingsRef = useRef({ audioShouldPlay, volume, videoUrl });
   audioSettingsRef.current = { audioShouldPlay, volume, videoUrl };
+  streamRestartingRef.current = streamRestarting;
+
+  const setFrozenFrame = useCallback((visible: boolean) => {
+    frozenFrameVisibleRef.current = visible;
+    setFrozenFrameVisible(visible);
+  }, []);
+
+  // Capture synchronously before the videoUrl effect tears down the old player.
+  // The canvas then covers the empty/reset video element until the replacement
+  // decoder presents a real frame, turning a codec-switch black flash into a
+  // short freeze of the last valid frame.
+  useLayoutEffect(() => {
+    if (!streamRestarting) return;
+
+    const video = videoRef.current;
+    const canvas = frozenFrameRef.current;
+
+    // A second restart can land while the previous release (pending rVFC or
+    // release timer) is still armed. Cancel both so they can't fire against
+    // the new session, then re-arm the unconditional max-hold fallback.
+    if (
+      video
+      && pendingVideoFrameCallbackRef.current !== null
+      && typeof video.cancelVideoFrameCallback === 'function'
+    ) {
+      video.cancelVideoFrameCallback(pendingVideoFrameCallbackRef.current);
+    }
+    pendingVideoFrameCallbackRef.current = null;
+    if (frozenFrameReleaseTimerRef.current !== null) {
+      window.clearTimeout(frozenFrameReleaseTimerRef.current);
+      frozenFrameReleaseTimerRef.current = null;
+    }
+    if (frozenFrameMaxHoldTimerRef.current !== null) {
+      window.clearTimeout(frozenFrameMaxHoldTimerRef.current);
+      frozenFrameMaxHoldTimerRef.current = null;
+    }
+    frozenFrameMaxHoldTimerRef.current = window.setTimeout(() => {
+      frozenFrameMaxHoldTimerRef.current = null;
+      setFrozenFrame(false);
+    }, FROZEN_FRAME_MAX_HOLD_MS);
+
+    if (!video || !canvas) return;
+    const frameSource = resolveFrozenFrameSource(video);
+    if (!frameSource) return;
+
+    try {
+      canvas.width = frameSource.width;
+      canvas.height = frameSource.height;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+      context.drawImage(frameSource.source, 0, 0, canvas.width, canvas.height);
+      setFrozenFrame(true);
+    } catch {
+      // A failed snapshot should never block the normal reconnect path.
+      setFrozenFrame(false);
+    }
+  }, [setFrozenFrame, streamRestarting]);
+
+  useEffect(() => () => {
+    const video = videoRef.current;
+    if (
+      video
+      && pendingVideoFrameCallbackRef.current !== null
+      && typeof video.cancelVideoFrameCallback === 'function'
+    ) {
+      video.cancelVideoFrameCallback(pendingVideoFrameCallbackRef.current);
+    }
+    if (frozenFrameReleaseTimerRef.current !== null) {
+      window.clearTimeout(frozenFrameReleaseTimerRef.current);
+    }
+    if (frozenFrameMaxHoldTimerRef.current !== null) {
+      window.clearTimeout(frozenFrameMaxHoldTimerRef.current);
+    }
+  }, []);
 
   const startAudioPlayer = useCallback(() => {
     const settings = audioSettingsRef.current;
@@ -225,10 +321,21 @@ export default function Player({
       }>;
       publishFrameSize(detail?.width ?? 0, detail?.height ?? 0);
     };
+    const releaseAfterWebCodecsFrame = () => {
+      if (!frozenFrameVisibleRef.current || streamRestartingRef.current) return;
+      if (frozenFrameReleaseTimerRef.current !== null) {
+        window.clearTimeout(frozenFrameReleaseTimerRef.current);
+      }
+      frozenFrameReleaseTimerRef.current = window.setTimeout(() => {
+        frozenFrameReleaseTimerRef.current = null;
+        if (!streamRestartingRef.current) setFrozenFrame(false);
+      }, FROZEN_FRAME_RELEASE_DELAY_MS);
+    };
 
     video.addEventListener('loadedmetadata', syncFromVideo);
     video.addEventListener('resize', syncFromVideo);
     video.addEventListener('aipc:video-frame-size', syncFromDecoder);
+    video.addEventListener('aipc:webcodecs-frame', releaseAfterWebCodecsFrame);
     const timer = window.setInterval(syncFromVideo, 1000);
     syncFromVideo();
 
@@ -236,9 +343,13 @@ export default function Player({
       video.removeEventListener('loadedmetadata', syncFromVideo);
       video.removeEventListener('resize', syncFromVideo);
       video.removeEventListener('aipc:video-frame-size', syncFromDecoder);
+      video.removeEventListener(
+        'aipc:webcodecs-frame',
+        releaseAfterWebCodecsFrame
+      );
       window.clearInterval(timer);
     };
-  }, [publishFrameSize]);
+  }, [publishFrameSize, setFrozenFrame]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -381,8 +492,8 @@ export default function Player({
   const handleReloadRef = useRef(handleReload);
   handleReloadRef.current = handleReload;
 
-  // External callers (e.g. encoder reconfigure) request a full player reconnect
-  // by dispatching 'player-reload'. This tears down WS + MSE and reconnects,
+  // External callers (for example a hot bitrate update) request a full player
+  // reconnect by dispatching 'player-reload'. This tears down WS + MSE and reconnects,
   // fetching fresh SPS/PPS and waiting for a clean IDR — avoiding 花屏/黑屏
   // after a resolution/codec/fps change.
   useEffect(() => {
@@ -516,6 +627,37 @@ export default function Player({
         setIsControlPanel(true);
         setConnectionState('connected');
         setVideoVisible(true);
+        if (
+          frozenFrameVisibleRef.current
+          && !streamRestartingRef.current
+          && pendingVideoFrameCallbackRef.current === null
+        ) {
+          const video = videoRef.current;
+          if (video && typeof video.requestVideoFrameCallback === 'function') {
+            pendingVideoFrameCallbackRef.current = video.requestVideoFrameCallback(
+              () => {
+                pendingVideoFrameCallbackRef.current = null;
+                if (streamRestartingRef.current) return;
+                frozenFrameReleaseTimerRef.current = window.setTimeout(() => {
+                  frozenFrameReleaseTimerRef.current = null;
+                  if (streamRestartingRef.current) return;
+                  setFrozenFrame(false);
+                }, FROZEN_FRAME_RELEASE_DELAY_MS);
+              }
+            );
+          } else {
+            // requestVideoFrameCallback is available in the supported Chromium
+            // browsers; this fallback still waits one paint before revealing.
+            window.requestAnimationFrame(() => {
+              if (streamRestartingRef.current) return;
+              frozenFrameReleaseTimerRef.current = window.setTimeout(() => {
+                frozenFrameReleaseTimerRef.current = null;
+                if (streamRestartingRef.current) return;
+                setFrozenFrame(false);
+              }, FROZEN_FRAME_RELEASE_DELAY_MS);
+            });
+          }
+        }
       } else {
         setIsControlPanel(false);
       }
@@ -532,7 +674,7 @@ export default function Player({
       window.removeEventListener('wv_close', handlWvClose);
       window.removeEventListener('wv_error', handleWvError);
     };
-  }, [t]);
+  }, [setFrozenFrame, t]);
 
   const handleSnapshot = () => {
     videoRendererInstance.current?.doSnapshot();
@@ -645,8 +787,13 @@ export default function Player({
             onResize={syncVideoDimensions}
             disableRemotePlayback
           />
+          <canvas
+            ref={frozenFrameRef}
+            aria-hidden="true"
+            className={`pointer-events-none absolute inset-0 z-[1] h-full w-full ${resolvedObjectFit === 'cover' ? 'object-cover' : 'object-contain'} ${frozenFrameVisible ? 'opacity-100' : 'opacity-0'}`}
+          />
           {isShowStreamStats && (
-            <div className="absolute md:top-4 top-2 md:right-4 right-2 bg-gray-800/50 px-2 py-1 rounded text-xs font-mono space-y-0.5">
+            <div className="absolute z-10 md:top-4 top-2 md:right-4 right-2 bg-gray-800/50 px-2 py-1 rounded text-xs font-mono space-y-0.5">
               <div>
                 <span className="text-gray-400 font-bold">
                   {t('sys.device_tool.fps')}:
@@ -674,7 +821,7 @@ export default function Player({
         </div>
         {showPanel && (
           <PlayerPanel
-            className={`absolute bottom-0 left-0 transition-all duration-300 ease-in-out ${
+            className={`absolute z-10 bottom-0 left-0 transition-all duration-300 ease-in-out ${
               isShowPanel
                 ? 'opacity-100 translate-y-0'
                 : 'opacity-0 translate-y-full'
@@ -698,7 +845,7 @@ export default function Player({
           />
         )}
         {(loading || configuring || isTransformUpdating) && (
-          <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-2">
+          <div className="absolute z-10 left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-2">
             <Loading
               fullHeight={false}
               className="w-40"
@@ -718,8 +865,9 @@ export default function Player({
         {!loading
           && !configuring
           && !isTransformUpdating
+          && !streamRestarting
           && connectionState === 'disconnected' && (
-            <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-3">
+            <div className="absolute z-10 left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-3">
               <WifiOff
                 aria-hidden="true"
                 className="size-10 text-white/70"

@@ -19,7 +19,7 @@ import (
 // Layout (all integers big-endian):
 //
 //	0   4   magic "AMPK"
-//	4   2   version (currently 1)
+//	4   2   version (currently 2; readers also accept legacy v1)
 //	6   2   flags (reserved, must be 0)
 //	8   4   json_len
 //	12  8   hef_len
@@ -35,7 +35,8 @@ import (
 
 const (
 	packageMagic        = "AMPK"
-	packageVersion      = uint16(1)
+	minPackageVersion   = uint16(1)
+	packageVersion      = uint16(2) // v2 adds optional resource estimates
 	packageHeaderSize   = 4 + 2 + 2 + 4 + 8 + sha256.Size
 	maxPackageJSONBytes = 1 << 20 // 1 MiB is far beyond any sane metadata payload
 )
@@ -58,15 +59,18 @@ type PackageNetwork struct {
 // SupportedModelTypes; the caller validates every key against the declared
 // type's field definitions. Everything around Config is a closed schema.
 type PackageMeta struct {
-	FormatVersion uint16          `json:"format_version"`
-	ModelID       string          `json:"model_id"`
-	Name          string          `json:"name,omitempty"`
-	ModelType     string          `json:"model_type,omitempty"`
-	OutputMode    string          `json:"output_mode,omitempty"`
-	Config        json.RawMessage `json:"config,omitempty"`
-	HEF           PackageHEF      `json:"hef"`
-	Network       PackageNetwork  `json:"network"`
-	OutputFormat  string          `json:"output_format,omitempty"` // advisory: nms | feature_map
+	FormatVersion uint16  `json:"format_version"`
+	ModelID       string  `json:"model_id"`
+	Name          string  `json:"name,omitempty"`
+	ModelType     string  `json:"model_type,omitempty"`
+	OutputMode    string  `json:"output_mode,omitempty"`
+	EstimatedTops float32 `json:"estimated_tops,omitempty"`
+	// EstimatedMemory is the compiler/package estimate in MiB.
+	EstimatedMemory uint32          `json:"estimated_memory,omitempty"`
+	Config          json.RawMessage `json:"config,omitempty"`
+	HEF             PackageHEF      `json:"hef"`
+	Network         PackageNetwork  `json:"network"`
+	OutputFormat    string          `json:"output_format,omitempty"` // advisory: nms | feature_map
 }
 
 // IsPackageFile reports whether the leading bytes of a file look like an
@@ -148,8 +152,8 @@ func OpenPackage(r io.Reader) (*PackageReader, error) {
 		return nil, fmt.Errorf("not a model package (bad magic)")
 	}
 	version := binary.BigEndian.Uint16(head[4:6])
-	if version != packageVersion {
-		return nil, fmt.Errorf("unsupported model package version %d (supported: %d)", version, packageVersion)
+	if version < minPackageVersion || version > packageVersion {
+		return nil, fmt.Errorf("unsupported model package version %d (supported: %d-%d)", version, minPackageVersion, packageVersion)
 	}
 	if flags := binary.BigEndian.Uint16(head[6:8]); flags != 0 {
 		return nil, fmt.Errorf("unsupported model package flags %d", flags)
@@ -179,8 +183,11 @@ func OpenPackage(r io.Reader) (*PackageReader, error) {
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return nil, fmt.Errorf("model package metadata must be exactly one JSON object")
 	}
-	if meta.FormatVersion != packageVersion {
-		return nil, fmt.Errorf("unsupported metadata format_version %d (supported: %d)", meta.FormatVersion, packageVersion)
+	if meta.FormatVersion != version {
+		return nil, fmt.Errorf("metadata format_version %d does not match package header version %d", meta.FormatVersion, version)
+	}
+	if version == 1 && (meta.EstimatedTops != 0 || meta.EstimatedMemory != 0) {
+		return nil, fmt.Errorf("model package v1 cannot contain resource estimates")
 	}
 	if meta.HEF.Filename == "" {
 		return nil, fmt.Errorf("model package metadata missing hef.filename")

@@ -47,6 +47,10 @@ struct ModelEntry {
     // NPU batch the HAL session was configured with (HalInferenceConfig).
     // 1 = single-frame; >1 requires InferBatch (grouped into one NPU job).
     uint32_t     batch_size = 1;
+    // Optional registration metadata. Zero means no compiler/package
+    // estimate was supplied; estimated_memory is expressed in MiB.
+    float        estimated_tops = 0.0f;
+    uint32_t     estimated_memory = 0;
     int          ref_count  = 0;
     int64_t      load_time  = 0;        // Unix timestamp
 };
@@ -99,7 +103,9 @@ public:
                        const std::string& variant = "",
                        const std::string& model_type = "",
                        std::string* why = nullptr,
-                       uint32_t batch_size = 1);
+                       uint32_t batch_size = 1,
+                       float estimated_tops = 0.0f,
+                       uint32_t estimated_memory = 0);
 
     /// Unregister (unload) a model. With owner_id, an absent owner is an
     /// idempotent no-op; other owners keep the model resident; the last owner

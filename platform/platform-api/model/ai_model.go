@@ -30,6 +30,12 @@ type AIModel struct {
 	InputWidth  int    `json:"input_width"`                   // extracted from HEF input vstream
 	InputHeight int    `json:"input_height"`                  // extracted from HEF input vstream
 
+	// Optional compiler/package estimates. Zero means the source did not
+	// provide an estimate; EstimatedMemory is expressed in MiB throughout the
+	// REST, package and gRPC surfaces.
+	EstimatedTops   float32 `json:"estimated_tops"`
+	EstimatedMemory uint32  `json:"estimated_memory"`
+
 	// Schema-driven config (JSON map of key→value, from model type field definitions)
 	Config string `gorm:"type:text" json:"config,omitempty"`
 

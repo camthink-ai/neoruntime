@@ -64,9 +64,9 @@ message ModelRegisterRequest {
   repeated TensorSpec inputs = 3;
   repeated TensorSpec outputs = 4;
 
-  // Resource requirement estimates
-  float estimated_tops = 10;
-  uint32 estimated_memory = 11;
+  // Optional compiler/package estimates. Zero means unavailable.
+  float estimated_tops = 10;    // Precomputed TOPS estimate supplied by the producer
+  uint32 estimated_memory = 11; // MiB
 
   string owner_id = 12;         // Optional: app_id that owns this model registration
 
@@ -105,8 +105,8 @@ message ModelInfo {
   repeated TensorSpec inputs = 5;
   repeated TensorSpec outputs = 6;
 
-  float estimated_tops = 10;
-  uint32 estimated_memory = 11;
+  float estimated_tops = 10;    // Optional; zero means unavailable
+  uint32 estimated_memory = 11; // Optional; MiB, zero means unavailable
   uint64 load_timestamp = 12;
   string owner_id = 13;         // Used during UnregisterModel to specify the caller's identity
   bool transient = 14;          // True for app-bundled models (see ModelRegisterRequest.transient)

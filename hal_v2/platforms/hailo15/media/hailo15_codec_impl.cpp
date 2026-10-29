@@ -1100,8 +1100,37 @@ static int hailo15_codec_unsubscribe(void *codec_ctx, HalCodecFrameCallback call
         return HAL_ERR_INVALID_ARG;
     }
     std::string eid = cc->codec_name;
-    std::lock_guard<std::recursive_mutex> lock(priv->mutex);
-    priv->codec_packet_subscribers.erase(eid);
+    {
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        priv->codec_packet_subscribers.erase(eid);
+    }
+    /* The dispatch thread copies the subscriber under priv->mutex and
+     * invokes it AFTER unlocking, so erasing the map entry does not stop
+     * an already-copied callback. Wait for THIS eid's in-flight copies to
+     * finish before returning: the caller (EncoderManager::destroy) drops
+     * its release-only bookkeeping for this ctx once we return, and a late
+     * callback would take the unknown-ctx path and leak the packet buffer.
+     * Per-eid wait (not global): sibling streams still producing must not
+     * turn this teardown into a spurious timeout. A timeout must propagate
+     * (HAL_ERR_TIMEOUT): the map entry is already erased so no NEW dispatch
+     * will find a subscriber, but the caller must NOT proceed to free the
+     * ctx — a copied callback is still running inside it. */
+    {
+        std::unique_lock<std::mutex> in_flight_lk(priv->packet_cb_mu);
+        const auto eid_quiesced = [priv, &eid] {
+            const auto it = priv->packet_cb_in_flight.find(eid);
+            return it == priv->packet_cb_in_flight.end() || it->second <= 0;
+        };
+        if (!priv->packet_cb_cv.wait_for(in_flight_lk, std::chrono::milliseconds(500),
+                                         eid_quiesced))
+        {
+            HAL_LOG_ERROR("hailo15_media: unsubscribe('%s') timed out with a "
+                          "packet callback still in flight — reporting "
+                          "HAL_ERR_TIMEOUT so the caller does not free the "
+                          "ctx under the live callback", eid.c_str());
+            return HAL_ERR_TIMEOUT;
+        }
+    }
     return HAL_OK;
 }
 
@@ -1401,7 +1430,18 @@ static int hailo15_codec_force_idr(void *codec_ctx)
     {
         return HAL_ERR_INVALID_ARG;
     }
-    MediaLibraryEncoderPtr enc = from_media_encoder(priv, cc);
+    /* Copy the shared_ptr under the lock, then call with NO locks held:
+       force_keyframe() can block indefinitely inside GStreamer on a stalled
+       pipeline (gst_pad_send_event waiting on pad locks — field deadlock
+       10-29), and priv->mutex serializes every other codec op on this media
+       instance, so holding it across the call wedges encode/stats/reconfigure
+       for the whole pipeline. The shared_ptr keeps the encoder object alive
+       even if a concurrent media reinit drops the map's reference first. */
+    MediaLibraryEncoderPtr enc;
+    {
+        std::lock_guard<std::recursive_mutex> lock(priv->mutex);
+        enc = from_media_encoder(priv, cc);
+    }
     if (!enc)
     {
         return HAL_ERR_INVALID_STATE;

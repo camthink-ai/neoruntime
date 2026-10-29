@@ -66,6 +66,8 @@ interface UpdateTargetModel {
    *  in update mode, where no re-parse happens. */
   input_width?: number;
   input_height?: number;
+  estimated_tops?: number;
+  estimated_memory?: number;
   config?: Record<string, unknown>;
   [key: string]: unknown;
 }
@@ -469,6 +471,11 @@ export default function ImportModelDialog({
                 ...(parseResult.input_height != null && {
                   input_height: parseResult.input_height,
                 }),
+                // The estimates belong to the replaced file: when the new
+                // package carries none, an explicit 0 clears the previous
+                // file's values instead of silently keeping them.
+                estimated_tops: parseResult.estimated_tops ?? 0,
+                estimated_memory: parseResult.estimated_memory ?? 0,
               }
             : {}),
         },
@@ -535,6 +542,12 @@ export default function ImportModelDialog({
         }),
         ...(parseResult.input_height != null && {
           input_height: parseResult.input_height,
+        }),
+        ...(parseResult.estimated_tops != null && {
+          estimated_tops: parseResult.estimated_tops,
+        }),
+        ...(parseResult.estimated_memory != null && {
+          estimated_memory: parseResult.estimated_memory,
         }),
       },
       {

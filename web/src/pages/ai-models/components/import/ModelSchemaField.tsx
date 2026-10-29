@@ -11,6 +11,7 @@ import {
 } from '@/components/ui/select';
 import type { ModelFieldDef } from '@/hooks/useModels';
 import { visibleSelectOptions } from '../../lib/modelImportFlow';
+import FieldHelp from './FieldHelp';
 
 /** Non-consumed effects get a badge naming their real semantics — the
  *  P2 registry says which values reach the decoder, and a form that shows a
@@ -79,10 +80,13 @@ export default function ModelSchemaField({
         : (field.step ?? 1);
       return (
         <div className="grid gap-2">
-          <Label htmlFor={field.key}>
-            {label}
-            <EffectBadge effect={field.effect} />
-          </Label>
+          <div className="flex items-center gap-1.5">
+            <Label htmlFor={field.key}>
+              {label}
+              <EffectBadge effect={field.effect} />
+            </Label>
+            <FieldHelp fieldKey={field.key} />
+          </div>
           <Input
             id={field.key}
             type="number"
@@ -111,10 +115,13 @@ export default function ModelSchemaField({
       const optionNote = t(`sys.ai_models.form.${field.key}_${val}_note`, '');
       return (
         <div className="grid gap-2">
-          <Label htmlFor={field.key}>
-            {label}
-            <EffectBadge effect={field.effect} />
-          </Label>
+          <div className="flex items-center gap-1.5">
+            <Label htmlFor={field.key}>
+              {label}
+              <EffectBadge effect={field.effect} />
+            </Label>
+            <FieldHelp fieldKey={field.key} />
+          </div>
           <Select
             value={val}
             onValueChange={v => onChange(field.key, v)}
@@ -164,6 +171,7 @@ export default function ModelSchemaField({
             {label}
             <EffectBadge effect={field.effect} />
           </Label>
+          <FieldHelp fieldKey={field.key} />
         </div>
       );
     }
@@ -174,10 +182,13 @@ export default function ModelSchemaField({
       const example = t(`sys.ai_models.form.${field.key}_placeholder`, '');
       return (
         <div className="grid gap-2 sm:col-span-2">
-          <Label htmlFor={field.key}>
-            {label}
-            <EffectBadge effect={field.effect} />
-          </Label>
+          <div className="flex items-center gap-1.5">
+            <Label htmlFor={field.key}>
+              {label}
+              <EffectBadge effect={field.effect} />
+            </Label>
+            <FieldHelp fieldKey={field.key} />
+          </div>
           <Input
             id={field.key}
             type="text"

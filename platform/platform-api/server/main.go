@@ -592,6 +592,7 @@ func (s *PlatformAPIServer) setupRoutes() {
 	s.persistCtx, s.persistCancel = context.WithCancel(context.Background())
 	go timeHandler.StartTimePersistLoop(s.persistCtx)
 	api.GET("/system/time", timeHandler.GetSystemTime)
+	api.GET("/system/time/mcu-rtc", timeHandler.GetMcuRtcTime)
 	api.POST("/system/time/set", timeHandler.SetSystemTime)
 	api.GET("/system/time/config", timeHandler.GetTimeConfig)
 	api.PUT("/system/time/timezone", timeHandler.SetTimezone)

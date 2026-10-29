@@ -57,6 +57,32 @@ func TestSyncRuntimeModelsToDBSkipsTransient(t *testing.T) {
 	}
 }
 
+func TestSyncRuntimeModelsToDBPersistsMissingResourceEstimates(t *testing.T) {
+	h := newAISyncTestHandler(t)
+	seed := &model.AIModel{
+		ModelID: "estimated", Name: "Estimated", Status: "loaded",
+		Source: "dynamic", DesiredState: "loaded",
+	}
+	if err := h.aiModelRepo.Create(seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	h.syncRuntimeModelsToDB(context.Background(), map[string]*inferencepb.ModelInfo{
+		"estimated": {
+			ModelId: "estimated", OwnerId: systemOwnerID,
+			EstimatedTops: 2.5, EstimatedMemory: 112,
+		},
+	}, true)
+
+	row, err := h.aiModelRepo.GetByModelID("estimated")
+	if err != nil || row == nil {
+		t.Fatalf("row missing: %v", err)
+	}
+	if row.EstimatedTops != 2.5 || row.EstimatedMemory != 112 {
+		t.Errorf("estimates = %v TOPS/%d MiB, want 2.5/112", row.EstimatedTops, row.EstimatedMemory)
+	}
+}
+
 func TestSyncRuntimeModelsToDBTransientDoesNotBlockSubtract(t *testing.T) {
 	h := newAISyncTestHandler(t)
 

@@ -10,8 +10,11 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
+#include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <cstdint>
 
@@ -47,8 +50,61 @@ public:
      */
     bool create_from_context(const std::string& stream_name, void* codec_ctx);
 
-    void destroy(const std::string& stream_name);
-    void destroy_all();
+    /**
+     * Tear down one encoder. Returns false when the bounded drain of
+     * in-flight force_keyframe() calls timed out, when the creation of
+     * this name is still inside the HAL, or when unsubscribe() could not
+     * prove packet-callback quiescence (HAL_ERR_TIMEOUT): in every case the
+     * HAL teardown was ABORTED (ctx leaked on purpose — freeing it would
+     * race the wedged call or a still-running copied callback) and the slot
+     * is parked as a closing tombstone whose late packets keep getting
+     * released; callers must abort the pipeline teardown they were about to
+     * perform and surface the failure. A later destroy() of the same name
+     * retries the parked teardown and reclaims the ctx once the call finally
+     * returns — unless another thread already owns that retry
+     * (teardown_in_progress), in which case this call also returns false
+     * without touching the ctx.
+     */
+    bool destroy(const std::string& stream_name);
+
+    /**
+     * destroy() every registered encoder. Returns false if ANY teardown
+     * aborted on drain timeout (see destroy()). Shutdown paths may ignore
+     * the result; rebuild paths must not proceed on false.
+     */
+    bool destroy_all();
+
+    /**
+     * destroy_all() with bounded retries and a backoff between attempts,
+     * for shutdown paths: a failed pass parks tombstones (packet callbacks
+     * not yet proven quiesced, or a creation still inside the HAL), and a
+     * retry re-checks quiescence once they drain. Returns false only when
+     * the LAST attempt still failed — the caller must then NOT proceed to
+     * free what the parked teardowns still reference (pipeline teardown /
+     * HAL unload under a live callback is a use-after-free).
+     */
+    bool destroy_all_with_retries(int attempts, int backoff_ms);
+
+    /**
+     * Gate keyframe requests during pipeline rebuilds. MediaLibrary frees
+     * borrowed FROM_MEDIA contexts on reinit while encoders_ still maps the
+     * stale pointers (cleared later by resync/discard_from_media); callers
+     * must set this across every stop->start media reinit window so
+     * force_keyframe() returns -1 instead of touching freed contexts.
+     */
+    void set_rebuild_active(bool active) { rebuild_active_.store(active); }
+    bool is_rebuild_active() const { return rebuild_active_.load(); }
+
+    /**
+     * Bounded wait for in-flight force_keyframe() HAL calls to return.
+     * Teardown paths that recycle borrowed FROM_MEDIA contexts (rebuild
+     * windows, destroy) drain first so a call that already captured the ctx
+     * pointer is not still inside the HAL when the ctx goes away. Returns
+     * false on timeout — the caller MUST abort the teardown it was about to
+     * run: medialib's force_idr has no deadline, and recycling a ctx the
+     * call still occupies is a use-after-free, not an acceptable fallback.
+     */
+    bool wait_keyframe_calls_drained(int timeout_ms = 2000);
 
     /**
      * Forget locally registered FROM_MEDIA contexts without calling HAL.
@@ -58,6 +114,12 @@ public:
      * them to unsubscribe would be a use-after-free.
      */
     void discard_from_media();
+
+    /**
+     * HAL codec output callback body (reached via codec_output_callback).
+     * Public so tests can drive parked-ctx packet-release behavior.
+     */
+    void on_packet(void* codec_ctx, const HalPacketBuffer* packet);
 
     bool start(const std::string& stream_name);
     bool stop(const std::string& stream_name);
@@ -115,6 +177,12 @@ private:
         std::string stream_name;
         bool        running = false;
         bool        from_media = false;
+        // Closing-tombstone only: a thread exclusively owns this teardown
+        // (set atomically when the slot is parked or a retry claims it, so a
+        // concurrent destroy() cannot run stop/unsubscribe/deinit on the
+        // same ctx a second time — that is a double-free). Cleared when a
+        // drain timeout hands the tombstone back for a later retry.
+        bool        teardown_in_progress = false;
         // Frame-health signals (steady_clock — monotonic, immune to NTP jumps).
         std::chrono::steady_clock::time_point created_at;
         std::chrono::steady_clock::time_point last_packet_time;  // epoch == never received
@@ -123,18 +191,53 @@ private:
     };
 
     HalCodecOps* ops_;
+    std::atomic<bool> rebuild_active_{false};
 
     bool subscribe_output(void* ctx, const std::string& stream_name);
     mutable std::mutex mu_;
     std::unordered_map<std::string, EncoderSlot> encoders_;
+    /** Slots whose HAL teardown aborted on drain timeout (destroy() == false).
+     *  Kept so a retry can reclaim the ctx once the wedged call returns; the
+     *  entries are invisible to has_encoder()/force_keyframe()/create(). */
+    std::unordered_map<std::string, EncoderSlot> closing_teardowns_;
+    /** ctx pointers whose packets must be dropped-but-RELEASED: (a) parked
+     *  closing tombstones above (subscription still live after a drain
+     *  abort), and (b) pending creations — a running FROM_MEDIA encoder can
+     *  deliver the moment subscribe() installs the callback, before the
+     *  promotion critical section adds the routing maps. Every packet owns
+     *  a shared buffer reference that must be returned. */
+    std::unordered_set<void*> release_only_ctxs_;
+    /** Names reserved by an in-flight create()/create_from_context() (mu_):
+     *  the existence check and the final insert are separate critical
+     *  sections around an unlocked HAL phase, so without the reservation two
+     *  concurrent creates of one name would both subscribe and the later
+     *  insert would overwrite (and leak) the earlier ctx. destroy()/destroy_
+     *  all() wait on creating_cv_ for reservations to clear so they never
+     *  report "all gone" while a ctx is about to be published. */
+    std::unordered_set<std::string> creating_names_;
+    /** Signaled when creating_names_ loses an entry (mu_ held). */
+    std::condition_variable creating_cv_;
+    /** True across destroy_all()'s snapshot+teardown window (mu_): new
+     *  create reservations are rejected so no ctx can be published right
+     *  after destroy_all() reported all-clear. */
+    bool destroy_all_active_ = false;
+    /** Serializes destroy_all() calls: the flag above is a plain bool, so
+     *  without exclusive ownership the first finisher would drop the
+     *  barrier while a second concurrent destroy_all() was still inside
+     *  its teardown window. Held across the whole body. */
+    std::mutex destroy_all_mu_;
     PacketOutputFn output_fn_;
 
     // Reverse map: codec_ctx → stream_name (for callback routing)
     std::unordered_map<void*, std::string> handle_to_stream_;
 
+    // Guarded by mu_: force_keyframe() increments before dropping mu_ for
+    // the HAL call and decrements after; destroy()/rebuilds drain on it.
+    int keyframes_in_flight_ = 0;
+    std::condition_variable keyframe_drained_cv_;
+
     /** HAL Codec push mode callback */
     static void codec_output_callback(void* codec_ctx,
                                        HalPacketBuffer* packet,
                                        void* userdata);
-    void on_packet(void* codec_ctx, const HalPacketBuffer* packet);
 };

@@ -2,14 +2,17 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 
 	devicepb "aipc/platform/device-control/proto"
-	"aipc/tools/aipc-cli/pkg/output"
 )
 
 var deviceCmd = &cobra.Command{
@@ -56,16 +59,12 @@ var deviceStatusCmd = &cobra.Command{
 		printer.Printf("  White Light:  %d%%\n", status.WhiteLightLevel)
 		printer.Printf("  IR LED:       %d%%\n", status.IrLedLevel)
 		printer.Printf("  IR-Cut:       %s\n", formatIrCutMode(status.IrcutMode))
-		printer.Printf("\nPTZ Position:\n")
-		printer.Printf("  Pan:          %d\n", status.PtzPanPos)
-		printer.Printf("  Tilt:         %d\n", status.PtzTiltPos)
 		printer.Printf("\nLens:\n")
 		printer.Printf("  Zoom:         %d\n", status.ZoomPos)
 		printer.Printf("  Focus:        %d\n", status.FocusPos)
 		printer.Printf("  Autofocus:    %s\n", formatBool(status.AutofocusEnabled))
 		printer.Printf("\nMCU:\n")
 		printer.Printf("  Version:      %s\n", status.McuVersion)
-		printer.Printf("  Uptime:       %s\n", output.FormatDuration(int64(status.McuUptimeMs/1000)))
 		return nil
 	},
 }
@@ -204,8 +203,12 @@ var (
 
 var devicePtzCmd = &cobra.Command{
 	Use:   "ptz <action>",
-	Short: "PTZ control",
+	Short: "PTZ control (unsupported on NE503)",
 	Long: `PTZ control commands.
+
+NOTE: NE503 has no PTZ hardware and the MCU host-link protocol has no PTZ
+command; the server rejects every action listed below. The subcommand
+exists for platforms that do ship a PTZ head.
 
 Actions:
   left [speed]    - Pan left (0-100)
@@ -454,8 +457,12 @@ Examples:
 
 var deviceGpioCmd = &cobra.Command{
 	Use:   "gpio <read|write> <pin> [value]",
-	Short: "GPIO control",
+	Short: "GPIO control (unsupported on NE503)",
 	Long: `Read or write GPIO pins.
+
+NOTE: the MCU host-link protocol has no GPIO command, so the server
+rejects every GPIO request on NE503 (after checking the pin against the
+configured catalog).
 
 Arguments:
   read <pin>        - Read GPIO pin value
@@ -538,6 +545,85 @@ Examples:
 	},
 }
 
+// ============ device rtc ============
+
+var deviceAPIBase string
+
+var deviceRtcCmd = &cobra.Command{
+	Use:   "rtc",
+	Short: "Read the MCU RTC time (diagnostic)",
+	Long: `Read the MCU real-time clock back from the MCU.
+
+The boot flow only pushes time host-to-MCU; this reads it back to verify
+the sync landed and to spot a dead MCU RTC (which reports year 2000).
+Goes through the platform REST API (--api), not the device-control
+channel — the MCU raw host-link path lives behind platform-api.
+
+Examples:
+  aipc-cli device rtc
+  aipc-cli device rtc --api http://<device>:8080
+`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		url := strings.TrimRight(deviceAPIBase, "/") + "/api/v1/system/time/mcu-rtc"
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return err
+		}
+		if token := viper.GetString("auth.token"); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := apiHTTPClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("platform API unreachable at %s: %w", deviceAPIBase, err)
+		}
+		defer resp.Body.Close()
+
+		var envelope struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Data    struct {
+				McuTime      string `json:"mcu_time"`
+				HostTime     string `json:"host_time"`
+				DriftSeconds int64  `json:"drift_seconds"`
+				Plausible    bool   `json:"plausible"`
+			} `json:"data"`
+			Error struct {
+				Detail string `json:"detail"`
+			} `json:"error"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+			return fmt.Errorf("invalid response from platform API: %w", err)
+		}
+		if envelope.Code != 0 {
+			detail := envelope.Message
+			if envelope.Error.Detail != "" {
+				detail = fmt.Sprintf("%s (%s)", envelope.Message, envelope.Error.Detail)
+			}
+			return fmt.Errorf("MCU RTC read failed: %s", detail)
+		}
+
+		if outputFmt == "json" || outputFmt == "yaml" {
+			return printer.Print(map[string]interface{}{
+				"mcu_time":      envelope.Data.McuTime,
+				"host_time":     envelope.Data.HostTime,
+				"drift_seconds": envelope.Data.DriftSeconds,
+				"plausible":     envelope.Data.Plausible,
+			})
+		}
+
+		printer.Printf("MCU RTC:   %s\n", envelope.Data.McuTime)
+		printer.Printf("Host Time: %s\n", envelope.Data.HostTime)
+		printer.Printf("Drift:     %ds\n", envelope.Data.DriftSeconds)
+		if !envelope.Data.Plausible {
+			printer.Printf("Plausible: No (MCU clock reads implausible; RTC was reset or never synced)\n")
+		}
+		return nil
+	},
+}
+
 // ============ Helper functions ============
 
 func formatBool(b bool) string {
@@ -561,12 +647,13 @@ func formatIrCutMode(mode devicepb.IrCutMode) string {
 }
 
 func protoDeviceStatusToMap(s *devicepb.DeviceStatus) map[string]interface{} {
+	// ptz_pan_pos/ptz_tilt_pos/mcu_uptime_ms stay unreported: the platform
+	// fills none of them (no PTZ hardware, no uptime field in the MCU
+	// host-link status), so printing them only showed hard zeros.
 	return map[string]interface{}{
 		"soc_temp_c":        s.SocTempC,
 		"mcu_temp_c":        s.McuTempC,
 		"light_sensor":      s.LightSensor,
-		"ptz_pan_pos":       s.PtzPanPos,
-		"ptz_tilt_pos":      s.PtzTiltPos,
 		"zoom_pos":          s.ZoomPos,
 		"focus_pos":         s.FocusPos,
 		"autofocus_enabled": s.AutofocusEnabled,
@@ -574,7 +661,6 @@ func protoDeviceStatusToMap(s *devicepb.DeviceStatus) map[string]interface{} {
 		"white_light_level": s.WhiteLightLevel,
 		"ir_led_level":      s.IrLedLevel,
 		"mcu_version":       s.McuVersion,
-		"mcu_uptime_ms":     s.McuUptimeMs,
 	}
 }
 
@@ -591,4 +677,7 @@ func init() {
 	deviceCmd.AddCommand(deviceZoomCmd)
 	deviceCmd.AddCommand(deviceFocusCmd)
 	deviceCmd.AddCommand(deviceGpioCmd)
+	deviceCmd.AddCommand(deviceRtcCmd)
+
+	deviceRtcCmd.Flags().StringVar(&deviceAPIBase, "api", "http://localhost:8080", "Platform API base URL")
 }

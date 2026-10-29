@@ -302,6 +302,39 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(frame-watchdog-in-use-test PRIVATE pthread)
     add_test(NAME frame-watchdog-in-use-test COMMAND frame-watchdog-in-use-test)
 
+    add_executable(encoded-publisher-keyframe-gate-test
+        tests/encoded_publisher_keyframe_gate_test.cpp
+        src/encoded_publisher.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(encoded-publisher-keyframe-gate-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/media
+    )
+    target_compile_options(encoded-publisher-keyframe-gate-test PRIVATE -UNDEBUG)
+    target_link_libraries(encoded-publisher-keyframe-gate-test PRIVATE pthread)
+    add_test(NAME encoded-publisher-keyframe-gate-test
+             COMMAND encoded-publisher-keyframe-gate-test)
+
+    add_executable(keyframe-async-dispatch-test
+        tests/keyframe_async_dispatch_test.cpp
+        src/encoded_publisher.cpp
+        src/encoder_manager.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(keyframe-async-dispatch-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/media
+    )
+    target_compile_options(keyframe-async-dispatch-test PRIVATE -UNDEBUG)
+    target_link_libraries(keyframe-async-dispatch-test PRIVATE pthread)
+    add_test(NAME keyframe-async-dispatch-test
+             COMMAND keyframe-async-dispatch-test)
+
     add_executable(ai-overlay-face-blur-test
         tests/ai_overlay_face_blur_test.cpp
         src/ai_overlay_subscriber.cpp

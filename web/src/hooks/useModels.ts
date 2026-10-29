@@ -15,6 +15,10 @@ export interface ModelPackagePrefill {
   name: string;
   model_type: string;
   output_mode: string;
+  /** Optional precomputed compiler/package estimate in TOPS. */
+  estimated_tops?: number;
+  /** Optional compiler estimate in MiB. */
+  estimated_memory?: number;
   config: Record<string, unknown>;
 }
 

@@ -1446,6 +1446,7 @@ int connect_encoders(Hailo15MediaPriv *p)
                 HalCodecContext *cctx = nullptr;
                 HalPacketType pt = HAL_PACKET_TYPE_H264;
                 uint64_t seq = 0;
+                bool counted = false;
                 {
                     /* Never hold priv->mutex across MediaLibrary calls or user callbacks: both may re-enter HAL. */
                     std::lock_guard<std::recursive_mutex> lock(p->mutex);
@@ -1463,8 +1464,22 @@ int connect_encoders(Hailo15MediaPriv *p)
                         cctx = cc_it->second;
                         pt = cctx ? cctx->config.packet_type : pt;
                     }
+                    if (cb)
+                    {
+                        /* Register in-flight INSIDE the same critical section
+                         * that copied the subscriber: incrementing after
+                         * releasing p->mutex left a window where unsubscribe()
+                         * erased the entry, observed the count at zero and
+                         * returned — while the copied callback still ran.
+                         * Counted per eid so an actively-producing sibling
+                         * stream cannot delay or time out this stream's
+                         * unsubscribe. */
+                        std::lock_guard<std::mutex> in_flight_lk(p->packet_cb_mu);
+                        ++p->packet_cb_in_flight[eid];
+                        counted = true;
+                    }
                 }
-                if (!cb)
+                if (!counted)
                 {
                     if (p->enc_pkt_count[eid] <= 5)
                     {
@@ -1485,6 +1500,18 @@ int connect_encoders(Hailo15MediaPriv *p)
                 pkt.sequence = static_cast<uint32_t>(seq);
                 cb(cctx, &pkt, cb_ud);
                 (void)buf->sync_end();
+                {
+                    /* Paired with the increment taken inside the p->mutex
+                     * critical section above; the per-eid entry is dropped at
+                     * zero so the map stays bounded by live dispatches. */
+                    std::lock_guard<std::mutex> in_flight_lk(p->packet_cb_mu);
+                    const auto it = p->packet_cb_in_flight.find(eid);
+                    if (it != p->packet_cb_in_flight.end() && --it->second <= 0)
+                    {
+                        p->packet_cb_in_flight.erase(it);
+                        p->packet_cb_cv.notify_all();
+                    }
+                }
             });
         if (s != MEDIA_LIBRARY_SUCCESS)
         {
@@ -5625,11 +5652,43 @@ static int hailo15_media_override_stream_params(void *media_ctx, const HalStream
     config_profile_t p = prof_exp.value();
     // Save original profile for restart detection (framerate changes need buffer pool reallocation).
     const config_profile_t prev_p = p;
+    // Resolve file-backed encoder configs before mutating p. Resolving prev_p
+    // later can observe the same backing entry after mutation and make the old
+    // and new maps look identical.
+    const auto original_encoder_map = p.to_encoder_config_map();
+    bool explicit_codec_change = false;
+    bool explicit_hevc_gop_change = false;
 
     for (uint32_t i = 0; i < batch->stream_count; i++)
     {
         const HalStreamOverride &ov = batch->streams[i];
         const std::string sid(ov.stream_id);
+
+        const auto original_it = original_encoder_map.find(sid);
+        if (original_it != original_encoder_map.end())
+        {
+            const auto *original =
+                std::get_if<hailo_encoder_config_t>(&original_it->second);
+            if (original)
+            {
+                if (ov.encoder_codec[0] != '\0')
+                {
+                    const std::string requested_codec(ov.encoder_codec);
+                    const auto requested_type =
+                        (requested_codec == "h265" || requested_codec == "HEVC")
+                            ? CODEC_TYPE_HEVC
+                            : CODEC_TYPE_H264;
+                    explicit_codec_change = explicit_codec_change ||
+                        original->output_stream.codec != requested_type;
+                }
+                if (ov.encoder_gop > 0 &&
+                    original->output_stream.codec == CODEC_TYPE_HEVC &&
+                    original->rate_control.intra_pic_rate != ov.encoder_gop)
+                {
+                    explicit_hevc_gop_change = true;
+                }
+            }
+        }
 
         // --- Override frontend input stream ---
         if (ov.input_width > 0 || ov.input_height > 0 || ov.input_framerate > 0)
@@ -5707,10 +5766,14 @@ static int hailo15_media_override_stream_params(void *media_ctx, const HalStream
     // accumulators stale, causing buffer pool exhaustion.  Do a full ML destroy+recreate instead.
     const bool full_reinit_required =
         ml_stream_restart_required(prev_p, p) || encoder_input_layout_changed(prev_p, p) ||
-        encoder_inplace_ineffective_change(prev_p, p);
+        encoder_inplace_ineffective_change(prev_p, p) || explicit_codec_change ||
+        explicit_hevc_gop_change;
     HAL_LOG_INFO("hailo15_media: override_stream_params: full_reinit_required=%d, "
+                 "explicit_codec_change=%d, explicit_hevc_gop_change=%d, "
                  "prev_framerate=%u, new_framerate=%u",
                  full_reinit_required,
+                 explicit_codec_change,
+                 explicit_hevc_gop_change,
                  prev_p.application_settings.application_input_streams.resolutions.empty() ? 0 :
                      prev_p.application_settings.application_input_streams.resolutions[0].framerate,
                  p.application_settings.application_input_streams.resolutions.empty() ? 0 :

@@ -20,6 +20,7 @@ type CallbackFunction = (event: CallbackEvent) => void;
 interface Mp4EventData {
   data: ArrayBuffer;
   codec: string;
+  pts90kHz?: number;
 }
 
 interface NALUnit {
@@ -72,6 +73,22 @@ class WebCodecsPlayer {
 
   private frameHeight: number = 0;
 
+  // Presentation scheduler: decoded frames are queued and drawn at their
+  // timestamp slot instead of immediately on decoder output. The Hailo
+  // encoders release frames in output bursts, and arrival-paced rendering
+  // turns those bursts into spring-like playback.
+  private presentQueue: { frame: VideoFrame; dueMs: number }[] = [];
+
+  private renderEpochMs: number | null = null;   // performance.now() at the anchor frame
+
+  private renderBaseUs: number | null = null;    // anchor frame's timestamp (µs)
+
+  private lastChunkTsUs: number | null = null;   // wrap/regression detection
+
+  private presentTimer: number | null = null;
+
+  private lastPts90kHz: number | null = null;
+
   constructor(cb: CallbackFunction) {
     this.cb = cb;
   }
@@ -114,6 +131,9 @@ class WebCodecsPlayer {
     this.canvas.style.height = '100%';
     this.canvas.style.display = 'block';
     this.canvas.style.pointerEvents = 'none';
+    this.canvas.style.zIndex = '0';
+    this.canvas.dataset.aipcVideoRenderer = 'webcodecs';
+    this.canvas.dataset.aipcFrameReady = 'false';
     this.ctx = this.canvas.getContext('2d', { alpha: false });
 
     // Keep the video element in the DOM so MSE fallback can re-use it after a
@@ -133,6 +153,7 @@ class WebCodecsPlayer {
 
     const objData = event.data;
     const data = new Uint8Array(objData.data);
+    this.lastPts90kHz = objData.pts90kHz ?? this.lastPts90kHz;
 
     // Parse NAL units from AVCC format
     const nals = this.parseAVCCNALs(data);
@@ -228,7 +249,7 @@ class WebCodecsPlayer {
 
       this.decoder = new VideoDecoder({
         output: (frame: VideoFrame) => {
-          this.renderFrame(frame);
+          this.enqueueFrame(frame);
         },
         error: (error: Error) => {
           console.error('[WebCodecs] Decoder error:', error);
@@ -339,8 +360,12 @@ class WebCodecsPlayer {
     }
 
     try {
-      // Generate timestamp in microseconds (90kHz * 1000 / 90 = microseconds)
-      const timestamp = this.frameCount * 33333; // ~30fps
+      // Prefer the stream's real presentation timestamp (90 kHz → µs); the
+      // sanitized device-side timeline is frame-paced and tracks the live
+      // clock. Fall back to a ~30fps counter when the header carried none.
+      const timestamp = this.lastPts90kHz != null
+        ? Math.round((this.lastPts90kHz * 1000) / 90)
+        : this.frameCount * 33333;
       this.frameCount++;
 
       const chunk = new EncodedVideoChunk({
@@ -354,6 +379,84 @@ class WebCodecsPlayer {
       console.error('[WebCodecs] Failed to decode chunk:', e);
       this.handleDecoderError();
     }
+  }
+
+  /**
+   * Queue a decoded frame for timestamp-paced presentation.
+   * The first frame anchors the clock and renders immediately; subsequent
+   * frames are drawn at their nominal frame interval so encoder output
+   * bursts (several frames delivered at once) play back smoothly.
+   */
+  private enqueueFrame(frame: VideoFrame): void {
+    if (!this.ctx || !this.canvas || !this.isActive) {
+      frame.close();
+      return;
+    }
+    const now = performance.now();
+
+    // Timestamp regression (stream restart or 90 kHz uint32 wrap): re-anchor.
+    if (
+      this.renderBaseUs === null
+      || this.renderEpochMs === null
+      || this.lastChunkTsUs === null
+      || frame.timestamp < this.lastChunkTsUs
+    ) {
+      this.renderBaseUs = frame.timestamp;
+      this.renderEpochMs = now;
+      this.lastChunkTsUs = frame.timestamp;
+      this.drainPresentQueue();
+      this.renderFrame(frame);
+      return;
+    }
+    this.lastChunkTsUs = frame.timestamp;
+
+    const dueMs = this.renderEpochMs + (frame.timestamp - this.renderBaseUs) / 1000;
+    this.presentQueue.push({ frame, dueMs });
+
+    // The producer outran the presentation clock (added latency ≥ queue
+    // depth): drop the stale head and re-anchor to the newest frame so the
+    // preview stays near the live edge.
+    while (this.presentQueue.length > 4) {
+      this.presentQueue.shift()?.frame.close();
+      const newest = this.presentQueue[this.presentQueue.length - 1];
+      if (newest) {
+        this.renderEpochMs = now;
+        this.renderBaseUs = newest.frame.timestamp;
+        newest.dueMs = now;
+      }
+    }
+    this.schedulePresent();
+  }
+
+  private schedulePresent(): void {
+    if (this.presentTimer !== null) return;
+    const next = this.presentQueue[0]?.dueMs;
+    const delay = next === undefined ? 16 : Math.max(0, Math.min(16, next - performance.now()));
+    this.presentTimer = window.setTimeout(() => {
+      this.presentTimer = null;
+      const now = performance.now();
+      // Present every frame whose slot has passed; when several are overdue
+      // (browser tab was busy), collapse them to the newest due frame.
+      while (this.presentQueue.length > 0 && this.presentQueue[0].dueMs <= now) {
+        const item = this.presentQueue.shift();
+        if (!item) break;
+        if (this.presentQueue.length > 0 && this.presentQueue[0].dueMs <= now) {
+          item.frame.close();
+        } else {
+          this.renderFrame(item.frame);
+        }
+      }
+      if (this.presentQueue.length > 0) this.schedulePresent();
+    }, delay);
+  }
+
+  private drainPresentQueue(): void {
+    if (this.presentTimer !== null) {
+      clearTimeout(this.presentTimer);
+      this.presentTimer = null;
+    }
+    for (const item of this.presentQueue) item.frame.close();
+    this.presentQueue = [];
   }
 
   /**
@@ -407,6 +510,8 @@ class WebCodecsPlayer {
     const drawY = (cssH - drawH) / 2;
 
     this.ctx.drawImage(frame, drawX, drawY, drawW, drawH);
+    this.canvas.dataset.aipcFrameReady = 'true';
+    this.videoElement?.dispatchEvent(new CustomEvent('aipc:webcodecs-frame'));
 
     frame.close();
 
@@ -460,6 +565,11 @@ class WebCodecsPlayer {
     this.isInitialized = false;
     this.frameCount = 0;
     this.hasDecodedKeyframe = false;
+    this.drainPresentQueue();
+    this.renderBaseUs = null;
+    this.renderEpochMs = null;
+    this.lastChunkTsUs = null;
+    this.lastPts90kHz = null;
   }
 
   /**

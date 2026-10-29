@@ -50,6 +50,10 @@ export const aiApi = {
     // UpdateModel's pointer semantics treat a sent 0 as "clear".
     input_width?: number;
     input_height?: number;
+    /** Optional precomputed compiler/package estimate in TOPS. */
+    estimated_tops?: number;
+    /** Compiler/package estimate in MiB. */
+    estimated_memory?: number;
   }) => request.post('/api/v1/ai/models', data),
 
   // Update an existing model (PUT); file_hash empty/omitted = metadata-only
@@ -66,6 +70,8 @@ export const aiApi = {
       vstream_info: string;
       input_width: number;
       input_height: number;
+      estimated_tops: number;
+      estimated_memory: number;
     }>
   ) => request.put(`/api/v1/ai/models/${modelId}`, data),
 

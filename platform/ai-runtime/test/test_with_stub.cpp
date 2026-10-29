@@ -32,6 +32,7 @@
 #include "auto_infer.h"
 
 #include <cassert>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -291,7 +292,8 @@ void test_model_manager() {
     const std::string variant =
         R"({"backend_function":"hailo_yolov8n","detection_threshold":0.25})";
     int rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-a",
-                                true, variant, "detection");
+                                true, variant, "detection", nullptr, 1,
+                                1.75f, 96);
     ASSERT_EQ(rc, 0, "register_model failed");
 
     // Same id/path/config from another owner is legitimate co-ownership.
@@ -336,6 +338,10 @@ void test_model_manager() {
     // List
     auto models = mgr.list_models();
     ASSERT_EQ(models.size(), 1u, "should have 1 model");
+    ASSERT_TRUE(std::abs(models[0].estimated_tops - 1.75f) < 0.0001f,
+                "TOPS estimate should survive registration");
+    ASSERT_EQ(models[0].estimated_memory, 96u,
+              "memory estimate should survive registration");
 
     // Infer (sync, with stub)
     HalTensor input{};

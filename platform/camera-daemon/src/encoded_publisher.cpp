@@ -94,6 +94,8 @@ EncodedPublisher::~EncodedPublisher() {
 }
 
 void EncodedPublisher::add_stream(const StreamConfig& cfg, const std::string& base_dir) {
+    std::unique_lock<std::shared_mutex> streams_lock(streams_mu_);
+
     // Clean up any existing entry for this name (close old socket, clients).
     auto it = streams_.find(cfg.name);
     if (it != streams_.end()) {
@@ -111,6 +113,16 @@ void EncodedPublisher::add_stream(const StreamConfig& cfg, const std::string& ba
             if (c->fd >= 0) ::close(c->fd);
         }
         old->clients.clear();
+    }
+
+    // A packet already queued for the replaced generation must not be framed
+    // using the new codec/dimensions.  Lock order is always streams -> queue.
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mu_);
+        queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
+            [&](const std::unique_ptr<QueuedPacket>& pkt) {
+                return pkt && pkt->stream_name == cfg.name;
+            }), queue_.end());
     }
 
     auto ss = std::make_unique<StreamState>();
@@ -159,6 +171,7 @@ void EncodedPublisher::add_stream(const StreamConfig& cfg, const std::string& ba
 }
 
 void EncodedPublisher::remove_stream(const std::string& name) {
+    std::unique_lock<std::shared_mutex> streams_lock(streams_mu_);
     auto it = streams_.find(name);
     if (it == streams_.end()) return;
 
@@ -177,15 +190,24 @@ void EncodedPublisher::remove_stream(const std::string& name) {
         }
         ss->clients.clear();
     }
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mu_);
+        queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
+            [&](const std::unique_ptr<QueuedPacket>& pkt) {
+                return pkt && pkt->stream_name == name;
+            }), queue_.end());
+    }
     streams_.erase(it);
     HAL_LOG_INFO("EncodedPublisher: Removed stream '%s'", name.c_str());
 }
 
 bool EncodedPublisher::has_stream(const std::string& name) const {
+    std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
     return streams_.find(name) != streams_.end();
 }
 
 std::vector<std::string> EncodedPublisher::stream_names() const {
+    std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
     std::vector<std::string> names;
     names.reserve(streams_.size());
     for (const auto& entry : streams_) {
@@ -209,6 +231,7 @@ void EncodedPublisher::set_keyframe_request_cb(KeyframeRequestFn fn) {
 }
 
 bool EncodedPublisher::start() {
+    std::unique_lock<std::shared_mutex> streams_lock(streams_mu_);
     epoll_fd_ = ::epoll_create1(0);
     if (epoll_fd_ < 0) {
         HAL_LOG_ERROR("EncodedPublisher: epoll_create1 failed: %s", strerror(errno));
@@ -259,8 +282,15 @@ bool EncodedPublisher::start() {
     }
 
     running_.store(true);
+    streams_lock.unlock();
+    {
+        // Reset for a stop()->start() cycle before the worker can observe it.
+        std::lock_guard<std::mutex> lock(kf_mu_);
+        kf_stopping_ = false;
+    }
     accept_thread_ = std::thread(&EncodedPublisher::accept_loop, this);
     dispatch_thread_ = std::thread(&EncodedPublisher::dispatch_loop, this);
+    keyframe_thread_ = std::thread(&EncodedPublisher::keyframe_dispatch_loop, this);
     return true;
 }
 
@@ -270,17 +300,31 @@ void EncodedPublisher::stop() {
     // Wake dispatch thread
     queue_cv_.notify_all();
 
-    for (auto& [name, ss] : streams_) {
-        if (ss->listen_fd >= 0) {
-            ::close(ss->listen_fd);
-            ::unlink(ss->sock_path.c_str());
-            ss->listen_fd = -1;
+    // Stop the keyframe worker. NOTE: join can block until an in-flight HAL
+    // force_idr returns — medialib has no deadline of its own, so a wedged
+    // call makes stop() depend on the supervisor's kill timeout. The
+    // stalled-encoder guard on the daemon side keeps that the rare case.
+    {
+        std::lock_guard<std::mutex> lock(kf_mu_);
+        kf_stopping_ = true;
+        kf_pending_.clear();
+    }
+    kf_cv_.notify_all();
+
+    {
+        std::unique_lock<std::shared_mutex> streams_lock(streams_mu_);
+        for (auto& [name, ss] : streams_) {
+            if (ss->listen_fd >= 0) {
+                ::close(ss->listen_fd);
+                ::unlink(ss->sock_path.c_str());
+                ss->listen_fd = -1;
+            }
+            std::lock_guard<std::mutex> lock(ss->clients_mu);
+            for (auto& c : ss->clients) {
+                if (c->fd >= 0) ::close(c->fd);
+            }
+            ss->clients.clear();
         }
-        std::lock_guard<std::mutex> lock(ss->clients_mu);
-        for (auto& c : ss->clients) {
-            if (c->fd >= 0) ::close(c->fd);
-        }
-        ss->clients.clear();
     }
 
     if (epoll_fd_ >= 0) {
@@ -290,6 +334,7 @@ void EncodedPublisher::stop() {
 
     if (accept_thread_.joinable()) accept_thread_.join();
     if (dispatch_thread_.joinable()) dispatch_thread_.join();
+    if (keyframe_thread_.joinable()) keyframe_thread_.join();
 
     HAL_LOG_INFO("EncodedPublisher: Stopped");
 }
@@ -308,6 +353,7 @@ void EncodedPublisher::accept_loop() {
 
         const auto now = std::chrono::steady_clock::now();
         if (now >= next_probe) {
+            std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
             for (auto& [name, ss] : streams_) {
                 probe_clients(name, *ss);
             }
@@ -317,6 +363,7 @@ void EncodedPublisher::accept_loop() {
         for (int i = 0; i < n; i++) {
             int listen_fd = events[i].data.fd;
 
+            std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
             for (auto& [name, ss] : streams_) {
                 if (ss->listen_fd != listen_fd) continue;
 
@@ -330,6 +377,15 @@ void EncodedPublisher::accept_loop() {
 
                     auto client = std::make_unique<ClientInfo>();
                     client->fd = cfd;
+                    // A newly connected video decoder has no reference chain.
+                    // Even though platform-api immediately asks the encoder for
+                    // an IDR, one or more already-queued P frames can otherwise
+                    // win that race and briefly render as corruption before the
+                    // IDR arrives. Gate initial delivery exactly like recovery
+                    // after a socket-buffer drop. Audio has no inter-frame
+                    // dependency and must continue immediately.
+                    client->needs_keyframe =
+                        ss->config.codec == "h264" || ss->config.codec == "h265";
 
                     probe_clients(name, *ss);
                     std::lock_guard<std::mutex> lock(ss->clients_mu);
@@ -358,6 +414,7 @@ void EncodedPublisher::on_packet(const std::string& stream_name, const HalPacket
     if (!running_.load()) return;
     if (!packet || !packet->data || packet->size == 0) return;
 
+    std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
     auto it = streams_.find(stream_name);
     if (it == streams_.end()) return;
 
@@ -365,8 +422,27 @@ void EncodedPublisher::on_packet(const std::string& stream_name, const HalPacket
     // All parsing (keyframe detection) and framing happens in dispatch_loop.
     auto qp = std::make_unique<QueuedPacket>();
     qp->stream_name = stream_name;
-    qp->timestamp_ns = packet->timestamp_ns;
-    qp->dts_ns = packet->timestamp_ns;
+
+    // Replace invalid encoder timestamps ((uint64_t)-1 on parameter-set
+    // buffers, 0 on unstamped ones) with the stream's last valid pts. The
+    // platform-api bridge divides this field into a 90 kHz uint32 — an
+    // unmapped -1 truncates to garbage. Nothing else is rewritten: the
+    // browser players consume the encoder's native (burst-shuffled) pts
+    // timeline fine in steady state; sanitizing regressions or synthesizing
+    // frame steps changes the statistics those players pace by and made
+    // playback visibly worse (stall / spring artifacts).
+    {
+        auto& st = *it->second;
+        uint64_t pts = packet->timestamp_ns;
+        if (pts == UINT64_MAX || pts == 0) {
+            pts = st.last_pts_ns.load(std::memory_order_relaxed);
+        }
+        if (pts != 0) {
+            st.last_pts_ns.store(pts, std::memory_order_relaxed);
+        }
+        qp->timestamp_ns = pts;
+        qp->dts_ns = pts;
+    }
     qp->raw_size = packet->size;
     qp->raw_data.assign(packet->data, packet->data + packet->size);
 
@@ -414,6 +490,11 @@ void EncodedPublisher::dispatch_loop() {
         }
 
         if (!pkt) continue;
+
+        // Keep the selected StreamState alive for the complete dispatch.  A
+        // runtime add/remove may replace the unique_ptr as soon as this read
+        // lock is released.
+        std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
 
         pkt_count++;
 
@@ -580,13 +661,10 @@ void EncodedPublisher::check_client_control(StreamState& ss, ClientInfo& c) {
         if (ctrl == CTRL_REQUEST_KEYFRAME && keyframe_request_fn_) {
             // HAL_LOG_INFO("EncodedPublisher [%s]: Keyframe request from client fd=%d",
             //            ss.config.name.c_str(), c.fd);
-            try {
-                keyframe_request_fn_(ss.config.name);
-            } catch (const std::exception& e) {
-                HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed: %s", e.what());
-            } catch (...) {
-                HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed (unknown)");
-            }
+            // Rate-limited (1/s, like the send path) and asynchronous: the
+            // HAL force_idr can block on a stalled pipeline, so it must
+            // never run inline under clients_mu (probe/accept hold it).
+            maybe_request_keyframe(ss);
         }
     }
 }
@@ -658,12 +736,46 @@ void EncodedPublisher::maybe_request_keyframe(StreamState& ss) {
     int64_t last = ss.last_keyframe_req_ms.load(std::memory_order_relaxed);
     if (now_ms - last < kKeyframeReqMinIntervalMs) return;
     if (!ss.last_keyframe_req_ms.compare_exchange_strong(last, now_ms)) return;
-    try {
-        keyframe_request_fn_(ss.config.name);
-    } catch (const std::exception& e) {
-        HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed: %s", e.what());
-    } catch (...) {
-        HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed (unknown)");
+    // Hand off, never call through: callers run under ss.clients_mu and the
+    // HAL force_idr behind the callback can block forever on a stalled
+    // encode pipeline (field deadlock, 10-29).
+    enqueue_keyframe_request(ss.config.name);
+}
+
+void EncodedPublisher::enqueue_keyframe_request(const std::string& name) {
+    {
+        std::lock_guard<std::mutex> lock(kf_mu_);
+        if (kf_stopping_) return;
+        // Idempotent request: one queued name covers later askers too.
+        for (const auto& pending : kf_pending_) {
+            if (pending == name) return;
+        }
+        kf_pending_.push_back(name);
+    }
+    kf_cv_.notify_one();
+}
+
+void EncodedPublisher::keyframe_dispatch_loop() {
+    std::unique_lock<std::mutex> lock(kf_mu_);
+    while (true) {
+        kf_cv_.wait(lock, [this] { return kf_stopping_ || !kf_pending_.empty(); });
+        if (kf_pending_.empty()) {
+            if (kf_stopping_) return;
+            continue;
+        }
+        const std::string name = std::move(kf_pending_.front());
+        kf_pending_.pop_front();
+        lock.unlock();
+        if (keyframe_request_fn_) {
+            try {
+                keyframe_request_fn_(name);
+            } catch (const std::exception& e) {
+                HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed: %s", e.what());
+            } catch (...) {
+                HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed (unknown)");
+            }
+        }
+        lock.lock();
     }
 }
 
@@ -772,6 +884,7 @@ void EncodedPublisher::broadcast(StreamState& ss, const uint8_t* buf, size_t len
 
 bool EncodedPublisher::get_stream_stats(const std::string& name, StreamDropStats* out) {
     if (!out) return false;
+    std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
     auto it = streams_.find(name);
     if (it == streams_.end()) return false;
     auto& ss = *it->second;

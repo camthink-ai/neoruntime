@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -164,6 +165,12 @@ func (h *APIHandlers) ParseModel(c *gin.Context) {
 	}
 	if pkgMeta != nil {
 		resp["package"] = pkgMeta
+		if pkgMeta.EstimatedTops > 0 {
+			resp["estimated_tops"] = pkgMeta.EstimatedTops
+		}
+		if pkgMeta.EstimatedMemory > 0 {
+			resp["estimated_memory"] = pkgMeta.EstimatedMemory
+		}
 	}
 	Resp(c).OK(resp)
 }
@@ -305,24 +312,26 @@ func (h *APIHandlers) ListModels(c *gin.Context) {
 					continue
 				}
 				em := EnrichedModel{
-					ModelId:       db.ModelID,
-					Name:          db.Name,
-					ModelPath:     db.FilePath,
-					Status:        db.Status,
-					Source:        db.Source,
-					OwnerAppID:    db.OwnerAppID,
-					DesiredState:  db.DesiredState,
-					ModelType:     db.ModelType,
-					OutputMode:    db.OutputMode,
-					Variant:       db.Variant,
-					Threshold:     db.Threshold,
-					MaxDetections: db.MaxDetections,
-					Config:        modelConfigJSON(db.Config),
-					FileSize:      db.FileSize,
-					FileHash:      db.FileHash,
-					NetworkName:   db.NetworkName,
-					InputWidth:    db.InputWidth,
-					InputHeight:   db.InputHeight,
+					ModelId:         db.ModelID,
+					Name:            db.Name,
+					ModelPath:       db.FilePath,
+					Status:          db.Status,
+					Source:          db.Source,
+					OwnerAppID:      db.OwnerAppID,
+					DesiredState:    db.DesiredState,
+					ModelType:       db.ModelType,
+					OutputMode:      db.OutputMode,
+					Variant:         db.Variant,
+					Threshold:       db.Threshold,
+					MaxDetections:   db.MaxDetections,
+					Config:          modelConfigJSON(db.Config),
+					FileSize:        db.FileSize,
+					FileHash:        db.FileHash,
+					NetworkName:     db.NetworkName,
+					InputWidth:      db.InputWidth,
+					InputHeight:     db.InputHeight,
+					EstimatedTops:   db.EstimatedTops,
+					EstimatedMemory: db.EstimatedMemory,
 				}
 				// Enrich with runtime info if loaded on NPU
 				if rt, ok := runtimeMap[db.ModelID]; ok {
@@ -330,8 +339,15 @@ func (h *APIHandlers) ListModels(c *gin.Context) {
 					em.LoadTimestamp = rt.LoadTimestamp
 					em.Inputs = rt.Inputs
 					em.Outputs = rt.Outputs
-					em.EstimatedTops = rt.EstimatedTops
-					em.EstimatedMemory = rt.EstimatedMemory
+					// DB metadata is authoritative for device-level models. A
+					// runtime registered outside platform-api can still fill an
+					// estimate that the row does not know yet.
+					if em.EstimatedTops <= 0 && rt.EstimatedTops > 0 {
+						em.EstimatedTops = rt.EstimatedTops
+					}
+					if em.EstimatedMemory == 0 && rt.EstimatedMemory > 0 {
+						em.EstimatedMemory = rt.EstimatedMemory
+					}
 					if em.Name == "" {
 						em.Name = rt.Name
 					}
@@ -374,27 +390,43 @@ func (h *APIHandlers) syncRuntimeModelsToDB(ctx context.Context, runtimeMap map[
 		existing, _ := h.aiModelRepo.GetByModelID(modelID)
 		if existing == nil {
 			newModel := &model.AIModel{
-				ModelID:      modelID,
-				Name:         rt.Name,
-				FilePath:     rt.ModelPath,
-				Version:      rt.Version,
-				Status:       "loaded",
-				Source:       "dynamic",
-				DesiredState: "loaded",
+				ModelID:         modelID,
+				Name:            rt.Name,
+				FilePath:        rt.ModelPath,
+				Version:         rt.Version,
+				Status:          "loaded",
+				Source:          "dynamic",
+				DesiredState:    "loaded",
+				EstimatedTops:   rt.EstimatedTops,
+				EstimatedMemory: rt.EstimatedMemory,
 			}
 			if err := h.aiModelRepo.Create(newModel); err != nil {
 				logger.Warn("syncRuntimeModelsToDB: failed to create %s: %v", modelID, err)
 			}
-		} else if existing.Status != "loaded" && existing.DesiredState != "unloaded" {
-			existing.Status = "loaded"
-			if existing.Source == "" {
-				existing.Source = "disk"
+		} else {
+			dirty := false
+			if existing.EstimatedTops <= 0 && rt.EstimatedTops > 0 {
+				existing.EstimatedTops = rt.EstimatedTops
+				dirty = true
 			}
-			if existing.DesiredState == "" {
-				existing.DesiredState = "loaded"
+			if existing.EstimatedMemory == 0 && rt.EstimatedMemory > 0 {
+				existing.EstimatedMemory = rt.EstimatedMemory
+				dirty = true
 			}
-			if err := h.aiModelRepo.Update(existing); err != nil {
-				logger.Warn("syncRuntimeModelsToDB: failed to update %s: %v", modelID, err)
+			if existing.Status != "loaded" && existing.DesiredState != "unloaded" {
+				existing.Status = "loaded"
+				if existing.Source == "" {
+					existing.Source = "disk"
+				}
+				if existing.DesiredState == "" {
+					existing.DesiredState = "loaded"
+				}
+				dirty = true
+			}
+			if dirty {
+				if err := h.aiModelRepo.Update(existing); err != nil {
+					logger.Warn("syncRuntimeModelsToDB: failed to update %s: %v", modelID, err)
+				}
 			}
 		}
 	}
@@ -483,21 +515,23 @@ func (h *APIHandlers) GetModelInfo(c *gin.Context) {
 		dbModel, err := h.aiModelRepo.GetByModelID(modelID)
 		if err == nil && dbModel != nil {
 			result := gin.H{
-				"model_id":       dbModel.ModelID,
-				"name":           dbModel.Name,
-				"model_path":     dbModel.FilePath,
-				"status":         dbModel.Status,
-				"model_type":     dbModel.ModelType,
-				"output_mode":    dbModel.OutputMode,
-				"output_format":  model.ClassifyOutputFormat(dbModel.VStreamInfo),
-				"variant":        dbModel.Variant,
-				"threshold":      dbModel.Threshold,
-				"max_detections": dbModel.MaxDetections,
-				"file_size":      dbModel.FileSize,
-				"file_hash":      dbModel.FileHash,
-				"network_name":   dbModel.NetworkName,
-				"input_width":    dbModel.InputWidth,
-				"input_height":   dbModel.InputHeight,
+				"model_id":         dbModel.ModelID,
+				"name":             dbModel.Name,
+				"model_path":       dbModel.FilePath,
+				"status":           dbModel.Status,
+				"model_type":       dbModel.ModelType,
+				"output_mode":      dbModel.OutputMode,
+				"output_format":    model.ClassifyOutputFormat(dbModel.VStreamInfo),
+				"variant":          dbModel.Variant,
+				"threshold":        dbModel.Threshold,
+				"max_detections":   dbModel.MaxDetections,
+				"file_size":        dbModel.FileSize,
+				"file_hash":        dbModel.FileHash,
+				"network_name":     dbModel.NetworkName,
+				"input_width":      dbModel.InputWidth,
+				"input_height":     dbModel.InputHeight,
+				"estimated_tops":   dbModel.EstimatedTops,
+				"estimated_memory": dbModel.EstimatedMemory,
 			}
 			// Expose registration-time config (labels, nms_threshold, ...)
 			// only when the stored JSON is parseable; corrupt rows stay hidden.
@@ -515,8 +549,12 @@ func (h *APIHandlers) GetModelInfo(c *gin.Context) {
 						result["load_timestamp"] = m.LoadTimestamp
 						result["inputs"] = m.Inputs
 						result["outputs"] = m.Outputs
-						result["estimated_tops"] = m.EstimatedTops
-						result["estimated_memory"] = m.EstimatedMemory
+						if dbModel.EstimatedTops <= 0 && m.EstimatedTops > 0 {
+							result["estimated_tops"] = m.EstimatedTops
+						}
+						if dbModel.EstimatedMemory == 0 && m.EstimatedMemory > 0 {
+							result["estimated_memory"] = m.EstimatedMemory
+						}
 						break
 					}
 				}
@@ -581,18 +619,20 @@ func (h *APIHandlers) GetAIStats(c *gin.Context) {
 // RegisterModel saves model metadata to DB without loading to NPU.
 func (h *APIHandlers) RegisterModel(c *gin.Context) {
 	var req struct {
-		FileHash    string                 `json:"file_hash"`
-		ModelPath   string                 `json:"model_path"`
-		ModelID     string                 `json:"model_id"`
-		ModelType   string                 `json:"model_type"`
-		OutputMode  string                 `json:"output_mode"`
-		Variant     string                 `json:"model_variant"`
-		Config      map[string]interface{} `json:"config"`
-		FileSize    int64                  `json:"file_size"`
-		NetworkName string                 `json:"network_name"`
-		VStreamInfo string                 `json:"vstream_info"`
-		InputWidth  int                    `json:"input_width"`
-		InputHeight int                    `json:"input_height"`
+		FileHash        string                 `json:"file_hash"`
+		ModelPath       string                 `json:"model_path"`
+		ModelID         string                 `json:"model_id"`
+		ModelType       string                 `json:"model_type"`
+		OutputMode      string                 `json:"output_mode"`
+		Variant         string                 `json:"model_variant"`
+		Config          map[string]interface{} `json:"config"`
+		FileSize        int64                  `json:"file_size"`
+		NetworkName     string                 `json:"network_name"`
+		VStreamInfo     string                 `json:"vstream_info"`
+		InputWidth      int                    `json:"input_width"`
+		InputHeight     int                    `json:"input_height"`
+		EstimatedTops   float32                `json:"estimated_tops"`
+		EstimatedMemory uint32                 `json:"estimated_memory"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -620,6 +660,10 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 
 	if req.ModelID == "" {
 		Resp(c).FailMsg(CodeInvalidRequest, "model_id is required")
+		return
+	}
+	if math.IsNaN(float64(req.EstimatedTops)) || math.IsInf(float64(req.EstimatedTops), 0) || req.EstimatedTops < 0 {
+		Resp(c).FailMsg(CodeInvalidRequest, "estimated_tops must be a finite non-negative number")
 		return
 	}
 	// The id flows into gRPC registrations and materialized runtime paths;
@@ -700,22 +744,24 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 		}
 
 		dbModel := &model.AIModel{
-			ModelID:       req.ModelID,
-			Name:          req.ModelID,
-			FilePath:      modelPath,
-			FileHash:      fileHash,
-			FileSize:      req.FileSize,
-			ModelType:     req.ModelType,
-			OutputMode:    outputMode,
-			Variant:       strings.TrimSpace(req.Variant),
-			Threshold:     threshold,
-			MaxDetections: maxDet,
-			NetworkName:   req.NetworkName,
-			VStreamInfo:   req.VStreamInfo,
-			InputWidth:    req.InputWidth,
-			InputHeight:   req.InputHeight,
-			Config:        string(configJSON),
-			Status:        "uploaded",
+			ModelID:         req.ModelID,
+			Name:            req.ModelID,
+			FilePath:        modelPath,
+			FileHash:        fileHash,
+			FileSize:        req.FileSize,
+			ModelType:       req.ModelType,
+			OutputMode:      outputMode,
+			Variant:         strings.TrimSpace(req.Variant),
+			Threshold:       threshold,
+			MaxDetections:   maxDet,
+			NetworkName:     req.NetworkName,
+			VStreamInfo:     req.VStreamInfo,
+			InputWidth:      req.InputWidth,
+			InputHeight:     req.InputHeight,
+			EstimatedTops:   req.EstimatedTops,
+			EstimatedMemory: req.EstimatedMemory,
+			Config:          string(configJSON),
+			Status:          "uploaded",
 			// Explicit "unloaded": registration is not a load promise, and
 			// desired_state=loaded would have the self-heal loop auto-load
 			// this model within a minute.
@@ -781,19 +827,25 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 	// Pointer fields distinguish "absent" (keep current) from zero values —
 	// the update applies exactly what the body carries.
 	var req struct {
-		FileHash    string                 `json:"file_hash"`
-		ModelType   string                 `json:"model_type"`
-		OutputMode  *string                `json:"output_mode"`
-		Variant     *string                `json:"model_variant"`
-		Config      map[string]interface{} `json:"config"`
-		FileSize    *int64                 `json:"file_size"`
-		NetworkName *string                `json:"network_name"`
-		VStreamInfo *string                `json:"vstream_info"`
-		InputWidth  *int                   `json:"input_width"`
-		InputHeight *int                   `json:"input_height"`
+		FileHash        string                 `json:"file_hash"`
+		ModelType       string                 `json:"model_type"`
+		OutputMode      *string                `json:"output_mode"`
+		Variant         *string                `json:"model_variant"`
+		Config          map[string]interface{} `json:"config"`
+		FileSize        *int64                 `json:"file_size"`
+		NetworkName     *string                `json:"network_name"`
+		VStreamInfo     *string                `json:"vstream_info"`
+		InputWidth      *int                   `json:"input_width"`
+		InputHeight     *int                   `json:"input_height"`
+		EstimatedTops   *float32               `json:"estimated_tops"`
+		EstimatedMemory *uint32                `json:"estimated_memory"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
+		return
+	}
+	if req.EstimatedTops != nil && (math.IsNaN(float64(*req.EstimatedTops)) || math.IsInf(float64(*req.EstimatedTops), 0) || *req.EstimatedTops < 0) {
+		Resp(c).FailMsg(CodeInvalidRequest, "estimated_tops must be a finite non-negative number")
 		return
 	}
 
@@ -896,6 +948,12 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 	}
 	if req.InputHeight != nil {
 		staged.InputHeight = *req.InputHeight
+	}
+	if req.EstimatedTops != nil {
+		staged.EstimatedTops = *req.EstimatedTops
+	}
+	if req.EstimatedMemory != nil {
+		staged.EstimatedMemory = *req.EstimatedMemory
 	}
 	if req.Config != nil {
 		merged := make(map[string]interface{})

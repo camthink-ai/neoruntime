@@ -32,6 +32,7 @@ interface MediaSettingsProps {
   onStreamChange?: (streamId: string) => void;
   onStreamToggleSuccess?: (streamId: string, enabled: boolean) => void;
   onEncoderConfiguringChange?: (isConfiguring: boolean) => void;
+  onEncoderRestartingChange?: (isRestarting: boolean) => void;
 }
 
 export default function MediaSettings({
@@ -39,6 +40,7 @@ export default function MediaSettings({
   onStreamChange: controlledOnStreamChange,
   onStreamToggleSuccess,
   onEncoderConfiguringChange,
+  onEncoderRestartingChange,
 }: MediaSettingsProps) {
   const { t } = useTranslation();
   const { data: statusData, isLoading, error } = useMediaStatus();
@@ -50,6 +52,7 @@ export default function MediaSettings({
   const [activeStreamState, setActiveStreamState] = useState<string>(
     controlledActiveStream ?? 'main'
   );
+  const [isPreparingPipelineRestart, setIsPreparingPipelineRestart] = useState(false);
   const setActiveStream = useCallback((streamId: string) => {
     setActiveStreamState(streamId);
   }, []);
@@ -202,13 +205,6 @@ export default function MediaSettings({
     onEncoderConfiguringChange,
   ]);
 
-  // Any encoder reconfiguration in flight (codec/resolution full reconfig, or
-  // bitrate/fps/gop hot reload). While true the codec & resolution dropdowns
-  // and the fps/bitrate/gop/dimension inputs stay disabled so a second change
-  // can't race the in-flight request — otherwise persistStreamConfig's
-  // early-return guard would silently drop an edit mid-save (UI shows the new
-  // value but it never reaches the device).
-  const isSavingEncoder = isUpdatingEncoder || isReconfiguringEncoder;
   const {
     mutate: enableStreamMutate,
     isPending: isEnablingStream,
@@ -219,6 +215,42 @@ export default function MediaSettings({
     isPending: isDisablingStream,
     variables: disablingStreamId,
   } = useDisableStream();
+
+  // Any encoder reconfiguration in flight (codec/resolution full reconfig,
+  // bitrate/fps/gop hot reload, or a stream enable/disable — those rebuild the
+  // same pipeline). While true the codec & resolution dropdowns and the
+  // fps/bitrate/gop/dimension inputs stay disabled so a second change can't
+  // race the in-flight request — otherwise persistStreamConfig's early-return
+  // guard would silently drop an edit mid-save (UI shows the new value but it
+  // never reaches the device).
+  const isSavingEncoder = (
+    isPreparingPipelineRestart
+    || isUpdatingEncoder
+    || isReconfiguringEncoder
+    || isEnablingStream
+    || isDisablingStream
+  );
+
+  // Codec/resolution changes and stream enable/disable all rebuild the complete
+  // MediaLibrary pipeline. The preparation flag is raised one animation frame
+  // before the request so Player can snapshot the last valid frame before the
+  // backend starts tearing down the stream.
+  const isPipelineRestarting = isPreparingPipelineRestart
+    || isReconfiguringEncoder
+    || isEnablingStream
+    || isDisablingStream;
+  useEffect(() => {
+    onEncoderRestartingChange?.(isPipelineRestarting);
+  }, [isPipelineRestarting, onEncoderRestartingChange]);
+
+  const runAfterPlayerFreeze = useCallback((operation: () => void) => {
+    // Queue the parent's restart state in the same click batch. Waiting for the
+    // passive effect alone can let requestAnimationFrame race ahead of Player's
+    // snapshot on a fast browser.
+    onEncoderRestartingChange?.(true);
+    setIsPreparingPipelineRestart(true);
+    window.requestAnimationFrame(operation);
+  }, [onEncoderRestartingChange]);
 
   // 常见分辨率选项（按码流区分：主码流允许更高分辨率）
   const mainResolutionOptions = [
@@ -339,17 +371,24 @@ export default function MediaSettings({
   const handleToggleStream = useCallback(
     (streamId: string, enabled: boolean) => {
       if (streamId === 'main') return;
-      if (enabled) {
-        enableStreamMutate(streamId, {
-          onSuccess: () => onStreamToggleSuccess?.(streamId, true),
-        });
-      } else {
-        disableStreamMutate(streamId, {
-          onSuccess: () => onStreamToggleSuccess?.(streamId, false),
-        });
-      }
+      runAfterPlayerFreeze(() => {
+        const options = {
+          onSuccess: () => onStreamToggleSuccess?.(streamId, enabled),
+          onSettled: () => setIsPreparingPipelineRestart(false),
+        };
+        if (enabled) {
+          enableStreamMutate(streamId, options);
+        } else {
+          disableStreamMutate(streamId, options);
+        }
+      });
     },
-    [disableStreamMutate, enableStreamMutate, onStreamToggleSuccess]
+    [
+      disableStreamMutate,
+      enableStreamMutate,
+      onStreamToggleSuccess,
+      runAfterPlayerFreeze,
+    ]
   );
 
   const getBitrateKbps = (bps: number) => Math.max(1, Math.round(bps / 1000));
@@ -473,25 +512,28 @@ export default function MediaSettings({
       || effective.height !== baseline.height;
 
     if (needsReconfiguration) {
-      reconfigureEncoder(
-        {
-          stream_name: streamId,
-          codec: effective.codec,
-          width: effective.width,
-          height: effective.height,
-          bitrate_bps: effective.bitrate_bps,
-          fps: effective.fps,
-          gop: effective.gop,
-        },
-        {
-          onSuccess: () => {
-            setSavedEdits(prev => ({
-              ...prev,
-              [streamId]: { ...prev[streamId], ...effective },
-            }));
+      runAfterPlayerFreeze(() => {
+        reconfigureEncoder(
+          {
+            stream_name: streamId,
+            codec: effective.codec,
+            width: effective.width,
+            height: effective.height,
+            bitrate_bps: effective.bitrate_bps,
+            fps: effective.fps,
+            gop: effective.gop,
           },
-        }
-      );
+          {
+            onSuccess: () => {
+              setSavedEdits(prev => ({
+                ...prev,
+                [streamId]: { ...prev[streamId], ...effective },
+              }));
+            },
+            onSettled: () => setIsPreparingPipelineRestart(false),
+          }
+        );
+      });
     } else {
       updateEncoderConfig(
         {

@@ -620,6 +620,165 @@ func TestSyncMCURTCFromHostAsyncSendsRTCSet(t *testing.T) {
 	}
 }
 
+func TestMcuRTCTimeFromPayload_RoundTripsSetBuilder(t *testing.T) {
+	// Arrange
+	sent := time.Date(2026, time.October, 28, 6, 30, 15, 0, time.UTC)
+	payload, err := mcuRTCPayloadFromTime(sent)
+	if err != nil {
+		t.Fatalf("mcuRTCPayloadFromTime() error = %v", err)
+	}
+
+	// Act
+	got := mcuRTCTimeFromPayload(payload)
+
+	// Assert
+	if !got.Equal(sent) {
+		t.Fatalf("decoded time = %v, want %v", got, sent)
+	}
+}
+
+func newMcuRtcTestContext(t *testing.T) (*gin.Context, *httptest.ResponseRecorder) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/system/time/mcu-rtc", nil)
+	return c, recorder
+}
+
+func decodeMcuRtcEnvelope(t *testing.T, recorder *httptest.ResponseRecorder) (int, McuRtcTime, string) {
+	t.Helper()
+	var envelope struct {
+		Code  int `json:"code"`
+		Error *struct {
+			Detail string `json:"detail"`
+		} `json:"error"`
+		Data McuRtcTime `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("invalid response body: %v", err)
+	}
+	detail := ""
+	if envelope.Error != nil {
+		detail = envelope.Error.Detail
+	}
+	return envelope.Code, envelope.Data, detail
+}
+
+func TestGetMcuRtcTime_SucceedsOnPlausibleReadback(t *testing.T) {
+	// Arrange
+	payload, err := mcuRTCPayloadFromTime(time.Now().UTC())
+	if err != nil {
+		t.Fatalf("mcuRTCPayloadFromTime() error = %v", err)
+	}
+	fake := &fakeMCURawRequester{
+		requests: make(chan *camerapb.McuRawRequestMessage, 1),
+		resp:     &camerapb.McuRawResponseMessage{Success: true, Payload: payload},
+	}
+	h := &TimeHandler{mcuRaw: fake}
+	c, recorder := newMcuRtcTestContext(t)
+
+	// Act
+	h.GetMcuRtcTime(c)
+
+	// Assert
+	code, data, _ := decodeMcuRtcEnvelope(t, recorder)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if !data.Plausible {
+		t.Fatalf("plausible = false, want true for a %s readback", data.McuTime)
+	}
+	if data.McuTime == "" || data.HostTime == "" {
+		t.Fatal("response must carry both mcu_time and host_time")
+	}
+}
+
+func TestGetMcuRtcTime_ReportsDeadRTCAPlausibleFalse(t *testing.T) {
+	// Arrange: year byte 0 → 2000, the dead-RTC signature. The verdict is
+	// delivered, not an error.
+	fake := &fakeMCURawRequester{
+		requests: make(chan *camerapb.McuRawRequestMessage, 1),
+		resp:     &camerapb.McuRawResponseMessage{Success: true, Payload: []byte{0, 1, 1, 1, 0, 0, 0}},
+	}
+	h := &TimeHandler{mcuRaw: fake}
+	c, recorder := newMcuRtcTestContext(t)
+
+	// Act
+	h.GetMcuRtcTime(c)
+
+	// Assert
+	code, data, _ := decodeMcuRtcEnvelope(t, recorder)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0 (a dead RTC is a verdict, not an error)", code)
+	}
+	if data.Plausible {
+		t.Fatal("year-2000 readback must report plausible=false")
+	}
+}
+
+func TestGetMcuRtcTime_RejectsShortPayload(t *testing.T) {
+	// Arrange
+	fake := &fakeMCURawRequester{
+		requests: make(chan *camerapb.McuRawRequestMessage, 1),
+		resp:     &camerapb.McuRawResponseMessage{Success: true, Payload: []byte{26, 10, 28}},
+	}
+	h := &TimeHandler{mcuRaw: fake}
+	c, recorder := newMcuRtcTestContext(t)
+
+	// Act
+	h.GetMcuRtcTime(c)
+
+	// Assert
+	code, _, detail := decodeMcuRtcEnvelope(t, recorder)
+	if code == 0 {
+		t.Fatal("short payload must fail")
+	}
+	if !strings.Contains(detail, "payload too short") {
+		t.Fatalf("detail = %q, want it to mention the short payload", detail)
+	}
+}
+
+func TestGetMcuRtcTime_FailsWhenMCUReportsFailure(t *testing.T) {
+	// Arrange
+	fake := &fakeMCURawRequester{
+		requests: make(chan *camerapb.McuRawRequestMessage, 1),
+		resp:     &camerapb.McuRawResponseMessage{Success: false, Message: "host-link busy", HalCode: 5},
+	}
+	h := &TimeHandler{mcuRaw: fake}
+	c, recorder := newMcuRtcTestContext(t)
+
+	// Act
+	h.GetMcuRtcTime(c)
+
+	// Assert
+	code, _, detail := decodeMcuRtcEnvelope(t, recorder)
+	if code == 0 {
+		t.Fatal("MCU-reported failure must surface as an error")
+	}
+	if !strings.Contains(detail, "hal=5") {
+		t.Fatalf("detail = %q, want it to carry the hal code", detail)
+	}
+}
+
+func TestGetMcuRtcTime_FailsWithoutCameraControlClient(t *testing.T) {
+	// Arrange
+	h := &TimeHandler{}
+	c, recorder := newMcuRtcTestContext(t)
+
+	// Act
+	h.GetMcuRtcTime(c)
+
+	// Assert
+	code, _, detail := decodeMcuRtcEnvelope(t, recorder)
+	if code == 0 {
+		t.Fatal("nil camera-control client must fail loudly")
+	}
+	if detail == "" {
+		t.Fatal("failure detail must not be empty")
+	}
+}
+
 // ============================================================
 // 6. Persist Loop Graceful Exit
 // ============================================================

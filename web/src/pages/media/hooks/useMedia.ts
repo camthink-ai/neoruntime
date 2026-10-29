@@ -245,14 +245,11 @@ export const useReconfigureEncoder = () => {
         queryClient,
         variables.stream_name
       );
-      // Resolution/codec/fps changed → stream identity changed. Force the player
-      // to reconnect so it fetches fresh SPS/PPS and waits for a clean IDR,
-      // instead of decoding transitional frames against the old reference
-      // (花屏/黑屏). Backend already invalidated the SPS cache, reset the UDS
-      // readLoop, and will force an IDR on the new WS connection (AddClient).
-      if (typeof window !== 'undefined') {
-        window.dispatchEvent(new CustomEvent('player-reload'));
-      }
+      // MediaSettings keeps the full-reconfigure mutation pending while this
+      // status refresh runs. The media page disconnects the old player for that
+      // whole interval, then connects once using the final codec/fallback stream.
+      // Do not also dispatch player-reload here: that used to reconnect a second
+      // time after frames had already resumed, causing a visible flash.
     },
     onError: (err: any) => {
       toast.error(
