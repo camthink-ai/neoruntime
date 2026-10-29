@@ -1446,6 +1446,7 @@ int connect_encoders(Hailo15MediaPriv *p)
                 HalCodecContext *cctx = nullptr;
                 HalPacketType pt = HAL_PACKET_TYPE_H264;
                 uint64_t seq = 0;
+                bool counted = false;
                 {
                     /* Never hold priv->mutex across MediaLibrary calls or user callbacks: both may re-enter HAL. */
                     std::lock_guard<std::recursive_mutex> lock(p->mutex);
@@ -1463,8 +1464,19 @@ int connect_encoders(Hailo15MediaPriv *p)
                         cctx = cc_it->second;
                         pt = cctx ? cctx->config.packet_type : pt;
                     }
+                    if (cb)
+                    {
+                        /* Register in-flight INSIDE the same critical section
+                         * that copied the subscriber: incrementing after
+                         * releasing p->mutex left a window where unsubscribe()
+                         * erased the entry, observed the count at zero and
+                         * returned — while the copied callback still ran. */
+                        std::lock_guard<std::mutex> in_flight_lk(p->packet_cb_mu);
+                        ++p->packet_cb_in_flight;
+                        counted = true;
+                    }
                 }
-                if (!cb)
+                if (!counted)
                 {
                     if (p->enc_pkt_count[eid] <= 5)
                     {
@@ -1483,16 +1495,11 @@ int connect_encoders(Hailo15MediaPriv *p)
                                   eid.c_str(), packet_index, sz, pkt.size);
                 }
                 pkt.sequence = static_cast<uint32_t>(seq);
-                {
-                    /* Counted while the subscriber is definitely non-null:
-                     * unsubscribe() waits this back to zero so no copied
-                     * callback runs after it returns. */
-                    std::lock_guard<std::mutex> in_flight_lk(p->packet_cb_mu);
-                    ++p->packet_cb_in_flight;
-                }
                 cb(cctx, &pkt, cb_ud);
                 (void)buf->sync_end();
                 {
+                    /* Paired with the increment taken inside the p->mutex
+                     * critical section above. */
                     std::lock_guard<std::mutex> in_flight_lk(p->packet_cb_mu);
                     if (--p->packet_cb_in_flight == 0)
                     {

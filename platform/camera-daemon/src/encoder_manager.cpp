@@ -554,20 +554,43 @@ bool EncoderManager::destroy(const std::string& stream_name) {
     }
 
     // FROM_MEDIA contexts are owned by media pipeline — skip start/stop/deinit
+    int unsub_rc = 0;
     if (!is_from_media) {
         if (was_running && ops_->stop) {
             ops_->stop(ctx);
         }
         if (ops_->unsubscribe) {
-            ops_->unsubscribe(ctx, codec_output_callback);
+            unsub_rc = ops_->unsubscribe(ctx, codec_output_callback);
         }
-        if (ops_->deinit) {
-            ops_->deinit(ctx);
+    } else if (ops_->unsubscribe) {
+        unsub_rc = ops_->unsubscribe(ctx, codec_output_callback);
+    }
+
+    if (unsub_rc != 0) {
+        // unsubscribe could not prove callback quiescence (the HAL reports
+        // HAL_ERR_TIMEOUT when a copied callback outlives its bounded wait):
+        // deinit would free the ctx under that live callback, and dropping
+        // the release-only bookkeeping now would turn its late packets into
+        // leaked buffer references. Park everything — same semantics as a
+        // drain timeout: the tombstone keeps the ctx, late packets keep
+        // getting released via release_only_ctxs_, and the claim is handed
+        // back so a later destroy() retries (the subscription map entry is
+        // already erased, so the retry only re-checks quiescence).
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            auto cit = closing_teardowns_.find(stream_name);
+            if (cit != closing_teardowns_.end()) {
+                cit->second.teardown_in_progress = false;
+            }
         }
-    } else {
-        if (ops_->unsubscribe) {
-            ops_->unsubscribe(ctx, codec_output_callback);
-        }
+        HAL_LOG_ERROR("EncoderManager: destroy('%s') aborted — unsubscribe "
+                      "rc=%d (packet-callback quiesce not proven); ctx stays "
+                      "parked as a closing tombstone (retry destroy to "
+                      "reclaim)", stream_name.c_str(), unsub_rc);
+        return false;
+    }
+    if (!is_from_media && ops_->deinit) {
+        ops_->deinit(ctx);
     }
 
     // Drop the closing bookkeeping only AFTER unsubscribe: callbacks can
@@ -585,6 +608,13 @@ bool EncoderManager::destroy(const std::string& stream_name) {
 }
 
 bool EncoderManager::destroy_all() {
+    // Exclusive ownership of the whole barrier window: with a plain flag,
+    // the first finisher would clear destroy_all_active_ while a second
+    // concurrent destroy_all() was still tearing down its snapshot — a
+    // create slipping in then would miss the second call's window and
+    // publish a ctx the second caller believes is gone. Serializing makes
+    // each call's barrier cover its own complete snapshot+teardown.
+    std::lock_guard<std::mutex> serialize(destroy_all_mu_);
     std::vector<std::string> names;
     {
         std::unique_lock<std::mutex> lock(mu_);

@@ -36,6 +36,13 @@
 //  11. A RUNNING FROM_MEDIA encoder delivering inside subscribe() — before
 //      the promotion critical section writes the routing maps — hits the
 //      release-only path: the packet is dropped but RELEASED, not leaked.
+//  12. unsubscribe() reporting a packet-callback quiesce timeout (HAL reports
+//      HAL_ERR_TIMEOUT) aborts the teardown: no deinit under a live copied
+//      callback, the tombstone stays parked (late packets keep getting
+//      released), and a retry once quiescence is proven reclaims the ctx.
+//  13. Concurrent destroy_all() calls serialize: the first finisher cannot
+//      drop the create barrier while the second call is still inside its
+//      teardown window.
 
 #include "encoded_publisher.h"
 #include "encoder_manager.h"
@@ -552,6 +559,159 @@ void test_pending_creation_packets_released() {
     assert(!mgr.has_encoder("aux"));
 }
 
+// --- Contract 12/13 mocks: standalone encoders (init/deinit) + unsubscribe
+// failure/gating for the quiesce-timeout and destroy_all-serialization
+// contracts.
+
+void* g_next_ctx = nullptr;  // set by the test before each create()
+
+int mock_init(const HalCodecConfig*, void** codec_ctx_return) {
+    *codec_ctx_return = g_next_ctx;
+    return 0;
+}
+
+std::atomic<int> g_deinits{0};
+
+int mock_deinit(void*) {
+    ++g_deinits;
+    return 0;
+}
+
+std::atomic<bool> g_unsub_fail{false};
+
+int mock_unsubscribe_checked(void*, HalCodecFrameCallback) {
+    if (g_unsub_fail.load()) {
+        return -1;  // analog of HAL_ERR_TIMEOUT: quiescence not proven
+    }
+    ++g_unsubscribes;
+    return 0;
+}
+
+void test_destroy_parks_on_unsubscribe_timeout() {
+    // Contract 12: unsubscribe() that cannot prove packet-callback quiescence
+    // must abort the teardown — deinit would free the ctx under the live
+    // copied callback — and park the tombstone: late packets keep getting
+    // released, same-name creation stays gated, and a retry once quiescence
+    // is proven reclaims the ctx.
+    HalCodecOps ops{};
+    ops.init = mock_init;
+    ops.subscribe = mock_subscribe;
+    ops.unsubscribe = mock_unsubscribe_checked;
+    ops.deinit = mock_deinit;
+    ops.release_packet = mock_release_packet;
+    ops.force_idr = mock_force_idr;
+    EncoderManager mgr(&ops);
+    HalCodecConfig config{};
+    void* const aux_ctx = reinterpret_cast<void*>(0x5150);
+    g_next_ctx = aux_ctx;
+    assert(mgr.create("aux", config));
+
+    g_unsubscribes.store(0);
+    g_deinits.store(0);
+    g_releases.store(0);
+    g_unsub_fail.store(true);
+
+    assert(!mgr.destroy("aux"));         // timeout surfaced, teardown aborted
+    assert(g_deinits.load() == 0);       // ctx NOT freed under a live callback
+    assert(!mgr.has_encoder("aux"));
+
+    // Parked bookkeeping intact: late packets are dropped but RELEASED...
+    HalPacketBuffer pkt{};
+    pkt.size = 4;
+    mgr.on_packet(aux_ctx, &pkt);
+    assert(g_releases.load() == 1);
+    // ...and a same-name create cannot overwrite the parked ctx (its reclaim
+    // pass hits the same refused teardown).
+    assert(!mgr.create("aux", config));
+
+    // Quiescence proven on retry: reclaims the parked ctx and finishes.
+    g_unsub_fail.store(false);
+    assert(mgr.destroy("aux"));
+    assert(g_unsubscribes.load() == 1);
+    assert(g_deinits.load() == 1);
+    assert(!mgr.has_encoder("aux"));
+}
+
+std::atomic<int> g_unsub_in{0};
+std::atomic<bool> g_unsub_release_a{false};
+
+int mock_unsubscribe_gated_one(void* codec_ctx, HalCodecFrameCallback) {
+    ++g_unsub_in;
+    if (codec_ctx == reinterpret_cast<void*>(0x5150)) {
+        // "a": stays inside unsubscribe until the test lets it go.
+        while (!g_unsub_release_a.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    ++g_unsubscribes;
+    return 0;
+}
+
+void test_concurrent_destroy_all_serialized() {
+    // Contract 13: a second destroy_all() must not complete (or drop the
+    // create barrier) while a first one is still inside its teardown window.
+    // The first call blocks in unsubscribe("a"); "b" tears down instantly, so
+    // WITHOUT serialization the second call would finish, clear the flag and
+    // admit a create while "a" was still being torn down.
+    HalCodecOps ops{};
+    ops.init = mock_init;
+    ops.subscribe = mock_subscribe;
+    ops.unsubscribe = mock_unsubscribe_gated_one;
+    ops.deinit = mock_deinit;
+    ops.force_idr = mock_force_idr;
+    EncoderManager mgr(&ops);
+    HalCodecConfig config{};
+    void* const a_ctx = reinterpret_cast<void*>(0x5150);
+    void* const b_ctx = reinterpret_cast<void*>(0xBEEF);
+    g_next_ctx = a_ctx;
+    assert(mgr.create("a", config));
+    g_next_ctx = b_ctx;
+    assert(mgr.create("b", config));
+
+    g_unsubscribes.store(0);
+    g_deinits.store(0);
+    g_unsub_in.store(0);
+    g_unsub_release_a.store(false);
+
+    std::thread first([&] { assert(mgr.destroy_all()); });
+    {
+        // Wait until the first call is parked inside unsubscribe("a").
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (g_unsub_in.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(g_unsub_in.load() > 0);
+    }
+
+    std::atomic<bool> second_done{false};
+    std::thread second([&] {
+        const bool ok = mgr.destroy_all();
+        assert(ok);
+        second_done.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    // Serialized behind the first call: with a plain flag barrier the second
+    // call would already have finished ("b" tears down instantly) and cleared
+    // destroy_all_active_ while "a" was still wedged in unsubscribe.
+    assert(!second_done.load());
+    // The first call's window is still up: new creations must be rejected.
+    assert(!mgr.create("c", config));
+
+    g_unsub_release_a.store(true);
+    first.join();
+    second.join();
+    assert(second_done.load());
+    assert(!mgr.has_encoder("a"));
+    assert(!mgr.has_encoder("b"));
+    assert(g_deinits.load() == 2);  // both standalone ctxs fully reclaimed
+
+    // Barrier down: creations work again.
+    g_next_ctx = reinterpret_cast<void*>(0xC0DE);
+    assert(mgr.create("c", config));
+    assert(mgr.destroy_all());
+    assert(!mgr.has_encoder("c"));
+}
+
 }  // namespace
 
 int main() {
@@ -564,5 +724,7 @@ int main() {
     test_destroy_waits_out_inflight_creation();
     test_destroy_all_bars_new_creates_and_waits();
     test_pending_creation_packets_released();
+    test_destroy_parks_on_unsubscribe_timeout();
+    test_concurrent_destroy_all_serialized();
     return 0;
 }

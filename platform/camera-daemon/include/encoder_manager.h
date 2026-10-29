@@ -52,14 +52,18 @@ public:
 
     /**
      * Tear down one encoder. Returns false when the bounded drain of
-     * in-flight force_keyframe() calls timed out: the HAL teardown was
-     * ABORTED (ctx leaked on purpose — freeing it would race the wedged
-     * call) and the slot is parked as a closing tombstone; callers must
-     * abort the pipeline teardown they were about to perform and surface
-     * the failure. A later destroy() of the same name retries the parked
-     * teardown and reclaims the ctx once the call finally returns — unless
-     * another thread already owns that retry (teardown_in_progress), in
-     * which case this call also returns false without touching the ctx.
+     * in-flight force_keyframe() calls timed out, when the creation of
+     * this name is still inside the HAL, or when unsubscribe() could not
+     * prove packet-callback quiescence (HAL_ERR_TIMEOUT): in every case the
+     * HAL teardown was ABORTED (ctx leaked on purpose — freeing it would
+     * race the wedged call or a still-running copied callback) and the slot
+     * is parked as a closing tombstone whose late packets keep getting
+     * released; callers must abort the pipeline teardown they were about to
+     * perform and surface the failure. A later destroy() of the same name
+     * retries the parked teardown and reclaims the ctx once the call finally
+     * returns — unless another thread already owns that retry
+     * (teardown_in_progress), in which case this call also returns false
+     * without touching the ctx.
      */
     bool destroy(const std::string& stream_name);
 
@@ -206,6 +210,11 @@ private:
      *  create reservations are rejected so no ctx can be published right
      *  after destroy_all() reported all-clear. */
     bool destroy_all_active_ = false;
+    /** Serializes destroy_all() calls: the flag above is a plain bool, so
+     *  without exclusive ownership the first finisher would drop the
+     *  barrier while a second concurrent destroy_all() was still inside
+     *  its teardown window. Held across the whole body. */
+    std::mutex destroy_all_mu_;
     PacketOutputFn output_fn_;
 
     // Reverse map: codec_ctx → stream_name (for callback routing)

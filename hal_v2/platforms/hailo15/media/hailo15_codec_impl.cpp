@@ -1109,15 +1109,21 @@ static int hailo15_codec_unsubscribe(void *codec_ctx, HalCodecFrameCallback call
      * an already-copied callback. Wait for in-flight copies to finish
      * before returning: the caller (EncoderManager::destroy) drops its
      * release-only bookkeeping for this ctx once we return, and a late
-     * callback would take the unknown-ctx path and leak the packet buffer. */
+     * callback would take the unknown-ctx path and leak the packet buffer.
+     * A timeout must propagate (HAL_ERR_TIMEOUT): the map entry is already
+     * erased so no NEW dispatch will find a subscriber, but the caller
+     * must NOT proceed to free the ctx — a copied callback is still
+     * running inside it. */
     {
         std::unique_lock<std::mutex> in_flight_lk(priv->packet_cb_mu);
         if (!priv->packet_cb_cv.wait_for(in_flight_lk, std::chrono::milliseconds(500),
                                          [priv] { return priv->packet_cb_in_flight == 0; }))
         {
-            HAL_LOG_ERROR("hailo15_media: unsubscribe('%s') left with a packet "
-                          "callback still in flight — a late callback may leak "
-                          "one packet buffer", eid.c_str());
+            HAL_LOG_ERROR("hailo15_media: unsubscribe('%s') timed out with a "
+                          "packet callback still in flight — reporting "
+                          "HAL_ERR_TIMEOUT so the caller does not free the "
+                          "ctx under the live callback", eid.c_str());
+            return HAL_ERR_TIMEOUT;
         }
     }
     return HAL_OK;
