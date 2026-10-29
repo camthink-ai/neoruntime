@@ -182,6 +182,20 @@ private:
 
     KeyframeRequestFn keyframe_request_fn_;
 
+    // Async keyframe dispatch. The HAL force_idr behind keyframe_request_fn_
+    // can block indefinitely inside medialib when the encode pipeline is
+    // stalled (gst_pad_send_event waiting on pad locks). Calling it inline
+    // from the CTRL/probe/broadcast paths held ss.clients_mu across that
+    // block and deadlocked the accept/probe/status paths daemon-wide
+    // (field-verified 10-29). Requests are queued here and drained by a
+    // worker that holds no publisher locks; a stuck call wedges only that
+    // worker.
+    std::mutex kf_mu_;
+    std::condition_variable kf_cv_;
+    std::deque<std::string> kf_pending_;
+    bool kf_stopping_ = false;
+    std::thread keyframe_thread_;
+
     static constexpr uint8_t CTRL_REQUEST_KEYFRAME = 0x4B;
 
     void accept_loop();
@@ -200,6 +214,12 @@ private:
     // Rate-limited (<=1/s per stream) encoder IDR request so a client that
     // lost frames can resync at the next keyframe.
     void maybe_request_keyframe(StreamState& ss);
+
+    // Queue one IDR request (deduped per stream) for async dispatch.
+    void enqueue_keyframe_request(const std::string& name);
+    // Drains kf_pending_ on a dedicated thread; never holds clients_mu_ or
+    // queue_mu_ across the callback.
+    void keyframe_dispatch_loop();
 
     // Fail-loud guard for the metadata-only syndrome: packets keep flowing
     // but no keyframe is ever coded. Latches ONE ERROR per stream (cleared on

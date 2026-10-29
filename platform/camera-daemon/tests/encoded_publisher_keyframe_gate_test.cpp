@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cerrno>
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <poll.h>
@@ -48,7 +49,7 @@ int main() {
     config.height = 1080;
     publisher.add_stream(config, dir);
 
-    int keyframe_requests = 0;
+    std::atomic<int> keyframe_requests{0};
     publisher.set_keyframe_request_cb(
         [&](const std::string& stream_name) {
             assert(stream_name == "main");
@@ -88,7 +89,16 @@ int main() {
 
     pollfd wait_for_p{client, POLLIN, 0};
     assert(::poll(&wait_for_p, 1, 200) == 0);
-    assert(keyframe_requests > 0);
+    // Keyframe dispatch is asynchronous (dedicated worker); poll for it.
+    {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(2);
+        while (keyframe_requests.load() == 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(keyframe_requests.load() > 0);
+    }
 
     const uint8_t idr_frame[] = {0x00, 0x00, 0x00, 0x01, 0x65, 0x88};
     publish(publisher, idr_frame, sizeof(idr_frame));

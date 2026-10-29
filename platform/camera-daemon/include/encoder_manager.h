@@ -13,6 +13,7 @@
 #include <functional>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <cstdint>
 
@@ -60,6 +61,15 @@ public:
      */
     void set_rebuild_active(bool active) { rebuild_active_.store(active); }
     bool is_rebuild_active() const { return rebuild_active_.load(); }
+
+    /**
+     * Bounded wait for in-flight force_keyframe() HAL calls to return.
+     * Teardown paths that recycle borrowed FROM_MEDIA contexts (rebuild
+     * windows, destroy) drain first so a call that already captured the ctx
+     * pointer is not still inside the HAL when the ctx goes away. On timeout
+     * logs ERROR and proceeds — medialib's force_idr has no deadline.
+     */
+    void wait_keyframe_calls_drained(int timeout_ms = 2000);
 
     /**
      * Forget locally registered FROM_MEDIA contexts without calling HAL.
@@ -143,6 +153,11 @@ private:
 
     // Reverse map: codec_ctx → stream_name (for callback routing)
     std::unordered_map<void*, std::string> handle_to_stream_;
+
+    // Guarded by mu_: force_keyframe() increments before dropping mu_ for
+    // the HAL call and decrements after; destroy()/rebuilds drain on it.
+    int keyframes_in_flight_ = 0;
+    std::condition_variable keyframe_drained_cv_;
 
     /** HAL Codec push mode callback */
     static void codec_output_callback(void* codec_ctx,

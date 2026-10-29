@@ -165,12 +165,43 @@ int EncoderManager::force_keyframe(const std::string& stream_name) {
     // encoders_ still maps the stale pointer; the gate keeps us out.
     if (is_rebuild_active()) return -1;
     if (!ops_ || !ops_->force_idr) return -1;
-    // Hold mu_ across the HAL call: without it, destroy() on another thread
-    // can erase and deinit/free the ctx between our lookup and force_idr.
-    std::lock_guard<std::mutex> lock(mu_);
-    auto it = encoders_.find(stream_name);
-    if (it == encoders_.end()) return -1;
-    return ops_->force_idr(it->second.codec_ctx);
+    // NEVER hold mu_ across the HAL call: force_idr can block indefinitely
+    // inside medialib (gst_pad_send_event waiting on pad locks of a stalled
+    // encode pipeline), and a mutex held across that block wedges every
+    // has_encoder()/status caller daemon-wide (field deadlock, 10-29).
+    // Lifetime is covered by the rebuild gate plus the in-flight drain in
+    // wait_keyframe_calls_drained().
+    void* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        // Re-check under mu_: a rebuild that sets the gate just after the
+        // fast-path check above must still exclude us — rebuilds drain
+        // in-flight calls only after taking mu_, which orders against this
+        // increment.
+        if (rebuild_active_.load()) return -1;
+        auto it = encoders_.find(stream_name);
+        if (it == encoders_.end()) return -1;
+        ctx = it->second.codec_ctx;
+        ++keyframes_in_flight_;
+    }
+    const int rc = ops_->force_idr(ctx);
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        --keyframes_in_flight_;
+    }
+    keyframe_drained_cv_.notify_all();
+    return rc;
+}
+
+void EncoderManager::wait_keyframe_calls_drained(int timeout_ms) {
+    std::unique_lock<std::mutex> lock(mu_);
+    if (!keyframe_drained_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+            [this] { return keyframes_in_flight_ == 0; })) {
+        HAL_LOG_ERROR("EncoderManager: force_idr still in flight after %dms "
+                      "(stalled encode pipeline?); proceeding — a borrowed ctx "
+                      "may be recycled under the call",
+                      timeout_ms);
+    }
 }
 
 int EncoderManager::reconfigure(const std::string& stream_name,
@@ -271,6 +302,9 @@ void EncoderManager::on_packet(void* codec_ctx, const HalPacketBuffer* packet) {
 // === Shared methods ===
 
 void EncoderManager::destroy(const std::string& stream_name) {
+    // An in-flight force_keyframe() captured the ctx pointer and may still
+    // be inside the HAL with it — wait (bounded) before erasing/deiniting.
+    wait_keyframe_calls_drained();
     void* ctx = nullptr;
     bool was_running = false;
     bool is_from_media = false;

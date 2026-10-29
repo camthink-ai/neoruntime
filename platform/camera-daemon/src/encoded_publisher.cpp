@@ -259,8 +259,14 @@ bool EncodedPublisher::start() {
     }
 
     running_.store(true);
+    {
+        // Reset for a stop()->start() cycle before the worker can observe it.
+        std::lock_guard<std::mutex> lock(kf_mu_);
+        kf_stopping_ = false;
+    }
     accept_thread_ = std::thread(&EncodedPublisher::accept_loop, this);
     dispatch_thread_ = std::thread(&EncodedPublisher::dispatch_loop, this);
+    keyframe_thread_ = std::thread(&EncodedPublisher::keyframe_dispatch_loop, this);
     return true;
 }
 
@@ -269,6 +275,17 @@ void EncodedPublisher::stop() {
 
     // Wake dispatch thread
     queue_cv_.notify_all();
+
+    // Stop the keyframe worker. NOTE: join can block until an in-flight HAL
+    // force_idr returns — medialib has no deadline of its own, so a wedged
+    // call makes stop() depend on the supervisor's kill timeout. The
+    // stalled-encoder guard on the daemon side keeps that the rare case.
+    {
+        std::lock_guard<std::mutex> lock(kf_mu_);
+        kf_stopping_ = true;
+        kf_pending_.clear();
+    }
+    kf_cv_.notify_all();
 
     for (auto& [name, ss] : streams_) {
         if (ss->listen_fd >= 0) {
@@ -290,6 +307,7 @@ void EncodedPublisher::stop() {
 
     if (accept_thread_.joinable()) accept_thread_.join();
     if (dispatch_thread_.joinable()) dispatch_thread_.join();
+    if (keyframe_thread_.joinable()) keyframe_thread_.join();
 
     HAL_LOG_INFO("EncodedPublisher: Stopped");
 }
@@ -608,8 +626,9 @@ void EncodedPublisher::check_client_control(StreamState& ss, ClientInfo& c) {
         if (ctrl == CTRL_REQUEST_KEYFRAME && keyframe_request_fn_) {
             // HAL_LOG_INFO("EncodedPublisher [%s]: Keyframe request from client fd=%d",
             //            ss.config.name.c_str(), c.fd);
-            // Rate-limited (1/s, like the send path): without it a client
-            // toggling this control floods the encoder with IDR requests.
+            // Rate-limited (1/s, like the send path) and asynchronous: the
+            // HAL force_idr can block on a stalled pipeline, so it must
+            // never run inline under clients_mu (probe/accept hold it).
             maybe_request_keyframe(ss);
         }
     }
@@ -682,12 +701,46 @@ void EncodedPublisher::maybe_request_keyframe(StreamState& ss) {
     int64_t last = ss.last_keyframe_req_ms.load(std::memory_order_relaxed);
     if (now_ms - last < kKeyframeReqMinIntervalMs) return;
     if (!ss.last_keyframe_req_ms.compare_exchange_strong(last, now_ms)) return;
-    try {
-        keyframe_request_fn_(ss.config.name);
-    } catch (const std::exception& e) {
-        HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed: %s", e.what());
-    } catch (...) {
-        HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed (unknown)");
+    // Hand off, never call through: callers run under ss.clients_mu and the
+    // HAL force_idr behind the callback can block forever on a stalled
+    // encode pipeline (field deadlock, 10-29).
+    enqueue_keyframe_request(ss.config.name);
+}
+
+void EncodedPublisher::enqueue_keyframe_request(const std::string& name) {
+    {
+        std::lock_guard<std::mutex> lock(kf_mu_);
+        if (kf_stopping_) return;
+        // Idempotent request: one queued name covers later askers too.
+        for (const auto& pending : kf_pending_) {
+            if (pending == name) return;
+        }
+        kf_pending_.push_back(name);
+    }
+    kf_cv_.notify_one();
+}
+
+void EncodedPublisher::keyframe_dispatch_loop() {
+    std::unique_lock<std::mutex> lock(kf_mu_);
+    while (true) {
+        kf_cv_.wait(lock, [this] { return kf_stopping_ || !kf_pending_.empty(); });
+        if (kf_pending_.empty()) {
+            if (kf_stopping_) return;
+            continue;
+        }
+        const std::string name = std::move(kf_pending_.front());
+        kf_pending_.pop_front();
+        lock.unlock();
+        if (keyframe_request_fn_) {
+            try {
+                keyframe_request_fn_(name);
+            } catch (const std::exception& e) {
+                HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed: %s", e.what());
+            } catch (...) {
+                HAL_LOG_ERROR("EncodedPublisher: keyframe request callback failed (unknown)");
+            }
+        }
+        lock.lock();
     }
 }
 

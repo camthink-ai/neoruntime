@@ -1124,6 +1124,11 @@ bool CameraDaemon::get_transform_config(aipc::camera::TransformConfig& config) {
     return true;
 }
 
+// Encoder treated as stalled after this long without an encoded packet:
+// force_idr on a non-consuming pipeline blocks inside medialib indefinitely,
+// and a stalled stream cannot comply with the request anyway.
+constexpr uint64_t kStalledEncoderSkipMs = 3000;
+
 // RAII wrapper for EncoderManager's rebuild gate (HIGH-2): while set,
 // force_keyframe() returns -1 instead of touching FROM_MEDIA codec contexts
 // that MediaLibrary may be freeing during a pipeline stop->reinit->start
@@ -1131,7 +1136,12 @@ bool CameraDaemon::get_transform_config(aipc::camera::TransformConfig& config) {
 class RebuildGateGuard {
 public:
     explicit RebuildGateGuard(EncoderManager* mgr) : mgr_(mgr) {
-        if (mgr_) mgr_->set_rebuild_active(true);
+        if (mgr_) {
+            mgr_->set_rebuild_active(true);
+            // Media reinit frees borrowed FROM_MEDIA ctxs without going
+            // through destroy(): drain calls already inside the HAL first.
+            mgr_->wait_keyframe_calls_drained();
+        }
     }
     ~RebuildGateGuard() { release(); }
     RebuildGateGuard(const RebuildGateGuard&) = delete;
@@ -5421,7 +5431,12 @@ bool CameraDaemon::init_encoded_publisher() {
                     if (cn == stream_name) { enc_name = mn; break; }
                 }
                 //HAL_LOG_DEBUG("CameraDaemon: Plugin requested keyframe for %s", stream_name.c_str());
-                encoder_mgr_->force_keyframe(enc_name);
+                // Skip stalled encoders (no recent encoded packet): force_idr
+                // blocks inside medialib on a pipeline that is not consuming.
+                if (encoder_mgr_->ms_since_last_packet(enc_name) <
+                    kStalledEncoderSkipMs) {
+                    encoder_mgr_->force_keyframe(enc_name);
+                }
             });
     }
 
