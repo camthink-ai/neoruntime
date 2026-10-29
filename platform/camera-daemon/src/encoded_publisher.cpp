@@ -94,6 +94,8 @@ EncodedPublisher::~EncodedPublisher() {
 }
 
 void EncodedPublisher::add_stream(const StreamConfig& cfg, const std::string& base_dir) {
+    std::unique_lock<std::shared_mutex> streams_lock(streams_mu_);
+
     // Clean up any existing entry for this name (close old socket, clients).
     auto it = streams_.find(cfg.name);
     if (it != streams_.end()) {
@@ -111,6 +113,16 @@ void EncodedPublisher::add_stream(const StreamConfig& cfg, const std::string& ba
             if (c->fd >= 0) ::close(c->fd);
         }
         old->clients.clear();
+    }
+
+    // A packet already queued for the replaced generation must not be framed
+    // using the new codec/dimensions.  Lock order is always streams -> queue.
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mu_);
+        queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
+            [&](const std::unique_ptr<QueuedPacket>& pkt) {
+                return pkt && pkt->stream_name == cfg.name;
+            }), queue_.end());
     }
 
     auto ss = std::make_unique<StreamState>();
@@ -159,6 +171,7 @@ void EncodedPublisher::add_stream(const StreamConfig& cfg, const std::string& ba
 }
 
 void EncodedPublisher::remove_stream(const std::string& name) {
+    std::unique_lock<std::shared_mutex> streams_lock(streams_mu_);
     auto it = streams_.find(name);
     if (it == streams_.end()) return;
 
@@ -177,15 +190,24 @@ void EncodedPublisher::remove_stream(const std::string& name) {
         }
         ss->clients.clear();
     }
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mu_);
+        queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
+            [&](const std::unique_ptr<QueuedPacket>& pkt) {
+                return pkt && pkt->stream_name == name;
+            }), queue_.end());
+    }
     streams_.erase(it);
     HAL_LOG_INFO("EncodedPublisher: Removed stream '%s'", name.c_str());
 }
 
 bool EncodedPublisher::has_stream(const std::string& name) const {
+    std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
     return streams_.find(name) != streams_.end();
 }
 
 std::vector<std::string> EncodedPublisher::stream_names() const {
+    std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
     std::vector<std::string> names;
     names.reserve(streams_.size());
     for (const auto& entry : streams_) {
@@ -209,6 +231,7 @@ void EncodedPublisher::set_keyframe_request_cb(KeyframeRequestFn fn) {
 }
 
 bool EncodedPublisher::start() {
+    std::unique_lock<std::shared_mutex> streams_lock(streams_mu_);
     epoll_fd_ = ::epoll_create1(0);
     if (epoll_fd_ < 0) {
         HAL_LOG_ERROR("EncodedPublisher: epoll_create1 failed: %s", strerror(errno));
@@ -259,6 +282,7 @@ bool EncodedPublisher::start() {
     }
 
     running_.store(true);
+    streams_lock.unlock();
     {
         // Reset for a stop()->start() cycle before the worker can observe it.
         std::lock_guard<std::mutex> lock(kf_mu_);
@@ -287,17 +311,20 @@ void EncodedPublisher::stop() {
     }
     kf_cv_.notify_all();
 
-    for (auto& [name, ss] : streams_) {
-        if (ss->listen_fd >= 0) {
-            ::close(ss->listen_fd);
-            ::unlink(ss->sock_path.c_str());
-            ss->listen_fd = -1;
+    {
+        std::unique_lock<std::shared_mutex> streams_lock(streams_mu_);
+        for (auto& [name, ss] : streams_) {
+            if (ss->listen_fd >= 0) {
+                ::close(ss->listen_fd);
+                ::unlink(ss->sock_path.c_str());
+                ss->listen_fd = -1;
+            }
+            std::lock_guard<std::mutex> lock(ss->clients_mu);
+            for (auto& c : ss->clients) {
+                if (c->fd >= 0) ::close(c->fd);
+            }
+            ss->clients.clear();
         }
-        std::lock_guard<std::mutex> lock(ss->clients_mu);
-        for (auto& c : ss->clients) {
-            if (c->fd >= 0) ::close(c->fd);
-        }
-        ss->clients.clear();
     }
 
     if (epoll_fd_ >= 0) {
@@ -326,6 +353,7 @@ void EncodedPublisher::accept_loop() {
 
         const auto now = std::chrono::steady_clock::now();
         if (now >= next_probe) {
+            std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
             for (auto& [name, ss] : streams_) {
                 probe_clients(name, *ss);
             }
@@ -335,6 +363,7 @@ void EncodedPublisher::accept_loop() {
         for (int i = 0; i < n; i++) {
             int listen_fd = events[i].data.fd;
 
+            std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
             for (auto& [name, ss] : streams_) {
                 if (ss->listen_fd != listen_fd) continue;
 
@@ -385,6 +414,7 @@ void EncodedPublisher::on_packet(const std::string& stream_name, const HalPacket
     if (!running_.load()) return;
     if (!packet || !packet->data || packet->size == 0) return;
 
+    std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
     auto it = streams_.find(stream_name);
     if (it == streams_.end()) return;
 
@@ -460,6 +490,11 @@ void EncodedPublisher::dispatch_loop() {
         }
 
         if (!pkt) continue;
+
+        // Keep the selected StreamState alive for the complete dispatch.  A
+        // runtime add/remove may replace the unique_ptr as soon as this read
+        // lock is released.
+        std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
 
         pkt_count++;
 
@@ -849,6 +884,7 @@ void EncodedPublisher::broadcast(StreamState& ss, const uint8_t* buf, size_t len
 
 bool EncodedPublisher::get_stream_stats(const std::string& name, StreamDropStats* out) {
     if (!out) return false;
+    std::shared_lock<std::shared_mutex> streams_lock(streams_mu_);
     auto it = streams_.find(name);
     if (it == streams_.end()) return false;
     auto& ss = *it->second;

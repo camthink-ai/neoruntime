@@ -131,6 +131,9 @@ class WebCodecsPlayer {
     this.canvas.style.height = '100%';
     this.canvas.style.display = 'block';
     this.canvas.style.pointerEvents = 'none';
+    this.canvas.style.zIndex = '0';
+    this.canvas.dataset.aipcVideoRenderer = 'webcodecs';
+    this.canvas.dataset.aipcFrameReady = 'false';
     this.ctx = this.canvas.getContext('2d', { alpha: false });
 
     // Keep the video element in the DOM so MSE fallback can re-use it after a
@@ -507,6 +510,8 @@ class WebCodecsPlayer {
     const drawY = (cssH - drawH) / 2;
 
     this.ctx.drawImage(frame, drawX, drawY, drawW, drawH);
+    this.canvas.dataset.aipcFrameReady = 'true';
+    this.videoElement?.dispatchEvent(new CustomEvent('aipc:webcodecs-frame'));
 
     frame.close();
 

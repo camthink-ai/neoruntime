@@ -119,6 +119,38 @@ int main() {
     assert(std::memcmp(payload, idr_frame, sizeof(idr_frame)) == 0);
 
     ::close(client);
+
+    // Runtime layout changes happen while encoder callbacks and both worker
+    // threads are live. Exercise replacement/insertion/removal concurrently;
+    // every StreamState dereference must remain valid until its operation
+    // completes (the old unprotected streams_ map was a UAF/data race here).
+    std::atomic<bool> keep_publishing{true};
+    std::thread producer([&] {
+        while (keep_publishing.load()) {
+            publish(publisher, idr_frame, sizeof(idr_frame));
+            std::this_thread::yield();
+        }
+    });
+    for (uint32_t i = 0; i < 40; ++i) {
+        config.width = 1920 + i;
+        publisher.add_stream(config, dir);
+
+        EncodedPublisher::StreamConfig aux{};
+        aux.name = "aux";
+        aux.codec = "h265";
+        aux.width = 640;
+        aux.height = 360;
+        publisher.add_stream(aux, dir);
+        assert(publisher.has_stream("aux"));
+        publisher.remove_stream("aux");
+
+        EncodedPublisher::StreamDropStats stats{};
+        assert(publisher.get_stream_stats("main", &stats));
+        assert(!publisher.stream_names().empty());
+    }
+    keep_publishing.store(false);
+    producer.join();
+
     publisher.stop();
     ::unlink(socket_path.c_str());
     ::rmdir(dir);

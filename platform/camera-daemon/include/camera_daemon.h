@@ -1015,7 +1015,9 @@ private:
     /** Rebind VideoSource after MediaLibrary replaces its borrowed video contexts. */
     bool resync_video_source_from_media_pipeline(const char* reason);
     /** Re-register EncoderManager from get_codec_list after MediaLibrary reallocates codec contexts. */
-    void resync_encoders_from_media_pipeline();
+    bool resync_encoders_from_media_pipeline();
+    /** Finish a partially aborted encoder teardown and restore all live HAL registrations. */
+    bool recover_encoder_registrations_after_teardown_abort(const char* reason);
 
     /**
      * Post-change frame verify: poll the primary encoder stream for fresh encoded

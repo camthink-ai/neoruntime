@@ -34,6 +34,7 @@
 #include <functional>
 #include <condition_variable>
 #include <deque>
+#include <shared_mutex>
 
 extern "C" {
     #include "hal_buffer.h"
@@ -167,6 +168,11 @@ private:
     static constexpr size_t MAX_QUEUE_SIZE = 120;
 
     std::atomic<bool> running_{false};
+    // add_stream()/remove_stream() are runtime operations.  The accept and
+    // dispatch workers, encoder callbacks, and status RPCs all dereference
+    // StreamState entries concurrently, so the map (and the lifetime of each
+    // pointed-to StreamState) must be protected as one unit.
+    mutable std::shared_mutex streams_mu_;
     std::unordered_map<std::string, std::unique_ptr<StreamState>> streams_;
     int epoll_fd_ = -1;
     std::thread accept_thread_;

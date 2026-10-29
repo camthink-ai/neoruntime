@@ -20,6 +20,7 @@ import {
   resolvePlayerObjectFit,
   type PlayerObjectFit,
 } from './objectFit';
+import { resolveFrozenFrameSource } from './freezeFrame';
 
 type PlayerProps = {
   videoUrl: string;
@@ -202,16 +203,16 @@ export default function Player({
       setFrozenFrame(false);
     }, FROZEN_FRAME_MAX_HOLD_MS);
 
-    if (!video || !canvas || video.videoWidth <= 0 || video.videoHeight <= 0) {
-      return;
-    }
+    if (!video || !canvas) return;
+    const frameSource = resolveFrozenFrameSource(video);
+    if (!frameSource) return;
 
     try {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
+      canvas.width = frameSource.width;
+      canvas.height = frameSource.height;
       const context = canvas.getContext('2d');
       if (!context) return;
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      context.drawImage(frameSource.source, 0, 0, canvas.width, canvas.height);
       setFrozenFrame(true);
     } catch {
       // A failed snapshot should never block the normal reconnect path.
@@ -320,10 +321,21 @@ export default function Player({
       }>;
       publishFrameSize(detail?.width ?? 0, detail?.height ?? 0);
     };
+    const releaseAfterWebCodecsFrame = () => {
+      if (!frozenFrameVisibleRef.current || streamRestartingRef.current) return;
+      if (frozenFrameReleaseTimerRef.current !== null) {
+        window.clearTimeout(frozenFrameReleaseTimerRef.current);
+      }
+      frozenFrameReleaseTimerRef.current = window.setTimeout(() => {
+        frozenFrameReleaseTimerRef.current = null;
+        if (!streamRestartingRef.current) setFrozenFrame(false);
+      }, FROZEN_FRAME_RELEASE_DELAY_MS);
+    };
 
     video.addEventListener('loadedmetadata', syncFromVideo);
     video.addEventListener('resize', syncFromVideo);
     video.addEventListener('aipc:video-frame-size', syncFromDecoder);
+    video.addEventListener('aipc:webcodecs-frame', releaseAfterWebCodecsFrame);
     const timer = window.setInterval(syncFromVideo, 1000);
     syncFromVideo();
 
@@ -331,9 +343,13 @@ export default function Player({
       video.removeEventListener('loadedmetadata', syncFromVideo);
       video.removeEventListener('resize', syncFromVideo);
       video.removeEventListener('aipc:video-frame-size', syncFromDecoder);
+      video.removeEventListener(
+        'aipc:webcodecs-frame',
+        releaseAfterWebCodecsFrame
+      );
       window.clearInterval(timer);
     };
-  }, [publishFrameSize]);
+  }, [publishFrameSize, setFrozenFrame]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -774,10 +790,10 @@ export default function Player({
           <canvas
             ref={frozenFrameRef}
             aria-hidden="true"
-            className={`pointer-events-none absolute inset-0 h-full w-full ${resolvedObjectFit === 'cover' ? 'object-cover' : 'object-contain'} ${frozenFrameVisible ? 'opacity-100' : 'opacity-0'}`}
+            className={`pointer-events-none absolute inset-0 z-[1] h-full w-full ${resolvedObjectFit === 'cover' ? 'object-cover' : 'object-contain'} ${frozenFrameVisible ? 'opacity-100' : 'opacity-0'}`}
           />
           {isShowStreamStats && (
-            <div className="absolute md:top-4 top-2 md:right-4 right-2 bg-gray-800/50 px-2 py-1 rounded text-xs font-mono space-y-0.5">
+            <div className="absolute z-10 md:top-4 top-2 md:right-4 right-2 bg-gray-800/50 px-2 py-1 rounded text-xs font-mono space-y-0.5">
               <div>
                 <span className="text-gray-400 font-bold">
                   {t('sys.device_tool.fps')}:
@@ -805,7 +821,7 @@ export default function Player({
         </div>
         {showPanel && (
           <PlayerPanel
-            className={`absolute bottom-0 left-0 transition-all duration-300 ease-in-out ${
+            className={`absolute z-10 bottom-0 left-0 transition-all duration-300 ease-in-out ${
               isShowPanel
                 ? 'opacity-100 translate-y-0'
                 : 'opacity-0 translate-y-full'
@@ -829,7 +845,7 @@ export default function Player({
           />
         )}
         {(loading || configuring || isTransformUpdating) && (
-          <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-2">
+          <div className="absolute z-10 left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-2">
             <Loading
               fullHeight={false}
               className="w-40"
@@ -851,7 +867,7 @@ export default function Player({
           && !isTransformUpdating
           && !streamRestarting
           && connectionState === 'disconnected' && (
-            <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-3">
+            <div className="absolute z-10 left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-3">
               <WifiOff
                 aria-hidden="true"
                 className="size-10 text-white/70"

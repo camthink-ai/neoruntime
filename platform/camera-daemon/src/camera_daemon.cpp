@@ -118,6 +118,23 @@ constexpr const char* kMediaConfigFieldsPath = "/data/aipc/etc/media_config_fiel
 constexpr int kShutdownTeardownAttempts = 3;
 constexpr int kShutdownTeardownBackoffMs = 500;
 
+// Runtime rebuilds use the same bounded tombstone reclamation as shutdown.
+// Returning to the RPC caller with only some EncoderManager entries removed
+// makes all surviving streams silently black, so failure to restore a complete
+// registration set must hand control to the service supervisor instead.
+constexpr int kRuntimeTeardownRecoveryAttempts = 3;
+constexpr int kRuntimeTeardownRecoveryBackoffMs = 500;
+
+[[noreturn]] void force_supervisor_restart_after_encoder_recovery_failure(
+    const char* operation) {
+    HAL_LOG_ERROR("CameraDaemon: %s could not restore a complete encoder "
+                  "registration set — forcing process exit for supervisor "
+                  "restart instead of continuing with black streams",
+                  operation ? operation : "runtime rebuild");
+    std::fflush(nullptr);
+    std::_Exit(EXIT_FAILURE);
+}
+
 // Allow-list of writable scalar profile fields. config_field deliberately does
 // NOT cover fields already owned by a typed RPC (dewarp/bitrate/gop/rotation/flip/
 // ISP exposure) — exposing them here would create a two-writer race. Add a field
@@ -5342,10 +5359,10 @@ bool CameraDaemon::resync_video_source_from_media_pipeline(const char* reason) {
     return true;
 }
 
-void CameraDaemon::resync_encoders_from_media_pipeline() {
-    if (!encoder_mgr_ || !hal_loader_) return;
+bool CameraDaemon::resync_encoders_from_media_pipeline() {
+    if (!encoder_mgr_ || !hal_loader_) return false;
     auto* media_ops = hal_loader_->media();
-    if (!media_ops || !media_ctx_ || !media_ops->get_codec_list) return;
+    if (!media_ops || !media_ctx_ || !media_ops->get_codec_list) return false;
 
     // Pipeline reconfiguration may destroy and replace HalCodecContext objects
     // before this function runs. FROM_MEDIA contexts are borrowed from HAL, so
@@ -5356,21 +5373,57 @@ void CameraDaemon::resync_encoders_from_media_pipeline() {
     uint32_t codec_count = 0;
     if (media_ops->get_codec_list(media_ctx_, &codec_list, &codec_count) < 0 || !codec_list || codec_count == 0) {
         HAL_LOG_WARNING("CameraDaemon: resync_encoders_from_media_pipeline: get_codec_list failed");
-        return;
+        return false;
     }
 
     void** clist = static_cast<void**>(codec_list);
+    uint32_t registered = 0;
+    bool complete = true;
     for (uint32_t i = 0; i < codec_count; i++) {
         auto* cc = static_cast<HalCodecContext*>(clist[i]);
-        if (!cc) continue;
+        if (!cc) {
+            complete = false;
+            continue;
+        }
         std::string name(cc->codec_name);
-        if (name.empty()) continue;
+        if (name.empty()) {
+            complete = false;
+            continue;
+        }
         if (!encoder_mgr_->create_from_context(name, clist[i])) {
             HAL_LOG_ERROR("CameraDaemon: resync create_from_context failed for %s", name.c_str());
+            complete = false;
+        } else {
+            ++registered;
         }
     }
-    HAL_LOG_INFO("CameraDaemon: resync_encoders_from_media_pipeline: re-registered %u encoder(s)",
-                 codec_count);
+    HAL_LOG_INFO("CameraDaemon: resync_encoders_from_media_pipeline: re-registered %u/%u encoder(s)",
+                 registered, codec_count);
+    return complete && registered == codec_count;
+}
+
+bool CameraDaemon::recover_encoder_registrations_after_teardown_abort(
+    const char* reason) {
+    const char* why = reason ? reason : "runtime teardown abort";
+    if (!encoder_mgr_) return false;
+
+    HAL_LOG_WARNING("CameraDaemon: %s left EncoderManager partially torn down; "
+                    "retrying teardown before restoring live HAL contexts", why);
+    if (!encoder_mgr_->destroy_all_with_retries(
+            kRuntimeTeardownRecoveryAttempts,
+            kRuntimeTeardownRecoveryBackoffMs)) {
+        HAL_LOG_ERROR("CameraDaemon: %s recovery could not reclaim encoder "
+                      "tombstones after %d attempts", why,
+                      kRuntimeTeardownRecoveryAttempts);
+        return false;
+    }
+    if (!resync_encoders_from_media_pipeline()) {
+        HAL_LOG_ERROR("CameraDaemon: %s recovery could not re-register every "
+                      "live media encoder", why);
+        return false;
+    }
+    HAL_LOG_INFO("CameraDaemon: %s recovery restored all encoder registrations", why);
+    return true;
 }
 
 void CameraDaemon::configure_osd() {
@@ -6847,6 +6900,7 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
             // Build encoder override that includes this stream and reinit pipeline
             auto* mops = hal_loader_ ? hal_loader_->media() : nullptr;
             if (!mops || !media_ctx_) {
+                ec.enabled = false;
                 response.set_success(false);
                 response.set_message("Media pipeline not available");
                 return;
@@ -6856,13 +6910,31 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
 
             // Destroy existing encoder state before pipeline reinit
             if (!encoder_mgr_->destroy_all()) {
-                // (Unreachable with the gate above — defense-in-depth.)
-                // Roll the config flip back so runtime == persisted state.
+                // destroy_all() is not atomic: entries torn down before a
+                // timeout stay removed.  Restore a complete registration set
+                // against the still-live pipeline before returning.
                 lock.lock();
                 ec.enabled = false;
                 lock.unlock();
+                if (!recover_encoder_registrations_after_teardown_abort(
+                        "stream re-enable teardown abort")) {
+                    force_supervisor_restart_after_encoder_recovery_failure(
+                        "stream re-enable teardown abort");
+                }
+                rebuild_gate.release();
+                std::vector<std::string> encoder_ids;
+                {
+                    std::shared_lock<std::shared_mutex> map_lock(op_mu_);
+                    for (const auto& [media_id, config_name] : encoder_name_map_) {
+                        (void)config_name;
+                        encoder_ids.push_back(media_id);
+                    }
+                }
+                for (const auto& media_id : encoder_ids) {
+                    encoder_mgr_->force_keyframe(media_id);
+                }
                 response.set_success(false);
-                response.set_message("encoder teardown timed out on a wedged keyframe call; retry after recovery");
+                response.set_message("encoder teardown timed out; live streams were restored, retry the operation");
                 return;
             }
 
@@ -7023,37 +7095,21 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
             // remove (the state-drift case) has no publisher entry / UDS socket
             // left, and without it WS streaming stays dead despite success.
             // add_stream() on an existing name recycles its socket+clients, so
-            // only register entries the publisher is missing. Unlike
-            // reconfigure_pipeline, this path never stopped the publisher, so
-            // its accept/dispatch threads are live here: mutating streams_
-            // while they iterate it is a data race. Quiesce by stopping the
-            // publisher when (and only when) there is something to register —
-            // stop() joins the threads, add_stream defers socket creation
-            // while stopped, start() re-creates all sockets. op_mu_ is NOT
-            // held here, so the stop/join cannot take part in the
-            // op_mu_→priv->mutex cycle documented at the reconfigure site.
+            // only register entries the publisher is missing. EncodedPublisher
+            // serializes its live map internally; no stop/start (and therefore
+            // no interruption to the surviving streams) is needed here.
             if (encoded_pub_) {
-                std::vector<const EncoderCfg*> missing;
                 for (const auto& enc : config_.encoders) {
                     if (!enc.enabled) continue;
                     if (encoded_pub_->has_stream(enc.stream_name)) continue;
-                    missing.push_back(&enc);
-                }
-                if (!missing.empty()) {
-                    encoded_pub_->stop();
-                    for (const auto* enc : missing) {
-                        EncodedPublisher::StreamConfig esc;
-                        esc.name   = enc->stream_name;
-                        esc.codec  = enc->codec;
-                        esc.width  = enc->width;
-                        esc.height = enc->height;
-                        encoded_pub_->add_stream(esc, config_.encoded_pub_dir);
-                        HAL_LOG_INFO("CameraDaemon: (re)registered '%s' with EncodedPublisher",
-                                     enc->stream_name.c_str());
-                    }
-                    if (!encoded_pub_->start()) {
-                        HAL_LOG_WARNING("CameraDaemon: EncodedPublisher restart after re-registration failed");
-                    }
+                    EncodedPublisher::StreamConfig esc;
+                    esc.name   = enc.stream_name;
+                    esc.codec  = enc.codec;
+                    esc.width  = enc.width;
+                    esc.height = enc.height;
+                    encoded_pub_->add_stream(esc, config_.encoded_pub_dir);
+                    HAL_LOG_INFO("CameraDaemon: (re)registered '%s' with EncodedPublisher",
+                                 enc.stream_name.c_str());
                 }
             }
 
@@ -7142,29 +7198,6 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
             HAL_LOG_INFO("CameraDaemon: encoder auto-feed %s %s",
                          enable ? "resumed" : "gated", phase);
         };
-        auto recover_stream_add = [&]() {
-            const bool rebound =
-                resync_video_source_from_media_pipeline("stream-add failure recovery");
-            resync_encoders_from_media_pipeline();
-            restore_image_config_if_cached();
-            reapply_isp_config_after_pipeline_rebuild("stream-add failure recovery");
-            reapply_osd_config_after_pipeline_rebuild("stream-add failure recovery");
-            if (encoder_mgr_) {
-                std::shared_lock<std::shared_mutex> map_lock(op_mu_);
-                for (const auto& [media_id, config_name] : encoder_name_map_) {
-                    (void)config_name;
-                    encoder_mgr_->force_keyframe(media_id);
-                }
-            }
-            if (layout_feed_gated) {
-                set_layout_auto_feed(true, "after stream-add failure recovery");
-            }
-            if (autofocus_controller_ && rebound) {
-                autofocus_controller_->update_video_context(video_source_->video_ctx());
-                autofocus_controller_->start();
-            }
-        };
-
         // Gate+drain BEFORE any state change below (AF stop, feed gate,
         // destroy_all): a wedged force_idr must abort the add with the
         // daemon exactly as it was — an abort after the feed gate would
@@ -7175,6 +7208,42 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
             response.set_message("keyframe request wedged in the encoder; stream add aborted, retry after recovery");
             return;
         }
+
+        auto recover_stream_add = [&]() {
+            const bool rebound =
+                resync_video_source_from_media_pipeline("stream-add failure recovery");
+            if (!recover_encoder_registrations_after_teardown_abort(
+                    "stream-add failure recovery")) {
+                force_supervisor_restart_after_encoder_recovery_failure(
+                    "stream-add failure recovery");
+            }
+            restore_image_config_if_cached();
+            reapply_isp_config_after_pipeline_rebuild("stream-add failure recovery");
+            reapply_osd_config_after_pipeline_rebuild("stream-add failure recovery");
+
+            std::vector<std::string> encoder_ids;
+            {
+                std::shared_lock<std::shared_mutex> map_lock(op_mu_);
+                for (const auto& [media_id, config_name] : encoder_name_map_) {
+                    (void)config_name;
+                    encoder_ids.push_back(media_id);
+                }
+            }
+            // force_keyframe() deliberately rejects calls while the rebuild
+            // gate is raised. Drop the gate only after all contexts and image
+            // state are stable, then arm IDRs before reopening encoder input.
+            rebuild_gate.release();
+            for (const auto& media_id : encoder_ids) {
+                encoder_mgr_->force_keyframe(media_id);
+            }
+            if (layout_feed_gated) {
+                set_layout_auto_feed(true, "after stream-add failure recovery");
+            }
+            if (autofocus_controller_ && rebound) {
+                autofocus_controller_->update_video_context(video_source_->video_ctx());
+                autofocus_controller_->start();
+            }
+        };
 
         if (autofocus_controller_) {
             autofocus_controller_->stop();
@@ -7342,7 +7411,12 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
         // Rebind them before replaying controls that dereference video_ctx().
         const bool video_source_rebound =
             resync_video_source_from_media_pipeline("stream addition");
-        resync_encoders_from_media_pipeline();
+        if (!resync_encoders_from_media_pipeline() &&
+            !recover_encoder_registrations_after_teardown_abort(
+                "stream-add encoder resync")) {
+            force_supervisor_restart_after_encoder_recovery_failure(
+                "stream-add encoder resync");
+        }
 
         restore_image_config_if_cached();
         reapply_isp_config_after_pipeline_rebuild("stream addition");
@@ -7360,6 +7434,7 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
                 rebuilt_encoder_ids.push_back(media_id);
             }
         }
+        rebuild_gate.release();
         for (const auto& media_id : rebuilt_encoder_ids) {
             const int kf = encoder_mgr_->force_keyframe(media_id);
             if (kf < 0) {
@@ -7682,19 +7757,36 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
         // Destroy ALL local encoder entries first — their codec_ctx pointers
         // will be invalidated by the pipeline reconfig below.
         if (!encoder_mgr_->destroy_all()) {
-            // (Unreachable with the gate above — defense-in-depth.) Restore
-            // the config edits so config_ matches the still-live HAL stream,
-            // and re-open the feed gate.
+            // Restore the config edits, then finish the non-atomic teardown
+            // and re-register every encoder against the still-live pipeline.
             {
                 std::unique_lock<std::shared_mutex> relock(op_mu_);
                 if (found) config_.encoders.push_back(removed_encoder);
                 if (stream_cfg_removed) config_.streams.push_back(removed_stream);
             }
+            if (!recover_encoder_registrations_after_teardown_abort(
+                    "stream removal teardown abort")) {
+                force_supervisor_restart_after_encoder_recovery_failure(
+                    "stream removal teardown abort");
+            }
+
+            std::vector<std::string> encoder_ids;
+            {
+                std::shared_lock<std::shared_mutex> map_lock(op_mu_);
+                for (const auto& [media_id, config_name] : encoder_name_map_) {
+                    (void)config_name;
+                    encoder_ids.push_back(media_id);
+                }
+            }
+            rebuild_gate.release();
+            for (const auto& media_id : encoder_ids) {
+                encoder_mgr_->force_keyframe(media_id);
+            }
             if (layout_feed_gated) {
                 set_layout_auto_feed(true, "removal aborted");
             }
             response.set_success(false);
-            response.set_message("encoder teardown timed out on a wedged keyframe call; retry after recovery");
+            response.set_message("encoder teardown timed out; live streams were restored, retry the operation");
             return;
         }
 
@@ -7794,7 +7886,12 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
     }
 
     // Rebuild encoder entries from new codec list (fresh HalCodecContext pointers).
-    resync_encoders_from_media_pipeline();
+    if (!resync_encoders_from_media_pipeline() &&
+        !recover_encoder_registrations_after_teardown_abort(
+            "stream-removal encoder resync")) {
+        force_supervisor_restart_after_encoder_recovery_failure(
+            "stream-removal encoder resync");
+    }
     restore_image_config_if_cached();
     reapply_osd_config_after_pipeline_rebuild("stream removal");
     reapply_isp_config_after_pipeline_rebuild("stream removal");
@@ -7812,6 +7909,7 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
                 surviving_encoder_ids.push_back(media_id);
             }
         }
+        rebuild_gate.release();
         for (const auto& media_id : surviving_encoder_ids) {
             const int kf = encoder_mgr_->force_keyframe(media_id);
             if (kf < 0) {
@@ -8648,11 +8746,6 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
         }
     }
 
-    if (autofocus_controller_) {
-        autofocus_controller_->stop();
-        autofocus_controller_->invalidate_anchor("media pipeline rebuilt");
-    }
-
     // 1. Build HAL reconfig struct
     std::map<std::string, std::string> payload_name_by_sink;
     std::vector<HalPipelineStreamConfig> hal_streams(req_streams.size());
@@ -8708,11 +8801,16 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
     // the rebuild below (borrowed codec contexts are freed and re-created).
     RebuildGateGuard rebuild_gate(encoder_mgr_.get());
     if (!rebuild_gate.ok()) {
-        // Nothing stopped, pipeline untouched — refuse the reconfigure.
+        // Nothing stopped (including AF), pipeline untouched — refuse the reconfigure.
         HAL_LOG_ERROR("CameraDaemon: pipeline reconfigure aborted — keyframe call wedged in HAL");
         response.set_success(false);
         response.set_message("Encoder keyframe request is wedged; reconfigure aborted, retry after the encoder recovers");
         return false;
+    }
+
+    if (autofocus_controller_) {
+        autofocus_controller_->stop();
+        autofocus_controller_->invalidate_anchor("media pipeline rebuilt");
     }
 
     // 2. Stop consumers
