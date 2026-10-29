@@ -202,7 +202,12 @@ export default function ModelCard({
                   <p className="text-xs text-muted-foreground mt-1 truncate">
                     {modelType}
                     {model.variant && (
-                      <span className="ml-1 opacity-70">({model.variant})</span>
+                      <span
+                        className="ml-1 opacity-70"
+                        title={model.variant}
+                      >
+                        ({model.variant})
+                      </span>
                     )}
                   </p>
                   <p className="mt-1.5 flex items-center gap-1.5 text-xs text-muted-foreground/80">

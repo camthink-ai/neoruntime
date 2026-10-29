@@ -41,6 +41,18 @@ type MaskPhase =
   | null;
 
 const unwrapOTAStatus = (response: any): OTAStatusResponse | undefined => response?.data?.data ?? response?.data ?? response;
+const persistedOTAKey = 'aipc.firmware-ota.active';
+const persistedOTAMaxAge = 2 * 60 * 60 * 1000;
+
+const clearPersistedOTA = () => {
+  try { localStorage.removeItem(persistedOTAKey); } catch { /* Storage may be unavailable. */ }
+};
+
+const persistOTA = (jobId: string, rebootArmed = false, rebootObservedOffline = false) => {
+  try {
+    localStorage.setItem(persistedOTAKey, JSON.stringify({ jobId, savedAt: Date.now(), rebootArmed, rebootObservedOffline }));
+  } catch { /* Upgrade can continue without persistence. */ }
+};
 
 export function FirmwareUpdateDialog({
   open,
@@ -81,6 +93,7 @@ export function FirmwareUpdateDialog({
   );
 
   const finishUpgrade = useCallback(() => {
+    clearPersistedOTA();
     cleanupPolling();
     releaseNetworkErrorSuppress();
     setMaskPhase(null);
@@ -108,17 +121,16 @@ export function FirmwareUpdateDialog({
         },
         onSuccess: ({ status }) => {
           if (!status) return false;
-          const terminalStatus =            status.status === 'success' || status.status === 'failed';
           if (
             jobId
             && status.job_id
             && status.job_id !== jobId
-            && !terminalStatus
           ) {
             return false;
           }
 
           if (status.status === 'failed') {
+            clearPersistedOTA();
             cleanupPolling();
             releaseNetworkErrorSuppress();
             setMaskErrorMessage(
@@ -144,6 +156,7 @@ export function FirmwareUpdateDialog({
               // Treat success as the point where reboot evidence may begin;
               // do not trust a single pre-reboot 200 response as completion.
               rebootArmedRef.current = true;
+              if (jobId) persistOTA(jobId, true, rebootObservedOfflineRef.current);
               setMaskPhase('rebooting');
               if (rebootObservedOfflineRef.current || rebootConfirmedByBootID) {
                 finishUpgrade();
@@ -179,6 +192,7 @@ export function FirmwareUpdateDialog({
           // outage as reboot evidence only after the OTA reached success.
           if (rebootArmedRef.current) {
             rebootObservedOfflineRef.current = true;
+            if (jobId) persistOTA(jobId, true, true);
             setMaskPhase('rebooting');
             return;
           }
@@ -188,6 +202,29 @@ export function FirmwareUpdateDialog({
     },
     [cleanupPolling, finishUpgrade, releaseNetworkErrorSuppress, t]
   );
+
+  const startOTAStatusPollingRef = useRef(startOTAStatusPolling);
+  startOTAStatusPollingRef.current = startOTAStatusPolling;
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(persistedOTAKey);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      const age = Date.now() - saved.savedAt;
+      if (typeof saved.jobId !== 'string' || !saved.jobId || !Number.isFinite(age) || age < 0 || age > persistedOTAMaxAge) {
+        clearPersistedOTA();
+        return;
+      }
+      jobIdRef.current = saved.jobId;
+      rebootArmedRef.current = saved.rebootArmed === true;
+      rebootObservedOfflineRef.current = saved.rebootObservedOffline === true;
+      setMaskPhase(rebootArmedRef.current ? 'rebooting' : 'upgrading');
+      releaseNetworkErrorSuppressRef.current = enterNetworkErrorToastSuppress();
+      startOTAStatusPollingRef.current(saved.jobId, true);
+    } catch {
+      clearPersistedOTA();
+    }
+  }, []);
 
   const reset = useCallback(() => {
     setFile(null);
@@ -288,6 +325,7 @@ export function FirmwareUpdateDialog({
       const installResp: any = await systemApi.otaInstallFromPath(firmwarePath);
       const jobId = installResp?.data?.job_id || '';
       jobIdRef.current = jobId;
+      if (jobId) persistOTA(jobId);
       startOTAStatusPolling(jobId);
     } catch (err) {
       releaseNetworkErrorSuppress();
@@ -305,6 +343,7 @@ export function FirmwareUpdateDialog({
   };
 
   const handleDismissError = () => {
+    clearPersistedOTA();
     cleanupPolling();
     releaseNetworkErrorSuppress();
     setMaskPhase(null);

@@ -176,6 +176,19 @@ export default function FileManagement() {
   const batchDelete = useBatchDeleteFiles();
   const renameFile = useRenameFile();
 
+  // ── Manual refresh ─────────────────────────────────────────────────────────
+  // invalidateQueries refetches in the background, so isLoading stays false and
+  // the table keeps showing stale rows; track it manually to show table loading
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const handleRefresh = async () => {
+    setIsRefreshing(true);
+    try {
+      await queryClient.invalidateQueries({ queryKey: ['files'] });
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
   // ── Filtered / paged files ─────────────────────────────────────────────────
   const filtered = files;
   const totalFiles = filtered.length;
@@ -610,12 +623,12 @@ export default function FileManagement() {
         <div className="w-full min-w-0 lg:w-auto lg:shrink-0">
           <ActionButtons
             selectedCount={selectedPaths.size}
-            isFetching={isFetching}
+            isFetching={isFetching || isRefreshing}
             onBatchDelete={() => setBatchDeleteOpen(true)}
             onBatchDownload={handleBatchDownload}
             onUpload={() => setUploadOpen(true)}
             onCreateFolder={() => setMkdirOpen(true)}
-            onRefresh={() => queryClient.invalidateQueries({ queryKey: ['files'] })}
+            onRefresh={handleRefresh}
           />
         </div>
       </div>
@@ -625,7 +638,7 @@ export default function FileManagement() {
         <div className="flex-1 min-h-0 overflow-hidden">
           <FileTable
             files={paged}
-            isLoading={isLoading || !resolved}
+            isLoading={isLoading || !resolved || isRefreshing}
             searchText=""
             selectedPaths={selectedPaths}
             allCurrentSelected={allCurrentSelected}

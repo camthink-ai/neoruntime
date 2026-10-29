@@ -469,8 +469,8 @@
       "config": "配置",
       "media": "媒体",
       "control": "控制",
-      "hevc_unsupported_fallback": "当前浏览器不支持 H.265 解码，已切换为 H.264 播放",
-      "hevc_unsupported_no_h264": "当前浏览器不支持 H.265 解码，且无可用 H.264 码流"
+      "hevc_unsupported_fallback": "当前浏览器不支持 H.265，请切换到 Chrome 或 Safari 浏览器",
+      "hevc_unsupported_no_h264": "当前浏览器不支持 H.265，且无可用 H.264 码流，请切换到 Chrome 或 Safari 浏览器"
     },
     "media_settings": {
       "configuring": "配置中...",
@@ -1175,6 +1175,8 @@
         "restart_failed": "应用重启失败",
         "uninstall_success": "应用卸载成功",
         "uninstall_failed": "应用卸载失败",
+        "install_success": "应用安装成功",
+        "install_failed": "应用安装失败",
         "confirm_uninstall": "确定要卸载此应用吗？"
       },
       "empty": {
@@ -1866,7 +1868,7 @@
       },
       "sort": {
         "label": "排序",
-        "default": "默认（加载优先）",
+        "default": "默认",
         "name": "名称",
         "size": "文件大小",
         "load_time": "最近加载"

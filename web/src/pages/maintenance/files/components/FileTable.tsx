@@ -295,7 +295,7 @@ export function FileTable({
           const canPreview = !file.is_dir && isPreviewable(file.name);
 
           return (
-            <div className="flex flex-wrap items-center gap-2 md:justify-start">
+            <div className="flex flex-nowrap items-center gap-2">
               <Button
                 variant="outline"
                 size="sm"
@@ -342,7 +342,7 @@ export function FileTable({
             </div>
           );
         },
-        size: 220,
+        size: 248,
         enableSorting: false,
       },
     ],
@@ -397,7 +397,13 @@ export function FileTable({
 
   return (
     <ScrollArea className="h-full w-full" type="always">
-      <Table className="table-fixed bg-white dark:bg-card" noWrapper>
+      {/* min-width keeps fixed columns (incl. Actions) from shrinking with the
+          window; the name column has no width so it absorbs the remaining space */}
+      <Table
+        className="table-fixed bg-white dark:bg-card"
+        noWrapper
+        style={{ minWidth: table.getTotalSize() }}
+      >
         <TableHeader className="sticky top-0 bg-background shadow-sm z-1">
           {table.getHeaderGroups().map(headerGroup => (
             <TableRow key={headerGroup.id}>
@@ -412,8 +418,10 @@ export function FileTable({
                             && 'sticky right-0 top-0 z-10 shadow-[-4px_0_6px_-2px_rgba(0,0,0,0.1)] dark:shadow-[-4px_0_6px_-2px_rgba(0,0,0,0.3)]'
                         )
                       : `bg-background${index === 0 ? ' pl-4' : ''}`
-                  }
-                  style={{ width: header.getSize() }}
+                    }
+                  style={header.column.id === 'name'
+                      ? undefined
+                      : { width: header.getSize() }}
                 >
                   {header.isPlaceholder
                     ? null
@@ -448,11 +456,13 @@ export function FileTable({
                             'bg-white dark:bg-card',
                             !isMobile && 'sticky right-0 z-0'
                           )
-                        : index === 0
+                          : index === 0
                           ? 'pl-4'
                           : ''
-                    }
-                    style={{ width: cell.column.getSize() }}
+                      }
+                    style={cell.column.id === 'name'
+                        ? undefined
+                        : { width: cell.column.getSize() }}
                   >
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </TableCell>

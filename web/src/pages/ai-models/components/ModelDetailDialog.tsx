@@ -852,9 +852,6 @@ export default function ModelDetailDialog({
                   {t('sys.ai_models.detail.action_edit', '编辑')}
                 </Button>
               )}
-              <Button variant="outline" onClick={() => onOpenChange(false)}>
-                {t('common.close', '关闭')}
-              </Button>
             </>
           )}
         </div>

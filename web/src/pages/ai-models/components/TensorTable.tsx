@@ -96,16 +96,16 @@ export default function TensorTable({
                   <TableHead className="h-8">
                     {t('sys.ai_models.detail.tensor_name', '名称')}
                   </TableHead>
-                  <TableHead className="h-8">
+                  <TableHead className="h-8 whitespace-nowrap min-w-24">
                     {t('sys.ai_models.detail.tensor_dtype', '数据类型')}
                   </TableHead>
                   <TableHead className="h-8">
                     {t('sys.ai_models.detail.tensor_shape', '形状')}
                   </TableHead>
-                  <TableHead className="h-8">
+                  <TableHead className="h-8 whitespace-nowrap min-w-24">
                     {t('sys.ai_models.detail.tensor_layout', '布局')}
                   </TableHead>
-                  <TableHead className="h-8">
+                  <TableHead className="h-8 whitespace-nowrap min-w-28">
                     {t('sys.ai_models.detail.tensor_bytes', '缓冲大小')}
                   </TableHead>
                 </TableRow>
@@ -118,13 +118,13 @@ export default function TensorTable({
                       <TableCell className="font-mono text-xs break-all">
                         {asText(spec.name) || '-'}
                       </TableCell>
-                      <TableCell className="text-xs">
+                      <TableCell className="text-xs whitespace-nowrap">
                         {asText(spec.dtype) || '-'}
                       </TableCell>
                       <TableCell className="font-mono text-xs whitespace-nowrap">
                         {specShape(spec) || '-'}
                       </TableCell>
-                      <TableCell className="font-mono text-xs">
+                      <TableCell className="font-mono text-xs whitespace-nowrap">
                         {asText(spec.layout) || '-'}
                       </TableCell>
                       <TableCell className="text-xs whitespace-nowrap">

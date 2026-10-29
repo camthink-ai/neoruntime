@@ -469,8 +469,8 @@
       "config": "Configuration",
       "media": "Media",
       "control": "Control",
-      "hevc_unsupported_fallback": "Your browser cannot decode H.265. Switched to H.264 playback.",
-      "hevc_unsupported_no_h264": "Your browser cannot decode H.265, and no H.264 stream is available."
+      "hevc_unsupported_fallback": "The current browser doesn't support H.265. Please switch to Chrome or Safari.",
+      "hevc_unsupported_no_h264": "The current browser doesn't support H.265 and no H.264 stream is available. Please switch to Chrome or Safari."
     },
     "media_settings": {
       "configuring": "Configuring...",
@@ -1256,6 +1256,8 @@
         "restart_failed": "Failed to restart app",
         "uninstall_success": "App uninstalled successfully",
         "uninstall_failed": "Failed to uninstall app",
+        "install_success": "App installed successfully",
+        "install_failed": "Failed to install app",
         "confirm_uninstall": "Are you sure you want to uninstall this app?"
       },
       "empty": {
@@ -1947,7 +1949,7 @@
       },
       "sort": {
         "label": "Sort",
-        "default": "Default (loaded first)",
+        "default": "Default",
         "name": "Name",
         "size": "File size",
         "load_time": "Recently loaded"

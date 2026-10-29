@@ -1318,7 +1318,6 @@ export default function ImportAppDialog({
           // collapse the moment the form column hides.
           page === 'form' ? 'sm:h-[90vh]' : ''
         }`}
-        onInteractOutside={e => e.preventDefault()}
       >
         <div className="p-4 pb-2 sm:p-6 sm:pb-2">
           <DialogTitle className="pr-10 text-lg font-bold text-foreground sm:text-xl">

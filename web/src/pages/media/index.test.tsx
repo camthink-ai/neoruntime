@@ -31,6 +31,7 @@ vi.mock('@/hooks/useStreamFallback', () => ({
     effectiveStreamInfo: streams[0],
     codecNotice: null,
   }),
+  useHevcNoticeDismissal: (): [boolean, () => void] => [false, vi.fn()],
 }));
 
 vi.mock('@/components/player/player', () => ({

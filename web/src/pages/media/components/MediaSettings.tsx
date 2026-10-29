@@ -6,7 +6,7 @@ import {
   useEnableStream,
   useDisableStream,
 } from '../hooks/useMedia';
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import MediaSettingsSkeleton from './MediaSettingsSkeleton';
@@ -24,6 +24,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Separator } from '@/components/ui/separator';
+import { isHevcSupported } from '@/lib/videoStream/hevcSupport';
 import { cn } from '@/lib/utils';
 
 interface MediaSettingsProps {
@@ -43,6 +44,10 @@ export default function MediaSettings({
 }: MediaSettingsProps) {
   const { t } = useTranslation();
   const { data: statusData, isLoading, error } = useMediaStatus();
+
+  // 浏览器不支持 HEVC 解码时，编码不允许配置/停留在 H265（配置了也无法播放）：
+  // 下拉中禁用 H265 选项，已是 H265 的码流自动切回 H264（见下方自动切换 effect）。
+  const hevcSupported = useMemo(() => isHevcSupported(), []);
 
   const [activeStreamState, setActiveStreamState] = useState<string>(
     controlledActiveStream ?? 'main'
@@ -440,6 +445,9 @@ export default function MediaSettings({
     if (!enc) return;
     const saved = savedEdits[streamId];
 
+    // baseline 必须保持设备真实值（含 H265），只在下发值上做 HEVC 兜底：
+    // 若把 baseline 的 H265 也改成 H264，codec 差异被抹平后会误判为"无变化"
+    // 走热更新接口，而热更新不下发 codec，设备将永远停留在 H265。
     const baseline = {
       codec: saved?.codec ?? enc.codec,
       width: saved?.width ?? enc.width,
@@ -449,8 +457,13 @@ export default function MediaSettings({
       gop: saved?.gop ?? enc.gop ?? 30,
     };
 
+    // 不支持 HEVC 的浏览器下，本次请求或基线为 H265 时一律按 H264 下发
+    const requestedCodec = overrides.codec ?? baseline.codec;
     const effective = {
-      codec: overrides.codec ?? baseline.codec,
+      codec:
+        !hevcSupported && requestedCodec.toLowerCase() === 'h265'
+          ? 'h264'
+          : requestedCodec,
       width: overrides.width ?? baseline.width,
       height: overrides.height ?? baseline.height,
       bitrate_bps: overrides.bitrate_bps ?? baseline.bitrate_bps,
@@ -540,6 +553,29 @@ export default function MediaSettings({
       );
     }
   };
+
+  // 浏览器不支持 HEVC 时，已是 H265 的码流（例如在支持的浏览器上配置过）
+  // 自动切回 H264，与播放端的 H264 回退保持一致。每个码流只自动尝试一次，
+  // 失败（如设备正忙）时由用户手动改选 H264，避免失败重试风暴。
+  const hevcAutoSwitchedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (hevcSupported || isSavingEncoder) return;
+    if (!currentEncoder?.enabled) return;
+    if (hevcAutoSwitchedRef.current.has(activeStream)) return;
+    const baselineCodec = (
+      savedEdits[activeStream]?.codec ?? currentEncoder.codec
+    ).toLowerCase();
+    if (baselineCodec !== 'h265') return;
+    hevcAutoSwitchedRef.current.add(activeStream);
+    persistStreamConfig(activeStream, { codec: 'h264' });
+  }, [
+    hevcSupported,
+    isSavingEncoder,
+    currentEncoder,
+    activeStream,
+    savedEdits,
+    persistStreamConfig,
+  ]);
 
   if (isLoading) {
     return (
@@ -692,7 +728,20 @@ export default function MediaSettings({
                           </SelectTrigger>
                           <SelectContent>
                             <SelectItem value="h264">H264</SelectItem>
-                            <SelectItem value="h265">H265</SelectItem>
+                            <SelectItem
+                              value="h265"
+                              disabled={!hevcSupported}
+                              title={
+                                !hevcSupported
+                                  ? t(
+                                      'sys.monitoring.hevc_unsupported_fallback',
+                                      '当前浏览器不支持 H.265，请切换到 Chrome 或 Safari 浏览器'
+                                    )
+                                  : undefined
+                              }
+                            >
+                              H265
+                            </SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
