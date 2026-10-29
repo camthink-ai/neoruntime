@@ -49,8 +49,23 @@ public:
      */
     bool create_from_context(const std::string& stream_name, void* codec_ctx);
 
-    void destroy(const std::string& stream_name);
-    void destroy_all();
+    /**
+     * Tear down one encoder. Returns false when the bounded drain of
+     * in-flight force_keyframe() calls timed out: the HAL teardown was
+     * ABORTED (ctx leaked on purpose — freeing it would race the wedged
+     * call) and the slot is parked as a closing tombstone; callers must
+     * abort the pipeline teardown they were about to perform and surface
+     * the failure. A later destroy() of the same name retries the parked
+     * teardown and reclaims the ctx once the call finally returns.
+     */
+    bool destroy(const std::string& stream_name);
+
+    /**
+     * destroy() every registered encoder. Returns false if ANY teardown
+     * aborted on drain timeout (see destroy()). Shutdown paths may ignore
+     * the result; rebuild paths must not proceed on false.
+     */
+    bool destroy_all();
 
     /**
      * Gate keyframe requests during pipeline rebuilds. MediaLibrary frees
@@ -151,6 +166,10 @@ private:
     bool subscribe_output(void* ctx, const std::string& stream_name);
     mutable std::mutex mu_;
     std::unordered_map<std::string, EncoderSlot> encoders_;
+    /** Slots whose HAL teardown aborted on drain timeout (destroy() == false).
+     *  Kept so a retry can reclaim the ctx once the wedged call returns; the
+     *  entries are invisible to has_encoder()/force_keyframe()/create(). */
+    std::unordered_map<std::string, EncoderSlot> closing_teardowns_;
     PacketOutputFn output_fn_;
 
     // Reverse map: codec_ctx → stream_name (for callback routing)

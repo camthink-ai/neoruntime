@@ -232,7 +232,13 @@ int EncoderManager::reconfigure(const std::string& stream_name,
     HAL_LOG_INFO("EncoderManager: Reconfiguring encoder %s (destroy+create, was_running=%d)",
                  stream_name.c_str(), was_running);
 
-    destroy(stream_name);
+    if (!destroy(stream_name)) {
+        HAL_LOG_ERROR("EncoderManager: reconfigure aborted for %s — previous "
+                      "encoder teardown timed out on a wedged force_idr; "
+                      "not creating a replacement against a parked ctx",
+                      stream_name.c_str());
+        return -1;
+    }
 
     if (!create(stream_name, new_config)) {
         HAL_LOG_ERROR("EncoderManager: create failed during reconfigure for %s", stream_name.c_str());
@@ -310,44 +316,55 @@ void EncoderManager::on_packet(void* codec_ctx, const HalPacketBuffer* packet) {
 
 // === Shared methods ===
 
-void EncoderManager::destroy(const std::string& stream_name) {
+bool EncoderManager::destroy(const std::string& stream_name) {
     void* ctx = nullptr;
     bool was_running = false;
     bool is_from_media = false;
     bool drained = true;
     {
-        // Erase the slot FIRST, inside the same critical section in-flight
-        // force_keyframe() calls increment under: once the entry is gone no
-        // new call can capture the ctx, so one bounded wait right here
-        // closes the capture/free race completely. (Waiting in a separate
-        // step before the erase re-opened it — a call could enter between
-        // the wait and the erase.)
+        // Take the slot out of encoders_ FIRST, inside the same critical
+        // section in-flight force_keyframe() calls increment under: once the
+        // entry is gone no new call can capture the ctx, so one bounded wait
+        // right here closes the capture/free race completely. On timeout the
+        // slot is parked in closing_teardowns_ instead of being torn down —
+        // freeing a ctx a wedged call still occupies is a use-after-free, so
+        // we leak it (loudly) and let a later destroy() retry the reclamation.
         std::unique_lock<std::mutex> lock(mu_);
         auto it = encoders_.find(stream_name);
-        if (it == encoders_.end()) return;
+        if (it != encoders_.end()) {
+            ctx = it->second.codec_ctx;
+            was_running = it->second.running;
+            is_from_media = it->second.from_media;
 
-        ctx = it->second.codec_ctx;
-        was_running = it->second.running;
-        is_from_media = it->second.from_media;
-
-        handle_to_stream_.erase(ctx);
-        encoders_.erase(it);
+            handle_to_stream_.erase(ctx);
+            closing_teardowns_[stream_name] = it->second;
+            encoders_.erase(it);
+        } else {
+            auto cit = closing_teardowns_.find(stream_name);
+            if (cit == closing_teardowns_.end()) {
+                return true;  // nothing registered under this name
+            }
+            // Retry of an aborted teardown: the parked ctx may be reclaimable
+            // now if the wedged call has since returned.
+            ctx = cit->second.codec_ctx;
+            was_running = cit->second.running;
+            is_from_media = cit->second.from_media;
+        }
         drained = keyframe_drained_cv_.wait_for(
             lock, std::chrono::milliseconds(kKeyframeDrainTimeoutMs),
             [this] { return keyframes_in_flight_ == 0; });
+        if (drained) {
+            closing_teardowns_.erase(stream_name);
+        }
     }
 
     if (!drained) {
-        // A force_keyframe() call is still inside the HAL occupying this ctx.
-        // Stopping/freeing it now would race that call (use-after-free);
-        // leak the HAL context and fail loudly instead. Manager-side state
-        // is already consistent (slot erased); recovery is a daemon restart,
-        // which the publisher's health alarm escalates anyway.
         HAL_LOG_ERROR("EncoderManager: destroy('%s') aborted before HAL "
                       "teardown — force_idr still in flight after %dms; "
-                      "leaking the codec ctx rather than racing the call",
+                      "ctx parked as closing tombstone (retry destroy to "
+                      "reclaim) rather than racing the call",
                       stream_name.c_str(), kKeyframeDrainTimeoutMs);
-        return;
+        return false;
     }
 
     // FROM_MEDIA contexts are owned by media pipeline — skip start/stop/deinit
@@ -369,19 +386,27 @@ void EncoderManager::destroy(const std::string& stream_name) {
 
     HAL_LOG_INFO("EncoderManager: Destroyed encoder for %s (from_media=%d)",
                  stream_name.c_str(), is_from_media);
+    return true;
 }
 
-void EncoderManager::destroy_all() {
+bool EncoderManager::destroy_all() {
     std::vector<std::string> names;
     {
         std::lock_guard<std::mutex> lock(mu_);
         for (auto& [name, _] : encoders_) {
             names.push_back(name);
         }
+        for (auto& [name, _] : closing_teardowns_) {
+            names.push_back(name);  // retry parked teardowns too
+        }
     }
+    bool all_torn_down = true;
     for (auto& name : names) {
-        destroy(name);
+        if (!destroy(name)) {
+            all_torn_down = false;
+        }
     }
+    return all_torn_down;
 }
 
 void EncoderManager::discard_from_media() {

@@ -12,9 +12,10 @@
 //      critical section: while a stuck call occupies the ctx, destroy is
 //      blocked, no new caller can capture the ctx, and once the call
 //      returns the teardown completes.
-//   4. When the drain times out, destroy() aborts the HAL teardown — it
-//      must NOT stop/unsubscribe/deinit a ctx the stuck call still occupies
-//      (use-after-free); the ctx leaks with an ERROR log instead.
+//   4. When the drain times out, destroy() returns false and aborts the
+//      HAL teardown — no stop/unsubscribe/deinit on a ctx the stuck call
+//      still occupies (use-after-free). The slot is parked as a closing
+//      tombstone; a retry after the call returns reclaims the ctx.
 
 #include "encoded_publisher.h"
 #include "encoder_manager.h"
@@ -163,8 +164,9 @@ void test_manager_does_not_hold_mu_across_force_idr() {
         assert(g_idr_in_calls.load() > 0);  // call is inside the "HAL"
     }
     std::atomic<bool> destroy_done{false};
+    std::atomic<bool> destroy_ok{false};
     std::thread destroyer([&] {
-        mgr.destroy("main");
+        destroy_ok.store(mgr.destroy("main"));
         destroy_done.store(true);
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -180,6 +182,7 @@ void test_manager_does_not_hold_mu_across_force_idr() {
     caller2.join();
     destroyer.join();
     assert(destroy_done.load());
+    assert(destroy_ok.load());  // drained in time → teardown ran, rc surfaced
     assert(!mgr.has_encoder("main"));
 }
 
@@ -211,13 +214,22 @@ void test_destroy_aborts_hal_teardown_on_drain_timeout() {
         assert(g_idr_in_calls.load() > 0);
     }
 
-    // Blocks ~2s in the drain, then aborts: no unsubscribe, slot still gone.
-    mgr.destroy("aux");
+    // Blocks ~2s in the drain, then aborts: no unsubscribe, slot parked.
+    const bool destroyed = mgr.destroy("aux");
+    assert(!destroyed);                  // timeout surfaced to the caller
     assert(g_unsubscribes.load() == 0);  // teardown aborted, not raced
     assert(!mgr.has_encoder("aux"));
 
-    g_idr_release.store(true);  // let the stuck call return; ctx leaks by design
+    g_idr_release.store(true);
     caller.join();
+
+    // Tombstone retry: the wedged call has returned by now, so a later
+    // destroy() of the same name reclaims the parked ctx and runs the
+    // deferred teardown instead of leaving a permanent leak.
+    const bool reclaimed = mgr.destroy("aux");
+    assert(reclaimed);
+    assert(g_unsubscribes.load() == 1);  // deferred unsubscribe finally ran
+    assert(!mgr.has_encoder("aux"));
 }
 
 }  // namespace
