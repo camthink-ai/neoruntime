@@ -10,6 +10,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 #include <atomic>
 #include <mutex>
@@ -97,6 +98,12 @@ public:
      */
     void discard_from_media();
 
+    /**
+     * HAL codec output callback body (reached via codec_output_callback).
+     * Public so tests can drive parked-ctx packet-release behavior.
+     */
+    void on_packet(void* codec_ctx, const HalPacketBuffer* packet);
+
     bool start(const std::string& stream_name);
     bool stop(const std::string& stream_name);
 
@@ -170,6 +177,10 @@ private:
      *  Kept so a retry can reclaim the ctx once the wedged call returns; the
      *  entries are invisible to has_encoder()/force_keyframe()/create(). */
     std::unordered_map<std::string, EncoderSlot> closing_teardowns_;
+    /** ctx pointers parked above. Their HAL subscription is still live, so
+     *  on_packet() uses this set to drop-but-release their callbacks —
+     *  every packet owns a shared buffer reference that must be returned. */
+    std::unordered_set<void*> closing_ctxs_;
     PacketOutputFn output_fn_;
 
     // Reverse map: codec_ctx → stream_name (for callback routing)
@@ -184,5 +195,4 @@ private:
     static void codec_output_callback(void* codec_ctx,
                                        HalPacketBuffer* packet,
                                        void* userdata);
-    void on_packet(void* codec_ctx, const HalPacketBuffer* packet);
 };

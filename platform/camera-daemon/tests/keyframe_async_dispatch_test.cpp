@@ -16,6 +16,12 @@
 //      HAL teardown — no stop/unsubscribe/deinit on a ctx the stuck call
 //      still occupies (use-after-free). The slot is parked as a closing
 //      tombstone; a retry after the call returns reclaims the ctx.
+//   5. Callbacks arriving for a parked (closing) ctx are dropped but their
+//      packet buffers are RELEASED — every packet owns a shared buffer
+//      reference; leaking them starves the pool (black screen).
+//   6. Creating a same-name encoder while a teardown is parked is rejected
+//      (it would overwrite and permanently leak the old ctx); after the
+//      tombstone is reclaimed, creation works again.
 
 #include "encoded_publisher.h"
 #include "encoder_manager.h"
@@ -193,6 +199,13 @@ int mock_unsubscribe(void*, HalCodecFrameCallback) {
     return 0;
 }
 
+std::atomic<int> g_releases{0};
+
+int mock_release_packet(void*, HalPacketBuffer*) {
+    ++g_releases;
+    return 0;
+}
+
 void test_destroy_aborts_hal_teardown_on_drain_timeout() {
     // Contract 4: on drain timeout destroy() returns WITHOUT running the
     // HAL teardown (stop/unsubscribe/deinit would race the stuck call).
@@ -232,11 +245,64 @@ void test_destroy_aborts_hal_teardown_on_drain_timeout() {
     assert(!mgr.has_encoder("aux"));
 }
 
+void test_closing_packets_released_and_create_gated() {
+    HalCodecOps ops{};
+    ops.force_idr = mock_force_idr;
+    ops.unsubscribe = mock_unsubscribe;
+    ops.release_packet = mock_release_packet;
+    EncoderManager mgr(&ops);
+    void* const aux_ctx = reinterpret_cast<void*>(0x5678);
+    assert(mgr.create_from_context("aux", aux_ctx));
+
+    g_unsubscribes.store(0);
+    g_releases.store(0);
+    g_idr_in_calls.store(0);
+    g_idr_release.store(false);
+    std::thread caller([&] { mgr.force_keyframe("aux"); });
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (g_idr_in_calls.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(g_idr_in_calls.load() > 0);
+    }
+
+    // Timed-out destroy parks the ctx; the subscription stays live.
+    assert(!mgr.destroy("aux"));
+    assert(g_unsubscribes.load() == 0);
+
+    // Contract 5: packets for the parked ctx are dropped but RELEASED —
+    // the buffer reference must go back or the pool starves.
+    HalPacketBuffer pkt{};
+    pkt.size = 4;
+    mgr.on_packet(aux_ctx, &pkt);
+    assert(g_releases.load() == 1);
+    // A ctx that was never registered keeps the old plain-drop behavior.
+    mgr.on_packet(reinterpret_cast<void*>(0x9999), &pkt);
+    assert(g_releases.load() == 1);
+
+    // Contract 6: same-name creation while the teardown is parked must be
+    // rejected — accepting it would overwrite (and leak) the parked ctx.
+    assert(!mgr.create_from_context("aux", reinterpret_cast<void*>(0xAAAA)));
+    assert(!mgr.has_encoder("aux"));
+
+    g_idr_release.store(true);
+    caller.join();
+
+    // After the wedged call returns: tombstone retry reclaims the ctx...
+    assert(mgr.destroy("aux"));
+    assert(g_unsubscribes.load() == 1);
+    // ...and creation under the same name is allowed again.
+    assert(mgr.create_from_context("aux", reinterpret_cast<void*>(0xBBBB)));
+    assert(mgr.has_encoder("aux"));
+}
+
 }  // namespace
 
 int main() {
     test_publisher_ctrl_does_not_block_on_callback();
     test_manager_does_not_hold_mu_across_force_idr();
     test_destroy_aborts_hal_teardown_on_drain_timeout();
+    test_closing_packets_released_and_create_gated();
     return 0;
 }

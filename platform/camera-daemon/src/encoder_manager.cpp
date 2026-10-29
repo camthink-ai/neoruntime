@@ -30,13 +30,31 @@ bool EncoderManager::create(const std::string& stream_name,
                             const HalCodecConfig& config) {
     if (!ops_) return false;
 
-    std::lock_guard<std::mutex> lock(mu_);
-    if (encoders_.count(stream_name)) {
-        HAL_LOG_WARNING("EncoderManager: Encoder already exists for %s",
-                       stream_name.c_str());
-        return true;
+    bool needs_reclaim = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (encoders_.count(stream_name)) {
+            HAL_LOG_WARNING("EncoderManager: Encoder already exists for %s",
+                           stream_name.c_str());
+            return true;
+        }
+        // A previous destroy() of this name timed out and parked the old
+        // ctx — reclaim it before registering a new one, or the next
+        // destroy would silently overwrite (and permanently leak) it.
+        needs_reclaim = closing_teardowns_.count(stream_name) > 0;
+    }
+    if (needs_reclaim) {
+        HAL_LOG_INFO("EncoderManager: create('%s') reclaiming parked teardown first",
+                     stream_name.c_str());
+        if (!destroy(stream_name)) {
+            HAL_LOG_ERROR("EncoderManager: create('%s') rejected — teardown of "
+                          "the previous encoder is still wedged in the HAL",
+                          stream_name.c_str());
+            return false;
+        }
     }
 
+    std::lock_guard<std::mutex> lock(mu_);
     void* ctx = nullptr;
     int ret = ops_->init(&config, &ctx);
     if (ret < 0 || !ctx) {
@@ -67,12 +85,27 @@ bool EncoderManager::create(const std::string& stream_name,
 bool EncoderManager::create_from_context(const std::string& stream_name, void* codec_ctx) {
     if (!ops_ || !codec_ctx) return false;
 
-    std::lock_guard<std::mutex> lock(mu_);
-    if (encoders_.count(stream_name)) {
-        HAL_LOG_WARNING("EncoderManager: Encoder already exists for %s",
-                       stream_name.c_str());
-        return true;
+    bool needs_reclaim = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (encoders_.count(stream_name)) {
+            HAL_LOG_WARNING("EncoderManager: Encoder already exists for %s",
+                           stream_name.c_str());
+            return true;
+        }
+        // See create(): never overwrite a teardown parked by a drain abort.
+        needs_reclaim = closing_teardowns_.count(stream_name) > 0;
     }
+    if (needs_reclaim) {
+        if (!destroy(stream_name)) {
+            HAL_LOG_ERROR("EncoderManager: create_from_context('%s') rejected — "
+                          "teardown of the previous encoder is still wedged in the HAL",
+                          stream_name.c_str());
+            return false;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(mu_);
 
     if (!subscribe_output(codec_ctx, stream_name)) {
         return false;
@@ -283,7 +316,20 @@ void EncoderManager::on_packet(void* codec_ctx, const HalPacketBuffer* packet) {
     {
         std::lock_guard<std::mutex> lock(mu_);
         auto hit = handle_to_stream_.find(codec_ctx);
-        if (hit == handle_to_stream_.end()) return;
+        if (hit == handle_to_stream_.end()) {
+            // Parked closing ctx (destroy() in its drain window, or a
+            // timed-out tombstone whose subscription never got torn down):
+            // the subscription is still live, so this packet owns a shared
+            // buffer reference we MUST hand back — returning without
+            // release leaks the pool one packet at a time (starvation →
+            // black screen). ctxs dropped via discard_from_media() are NOT
+            // in the closing set and keep the plain return: their ctx may
+            // already be freed, and touching it would be the bigger bug.
+            if (closing_ctxs_.count(codec_ctx) && ops_ && ops_->release_packet) {
+                ops_->release_packet(codec_ctx, const_cast<HalPacketBuffer*>(packet));
+            }
+            return;
+        }
         stream_name = hit->second;
 
         // Stamp frame-health signal and emit the first-packet log once per slot
@@ -338,6 +384,7 @@ bool EncoderManager::destroy(const std::string& stream_name) {
 
             handle_to_stream_.erase(ctx);
             closing_teardowns_[stream_name] = it->second;
+            closing_ctxs_.insert(ctx);
             encoders_.erase(it);
         } else {
             auto cit = closing_teardowns_.find(stream_name);
@@ -353,9 +400,6 @@ bool EncoderManager::destroy(const std::string& stream_name) {
         drained = keyframe_drained_cv_.wait_for(
             lock, std::chrono::milliseconds(kKeyframeDrainTimeoutMs),
             [this] { return keyframes_in_flight_ == 0; });
-        if (drained) {
-            closing_teardowns_.erase(stream_name);
-        }
     }
 
     if (!drained) {
@@ -384,6 +428,15 @@ bool EncoderManager::destroy(const std::string& stream_name) {
         }
     }
 
+    // Drop the closing bookkeeping only AFTER unsubscribe: callbacks can
+    // arrive until the subscription is actually gone, and while it lives
+    // on_packet() needs the closing set to hand their buffers back.
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        closing_teardowns_.erase(stream_name);
+        closing_ctxs_.erase(ctx);
+    }
+
     HAL_LOG_INFO("EncoderManager: Destroyed encoder for %s (from_media=%d)",
                  stream_name.c_str(), is_from_media);
     return true;
@@ -393,11 +446,14 @@ bool EncoderManager::destroy_all() {
     std::vector<std::string> names;
     {
         std::lock_guard<std::mutex> lock(mu_);
+        std::unordered_set<std::string> seen;
         for (auto& [name, _] : encoders_) {
-            names.push_back(name);
+            if (seen.insert(name).second) names.push_back(name);
         }
         for (auto& [name, _] : closing_teardowns_) {
-            names.push_back(name);  // retry parked teardowns too
+            // retry parked teardowns too (create() normally reclaims them,
+            // but a name can linger if no re-registration ever happened)
+            if (seen.insert(name).second) names.push_back(name);
         }
     }
     bool all_torn_down = true;

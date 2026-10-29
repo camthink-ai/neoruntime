@@ -6820,6 +6820,15 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
             }
             // Stream exists but is disabled — re-enable it
             HAL_LOG_INFO("CameraDaemon: Re-enabling disabled stream '%s'", stream_id.c_str());
+
+            // Gate+drain BEFORE flipping config or touching state: a wedged
+            // force_idr must abort the re-enable with nothing changed.
+            RebuildGateGuard rebuild_gate(encoder_mgr_.get());
+            if (!rebuild_gate.ok()) {
+                response.set_success(false);
+                response.set_message("keyframe request wedged in the encoder; re-enable aborted, retry after recovery");
+                return;
+            }
             ec.enabled = true;
 
             // Build encoder override that includes this stream and reinit pipeline
@@ -6834,8 +6843,11 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
 
             // Destroy existing encoder state before pipeline reinit
             if (!encoder_mgr_->destroy_all()) {
-                // A wedged force_idr still occupies a codec ctx — the
-                // pipeline reinit below would free it mid-call.
+                // (Unreachable with the gate above — defense-in-depth.)
+                // Roll the config flip back so runtime == persisted state.
+                lock.lock();
+                ec.enabled = false;
+                lock.unlock();
                 response.set_success(false);
                 response.set_message("encoder teardown timed out on a wedged keyframe call; retry after recovery");
                 return;
@@ -7140,6 +7152,17 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
             }
         };
 
+        // Gate+drain BEFORE any state change below (AF stop, feed gate,
+        // destroy_all): a wedged force_idr must abort the add with the
+        // daemon exactly as it was — an abort after the feed gate would
+        // leave the encoders starved and the stream black.
+        RebuildGateGuard rebuild_gate(encoder_mgr_.get());
+        if (!rebuild_gate.ok()) {
+            response.set_success(false);
+            response.set_message("keyframe request wedged in the encoder; stream add aborted, retry after recovery");
+            return;
+        }
+
         if (autofocus_controller_) {
             autofocus_controller_->stop();
             autofocus_controller_->invalidate_anchor("stream layout changing");
@@ -7154,8 +7177,10 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
         // Destroy all local encoder entries before pipeline reconfig —
         // their HalCodecContext pointers will be invalidated.
         if (!encoder_mgr_->destroy_all()) {
-            // Wedged force_idr holds a ctx; the reconfig below would free it
-            // mid-call. Layout/feed left as-is; retry once recovered.
+            // (Unreachable with the gate above — defense-in-depth.) The AF
+            // stop and feed gate have already happened, so run the same
+            // recovery the HAL-failure paths use before refusing.
+            recover_stream_add();
             response.set_success(false);
             response.set_message("encoder teardown timed out on a wedged keyframe call; retry after recovery");
             return;
@@ -7460,10 +7485,23 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
         return;
     }
 
+    // Gate+drain BEFORE the config edits below: a wedged force_idr must
+    // abort the removal with config_ and HAL in agreement — an abort after
+    // the erase would leave the stream live at the HAL level but gone from
+    // the config (an unremovable zombie on retry).
+    RebuildGateGuard rebuild_gate(encoder_mgr_.get());
+    if (!rebuild_gate.ok()) {
+        response.set_success(false);
+        response.set_message("keyframe request wedged in the encoder; stream removal aborted, retry after recovery");
+        return;
+    }
+
     // Find and remove from config
     bool found = false;
+    EncoderCfg removed_encoder{};
     for (auto it = config_.encoders.begin(); it != config_.encoders.end(); ++it) {
         if (it->stream_name == stream_name) {
+            removed_encoder = *it;  // rollback copy (drain-abort path)
             config_.encoders.erase(it);
             found = true;
             break;
@@ -7563,9 +7601,13 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
     }
 
     // Remove from streams config
+    StreamCfg removed_stream{};
+    bool stream_cfg_removed = false;
     for (auto it = config_.streams.begin(); it != config_.streams.end(); ++it) {
         if (it->name == stream_name) {
+            removed_stream = *it;  // rollback copy (drain-abort path)
             config_.streams.erase(it);
+            stream_cfg_removed = true;
             break;
         }
     }
@@ -7627,8 +7669,17 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
         // Destroy ALL local encoder entries first — their codec_ctx pointers
         // will be invalidated by the pipeline reconfig below.
         if (!encoder_mgr_->destroy_all()) {
-            // Wedged force_idr holds a ctx; the removal reconfig below would
-            // free it mid-call. Stream stays as-is; retry once recovered.
+            // (Unreachable with the gate above — defense-in-depth.) Restore
+            // the config edits so config_ matches the still-live HAL stream,
+            // and re-open the feed gate.
+            {
+                std::unique_lock<std::shared_mutex> relock(op_mu_);
+                if (found) config_.encoders.push_back(removed_encoder);
+                if (stream_cfg_removed) config_.streams.push_back(removed_stream);
+            }
+            if (layout_feed_gated) {
+                set_layout_auto_feed(true, "removal aborted");
+            }
             response.set_success(false);
             response.set_message("encoder teardown timed out on a wedged keyframe call; retry after recovery");
             return;
@@ -9092,9 +9143,23 @@ void CameraDaemon::shutdown() {
     //    destructor times out waiting for buffers and then crashes (SIGSEGV)
     //    during forced cleanup.
 
+    // Gate+drain BEFORE stopping the publisher: stop() joins the keyframe
+    // worker, which blocks forever inside a wedged force_idr. On drain
+    // failure skip the publisher join entirely (the worker thread leaks to
+    // process exit; the supervisor kill timeout is the backstop either way)
+    // and skip the encoder teardown below, which cannot succeed while the
+    // wedged call holds the in-flight slot.
+    RebuildGateGuard shutdown_gate(encoder_mgr_.get());
+    const bool encoder_calls_drained = shutdown_gate.ok();
+
     // 3a. Stop encoded publisher (consumes encoder packets)
     if (encoded_pub_) {
-        encoded_pub_->stop();
+        if (encoder_calls_drained) {
+            encoded_pub_->stop();
+        } else {
+            HAL_LOG_WARNING("CameraDaemon: shutdown skips publisher join — "
+                            "keyframe worker wedged in HAL");
+        }
     }
 
     // 3b. Stop RTSP server (consumes encoded packets)
@@ -9103,11 +9168,16 @@ void CameraDaemon::shutdown() {
     }
 
     // 3c. Destroy encoders (release resize output buffers via from_media path)
-    if (encoder_mgr_ && !encoder_mgr_->destroy_all()) {
-        // Shutdown path: a wedged force_idr parks the ctx as a tombstone;
-        // process exit reclaims it. Logged for the post-mortem.
-        HAL_LOG_WARNING("CameraDaemon: shutdown encoder teardown incomplete "
-                        "(wedged keyframe call) — codec ctx leaked to process exit");
+    if (encoder_mgr_ && encoder_calls_drained) {
+        if (!encoder_mgr_->destroy_all()) {
+            // Shutdown path: a wedged force_idr parks the ctx as a tombstone;
+            // process exit reclaims it. Logged for the post-mortem.
+            HAL_LOG_WARNING("CameraDaemon: shutdown encoder teardown incomplete "
+                            "(wedged keyframe call) — codec ctx leaked to process exit");
+        }
+    } else if (encoder_mgr_) {
+        HAL_LOG_WARNING("CameraDaemon: shutdown skips encoder teardown — wedged "
+                        "keyframe call; codec ctx leaked to process exit");
     }
 
     // 3d. Stop FD publisher (releases DMA-BUF references)
