@@ -17,6 +17,10 @@ media:
   # Product-owned profile list adds Infrared_Basic while retaining vendor IQ paths.
   config_path: /data/aipc/etc/imaging/hailo15h/imx678/theia_sl410m/4k/medialib_configs/webserver_medialib_config.json
   backup_path: /data/aipc/data/media-backup
+  # Day profile is auto-resolved per lens at boot (FG2009 motorized-zoom units
+  # use Daylight_Basic_FG2009, others stay on Daylight_Basic). Only set this to
+  # pin a specific entry for bench tuning.
+  # daylight_profile: Daylight_Basic
 
 video:
   device_path: /dev/video0
@@ -174,10 +178,10 @@ ai_overlay:
 encoders:
   - stream_name: main
     codec: h264
-    width: 1920
-    height: 1080
+    width: 3840
+    height: 2160
     fps: 30
-    bitrate: 4000000
+    bitrate: 16000000
     gop: 30
     enabled: true
   - stream_name: sub

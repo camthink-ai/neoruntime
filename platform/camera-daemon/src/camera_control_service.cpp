@@ -444,21 +444,32 @@ grpc::Status CameraControlServiceImpl::SwitchProfile(
 
     // Reject unknown profiles before touching the pipeline.
     auto profiles = daemon_->list_profiles();
-    if (std::find(profiles.begin(), profiles.end(), name) == profiles.end()) {
+
+    // The UI's "AI ISP off" target is the generic day name; resolve it to this
+    // unit's lens-specific day entry (per-lens IQ tuning) so clients never need
+    // to know the lens variant. After the allowlist: the UI contract keeps the
+    // generic name, and the resolved entry is what actually runs.
+    std::string target = name;
+    if (name == "Daylight_Basic" && daemon_->daylight_profile() != name) {
+        target = daemon_->daylight_profile();
+        HAL_LOG_INFO("[CameraControl] SwitchProfile: '%s' -> '%s' (per-lens day)",
+                     name.c_str(), target.c_str());
+    }
+    if (std::find(profiles.begin(), profiles.end(), target) == profiles.end()) {
         response->set_success(false);
-        response->set_message("profile '" + name + "' not found on device");
+        response->set_message("profile '" + target + "' not found on device");
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "unknown profile");
     }
 
     HAL_LOG_INFO("[CameraControl] SwitchProfile: '%s' (current: '%s')",
-                 name.c_str(), daemon_->get_current_profile().c_str());
+                 target.c_str(), daemon_->get_current_profile().c_str());
 
     // switch_profile is synchronous: it stops consumers, switches, and re-discovers
     // stream config before returning. The wall-clock duration IS the pipeline
     // interruption window the player must wait out before reconnecting.
     std::string message;
     auto t0 = std::chrono::steady_clock::now();
-    bool ok = daemon_->switch_profile(name, &message);
+    bool ok = daemon_->switch_profile(target, &message);
     auto t1 = std::chrono::steady_clock::now();
     uint32_t interrupt_ms = static_cast<uint32_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());

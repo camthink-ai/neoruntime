@@ -14,6 +14,10 @@
       "name": "Daylight_Basic"
     },
     {
+      "config_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/webserver_daylight_fg2009_basic_profile.json",
+      "name": "Daylight_Basic_FG2009"
+    },
+    {
       "config_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/HDR/webserver_HDR/webserver_HDR_basic_profile.json",
       "name": "High_Dynamic_Range_Basic"
     },
