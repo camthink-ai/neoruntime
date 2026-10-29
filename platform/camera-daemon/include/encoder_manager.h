@@ -75,6 +75,17 @@ public:
     bool destroy_all();
 
     /**
+     * destroy_all() with bounded retries and a backoff between attempts,
+     * for shutdown paths: a failed pass parks tombstones (packet callbacks
+     * not yet proven quiesced, or a creation still inside the HAL), and a
+     * retry re-checks quiescence once they drain. Returns false only when
+     * the LAST attempt still failed — the caller must then NOT proceed to
+     * free what the parked teardowns still reference (pipeline teardown /
+     * HAL unload under a live callback is a use-after-free).
+     */
+    bool destroy_all_with_retries(int attempts, int backoff_ms);
+
+    /**
      * Gate keyframe requests during pipeline rebuilds. MediaLibrary frees
      * borrowed FROM_MEDIA contexts on reinit while encoders_ still maps the
      * stale pointers (cleared later by resync/discard_from_media); callers

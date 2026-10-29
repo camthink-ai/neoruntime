@@ -5,6 +5,8 @@
 
 #include "../include/encoder_manager.h"
 
+#include <thread>
+
 extern "C" {
     #include "hal_log.h"
 }
@@ -655,6 +657,23 @@ bool EncoderManager::destroy_all() {
         destroy_all_active_ = false;
     }
     return all_torn_down;
+}
+
+bool EncoderManager::destroy_all_with_retries(int attempts, int backoff_ms) {
+    for (int attempt = 1; attempt <= attempts; ++attempt) {
+        if (destroy_all()) {
+            return true;
+        }
+        HAL_LOG_WARNING("EncoderManager: destroy_all attempt %d/%d left "
+                        "teardowns parked — %s",
+                        attempt, attempts,
+                        attempt < attempts ? "retrying after backoff"
+                                           : "giving up");
+        if (attempt < attempts) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+        }
+    }
+    return false;
 }
 
 void EncoderManager::discard_from_media() {

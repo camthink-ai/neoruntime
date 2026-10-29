@@ -43,6 +43,10 @@
 //  13. Concurrent destroy_all() calls serialize: the first finisher cannot
 //      drop the create barrier while the second call is still inside its
 //      teardown window.
+//  14. Shutdown teardown retries parked tombstones to quiescence: transient
+//      unsubscribe failures are retried and the pass eventually succeeds;
+//      exhausted retries return false so shutdown takes the forced-exit
+//      backstop instead of tearing the pipeline down under live callbacks.
 
 #include "encoded_publisher.h"
 #include "encoder_manager.h"
@@ -578,10 +582,15 @@ int mock_deinit(void*) {
 }
 
 std::atomic<bool> g_unsub_fail{false};
+std::atomic<int> g_unsub_fail_n{0};  // first N unsubscribe calls fail
 
 int mock_unsubscribe_checked(void*, HalCodecFrameCallback) {
     if (g_unsub_fail.load()) {
         return -1;  // analog of HAL_ERR_TIMEOUT: quiescence not proven
+    }
+    if (g_unsub_fail_n.load() > 0) {
+        g_unsub_fail_n.fetch_sub(1);
+        return -1;
     }
     ++g_unsubscribes;
     return 0;
@@ -712,6 +721,62 @@ void test_concurrent_destroy_all_serialized() {
     assert(!mgr.has_encoder("c"));
 }
 
+void test_shutdown_retries_parked_teardowns() {
+    // Contract 14: transient unsubscribe quiesce failures must be retried —
+    // the pass eventually reclaims the parked tombstone — and exhausted
+    // retries return false so shutdown _Exits instead of tearing the
+    // pipeline down under live callbacks.
+    HalCodecOps ops{};
+    ops.init = mock_init;
+    ops.subscribe = mock_subscribe;
+    ops.unsubscribe = mock_unsubscribe_checked;
+    ops.deinit = mock_deinit;
+    ops.release_packet = mock_release_packet;
+    ops.force_idr = mock_force_idr;
+    EncoderManager mgr(&ops);
+    HalCodecConfig config{};
+    g_next_ctx = reinterpret_cast<void*>(0x3333);
+    assert(mgr.create("aux", config));
+
+    // First two attempts hit a not-yet-quiesced callback, the third pass
+    // reclaims the tombstone and succeeds.
+    g_unsubscribes.store(0);
+    g_deinits.store(0);
+    g_releases.store(0);
+    g_unsub_fail.store(false);
+    g_unsub_fail_n.store(2);
+    assert(mgr.destroy_all_with_retries(3, 5));
+    assert(g_unsubscribes.load() == 1);  // the successful attempt's call
+    assert(g_deinits.load() == 1);       // ctx fully reclaimed
+    assert(!mgr.has_encoder("aux"));
+    // ...and the manager is empty, so re-creation works afterwards.
+    g_next_ctx = reinterpret_cast<void*>(0x4444);
+    assert(mgr.create("aux", config));
+
+    // Exhausted retries: tombstone stays parked, false propagates — the
+    // caller (shutdown) must take the forced-exit backstop, not continue.
+    g_unsubscribes.store(0);
+    g_deinits.store(0);
+    g_unsub_fail.store(true);
+    assert(!mgr.destroy_all_with_retries(2, 5));
+    assert(g_unsubscribes.load() == 0);
+    assert(g_deinits.load() == 0);       // nothing freed under the "callback"
+    assert(!mgr.has_encoder("aux"));
+
+    // Late packets for the parked ctx are still released while shutdown
+    // decides what to do.
+    HalPacketBuffer pkt{};
+    pkt.size = 4;
+    mgr.on_packet(reinterpret_cast<void*>(0x4444), &pkt);
+    assert(g_releases.load() == 1);
+
+    g_unsub_fail.store(false);
+    assert(mgr.destroy_all_with_retries(1, 5));
+    assert(g_unsubscribes.load() == 1);
+    assert(g_deinits.load() == 1);
+    assert(!mgr.has_encoder("aux"));
+}
+
 }  // namespace
 
 int main() {
@@ -726,5 +791,6 @@ int main() {
     test_pending_creation_packets_released();
     test_destroy_parks_on_unsubscribe_timeout();
     test_concurrent_destroy_all_serialized();
+    test_shutdown_retries_parked_teardowns();
     return 0;
 }

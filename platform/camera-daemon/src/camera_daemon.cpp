@@ -111,6 +111,13 @@ constexpr const char* kTransformLensHintPath = "/data/aipc/etc/transform_lens_hi
 // profile default (replay-on-boot wins over HAL's own profile persistence).
 constexpr const char* kMediaConfigFieldsPath = "/data/aipc/etc/media_config_fields.json";
 
+// Shutdown encoder teardown: bounded retries when destroy_all() parks
+// tombstones (packet callbacks not yet proven quiesced) before falling back
+// to the forced-exit backstop — pipeline deinit / HAL unload under a live
+// copied callback is a use-after-free, not an acceptable fallback.
+constexpr int kShutdownTeardownAttempts = 3;
+constexpr int kShutdownTeardownBackoffMs = 500;
+
 // Allow-list of writable scalar profile fields. config_field deliberately does
 // NOT cover fields already owned by a typed RPC (dewarp/bitrate/gop/rotation/flip/
 // ISP exposure) — exposing them here would create a two-writer race. Add a field
@@ -9179,12 +9186,24 @@ void CameraDaemon::shutdown() {
     }
 
     // 3c. Destroy encoders (release resize output buffers via from_media path)
-    if (encoder_mgr_ && !encoder_mgr_->destroy_all()) {
-        // Belt-and-braces: the drain above succeeded and the gate is still
-        // up, so a timeout here is not expected; if it ever happens the
-        // tombstone simply outlives us into process exit.
-        HAL_LOG_WARNING("CameraDaemon: shutdown encoder teardown incomplete — "
-                        "codec ctx leaked to process exit");
+    if (encoder_mgr_ &&
+        !encoder_mgr_->destroy_all_with_retries(kShutdownTeardownAttempts,
+                                                kShutdownTeardownBackoffMs)) {
+        // destroy_all() failing here means tombstones stay parked: a packet
+        // callback could not be proven quiesced (or a creation is still
+        // inside the HAL). Continuing the teardown below would deinit the
+        // media pipeline and dlclose the HAL while a copied callback still
+        // runs inside them — a use-after-free — and the residual tombstones
+        // would make ~EncoderManager call the about-to-be-unloaded ops again
+        // during member destruction. Same forced-exit backstop as a wedged
+        // force_idr: no unwinding, no destructors, supervisor restart.
+        HAL_LOG_ERROR("CameraDaemon: shutdown cannot prove encoder callback "
+                      "quiescence after %d attempts — forcing process exit "
+                      "for supervisor restart (orderly teardown would free "
+                      "the pipeline/HAL under a live packet callback)",
+                      kShutdownTeardownAttempts);
+        std::fflush(nullptr);
+        std::_Exit(EXIT_FAILURE);
     }
 
     // 3d. Stop FD publisher (releases DMA-BUF references)

@@ -1470,9 +1470,12 @@ int connect_encoders(Hailo15MediaPriv *p)
                          * that copied the subscriber: incrementing after
                          * releasing p->mutex left a window where unsubscribe()
                          * erased the entry, observed the count at zero and
-                         * returned — while the copied callback still ran. */
+                         * returned — while the copied callback still ran.
+                         * Counted per eid so an actively-producing sibling
+                         * stream cannot delay or time out this stream's
+                         * unsubscribe. */
                         std::lock_guard<std::mutex> in_flight_lk(p->packet_cb_mu);
-                        ++p->packet_cb_in_flight;
+                        ++p->packet_cb_in_flight[eid];
                         counted = true;
                     }
                 }
@@ -1499,10 +1502,13 @@ int connect_encoders(Hailo15MediaPriv *p)
                 (void)buf->sync_end();
                 {
                     /* Paired with the increment taken inside the p->mutex
-                     * critical section above. */
+                     * critical section above; the per-eid entry is dropped at
+                     * zero so the map stays bounded by live dispatches. */
                     std::lock_guard<std::mutex> in_flight_lk(p->packet_cb_mu);
-                    if (--p->packet_cb_in_flight == 0)
+                    const auto it = p->packet_cb_in_flight.find(eid);
+                    if (it != p->packet_cb_in_flight.end() && --it->second <= 0)
                     {
+                        p->packet_cb_in_flight.erase(it);
                         p->packet_cb_cv.notify_all();
                     }
                 }
