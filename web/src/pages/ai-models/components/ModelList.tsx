@@ -29,6 +29,7 @@ import { Empty } from '@/components/ui/empty';
 import { TruncateWithTooltip } from '@/components/truncate-with-tooltip';
 import { useState } from 'react';
 import ModelDetailDialog from './ModelDetailDialog';
+import VariantBadge from './VariantBadge';
 import { getModelTypeLabel } from '../utils';
 
 interface ModelData {
@@ -238,15 +239,10 @@ export default function ModelList({
                           value={modelType}
                           className="min-w-0 flex-1 text-muted-foreground"
                         />
-                        {model.variant && (
-                          <Badge
-                            variant="outline"
-                            className="max-w-[140px] shrink-0 text-xs"
-                            title={model.variant}
-                          >
-                            <span className="truncate">{model.variant}</span>
-                          </Badge>
-                        )}
+                        <VariantBadge
+                          variant={model.variant}
+                          className="max-w-[150px] shrink-0"
+                        />
                         <Badge
                           variant="outline"
                           className="max-w-[150px] shrink-0 truncate text-xs text-muted-foreground"
