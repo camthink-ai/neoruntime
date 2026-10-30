@@ -1307,6 +1307,37 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
         return false;
     }
 
+    // Gate the encoder auto-feed BEFORE the rebuild below. The rebuilt
+    // pipeline's freshly allocated CMA pools read as zero-filled NV12 (which
+    // decodes green) until the DSP produces real pixels, and a startup race
+    // can encode those first buffers — the probabilistic green flash on
+    // rotation. With feeding gated, nothing is encoded until the post-rebuild
+    // tail arms every rebuilt encoder for an IDR and releases the gate, so the
+    // first encoded frame is a keyframe off stable pixels. Same protocol as
+    // the stream-add tail. Harmless on the in-place path: the gate is released
+    // right after the HAL call returns.
+    bool feed_gated = false;
+    auto release_feed_gate = [&]() {
+        if (!feed_gated) return;
+        if (media_ops->set_encoder_auto_feed(media_ctx_, true) < 0) {
+            HAL_LOG_ERROR("CameraDaemon: transform feed-gate release FAILED — "
+                          "encoders starved until the next transform");
+        } else {
+            HAL_LOG_INFO("CameraDaemon: encoder auto-feed resumed after transform");
+        }
+        feed_gated = false;
+    };
+    if (encoder_auto_feed_enabled_.load() && media_ops->set_encoder_auto_feed) {
+        if (media_ops->set_encoder_auto_feed(media_ctx_, false) >= 0) {
+            feed_gated = true;
+            HAL_LOG_INFO("CameraDaemon: encoder auto-feed gated for transform "
+                         "(first-frame IDR arming)");
+        } else {
+            HAL_LOG_WARNING("CameraDaemon: transform feed gate failed; "
+                            "first frames go out ungated");
+        }
+    }
+
     if (rotation_changed) {
 #ifdef HAS_GRPC
         if (autofocus_controller_) {
@@ -1336,6 +1367,8 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
         // Restore display-space coordinates when the transform was rejected.
         remap_privacy_mask_flip(&cached_pm_items_, new_flip, old_flip);
         HAL_LOG_ERROR("CameraDaemon: dynamic_change_image_config failed: %d", ret);
+        // Pipeline rejected/unchanged: encoders must resume feeding.
+        release_feed_gate();
         // If we pre-stopped consumers for a rotation, restart them on the
         // (rejected/unchanged) pipeline so we don't leave the streams drained.
         if (rotation_changed) {
@@ -1410,6 +1443,31 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
         reapply_osd_config_after_pipeline_rebuild("transform reinit");
         reapply_isp_config_after_pipeline_rebuild("transform reinit");
 #endif
+        // Arm every rebuilt encoder for a clean first frame while feeding is
+        // still gated, then release the gate: the first frontend buffer after
+        // the rebuild is encoded as an IDR from the replayed, stable pipeline
+        // state instead of a possibly-zeroed startup buffer. Mirrors the
+        // stream-add tail.
+        {
+            std::vector<std::string> rebuilt_encoder_ids;
+            {
+                std::shared_lock<std::shared_mutex> map_lock(op_mu_);
+                rebuilt_encoder_ids.reserve(encoder_name_map_.size());
+                for (const auto& [media_id, config_name] : encoder_name_map_) {
+                    (void)config_name;
+                    rebuilt_encoder_ids.push_back(media_id);
+                }
+            }
+            for (const auto& media_id : rebuilt_encoder_ids) {
+                const int kf = encoder_mgr_ ? encoder_mgr_->force_keyframe(media_id) : -1;
+                if (kf < 0) {
+                    HAL_LOG_WARNING("CameraDaemon: force keyframe for %s after "
+                                    "transform reinit failed: %d",
+                                    media_id.c_str(), kf);
+                }
+            }
+        }
+        release_feed_gate();
         restart_data_consumers();
 
         // Whole-pipeline rebuild: every stream's frame generation restarted.
@@ -1451,6 +1509,9 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
         reapply_osd_config_after_pipeline_rebuild("transform rotation");
         reapply_isp_config_after_pipeline_rebuild("transform rotation");
 #endif
+        // In-place stop→reconfigure→start: same zeroed-first-buffer exposure,
+        // ungated here (encoder contexts survived; no re-arm needed).
+        release_feed_gate();
         restart_data_consumers();
 
         // Verify the in-place rotation actually produces frames. The in-place
@@ -1473,6 +1534,10 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
         }
         HAL_LOG_INFO("CameraDaemon: transform rotation completed without full reinit; consumers restarted");
     }
+
+    // Light in-place path (flip/dewarp/grayscale/DIS/EIS — no pipeline restart):
+    // nothing was armed, just resume feeding.
+    release_feed_gate();
 
     HAL_LOG_INFO("CameraDaemon: Transform config applied: rot=%d flip=%d dewarp=%d gray=%d dis=%d eis=%d",
                  (int)ic.rotation_angle, (int)ic.flip_direction, ic.dewarp, ic.grayscale, ic.dis, ic.eis);
