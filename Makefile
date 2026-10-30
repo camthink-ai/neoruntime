@@ -447,6 +447,7 @@ _pack-stage:
 	@cp -f configs/platform-api.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@cp -f configs/platform/discovery.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@cp -f configs/platform/onvif.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
+	@cp -f configs/platform/cellular-hw.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@printf '%s\n' \
 		'lens:' \
 		'  model: $(LENS_PRODUCT)' > "$(STAGE_DIR)/opt/aipc/etc/product.yaml" \

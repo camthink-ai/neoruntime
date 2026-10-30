@@ -102,6 +102,40 @@ type Config struct {
 	} `yaml:"database"`
 
 	Gyro GyroConfig `yaml:"gyro"`
+
+	// Cellular is legacy-only; prefer device-control.yaml capabilities.cellular.
+	Cellular CellularServiceConfig `yaml:"cellular"`
+}
+
+// CellularServiceConfig is a legacy hw_profile override. Canonical probe
+// contract is device-control.yaml capabilities.cellular.hw_profile.
+type CellularServiceConfig struct {
+	HWProfile string `yaml:"hw_profile"`
+}
+
+type deviceControlCellularFile struct {
+	Capabilities struct {
+		Cellular struct {
+			HWProfile string `yaml:"hw_profile"`
+		} `yaml:"cellular"`
+	} `yaml:"capabilities"`
+}
+
+func cellularHWProfileFromDeviceControl(path string) string {
+	var doc deviceControlCellularFile
+	if err := config.LoadYAML(path, &doc); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(doc.Capabilities.Cellular.HWProfile)
+}
+
+// resolveCellularHWProfile prefers device-control.yaml, then legacy platform-api.yaml.
+func resolveCellularHWProfile(apiConfigPath string, legacy CellularServiceConfig) string {
+	dcPath := filepath.Join(filepath.Dir(apiConfigPath), "device-control.yaml")
+	if p := cellularHWProfileFromDeviceControl(dcPath); p != "" {
+		return p
+	}
+	return strings.TrimSpace(legacy.HWProfile)
 }
 
 // GyroConfig configures the on-board IMU attitude source for the gyro
@@ -465,11 +499,10 @@ func (s *PlatformAPIServer) setupRoutes() {
 	go apiHandlers.StartModelSelfHeal(modelHealCtx, time.Minute)
 
 	// Phase 2: reconcile the desired-state store with live config at startup.
-	// Currently scopes the media domain (camera-daemon.yaml): confirms the live
-	// file matches the desired row (in-sync no-op), re-projects the desired
-	// value to disk on drift, or imports a pre-existing live file into an empty
-	// store (R-migration) without overwriting the file. Non-fatal: a reconcile
-	// error is logged and the server continues serving.
+	// Snapshotter domains (media camera-daemon.yaml, cellular cellular.json):
+	// confirm live matches desired (in-sync), re-project on drift, or import a
+	// pre-existing live file into an empty store (R-migration). Non-fatal: a
+	// reconcile error is logged and the server continues serving.
 	if cm := apiHandlers.ConfigManager(); cm != nil {
 		cameraConfigPath := s.config.Stream.CameraConfig
 		if cameraConfigPath == "" {
@@ -486,7 +519,10 @@ func (s *PlatformAPIServer) setupRoutes() {
 			}
 		}
 
-		targets := []cfgctrl.ReconcileTarget{{Domain: "media", Key: "config"}}
+		targets := []cfgctrl.ReconcileTarget{
+			{Domain: "media", Key: "config"},
+			{Domain: "cellular", Key: "config"},
+		}
 		if err := cm.Reconcile(context.Background(), targets, "system"); err != nil {
 			logger.Warn("Config reconcile completed with errors: %v", err)
 		} else {
@@ -853,6 +889,21 @@ func (s *PlatformAPIServer) setupRoutes() {
 	network.GET("/config", networkHandler.GetConfig)
 	network.POST("/config", networkHandler.UpdateConfig)
 	network.GET("/interfaces", networkHandler.GetInterfaces)
+
+	// Cellular — probe contract from device-control.yaml; capability = USB self-check.
+	if hwPath := resolveCellularHWProfile(*configPath, s.config.Cellular); hwPath != "" {
+		logger.Info("cellular: hw_profile=%s (capability via hardware self-check)", hwPath)
+		cellularHandler := handlers.NewCellularHandler(s.eventLogger, hwPath, apiHandlers.ConfigManager())
+		cellularHandler.StartAutoDial()
+		cellular := api.Group("/cellular")
+		cellular.GET("/capability", cellularHandler.GetCapability)
+		cellular.GET("/status", cellularHandler.GetStatus)
+		cellular.GET("/config", cellularHandler.GetConfig)
+		cellular.PUT("/config", cellularHandler.UpdateConfig)
+		cellular.POST("/connect", cellularHandler.Connect)
+	} else {
+		logger.Info("cellular: no capabilities.cellular.hw_profile; cellular API not registered")
+	}
 
 	// Device Information
 	deviceInfoHandler := handlers.NewDeviceInfoHandler("", s.grpcClients.cameraControl, apiHandlers.ConfigManager())

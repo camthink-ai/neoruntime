@@ -13,6 +13,7 @@ All services use YAML configuration files, deployed at `/data/aipc/etc/`.
 | `configs/platform/event-bus.yaml` | event-bus | Message bus |
 | `configs/platform/device-control.yaml` | device-control | Device control |
 | `configs/platform/camera-daemon.yaml` | camera-daemon | Media pipeline |
+| `configs/platform/cellular-hw.yaml` | platform-api (cellular) | Board/module topology (USB/GPIO/ifaces/dialer); referenced by `capabilities.cellular.hw_profile` |
 | `configs/platform/discovery.yaml` | device-discovery | Device discovery |
 | `configs/ai/ai-runtime.yaml` | ai-runtime | AI inference |
 | `configs/preload.yaml` | — (factory preload manifest) | Factory preload model/app lists bundled into the factory image |
@@ -255,6 +256,9 @@ capabilities:
     available_pins: [12, 13, 21, 22]
     input_pins: [12, 13]
     output_pins: [21, 22]
+
+  cellular:
+    hw_profile: "/data/aipc/etc/cellular-hw.yaml"
 
 automation:
   day_night_auto:

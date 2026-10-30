@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "apn": "",
+  "user": "",
+  "password": "",
+  "auth": "none",
+  "ip_type": "ipv4v6",
+  "pdp_cid": 1,
+  "carrier_profile": "generic",
+  "usbnet": "mbim",
+  "network_mode": "auto",
+  "roaming": false,
+  "pin": ""
+}

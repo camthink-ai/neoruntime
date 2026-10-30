@@ -12,9 +12,12 @@ var zhCNMessages = map[string]string{
 	"password.changed": "用户 {{.username}} 密码已更改",
 
 	// Network
-	"network.config.changed": "网络配置已更新: {{.interface}} ({{.mode}}, {{.ip}})",
-	"network.connected":      "网络已连接: {{.interface}} @ {{.ip}}",
-	"network.disconnected":   "网络已断开: {{.interface}}",
+	"network.config.changed":      "网络配置已更新: {{.interface}} ({{.mode}}, {{.ip}})",
+	"network.connected":           "网络已连接: {{.interface}} @ {{.ip}}",
+	"network.disconnected":        "网络已断开: {{.interface}}",
+	"network.cellular.config":     "蜂窝网络配置已更新 (enabled={{.enabled}}, apn={{.apn}}, profile={{.profile}})",
+	"network.cellular.connect":    "蜂窝网络连接请求 (apn={{.apn}})",
+	"network.cellular.disconnect": "蜂窝网络断开请求",
 
 	// Storage
 	"storage.disk.mounted":   "磁盘已挂载: {{.device}} 挂载至 {{.target}}",

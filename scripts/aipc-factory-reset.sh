@@ -20,6 +20,11 @@
 #     - SN / MAC                             (U-Boot env + MCU EEPROM, outside
 #                                             /data/aipc entirely)
 #     - logs under /data/aipc/log            (kept for RMA traceability)
+#     - /data/aipc/etc/cellular.json         (WWAN dial; not on whitelist —
+#                                             delete manually if dial must
+#                                             reset; boot Reconcile may
+#                                             re-import into config_items)
+#     - /data/aipc/etc/time-config.json      (same class as cellular.json)
 #
 # Optional: AIPC_RESET_PAYLOAD_DIR=/path/to/release/opt/aipc also restores
 # /data/aipc/etc/*.yaml from the packaged defaults.

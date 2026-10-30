@@ -1,0 +1,64 @@
+# Probe contract for device-control.yaml capabilities.cellular.hw_profile.
+# Capability = runtime USB self-check.
+
+platform: hailo15-ne503
+
+usb:
+  devices:
+    - vendor: "2c7c" # Quectel
+      products:
+        - "0309" # EM05-E
+        - "030a" # EM05-G
+        - "030c" # EM05-G CS
+        - "030e" # EM05-G
+        - "0310" # EM05-CN SG
+        - "0311" # EM05-G SG
+        - "0312" # EM05-CN
+        - "0313" # EM05-G GR
+        - "0314" # EM05-G RS
+
+at:
+  ports:
+    - /dev/ttyUSB2
+    - /dev/ttyUSB3
+    - /dev/ttyUSB1
+    - /dev/ttyUSB0
+  port_glob: /dev/ttyUSB*
+
+control:
+  globs:
+    - /dev/cdc-wdm*
+
+gpio:
+  chip: gpiochip1
+  power:
+    name: wwan_pwr_on
+    offset: 7
+    active: high
+    hold: true
+  reset:
+    name: wwan_reset_n
+    offset: 5
+    active: low
+
+net:
+  ifaces:
+    - wwan0
+    - wwan1
+    - usb0
+    - usb1
+
+dialer:
+  binaries:
+    - aipc-cellular
+    - quectel-CM
+  # style is an arg dialect enum (aipc | quectel_cm), not a binary name
+  style: quectel_cm
+
+paths:
+  sysfs_usb: /sys/bus/usb/devices
+  sysfs_net: /sys/class/net
+  run_dir: /run/aipc
+  # Config Controller projection target (domain=cellular, key=config).
+  # Not packaged; created on first save / boot Reconcile import.
+  user_config: /data/aipc/etc/cellular.json

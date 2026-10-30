@@ -324,6 +324,9 @@ capabilities:
   gpio:
     available_pins: [12, 13, 21, 22]
 
+  cellular:
+    hw_profile: "/data/aipc/etc/cellular-hw.yaml"
+
 automation:
   day_night_auto:
     enabled: true

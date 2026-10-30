@@ -81,6 +81,8 @@ tags:
   description: Debug log export and service log access
 - name: Network
   description: Network interface configuration (DHCP, static IP)
+- name: Cellular
+  description: Cellular WWAN dial settings and runtime status (Config Controller domain=cellular)
 - name: Device Info
   description: Device information and naming
 - name: Store
@@ -5915,6 +5917,122 @@ paths:
                           items:
                             $ref: '#/components/schemas/NetworkInterfaceInfo'
 
+  # ==================== Cellular ====================
+  # Board topology is cellular-hw.yaml (not API). Dial JSON is projected via
+  # Config Controller (domain=cellular, key=config) to paths.user_config.
+  /cellular/capability:
+    get:
+      tags: [Cellular]
+      summary: Probe cellular hardware capability
+      description: |
+        Sysfs-only USB self-check (no AT). Returns whether this device supports
+        cellular and whether a matching module is currently present.
+      operationId: getCellularCapability
+      responses:
+        '200':
+          description: Capability probe result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularCapability'
+
+  /cellular/status:
+    get:
+      tags: [Cellular]
+      summary: Get cellular runtime status
+      description: |
+        Live module/SIM/registration/PDP view. Includes capability and dialer
+        readiness; does not change dial settings.
+      operationId: getCellularStatus
+      responses:
+        '200':
+          description: Cellular status
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularStatus'
+
+  /cellular/config:
+    get:
+      tags: [Cellular]
+      summary: Get cellular dial configuration
+      description: |
+        Persisted user dial settings (APN/auth/usbnet/RAT). Missing file returns
+        code defaults. Desired-state also lives in config_items (domain=cellular,
+        key=config) when the Config Controller DB is enabled.
+      operationId: getCellularConfig
+      responses:
+        '200':
+          description: Cellular dial configuration
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularConfig'
+    put:
+      tags: [Cellular]
+      summary: Update cellular dial configuration
+      description: |
+        Validates and persists dial settings through the Config Controller when
+        available (revision + audit + file projection), then applies live side
+        effects (GPIO power, usbnet, modem prefs, auto-dial kick). Enabling with
+        no module on USB after the detect timeout turns cellular back off.
+      operationId: updateCellularConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CellularConfig'
+      responses:
+        '200':
+          description: Updated configuration (or error payload via APIResponse code)
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularConfig'
+
+  /cellular/connect:
+    post:
+      tags: [Cellular]
+      summary: Start cellular dialer
+      description: |
+        Powers the module (when enabled) and starts the board dialer. Soft
+        failures (disabled, unsupported, no module, dialer missing) return HTTP
+        200 with data.ok=false and a message — same pattern as other action APIs.
+      operationId: connectCellular
+      responses:
+        '200':
+          description: Dialer start attempt result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularConnectResult'
+
   # ==================== Device Info ====================
   /device-info:
     get:
@@ -8432,6 +8550,117 @@ components:
           type: array
           items:
             type: string
+
+    CellularConfig:
+      type: object
+      description: Persisted WWAN dial settings (not board topology)
+      properties:
+        enabled:
+          type: boolean
+        apn:
+          type: string
+        user:
+          type: string
+        password:
+          type: string
+          format: password
+        auth:
+          type: string
+          enum: [none, pap, chap]
+        ip_type:
+          type: string
+          enum: [ipv4, ipv6, ipv4v6]
+        pdp_cid:
+          type: integer
+          minimum: 1
+          maximum: 16
+        carrier_profile:
+          type: string
+          enum: [generic, verizon]
+        usbnet:
+          type: string
+          enum: [qmi, ecm, mbim]
+        network_mode:
+          type: string
+          enum: [auto, lte, wcdma]
+        roaming:
+          type: boolean
+          description: Omitted/null treated as false
+        pin:
+          type: string
+          description: Numeric SIM PIN, at most 8 digits
+          maxLength: 8
+
+    CellularCapability:
+      type: object
+      properties:
+        capability:
+          type: string
+          enum: [pending, supported, unsupported]
+        module_present:
+          type: boolean
+
+    CellularStatus:
+      type: object
+      properties:
+        module_present:
+          type: boolean
+        module:
+          type: string
+          description: USB sysfs product string when present
+        platform:
+          type: string
+        sim_ready:
+          type: boolean
+        operator:
+          type: string
+        network:
+          type: string
+        imei:
+          type: string
+        iccid:
+          type: string
+        imsi:
+          type: string
+        msisdn:
+          type: string
+        firmware:
+          type: string
+        signal_rsrp:
+          type: integer
+          nullable: true
+        signal_rsrq:
+          type: integer
+          nullable: true
+        reg_state:
+          type: string
+        connected:
+          type: boolean
+        iface:
+          type: string
+        ipv4:
+          type: string
+        ipv6:
+          type: string
+        message:
+          type: string
+        stub:
+          type: boolean
+        dialer_ready:
+          type: boolean
+        supported:
+          type: boolean
+        capability:
+          type: string
+          enum: [pending, supported, unsupported]
+
+    CellularConnectResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
 
     DeviceInfo:
       type: object

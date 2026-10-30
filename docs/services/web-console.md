@@ -279,6 +279,7 @@ System configuration and management:
   - Static IP settings
   - DNS configuration
   - Network diagnostics
+  - Cellular WWAN (capability/status, APN/usbnet/RAT, connect)
 
 - **Time Settings**
   - Timezone selection
@@ -607,6 +608,8 @@ Main API endpoints:
 - /api/v1/ai/models/*    - Model management
 - /api/v1/events/*       - Event handling
 - /api/v1/system/*       - System monitoring
+- /api/v1/network/*      - Ethernet configuration
+- /api/v1/cellular/*     - Cellular WWAN (capability/status/config/connect)
 ```
 
 ## Browser Compatibility

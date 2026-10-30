@@ -16,6 +16,7 @@ import (
 	"aipc/platform/common/constants"
 	eventLoggerPkg "aipc/platform/common/events"
 	authadapter "aipc/platform/platform-api/adapters/auth"
+	cellularadapter "aipc/platform/platform-api/adapters/cellular"
 	"aipc/platform/platform-api/adapters/deviceinfo"
 	"aipc/platform/platform-api/adapters/media"
 	"aipc/platform/platform-api/adapters/network"
@@ -78,9 +79,8 @@ func NewAPIHandlers(clients *GRPCClients, modelStorage string, modelStore *stora
 	if db != nil {
 		h.aiModelRepo = repo.NewAIModelRepo(db)
 		h.settingRepo = repo.NewSettingRepo(db)
-		// Config Controller: desired-state DB + per-domain adapters. The system
-		// domain (settings KV) is registered now; file-projecting domains
-		// (media/network/time/device_info/auth) register as their adapters land.
+		// Config Controller: desired-state DB + per-domain adapters.
+		// File-projecting domains: media, network, time, device_info, auth, cellular.
 		h.configRepo = repo.NewConfigRepo(db)
 		h.configMgr = config.NewManager(h.configRepo, eventLogger)
 		h.configMgr.Register("system", systemparams.New(h.settingRepo))
@@ -106,14 +106,18 @@ func NewAPIHandlers(clients *GRPCClients, modelStorage string, modelStore *stora
 		// detached systemd-run probe that restores the pre-Apply backup if the
 		// service fails to come up (R-auth-rollback — see rollback_probe.go).
 		h.configMgr.Register("auth", authadapter.New(""))
+		// cellular: user dial JSON. Path from cellular-hw paths.user_config when
+		// resolvable (same board contract as NewCellularHandler). Board topology
+		// in cellular-hw.yaml is not projected through the Controller.
+		h.configMgr.Register("cellular", cellularadapter.New(DefaultCellularUserConfigPath()))
 	}
 	return h
 }
 
 // ConfigManager returns the Config Controller Manager, or nil when no DB was
 // provided (the apply state machine is disabled). Handlers constructed outside
-// APIHandlers (device_info, network, time, auth) use this to route their writes
-// through the state machine for revision history + audit + auto-restore.
+// APIHandlers (device_info, network, time, auth, cellular) use this to route
+// their writes through the state machine for revision history + audit + auto-restore.
 func (h *APIHandlers) ConfigManager() *config.Manager {
 	return h.configMgr
 }

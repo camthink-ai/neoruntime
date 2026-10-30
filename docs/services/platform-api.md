@@ -23,6 +23,7 @@ platform/platform-api/
 │   ├── h264_stream.go       # H.264 video stream
 │   ├── monitor.go           # System monitoring
 │   ├── network.go           # Network configuration
+│   ├── cellular*.go         # Cellular WWAN (hw profile + dial + autodial)
 │   ├── system.go            # System operations
 │   ├── terminal.go          # Web terminal
 │   ├── settings.go          # Settings management
@@ -246,6 +247,7 @@ graph TD
     A --> K[Storage Management]
     A --> L[File Management]
     A --> M[Network Configuration]
+    A --> MCell[Cellular WWAN]
     A --> N[Log System]
     A --> O[Development Tools]
 
@@ -300,6 +302,11 @@ graph TD
     M --> M1["GET /network/config"]
     M --> M2["POST /network/config"]
     M --> M3["GET /network/interfaces"]
+
+    MCell --> MC1["GET /cellular/capability"]
+    MCell --> MC2["GET /cellular/status"]
+    MCell --> MC3["GET/PUT /cellular/config"]
+    MCell --> MC4["POST /cellular/connect"]
 
     O --> O1["GET /dev/projects"]
     O --> O2["POST /dev/projects/{id}/build"]
@@ -453,6 +460,16 @@ graph TD
 | GET | `/network/config` | Network configuration |
 | POST | `/network/config` | Update configuration |
 | GET | `/network/interfaces` | Network interface list |
+
+### Cellular WWAN
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/cellular/capability` | USB self-check (no AT) |
+| GET | `/cellular/status` | Runtime module/SIM/PDP status |
+| GET | `/cellular/config` | Persisted dial settings |
+| PUT | `/cellular/config` | Update dial settings (+ live apply) |
+| POST | `/cellular/connect` | Start dialer (soft-fail via `data.ok`) |
 
 ### Logs
 
