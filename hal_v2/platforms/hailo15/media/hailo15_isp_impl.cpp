@@ -227,7 +227,8 @@ static void ml_apply_isp_auto_algorithm_blocks(Hailo15MediaPriv *priv, bool enab
      * Cost is one set_override_parameters (~30ms) per ISP update, matching the
      * webserver IspBlender::set_auto_configs flow this mirrors. */
     /* V1 video_impl: brief delay before disabling auto blocks when entering manual (AE converge). */
-    if (s_ml_ae_cproc_aw_drv_enabled && !enable_ae_cproc_aw_drv)
+    const bool disabling_auto_blocks = s_ml_ae_cproc_aw_drv_enabled && !enable_ae_cproc_aw_drv;
+    if (disabling_auto_blocks)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
@@ -260,6 +261,19 @@ static void ml_apply_isp_auto_algorithm_blocks(Hailo15MediaPriv *priv, bool enab
         {
             std::lock_guard<std::recursive_mutex> lock(priv->mutex);
             hailo15::video_ml::refresh_all_context_configs(priv, priv->hal_media_ctx);
+        }
+        if (disabling_auto_blocks)
+        {
+            /* Entering manual: the firmware applies the a_cproc/ae/awdrv
+             * disable asynchronously — after pipeline rebuilds it was observed
+             * writing cproc values and resetting isp_cproc_enable to its
+             * firmware default seconds after the config reload. A straggler
+             * ACproc pass landing after the caller's manual V4L2 writes
+             * reverts them, so toggling manual mode on leaves the picture on
+             * the auto look until a later single-field update rewrites the
+             * controls (user drags a slider). Quiesce here so apply_manual's
+             * writes land after the firmware's last one. */
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
     }
     catch (const std::exception &e)

@@ -930,7 +930,15 @@ void CameraDaemon::init_isp_cache() {
 // equals the cached applied state.
 static bool isp_manual_group_changed(const aipc::camera::ISPUpdateRequest& request,
                                      const HalIspManualConfig& cur) {
-    if (request.has_manual_mode() && request.manual_mode() != cur.manual_state) return true;
+    // An explicit manual_mode field always re-applies the whole group (mode +
+    // cached B/C/S/Sh). The web switch PUTs {manual_mode} alone; if the cache
+    // has diverged from HAL state (pipeline rebuild re-enabled the firmware
+    // auto algorithms while the cache kept the tuned values), equal-value
+    // dedup would return success without touching the hardware — the toggle
+    // would visibly do nothing until the user drags a slider. Toggles are
+    // rare single PUTs, so the stacked-no-op relief the dedup exists for is
+    // unaffected.
+    if (request.has_manual_mode()) return true;
     if (request.has_brightness()  && request.brightness()  != cur.brightness)   return true;
     if (request.has_contrast()    && request.contrast()    != cur.contrast)     return true;
     if (request.has_saturation()  && request.saturation()  != cur.saturation)   return true;
@@ -1388,6 +1396,15 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
         // (read) — they run with op_mu_ released (consumers stopped), matching
         // switch_profile.
         resync_encoders_from_media_pipeline();
+        // The rebuilt MediaLibrary owns brand-new video contexts
+        // (rotation_full_reinit frees every old HalVideoContext), but
+        // video_source_ still caches the freed pointer. Rebind it before the
+        // replays below — the ISP replay writes through video_ctx() and its
+        // liveness check would otherwise fail-soft, leaving the web-tuned ISP
+        // values stuck at profile defaults until the next stream layout
+        // change or boot. Same rebind-then-replay order as the stream-add
+        // tail.
+        resync_video_source_from_media_pipeline("transform reinit");
         rebuild_gate.release();  // contexts repopulated after full reinit
 #ifdef HAS_GRPC
         reapply_osd_config_after_pipeline_rebuild("transform reinit");
