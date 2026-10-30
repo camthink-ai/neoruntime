@@ -658,6 +658,37 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     // Wire VideoSource callbacks to FrameRouter through the pre-encode overlay path.
     bind_video_source_callbacks();
 
+#ifdef HAS_GRPC
+    // DPM boot re-arm (test issue #13: 隐私遮挡+AI自动遮挡, 重启后AI自动遮挡关闭).
+    // The persisted privacy-mask replay earlier in init() ran before frame_router_
+    // existed, so its DPM start failed the frame_router/media_ctx guard in
+    // start_dpm_worker and left dpm_enabled_ honestly OFF while the static mask
+    // applied fine — every reboot silently lost AI auto-masking. The router and
+    // the pre-encode frame callbacks (offer_frame path) are live now, and gRPC
+    // is not yet serving, so re-arm exactly once from the persisted desired
+    // state: static fields come from the LIVE config (true no-op on re-apply,
+    // immune to any flip remap the transform replay performed in between),
+    // DPM fields from the mirror. Skipped when the worker is already armed or
+    // DPM was not requested. A restricted/failed re-arm keeps honest OFF; the
+    // mirror keeps the desired state, so the next reboot retries.
+    {
+        aipc::camera::PrivacyMaskConfig persisted;
+        if (load_privacy_mask_config(&persisted) && persisted.dpm_enabled() &&
+            !dpm_armed_) {
+            aipc::camera::PrivacyMaskConfig live;
+            if (get_privacy_mask_config(live)) {
+                live.set_dpm_enabled(true);
+                live.set_dpm_labels(persisted.dpm_labels());
+                live.set_dpm_mode(persisted.dpm_mode());
+                live.set_dpm_color(persisted.dpm_color());
+                set_privacy_mask_config(live);
+                HAL_LOG_INFO("CameraDaemon: DPM boot re-arm after frame_router ready: %s",
+                             dpm_enabled_ ? "armed" : "still off (restricted or start failed)");
+            }
+        }
+    }
+#endif
+
     // Start watchdog with reclaim callback
     watchdog_->start([this](uint64_t frame_id) {
         frame_router_->force_reclaim(frame_id);
