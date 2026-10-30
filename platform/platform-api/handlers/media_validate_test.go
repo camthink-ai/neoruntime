@@ -8,6 +8,60 @@ func intPtr(v int32) *int32    { return &v }
 func uintPtr(v uint32) *uint32 { return &v }
 func boolPtr(v bool) *bool     { return &v }
 
+// -- Encoder validation tests --
+
+func TestValidateEncoderReconfig_AllNamedStreamsSupportH264AndH265(t *testing.T) {
+	for _, streamName := range []string{"main", "sub", "third"} {
+		for _, codec := range []string{"h264", "h265"} {
+			t.Run(streamName+"_"+codec, func(t *testing.T) {
+				err := ValidateEncoderReconfig(
+					streamName,
+					640, 384,
+					codec,
+					1_000_000,
+					30,
+					30,
+				)
+				if err != nil {
+					t.Fatalf("expected %s to support %s, got: %v", streamName, codec, err)
+				}
+			})
+		}
+	}
+}
+
+func TestValidatePipelineReconfig_Sink2SupportsH265(t *testing.T) {
+	err := ValidatePipelineReconfig([]PipelineStreamInput{{
+		StreamID:         "sink2",
+		InputWidth:       640,
+		InputHeight:      384,
+		InputFramerate:   30,
+		Codec:            "h265",
+		EncoderWidth:     640,
+		EncoderHeight:    384,
+		EncoderFramerate: 30,
+		EncoderBitrate:   1_000_000,
+		EncoderGOP:       30,
+	}})
+	if err != nil {
+		t.Fatalf("expected sink2/third pipeline stream to support h265, got: %v", err)
+	}
+}
+
+func TestValidateEncoderReconfig_UnknownStreamKeepsConservativeCodecRule(t *testing.T) {
+	err := ValidateEncoderReconfig(
+		"__unknown_stream_codec_test__",
+		640, 384,
+		"h265",
+		1_000_000,
+		30,
+		30,
+	)
+	if err == nil {
+		t.Fatal("expected an unknown dynamic stream to reject h265")
+	}
+}
+
 // -- ValidateISPUpdate tests --
 
 func TestValidateISPUpdate_AllFieldsValid(t *testing.T) {
