@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/glebarez/sqlite"
 	"google.golang.org/grpc"
@@ -1744,8 +1745,16 @@ func (s *AppManagerServer) StopApp(ctx context.Context, req *proto.StopRequest) 
 		}, nil
 	}
 
-	// Use a background context for the actual stop operation
-	termCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Use a background context for the actual stop operation. The budget must
+	// cover the graceful window plus the containerd client's force-kill phase
+	// (see containerd.KillPhaseBudget): sizing it equal to the graceful
+	// timeout would expire the context exactly when the SIGKILL matters.
+	gracefulSeconds := req.TimeoutSeconds
+	if gracefulSeconds <= 0 {
+		gracefulSeconds = 10
+	}
+	stopBudget := time.Duration(gracefulSeconds)*time.Second + containerd.KillPhaseBudget + 5*time.Second
+	termCtx, cancel := context.WithTimeout(context.Background(), stopBudget)
 	defer cancel()
 	termCtx = s.withNamespace(termCtx)
 
@@ -1766,23 +1775,46 @@ func (s *AppManagerServer) stopSingleContainerApp(ctx context.Context, appID str
 		ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
 
 		container, err := s.client.GetContainer(ctxWithNamespace, appInfo.ContainerID)
-		if err == nil {
+		if err != nil {
+			if !errdefs.IsNotFound(err) {
+				return &proto.Status{
+					Success: false,
+					Message: fmt.Sprintf("Failed to get container: %v", err),
+					Code:    500,
+				}, nil
+			}
+			// Container is gone; nothing to stop at the runtime level.
+		} else {
 			// Get task with namespace context
 			task, err := container.Task(ctxWithNamespace, nil)
-			if err == nil {
+			if err != nil {
+				if !errdefs.IsNotFound(err) {
+					return &proto.Status{
+						Success: false,
+						Message: fmt.Sprintf("Failed to get container task: %v", err),
+						Code:    500,
+					}, nil
+				}
+				// No task: the container is not running at the runtime level.
+			} else {
 				timeout := int32(timeoutSeconds)
 				if timeout <= 0 {
 					timeout = 10 // Default 10 seconds
 				}
 				if err := s.runtime.StopAppContainer(ctxWithNamespace, task, timeout); err != nil {
-					logger.Warn("Failed to stop container: %v", err)
-					// Continue with state update even if stop fails
+					if !errdefs.IsNotFound(err) {
+						// The task could not be proven stopped. Report failure
+						// instead of updating state: pretending the app stopped
+						// would orphan a still-running container.
+						logger.Error("Failed to stop container for app %s: %v", appID, err)
+						return &proto.Status{
+							Success: false,
+							Message: fmt.Sprintf("Failed to stop container: %v", err),
+							Code:    500,
+						}, nil
+					}
 				}
-			} else {
-				logger.Warn("Failed to get container task: %v", err)
 			}
-		} else {
-			logger.Warn("Failed to get container: %v", err)
 		}
 	}
 
@@ -1849,16 +1881,27 @@ func (s *AppManagerServer) stopMultiContainerApp(ctx context.Context, appID stri
 	// Load manifest to get shutdown order
 	appManifest, err := manifest.LoadManifest(appInfo.ManifestPath)
 	if err != nil {
-		logger.Warn("Failed to load manifest for shutdown: %v", err)
+		logger.Warn("Failed to load manifest for shutdown, stopping tasks in name order: %v", err)
 	}
 
 	ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
 
-	// Stop containers in order
+	// Stop containers in order. On failure report it honestly and keep the
+	// instance tracked (and the state running) so a retry can stop the rest;
+	// marking the app stopped here would orphan still-running containers.
+	var stopErr error
 	if appManifest != nil {
-		if err := s.runtime.StopMultiContainerApp(ctxWithNamespace, instance, appManifest, timeoutSeconds); err != nil {
-			logger.Warn("Failed to stop multi-container app: %v", err)
-		}
+		stopErr = s.runtime.StopMultiContainerApp(ctxWithNamespace, instance, appManifest, timeoutSeconds)
+	} else {
+		stopErr = s.runtime.StopInstanceTasks(ctxWithNamespace, instance, timeoutSeconds)
+	}
+	if stopErr != nil {
+		logger.Error("Failed to stop multi-container app %s: %v", appID, stopErr)
+		return &proto.Status{
+			Success: false,
+			Message: fmt.Sprintf("Failed to stop multi-container app: %v", stopErr),
+			Code:    500,
+		}, nil
 	}
 
 	// Remove from tracking

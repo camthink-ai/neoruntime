@@ -464,8 +464,11 @@ func (h *APIHandlers) StopApp(c *gin.Context) {
 		return
 	}
 
-	// Parse timeout from query or body
-	timeoutSeconds := int32(30)
+	// Parse timeout from query or body. Default 10s graceful window (docker/
+	// containerd convention); the app-manager stop can additionally spend its
+	// force-kill phase budget, which the RPC context below must cover so the
+	// client receives the real outcome instead of a deadline error.
+	timeoutSeconds := int32(10)
 	if timeoutStr := c.Query("timeout"); timeoutStr != "" {
 		if parsed, err := strconv.ParseInt(timeoutStr, 10, 32); err == nil {
 			timeoutSeconds = int32(parsed)
@@ -473,7 +476,7 @@ func (h *APIHandlers) StopApp(c *gin.Context) {
 	}
 
 	client := apppb.NewAppManagerClient(h.grpcClients.AppManager)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds+5)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds+35)*time.Second)
 	defer cancel()
 
 	resp, err := client.StopApp(ctx, &apppb.StopRequest{
@@ -517,8 +520,10 @@ func (h *APIHandlers) RestartApp(c *gin.Context) {
 		return
 	}
 
-	// Parse timeout from query
-	timeoutSeconds := int32(30)
+	// Parse timeout from query. Same default as StopApp (10s graceful window);
+	// the context covers the stop (graceful + force-kill budget) plus the
+	// start phase that follows in the same request.
+	timeoutSeconds := int32(10)
 	if timeoutStr := c.Query("timeout"); timeoutStr != "" {
 		if parsed, err := strconv.ParseInt(timeoutStr, 10, 32); err == nil {
 			timeoutSeconds = int32(parsed)
@@ -526,7 +531,7 @@ func (h *APIHandlers) RestartApp(c *gin.Context) {
 	}
 
 	client := apppb.NewAppManagerClient(h.grpcClients.AppManager)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds+15)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds+65)*time.Second)
 	defer cancel()
 
 	// Stop the app
