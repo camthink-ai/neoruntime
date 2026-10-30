@@ -11,6 +11,7 @@ import {
   variantOverridesProfile,
 } from '../../lib/modelImportFlow';
 import { EffectBadge } from './ModelSchemaField';
+import VariantBadge from '../VariantBadge';
 
 export interface EffectiveConfigPanelProps {
   modelType: string;
@@ -116,19 +117,28 @@ export default function EffectiveConfigPanel({
       ? JSON.stringify(effective.blob ?? variant, null, 2)
       : null;
 
+  const backendFunction = effective.blob?.backend_function;
+
   return (
     <section className="rounded-lg border">
-      <header className="flex items-center gap-2 border-b border-border px-4 py-2.5">
-        <Zap className="h-4 w-4 text-primary" />
-        <h4 className="text-sm font-medium text-foreground">
-          {t('sys.ai_models.detail.effective_title', '生效配置（运行时）')}
-        </h4>
+      <header className="flex items-center justify-between gap-3 border-b border-border px-4 py-2.5">
+        <div className="flex min-w-0 items-center gap-2">
+          <Zap className="h-4 w-4 shrink-0 text-primary" />
+          <h4 className="truncate text-sm font-medium text-foreground">
+            {t('sys.ai_models.detail.variant_section_title', '模型变体')}
+          </h4>
+        </div>
+        <VariantBadge
+          variant={variant}
+          showDefault
+          className="max-w-[220px] shrink-0"
+        />
       </header>
       <div className="space-y-3 px-4 py-3">
         <p className="text-xs text-muted-foreground">
           {t(
-            'sys.ai_models.detail.effective_hint',
-            '加载时运行时实际收到的后处理参数——按与装载器相同的裁决顺序投影（自定义 blob 优先于档案组合）。'
+            'sys.ai_models.detail.variant_runtime_note',
+            '仅影响输出后处理与解码，不改变模型推理；以下为运行时实际生效的配置。'
           )}
         </p>
 
@@ -186,12 +196,22 @@ export default function EffectiveConfigPanel({
         {(effective.source === 'composed'
           || effective.source === 'custom-blob')
           && effective.blob
-          && rows.length > 0 && (
+          && (backendFunction !== undefined || rows.length > 0) && (
             <div className="divide-y divide-border rounded-md border">
+              {backendFunction !== undefined && (
+                <div className="flex items-center gap-3 px-3 py-2">
+                  <span className="w-32 shrink-0 truncate text-xs text-muted-foreground">
+                    {t('sys.ai_models.detail.variant_decoder', '解码器')}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <ValueText value={backendFunction} />
+                  </div>
+                </div>
+              )}
               {rows.map(({ f, effect, value }) => (
                 <div key={f.key} className="flex items-center gap-3 px-3 py-2">
                   <span className="w-32 shrink-0 truncate text-xs text-muted-foreground">
-                    {f.key}
+                    {t(`sys.ai_models.form.${f.key}`, f.key)}
                   </span>
                   <div className="min-w-0 flex-1">
                     <ValueText value={value} />
