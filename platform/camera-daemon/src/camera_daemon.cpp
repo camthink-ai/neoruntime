@@ -1408,6 +1408,20 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
         return false;
     }
 
+    if (full_reinit && feed_gated && media_ops->set_encoder_auto_feed) {
+        /* A conforming HAL preserves the gate across a full rebuild. Reassert
+         * it defensively before any state replay, both for older HAL plugins
+         * and to keep this boundary safe if a future reinit path replaces its
+         * private runtime state. The Hailo implementation now also preserves
+         * the gate before reconnecting callbacks, which closes the earlier
+         * return-to-caller race this check alone could not cover. */
+        const int gate_ret = media_ops->set_encoder_auto_feed(media_ctx_, false);
+        if (gate_ret < 0) {
+            HAL_LOG_WARNING("CameraDaemon: failed to reassert transform feed gate "
+                            "after full reinit: %d", gate_ret);
+        }
+    }
+
     // Cache the applied values so they can be restored after a pipeline rebuild
     // (deinit+init on stream re-enable/rollback), which otherwise resets them to
     // the medialib config file defaults.
