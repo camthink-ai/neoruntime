@@ -504,6 +504,46 @@ static void apply_lens_infrared_profile(DaemonConfig& config) {
                  config.infrared.infrared_profile.c_str());
 }
 
+/* Per-lens day profile: same contract as the IR substitution above. The
+ * daylight IQ tuning differs between the AF lens and the FG2009 motorized
+ * zoom (each lens was tuned separately), so when the yaml still carries the
+ * generic name, the FG2009 unit resolves to its own entry. An explicit
+ * non-default daylight_profile is respected for bench tuning, and the
+ * substitution only fires when the media config that will actually be loaded
+ * can resolve the new name: an empty config_path means the compiled-in
+ * default bundle (whose profile list is build-gated to carry both entries);
+ * otherwise the configured container itself must list it. Unlike the IR
+ * substitution, the pack product container does NOT count as a provider —
+ * the IR path is paired with select_product_media_config_for_infrared, which
+ * switches config_path to whichever container serves the resolved entry, so
+ * checking both containers there is safe; the day path has no such selector,
+ * and renaming into an entry the loaded (custom) container cannot serve
+ * would make every boot/UI/IR-exit switch target an unknown profile. A
+ * custom container without the entry keeps the shared Daylight_Basic name —
+ * day mode degrades to the previous behavior rather than failing
+ * HAL_ERR_PROFILE_INVALID. */
+static void apply_lens_daylight_profile(DaemonConfig& config) {
+    if (config.lens_model != "fg2009" ||
+        config.media_daylight_profile != "Daylight_Basic") {
+        return;
+    }
+    static const std::string kFg2009DayProfile = "Daylight_Basic_FG2009";
+    if (!config.media_config_path.empty() &&
+        !media_config_contains_profile(config.media_config_path,
+                                       kFg2009DayProfile)) {
+        HAL_LOG_WARNING("FG2009 lens but the configured media file '%s' does not "
+                        "provide '%s'; keeping '%s' (the loaded container must "
+                        "serve the per-lens day entry)",
+                        config.media_config_path.c_str(),
+                        kFg2009DayProfile.c_str(),
+                        config.media_daylight_profile.c_str());
+        return;
+    }
+    config.media_daylight_profile = kFg2009DayProfile;
+    HAL_LOG_INFO("FG2009 lens; day profile -> %s",
+                 config.media_daylight_profile.c_str());
+}
+
 static DaemonConfig load_config(const std::string& path) {
     DaemonConfig cfg;
 
@@ -615,6 +655,8 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.media_config_json = val;
             else if (trimmed.find("backup_path:") != std::string::npos)
                 cfg.backup_folder_path = val;
+            else if (trimmed.find("daylight_profile:") != std::string::npos)
+                cfg.media_daylight_profile = val;
         } else if (section == "video") {
             if (trimmed.find("device_path:") != std::string::npos)
                 cfg.device_path = val;
@@ -1165,6 +1207,7 @@ int main(int argc, char** argv) {
     apply_lens_model_identity(config);
     apply_lens_infrared_profile(config);
     select_product_media_config_for_infrared(config);
+    apply_lens_daylight_profile(config);
 
     HAL_LOG_INFO("===================================");
     HAL_LOG_INFO("AIPC Camera Daemon v2.0.0");

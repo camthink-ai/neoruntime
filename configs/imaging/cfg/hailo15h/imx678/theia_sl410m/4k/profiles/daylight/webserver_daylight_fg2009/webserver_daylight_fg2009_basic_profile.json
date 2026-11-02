@@ -1,0 +1,33 @@
+{
+  "application_settings": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/application_settings.json",
+  "encoded_output_streams": [
+    {
+      "encoding": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/encoder_sink0.json",
+      "masking": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/masking_sink0.json",
+      "osd": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/osd_sink0.json",
+      "stream_id": "sink0"
+    },
+    {
+      "encoding": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/encoder_sink1.json",
+      "masking": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/masking_sink1.json",
+      "osd": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/osd_sink1.json",
+      "stream_id": "sink1"
+    },
+    {
+      "encoding": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/encoder_sink2.json",
+      "masking": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/masking_sink2.json",
+      "osd": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/osd_sink2.json",
+      "stream_id": "sink2"
+    }
+  ],
+  "iq_settings": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/iq_settings.json",
+  "metadata": {
+    "architecture": "hailo15h",
+    "content_hash": "831b0144690729d850ac3bdc72716c31aa52c955d99128cc7415081fb700b512",
+    "description": "",
+    "generation_timestamp": "2025-11-24T12:15:21.636391+00:00"
+  },
+  "sensor_config": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/sensor_config.json",
+  "stabilizer_settings": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/daylight/webserver_daylight_fg2009/stabilizer_settings.json",
+  "version": "1.0.0"
+}
