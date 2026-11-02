@@ -10,6 +10,12 @@ vi.mock('@/utils/storage', () => ({
   getItem: () => 'test-token',
 }));
 
+const state = vi.hoisted(() => ({ codec: 'h264', hevcSupported: true }));
+
+vi.mock('@/lib/videoStream/hevcSupport', () => ({
+  isHevcSupported: () => state.hevcSupported,
+}));
+
 vi.mock('./hooks/useMedia', () => ({
   useMediaStatus: () => ({
     data: {
@@ -17,21 +23,12 @@ vi.mock('./hooks/useMedia', () => ({
         stream_id: 'main',
         status: 'active',
         has_encoder: true,
-        codec: 'h264',
+        codec: state.codec,
         width: 1920,
         height: 1080,
       }],
     },
   }),
-}));
-
-vi.mock('@/hooks/useStreamFallback', () => ({
-  useStreamFallback: ({ streams }: { streams: any[] }) => ({
-    effectiveStreamId: 'main',
-    effectiveStreamInfo: streams[0],
-    codecNotice: null,
-  }),
-  useHevcNoticeDismissal: (): [boolean, () => void] => [false, vi.fn()],
 }));
 
 vi.mock('@/components/player/player', () => ({
@@ -75,6 +72,25 @@ vi.mock('./components/MediaSettings', () => ({
 describe('Monitoring encoder reconfiguration', () => {
   beforeEach(() => {
     window.localStorage.clear();
+    state.codec = 'h264';
+    state.hevcSupported = true;
+  });
+
+  it('shows an unsupported preview for H.265 without changing streams', () => {
+    state.codec = 'h265';
+    state.hevcSupported = false;
+    render(<Monitoring />);
+    expect(screen.getByRole('status').textContent).toContain('不支持 H.265');
+    expect(screen.queryByTestId('player')).toBeNull();
+  });
+
+  it('plays H.265 when supported and handles a runtime codec mismatch', () => {
+    state.codec = 'h265';
+    render(<Monitoring />);
+    expect(screen.getByTestId('player').getAttribute('data-video-url')).toContain('/main?');
+    fireEvent(window, new CustomEvent('wv_error', { detail: { type: 'codec_mismatch' } }));
+    expect(screen.getByRole('status').textContent).toContain('不支持 H.265');
+    expect(screen.queryByTestId('player')).toBeNull();
   });
 
   it('disconnects the old player until the final stream is ready', () => {
