@@ -57,6 +57,7 @@ validate_restored_release() {
         case "$empty" in
             /data/aipc/etc/last-known-time.json*|\
             /data/aipc/etc/time-config.json*|\
+            /data/aipc/etc/cellular.json*|\
             /data/aipc/etc/osd-logo.conf)
                 continue ;;
         esac

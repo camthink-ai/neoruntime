@@ -6,7 +6,9 @@ import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
+  fetchCellularCapability,
   fetchNetworkConfig,
   updateNetworkConfig,
   type NetworkConfig,
@@ -19,9 +21,11 @@ import {
   Copy,
   Check,
   ExternalLink,
+  Antenna,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { NetworkSkeleton } from './components/NetworkSkeleton';
+import CellularPanel from './components/CellularPanel';
 import ErrorState from '@/components/ErrorState';
 import {
   AlertDialog,
@@ -126,7 +130,7 @@ function validateNetworkForm(
   return null;
 }
 
-export default function NetworkPage() {
+function WiredNetworkPanel() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
@@ -188,13 +192,8 @@ export default function NetworkPage() {
 
   if (error || !data) {
     return (
-      <div className="p-6">
-        <h1 className="text-2xl font-bold mb-6 text-foreground">
-          {t('common.network')}
-        </h1>
-        <div className="mx-auto flex h-64 max-w-xl items-center justify-center">
-          <ErrorState />
-        </div>
+      <div className="mx-auto flex h-64 max-w-xl items-center justify-center">
+        <ErrorState />
       </div>
     );
   }
@@ -235,11 +234,7 @@ export default function NetworkPage() {
 
   return (
     <>
-      <div className="p-6 md:p-12 space-y-6 max-w-4xl mx-auto">
-        <h1 className="text-2xl font-bold tracking-tight text-foreground">
-          {t('common.network')}
-        </h1>
-        <Card className="p-6">
+      <Card className="p-6">
           {/* Header */}
           <div className="mb-4 w-2xl:mb-8 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-2">
@@ -360,8 +355,7 @@ export default function NetworkPage() {
                 : t('sys.network.save', 'Save')}
             </Button>
           </div>
-        </Card>
-      </div>
+      </Card>
 
       {/* Confirm Dialog */}
       <AlertDialog open={showConfirmDialog} onOpenChange={setShowConfirmDialog}>
@@ -449,5 +443,50 @@ export default function NetworkPage() {
         </div>
       )}
     </>
+  );
+}
+
+export default function NetworkPage() {
+  const { t } = useTranslation();
+  const { data: cellularCap } = useQuery({
+    queryKey: ['cellularCapability'],
+    queryFn: fetchCellularCapability,
+    refetchInterval: q => {
+      const cap = q.state.data?.capability;
+      if (cap === 'unsupported') return 5000;
+      return 2000;
+    },
+  });
+  const showCellular =    cellularCap?.capability === 'supported'
+    || (cellularCap?.capability === 'pending' && !!cellularCap?.module_present);
+
+  return (
+    <div className="p-6 md:p-12 space-y-6 max-w-4xl mx-auto">
+      <h1 className="text-2xl font-bold tracking-tight text-foreground">
+        {t('common.network')}
+      </h1>
+      <Tabs defaultValue="wired">
+        <TabsList>
+          <TabsTrigger value="wired" className="gap-2">
+            <Network className="w-4 h-4" />
+            {t('sys.network.tab_wired', 'Wired')}
+          </TabsTrigger>
+          {showCellular && (
+            <TabsTrigger value="cellular" className="gap-2">
+              <Antenna className="w-4 h-4" />
+              {t('sys.network.tab_cellular', 'Cellular')}
+            </TabsTrigger>
+          )}
+        </TabsList>
+        <TabsContent value="wired" className="mt-6">
+          <WiredNetworkPanel />
+        </TabsContent>
+        {showCellular && (
+          <TabsContent value="cellular" className="mt-6">
+            <CellularPanel />
+          </TabsContent>
+        )}
+      </Tabs>
+    </div>
   );
 }

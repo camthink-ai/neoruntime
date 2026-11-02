@@ -338,3 +338,211 @@ export const rebootSystem = async () => {
   // Simulate success
   return { success: true };
 };
+
+// ==================== Cellular (EM05) Types & API ====================
+
+export type CellularCarrierProfile = 'generic' | 'verizon';
+export type CellularIpType = 'ipv4' | 'ipv6' | 'ipv4v6';
+export type CellularAuth = 'none' | 'pap' | 'chap';
+export type CellularUsbnet = 'qmi' | 'ecm' | 'mbim';
+/** RAT preference via AT+QCFG="nwscanmode". EM05-G has no GSM. */
+export type CellularNetworkMode = 'auto' | 'lte' | 'wcdma';
+
+export interface CellularConfig {
+  enabled: boolean;
+  apn: string;
+  user: string;
+  password: string;
+  auth: CellularAuth;
+  ip_type: CellularIpType;
+  pdp_cid: number;
+  carrier_profile: CellularCarrierProfile;
+  /** Quectel usbnet: qmi | mbim | ecm. */
+  usbnet: CellularUsbnet;
+  /** Preferred radio access: auto | lte | wcdma. */
+  network_mode: CellularNetworkMode;
+  /** Allow data roaming (AT+QCFG roamservice). */
+  roaming: boolean;
+  /** SIM PIN when the card requires unlock (optional). */
+  pin: string;
+}
+
+export type CellularCapability = 'pending' | 'supported' | 'unsupported';
+
+export interface CellularStatus {
+  module_present: boolean;
+  module?: string;
+  platform?: string;
+  sim_ready: boolean;
+  operator: string;
+  network?: string;
+  imei?: string;
+  iccid?: string;
+  imsi?: string;
+  msisdn?: string;
+  firmware?: string;
+  signal_rsrp: number | null;
+  signal_rsrq?: number | null;
+  reg_state: string;
+  connected: boolean;
+  iface: string;
+  ipv4: string;
+  ipv6: string;
+  dialer_ready?: boolean;
+  supported?: boolean;
+  capability?: CellularCapability;
+  message: string;
+  stub: boolean;
+}
+
+const CELLULAR_STORAGE_KEY = 'aipc.cellular.config';
+
+/** Factory defaults — keep in sync with handlers.defaultCellularConfig(). */
+const DEFAULT_CELLULAR_CONFIG: CellularConfig = {
+  enabled: true,
+  apn: '',
+  user: '',
+  password: '',
+  auth: 'none',
+  ip_type: 'ipv4v6',
+  pdp_cid: 1,
+  carrier_profile: 'generic',
+  usbnet: 'mbim',
+  network_mode: 'auto',
+  roaming: false,
+  pin: '',
+};
+
+function readLocalCellularConfig(): CellularConfig {
+  try {
+    const raw = getItem(CELLULAR_STORAGE_KEY);
+    if (!raw) return { ...DEFAULT_CELLULAR_CONFIG };
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return { ...DEFAULT_CELLULAR_CONFIG, ...parsed };
+  } catch {
+    return { ...DEFAULT_CELLULAR_CONFIG };
+  }
+}
+
+function writeLocalCellularConfig(cfg: CellularConfig) {
+  try {
+    localStorage.setItem(CELLULAR_STORAGE_KEY, JSON.stringify(cfg));
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+const STUB_CELLULAR_STATUS: CellularStatus = {
+  module_present: false,
+  sim_ready: false,
+  operator: '',
+  network: '',
+  imei: '',
+  iccid: '',
+  imsi: '',
+  msisdn: '',
+  firmware: '',
+  signal_rsrp: null,
+  signal_rsrq: null,
+  reg_state: 'unknown',
+  connected: false,
+  iface: '',
+  ipv4: '',
+  ipv6: '',
+  message:
+    'Cellular backend is not ready yet. Kernel WWAN drivers / dialer service pending.',
+  stub: true,
+};
+
+export const fetchCellularStatus = async (): Promise<CellularStatus> => {
+  try {
+    const response = await request.get('/api/v1/cellular/status');
+    return { ...STUB_CELLULAR_STATUS, ...response.data, stub: false };
+  } catch {
+    return { ...STUB_CELLULAR_STATUS };
+  }
+};
+
+export type CellularCapabilityStatus = {
+  capability: CellularCapability;
+  module_present: boolean;
+};
+
+export const fetchCellularCapability =  async (): Promise<CellularCapabilityStatus> => {
+    try {
+      const response = await request.get('/api/v1/cellular/capability');
+      return {
+        capability: 'unsupported',
+        module_present: false,
+        ...response.data,
+      };
+    } catch {
+      return { capability: 'unsupported', module_present: false };
+    }
+  };
+
+export const fetchCellularConfig = async (): Promise<CellularConfig> => {
+  try {
+    const response = await request.get('/api/v1/cellular/config');
+    return { ...DEFAULT_CELLULAR_CONFIG, ...response.data };
+  } catch {
+    return readLocalCellularConfig();
+  }
+};
+
+function cellularApiErrorMessage(err: unknown): string | null {
+  // request.ts rejects either AxiosError or the bare response object.
+  const anyErr = err as {
+    response?: { status?: number; data?: { code?: number; error?: { detail?: string }; message?: string } };
+    status?: number;
+    data?: { code?: number; error?: { detail?: string }; message?: string };
+    message?: string;
+  };
+  const status = anyErr?.response?.status ?? anyErr?.status;
+  const body = anyErr?.response?.data ?? anyErr?.data;
+  if (status == null && body?.code == null) return null;
+  return body?.error?.detail || body?.message || anyErr?.message || `HTTP ${status}`;
+}
+
+export const updateCellularConfig = async (
+  data: Partial<CellularConfig>
+): Promise<CellularConfig> => {
+  const next = { ...readLocalCellularConfig(), ...data };
+  try {
+    const response = await request.put('/api/v1/cellular/config', next);
+    // Interceptor returns { code, data, message } on success.
+    const payload = (response as { data?: CellularConfig }).data ?? response;
+    const saved = { ...DEFAULT_CELLULAR_CONFIG, ...(payload as CellularConfig) };
+    writeLocalCellularConfig(saved);
+    return saved;
+  } catch (err) {
+    const detail = cellularApiErrorMessage(err);
+    if (detail) {
+      throw new Error(detail);
+    }
+    // True offline / no HTTP response: keep local stub behavior.
+    writeLocalCellularConfig(next);
+    return next;
+  }
+};
+
+export function applyCarrierProfile(
+  profile: CellularCarrierProfile,
+  current: CellularConfig
+): CellularConfig {
+  if (profile === 'verizon') {
+    return {
+      ...current,
+      carrier_profile: 'verizon',
+      apn: current.apn || 'vzwinternet',
+      pdp_cid: 3,
+      ip_type: 'ipv4v6',
+      auth: 'none',
+    };
+  }
+  return {
+    ...current,
+    carrier_profile: 'generic',
+    pdp_cid: current.pdp_cid === 3 ? 1 : current.pdp_cid,
+  };
+}

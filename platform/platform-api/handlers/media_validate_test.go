@@ -6,7 +6,6 @@ import (
 
 func intPtr(v int32) *int32    { return &v }
 func uintPtr(v uint32) *uint32 { return &v }
-func boolPtr(v bool) *bool     { return &v }
 
 // -- ValidateISPUpdate tests --
 

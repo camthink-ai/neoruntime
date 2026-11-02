@@ -361,7 +361,7 @@ validate_no_empty_immutable_files() {
         # aipc-restore.sh.
         case "$empty" in
             */etc/last-known-time.json*|*/etc/time-config.json*|\
-            */etc/osd-logo.conf)
+            */etc/cellular.json*|*/etc/osd-logo.conf)
                 continue ;;
         esac
         local msg="$context validation failed: empty immutable file $empty"

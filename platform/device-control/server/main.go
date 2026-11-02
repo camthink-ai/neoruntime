@@ -83,6 +83,9 @@ type Config struct {
 			InputPins     []uint32 `yaml:"input_pins"`
 			OutputPins    []uint32 `yaml:"output_pins"`
 		} `yaml:"gpio"`
+		Cellular struct {
+			HWProfile string `yaml:"hw_profile"`
+		} `yaml:"cellular"`
 	} `yaml:"capabilities"`
 
 	EventBus struct {

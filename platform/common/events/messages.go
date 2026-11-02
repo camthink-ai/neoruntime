@@ -141,6 +141,30 @@ var messageTemplates = map[string]*MessageTemplate{
 		Level:    LevelWarning,
 		Category: CategorySystem,
 	},
+	"network.cellular.config": {
+		Code:     "network.cellular.config",
+		Module:   "network",
+		Params:   []string{"enabled", "apn", "profile"},
+		Default:  "Cellular config updated (enabled={{.enabled}}, apn={{.apn}}, profile={{.profile}})",
+		Level:    LevelInfo,
+		Category: CategoryOperation,
+	},
+	"network.cellular.connect": {
+		Code:     "network.cellular.connect",
+		Module:   "network",
+		Params:   []string{"apn"},
+		Default:  "Cellular connect requested (apn={{.apn}})",
+		Level:    LevelInfo,
+		Category: CategoryOperation,
+	},
+	"network.cellular.disconnect": {
+		Code:     "network.cellular.disconnect",
+		Module:   "network",
+		Params:   []string{},
+		Default:  "Cellular disconnect requested",
+		Level:    LevelInfo,
+		Category: CategoryOperation,
+	},
 
 	// Storage
 	"storage.disk.mounted": {

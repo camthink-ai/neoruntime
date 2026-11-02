@@ -70,6 +70,11 @@ capabilities:
     input_pins: []
     output_pins: []
 
+  # Cellular — probe contract only. Do NOT set enabled/supported here;
+  # runtime capability is decided by USB/power self-check in platform-api.
+  cellular:
+    hw_profile: /data/aipc/etc/cellular-hw.yaml
+
 # Automation control
 automation:
   # Day/night auto switching
