@@ -191,6 +191,8 @@ All configuration files are located at `/etc/aipc/` on the rootfs and at
 `/data/aipc/etc/` on the device:
 - `ai-runtime.yaml`
 - `app-manager.yaml`
+- `camera-daemon.yaml`
+- `cellular-hw.yaml`
 - `device-control.yaml`
 - `event-bus.yaml`
 - `platform-api.yaml`
@@ -229,8 +231,8 @@ journalctl -u app-manager.service -f
 curl http://localhost:8080/api/v1/system/health
 
 # Or use CLI
-/usr/bin/aipc-cli status
 ```
+/usr/bin/aipc-cli status
 
 ### 4. Check Processes
 

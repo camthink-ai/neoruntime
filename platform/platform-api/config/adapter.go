@@ -13,8 +13,8 @@ import "context"
 
 // Adapter translates a desired JSON value for one configuration domain into a
 // live-system change and verifies it took effect. Each domain (media, network,
-// time, device_info, auth, system_params) registers one Adapter with the
-// Manager.
+// time, device_info, auth, system_params, cellular) registers one Adapter with
+// the Manager.
 //
 // The Backup/Rendered values are opaque to the Manager: an adapter may use a
 // []byte (file bytes), a proto message, or any struct it round-trips itself.
@@ -60,8 +60,9 @@ type Adapter interface {
 // Reconcile records the normalized state and re-projects it once.
 //
 // An adapter that does not implement Snapshotter is skipped by Reconcile when
-// no desired row exists (Reconcile cannot discover live state for it). This is
-// non-breaking: the six Phase 1 adapters do not implement it and are unaffected.
+// no desired row exists (Reconcile cannot discover live state for it). Today
+// media and cellular implement Snapshotter; other domains are skipped until
+// they opt in.
 //
 // Snapshot should return the desiredJSON that, if passed to Apply, would leave
 // the live state unchanged before optional normalization. A missing live state

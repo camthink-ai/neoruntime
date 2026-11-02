@@ -91,7 +91,7 @@ validate_release_root() {
     while IFS= read -r empty; do
         case "$empty" in
             */etc/last-known-time.json*|*/etc/time-config.json*|\
-            */etc/osd-logo.conf)
+            */etc/cellular.json*|*/etc/osd-logo.conf)
                 continue ;;
         esac
         fail "empty immutable release file: $empty"
