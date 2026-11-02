@@ -36,6 +36,7 @@ import (
 	"aipc/platform/app-manager/proto"
 	"aipc/platform/app-manager/registry"
 	"aipc/platform/app-manager/security"
+	"aipc/platform/app-manager/stopbudget"
 	"aipc/platform/common/constants"
 	"aipc/platform/common/logger"
 	"aipc/platform/common/socket"
@@ -1745,26 +1746,35 @@ func (s *AppManagerServer) StopApp(ctx context.Context, req *proto.StopRequest) 
 		}, nil
 	}
 
-	// Use a background context for the actual stop operation. The budget must
-	// cover the graceful window plus the containerd client's force-kill phase
-	// (see containerd.KillPhaseBudget): sizing it equal to the graceful
-	// timeout would expire the context exactly when the SIGKILL matters.
-	gracefulSeconds := req.TimeoutSeconds
-	if gracefulSeconds <= 0 {
-		gracefulSeconds = 10
+	// Use a background context for the actual stop operation. Multi-container
+	// tasks stop sequentially to honor shutdown_order, and every task may spend
+	// both its graceful window and its detached force-kill phase. Size the
+	// deadline from the actual tracked task count instead of covering only the
+	// first task.
+	gracefulSeconds := stopbudget.NormalizeGracefulTimeoutSeconds(req.TimeoutSeconds)
+	containerCount := 1
+	if appInfo.IsMultiContainer {
+		// Count from the immutable installed manifest instead of the live task
+		// map, which the ordered stop loop mutates as tasks exit. If the
+		// manifest is temporarily unreadable, use the validated maximum so the
+		// fallback name-ordered stop still has a safe deadline.
+		containerCount = stopbudget.MaxContainersPerApp
+		if appManifest, loadErr := manifest.LoadManifest(appInfo.ManifestPath); loadErr == nil && len(appManifest.Spec.Containers) > 0 {
+			containerCount = len(appManifest.Spec.Containers)
+		}
 	}
-	stopBudget := time.Duration(gracefulSeconds)*time.Second + containerd.KillPhaseBudget + 5*time.Second
+	stopBudget := stopbudget.ForContainers(gracefulSeconds, containerCount)
 	termCtx, cancel := context.WithTimeout(context.Background(), stopBudget)
 	defer cancel()
 	termCtx = s.withNamespace(termCtx)
 
 	// Check if this is a multi-container application
 	if appInfo.IsMultiContainer {
-		return s.stopMultiContainerApp(termCtx, req.AppId, appInfo, req.TimeoutSeconds)
+		return s.stopMultiContainerApp(termCtx, req.AppId, appInfo, gracefulSeconds)
 	}
 
 	// Single container mode
-	return s.stopSingleContainerApp(termCtx, req.AppId, appInfo, req.TimeoutSeconds)
+	return s.stopSingleContainerApp(termCtx, req.AppId, appInfo, gracefulSeconds)
 }
 
 // stopSingleContainerApp stops a single-container application
