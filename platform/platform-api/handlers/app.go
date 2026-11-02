@@ -27,6 +27,7 @@ import (
 
 	"aipc/platform/app-manager/manifest"
 	apppb "aipc/platform/app-manager/proto"
+	"aipc/platform/app-manager/stopbudget"
 	"aipc/platform/common/events"
 	"aipc/platform/common/logger"
 )
@@ -464,16 +465,20 @@ func (h *APIHandlers) StopApp(c *gin.Context) {
 		return
 	}
 
-	// Parse timeout from query or body
-	timeoutSeconds := int32(30)
+	// Parse timeout from query or body. Default 10s graceful window (docker/
+	// containerd convention); the app-manager stop can additionally spend its
+	// force-kill phase budget, which the RPC context below must cover so the
+	// client receives the real outcome instead of a deadline error.
+	timeoutSeconds := int32(10)
 	if timeoutStr := c.Query("timeout"); timeoutStr != "" {
 		if parsed, err := strconv.ParseInt(timeoutStr, 10, 32); err == nil {
 			timeoutSeconds = int32(parsed)
 		}
 	}
+	timeoutSeconds = stopbudget.NormalizeGracefulTimeoutSeconds(timeoutSeconds)
 
 	client := apppb.NewAppManagerClient(h.grpcClients.AppManager)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds+5)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), stopbudget.ForAPI(timeoutSeconds))
 	defer cancel()
 
 	resp, err := client.StopApp(ctx, &apppb.StopRequest{
@@ -517,16 +522,19 @@ func (h *APIHandlers) RestartApp(c *gin.Context) {
 		return
 	}
 
-	// Parse timeout from query
-	timeoutSeconds := int32(30)
+	// Parse timeout from query. Same default as StopApp (10s graceful window);
+	// the context covers the stop (graceful + force-kill budget) plus the
+	// start phase that follows in the same request.
+	timeoutSeconds := int32(10)
 	if timeoutStr := c.Query("timeout"); timeoutStr != "" {
 		if parsed, err := strconv.ParseInt(timeoutStr, 10, 32); err == nil {
 			timeoutSeconds = int32(parsed)
 		}
 	}
+	timeoutSeconds = stopbudget.NormalizeGracefulTimeoutSeconds(timeoutSeconds)
 
 	client := apppb.NewAppManagerClient(h.grpcClients.AppManager)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds+15)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), stopbudget.ForRestartAPI(timeoutSeconds))
 	defer cancel()
 
 	// Stop the app

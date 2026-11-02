@@ -59,6 +59,7 @@ import ModelConfigEditor, {
 } from './import/ModelConfigEditor';
 import EffectiveConfigPanel from './import/EffectiveConfigPanel';
 import TensorTable from './TensorTable';
+import VariantBadge from './VariantBadge';
 
 interface ModelData {
   model_id: string;
@@ -252,6 +253,7 @@ export default function ModelDetailDialog({
   const hasNmsThreshold = hasNumber(nmsThreshold);
 
   const hasPostprocessSection =    hasNonEmptyString(mergedModel.output_mode)
+    || hasNonEmptyString(mergedModel.variant)
     || hasNumber(mergedModel.threshold)
     || hasNumber(mergedModel.max_detections)
     || hasNmsThreshold
@@ -476,14 +478,10 @@ export default function ModelDetailDialog({
                 <Badge variant="secondary" className="rounded-full">
                   {typeInfo.type}
                 </Badge>
-                {mergedModel.variant && (
-                  <Badge
-                    variant="outline"
-                    className="max-w-full rounded-full text-xs break-words whitespace-normal"
-                  >
-                    {mergedModel.variant}
-                  </Badge>
-                )}
+                <VariantBadge
+                  variant={mergedModel.variant}
+                  className="max-w-[240px]"
+                />
                 {mergedModel.output_mode && (
                   <Badge
                     variant={isRawMode ? 'outline' : 'secondary'}
@@ -520,12 +518,6 @@ export default function ModelDetailDialog({
                     Tag,
                     t('sys.ai_models.detail.model_type', '模型类型'),
                     mergedModel.model_type
-                  )}
-                {hasNonEmptyString(mergedModel.variant)
-                  && item(
-                    Tag,
-                    t('sys.ai_models.detail.variant', '变体'),
-                    mergedModel.variant
                   )}
                 {hasNonEmptyString(mergedModel.version)
                   && item(

@@ -32,6 +32,7 @@ import {
   SearchX,
 } from 'lucide-react';
 import ModelDetailDialog from './ModelDetailDialog';
+import VariantBadge from './VariantBadge';
 import { resolveModelType } from '../utils';
 import { getModelIcon } from '../modelIcons';
 
@@ -199,17 +200,13 @@ export default function ModelCard({
                   <h3 className="font-semibold text-foreground leading-tight truncate">
                     {model.name || model.model_id}
                   </h3>
-                  <p className="text-xs text-muted-foreground mt-1 truncate">
-                    {modelType}
-                    {model.variant && (
-                      <span
-                        className="ml-1 opacity-70"
-                        title={model.variant}
-                      >
-                        ({model.variant})
-                      </span>
-                    )}
-                  </p>
+                  <div className="mt-1 flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+                    <span className="min-w-0 truncate">{modelType}</span>
+                    <VariantBadge
+                      variant={model.variant}
+                      className="max-w-[150px] shrink-0"
+                    />
+                  </div>
                   <p className="mt-1.5 flex items-center gap-1.5 text-xs text-muted-foreground/80">
                     <span>
                       {model.source === 'disk'

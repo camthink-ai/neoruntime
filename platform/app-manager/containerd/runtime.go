@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/containers"
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/oci"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -231,7 +233,7 @@ func (r *Runtime) StartMultiContainerApp(
 		task, err := r.client.StartContainer(ctx, container, logPath)
 		if err != nil {
 			// Stop already started containers on failure
-			r.stopMultiContainer(ctx, instance, appManifest)
+			r.stopMultiContainer(ctx, instance, appManifest.GetShutdownOrder(), 5)
 			return fmt.Errorf("failed to start container %s: %w", containerName, err)
 		}
 
@@ -245,24 +247,47 @@ func (r *Runtime) StartMultiContainerApp(
 	return nil
 }
 
-// StopMultiContainerApp stops all containers in the correct order
+// StopMultiContainerApp stops all containers in the correct order.
+// It returns an error when any container could not be proven stopped;
+// callers must not report the app as stopped in that case.
 func (r *Runtime) StopMultiContainerApp(
 	ctx context.Context,
 	instance *MultiContainerInstance,
 	appManifest *manifest.AppManifest,
 	timeoutSeconds int32,
 ) error {
-	return r.stopMultiContainer(ctx, instance, appManifest)
+	return r.stopMultiContainer(ctx, instance, appManifest.GetShutdownOrder(), timeoutSeconds)
 }
 
-// stopMultiContainer internal implementation
+// StopInstanceTasks stops every task still tracked on the instance, in
+// deterministic name order, without manifest shutdown ordering. Used when the
+// manifest cannot be loaded at stop time and stopping must still be enforced.
+func (r *Runtime) StopInstanceTasks(
+	ctx context.Context,
+	instance *MultiContainerInstance,
+	timeoutSeconds int32,
+) error {
+	names := make([]string, 0, len(instance.Tasks))
+	for name := range instance.Tasks {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return r.stopMultiContainer(ctx, instance, names, timeoutSeconds)
+}
+
+// stopMultiContainer stops the named containers sequentially.
 func (r *Runtime) stopMultiContainer(
 	ctx context.Context,
 	instance *MultiContainerInstance,
-	appManifest *manifest.AppManifest,
+	shutdownOrder []string,
+	timeoutSeconds int32,
 ) error {
-	shutdownOrder := appManifest.GetShutdownOrder()
+	timeout := 10 * time.Second
+	if timeoutSeconds > 0 {
+		timeout = time.Duration(timeoutSeconds) * time.Second
+	}
 
+	var failures []string
 	for _, containerName := range shutdownOrder {
 		task, ok := instance.Tasks[containerName]
 		if !ok {
@@ -270,16 +295,23 @@ func (r *Runtime) stopMultiContainer(
 		}
 
 		// Stop task
-		timeout := 10 * time.Second
 		if err := r.client.StopContainer(ctx, task, timeout); err != nil {
+			if errdefs.IsNotFound(err) {
+				delete(instance.Tasks, containerName)
+				continue
+			}
 			logger.Warn("Failed to stop container %s: %v", containerName, err)
-		} else {
-			logger.Info("Multi-container stopped: app_id=%s, container=%s", instance.AppID, containerName)
+			// Keep the task entry so a retry can re-attempt the stop.
+			failures = append(failures, fmt.Sprintf("%s: %v", containerName, err))
+			continue
 		}
-
+		logger.Info("Multi-container stopped: app_id=%s, container=%s", instance.AppID, containerName)
 		delete(instance.Tasks, containerName)
 	}
 
+	if len(failures) > 0 {
+		return fmt.Errorf("failed to stop containers: %s", strings.Join(failures, "; "))
+	}
 	return nil
 }
 

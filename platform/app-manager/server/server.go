@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/glebarez/sqlite"
 	"google.golang.org/grpc"
@@ -35,6 +36,7 @@ import (
 	"aipc/platform/app-manager/proto"
 	"aipc/platform/app-manager/registry"
 	"aipc/platform/app-manager/security"
+	"aipc/platform/app-manager/stopbudget"
 	"aipc/platform/common/constants"
 	"aipc/platform/common/logger"
 	"aipc/platform/common/socket"
@@ -1744,18 +1746,35 @@ func (s *AppManagerServer) StopApp(ctx context.Context, req *proto.StopRequest) 
 		}, nil
 	}
 
-	// Use a background context for the actual stop operation
-	termCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Use a background context for the actual stop operation. Multi-container
+	// tasks stop sequentially to honor shutdown_order, and every task may spend
+	// both its graceful window and its detached force-kill phase. Size the
+	// deadline from the actual tracked task count instead of covering only the
+	// first task.
+	gracefulSeconds := stopbudget.NormalizeGracefulTimeoutSeconds(req.TimeoutSeconds)
+	containerCount := 1
+	if appInfo.IsMultiContainer {
+		// Count from the immutable installed manifest instead of the live task
+		// map, which the ordered stop loop mutates as tasks exit. If the
+		// manifest is temporarily unreadable, use the validated maximum so the
+		// fallback name-ordered stop still has a safe deadline.
+		containerCount = stopbudget.MaxContainersPerApp
+		if appManifest, loadErr := manifest.LoadManifest(appInfo.ManifestPath); loadErr == nil && len(appManifest.Spec.Containers) > 0 {
+			containerCount = len(appManifest.Spec.Containers)
+		}
+	}
+	stopBudget := stopbudget.ForContainers(gracefulSeconds, containerCount)
+	termCtx, cancel := context.WithTimeout(context.Background(), stopBudget)
 	defer cancel()
 	termCtx = s.withNamespace(termCtx)
 
 	// Check if this is a multi-container application
 	if appInfo.IsMultiContainer {
-		return s.stopMultiContainerApp(termCtx, req.AppId, appInfo, req.TimeoutSeconds)
+		return s.stopMultiContainerApp(termCtx, req.AppId, appInfo, gracefulSeconds)
 	}
 
 	// Single container mode
-	return s.stopSingleContainerApp(termCtx, req.AppId, appInfo, req.TimeoutSeconds)
+	return s.stopSingleContainerApp(termCtx, req.AppId, appInfo, gracefulSeconds)
 }
 
 // stopSingleContainerApp stops a single-container application
@@ -1766,23 +1785,46 @@ func (s *AppManagerServer) stopSingleContainerApp(ctx context.Context, appID str
 		ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
 
 		container, err := s.client.GetContainer(ctxWithNamespace, appInfo.ContainerID)
-		if err == nil {
+		if err != nil {
+			if !errdefs.IsNotFound(err) {
+				return &proto.Status{
+					Success: false,
+					Message: fmt.Sprintf("Failed to get container: %v", err),
+					Code:    500,
+				}, nil
+			}
+			// Container is gone; nothing to stop at the runtime level.
+		} else {
 			// Get task with namespace context
 			task, err := container.Task(ctxWithNamespace, nil)
-			if err == nil {
+			if err != nil {
+				if !errdefs.IsNotFound(err) {
+					return &proto.Status{
+						Success: false,
+						Message: fmt.Sprintf("Failed to get container task: %v", err),
+						Code:    500,
+					}, nil
+				}
+				// No task: the container is not running at the runtime level.
+			} else {
 				timeout := int32(timeoutSeconds)
 				if timeout <= 0 {
 					timeout = 10 // Default 10 seconds
 				}
 				if err := s.runtime.StopAppContainer(ctxWithNamespace, task, timeout); err != nil {
-					logger.Warn("Failed to stop container: %v", err)
-					// Continue with state update even if stop fails
+					if !errdefs.IsNotFound(err) {
+						// The task could not be proven stopped. Report failure
+						// instead of updating state: pretending the app stopped
+						// would orphan a still-running container.
+						logger.Error("Failed to stop container for app %s: %v", appID, err)
+						return &proto.Status{
+							Success: false,
+							Message: fmt.Sprintf("Failed to stop container: %v", err),
+							Code:    500,
+						}, nil
+					}
 				}
-			} else {
-				logger.Warn("Failed to get container task: %v", err)
 			}
-		} else {
-			logger.Warn("Failed to get container: %v", err)
 		}
 	}
 
@@ -1849,16 +1891,27 @@ func (s *AppManagerServer) stopMultiContainerApp(ctx context.Context, appID stri
 	// Load manifest to get shutdown order
 	appManifest, err := manifest.LoadManifest(appInfo.ManifestPath)
 	if err != nil {
-		logger.Warn("Failed to load manifest for shutdown: %v", err)
+		logger.Warn("Failed to load manifest for shutdown, stopping tasks in name order: %v", err)
 	}
 
 	ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
 
-	// Stop containers in order
+	// Stop containers in order. On failure report it honestly and keep the
+	// instance tracked (and the state running) so a retry can stop the rest;
+	// marking the app stopped here would orphan still-running containers.
+	var stopErr error
 	if appManifest != nil {
-		if err := s.runtime.StopMultiContainerApp(ctxWithNamespace, instance, appManifest, timeoutSeconds); err != nil {
-			logger.Warn("Failed to stop multi-container app: %v", err)
-		}
+		stopErr = s.runtime.StopMultiContainerApp(ctxWithNamespace, instance, appManifest, timeoutSeconds)
+	} else {
+		stopErr = s.runtime.StopInstanceTasks(ctxWithNamespace, instance, timeoutSeconds)
+	}
+	if stopErr != nil {
+		logger.Error("Failed to stop multi-container app %s: %v", appID, stopErr)
+		return &proto.Status{
+			Success: false,
+			Message: fmt.Sprintf("Failed to stop multi-container app: %v", stopErr),
+			Code:    500,
+		}, nil
 	}
 
 	// Remove from tracking

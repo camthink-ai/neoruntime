@@ -239,6 +239,69 @@ float bbox_iou_norm(float ax, float ay, float aw, float ah,
 // Fill a normalized bbox (x,y,w,h in [0..1]) as a solid 255 rect into the
 // frame-resolution bytemask, clamped to frame bounds. Shared by the postproc
 // detection path and the grid path (DRY: was inlined in run_detector).
+// Letterbox geometry of one model input against one capture. offer_frame()'s
+// DSP crop_and_resize scales the frame by `s` and centers the `fit_w x fit_h`
+// image at (pad_x, pad_y) inside the model input, padding the remainder —
+// aspect-preserving instead of the old plain stretch, which squeezed portrait
+// (90°/270°) frames ~1.9x into e.g. the 640x384 detector input and collapsed
+// person recall (AI privacy mask never fired in portrait). Derived here from
+// the same inputs both sides use (model dims are session constants, frame dims
+// travel with the capture), so no cross-thread state is needed. When the
+// aspects already match, padded() is false and everything degenerates to the
+// old stretch behavior.
+struct LbGeom {
+    float s = 1.0f;
+    uint32_t fit_w = 0, fit_h = 0, pad_x = 0, pad_y = 0;
+    bool padded = false;
+};
+
+static LbGeom lb_geom_for(uint32_t in_w, uint32_t in_h, uint32_t fr_w, uint32_t fr_h) {
+    LbGeom g;
+    g.fit_w = in_w;
+    g.fit_h = in_h;
+    if (in_w == 0 || in_h == 0 || fr_w == 0 || fr_h == 0) return g;
+    const float sx = static_cast<float>(in_w) / static_cast<float>(fr_w);
+    const float sy = static_cast<float>(in_h) / static_cast<float>(fr_h);
+    g.s = (sx < sy) ? sx : sy;
+    if (g.s <= 0.0f) g.s = 1.0f;
+    g.fit_w = static_cast<uint32_t>(static_cast<float>(fr_w) * g.s + 0.5f);
+    g.fit_h = static_cast<uint32_t>(static_cast<float>(fr_h) * g.s + 0.5f);
+    if (g.fit_w > in_w) g.fit_w = in_w;
+    if (g.fit_h > in_h) g.fit_h = in_h;
+    g.pad_x = (in_w - g.fit_w) / 2;
+    g.pad_y = (in_h - g.fit_h) / 2;
+    g.padded = (g.fit_w != in_w) || (g.fit_h != in_h);
+    return g;
+}
+
+// Map a model-input-normalized rect back through the letterbox to
+// frame-normalized coordinates (the inverse of what the DSP wrote). Returns
+// false when the rect lands entirely in the pad — no frame content behind it.
+static bool lb_unmap_rect(const LbGeom& g, uint32_t in_w, uint32_t in_h,
+                          uint32_t fr_w, uint32_t fr_h,
+                          float& x, float& y, float& w, float& h) {
+    const float mx0 = x * static_cast<float>(in_w);
+    const float my0 = y * static_cast<float>(in_h);
+    const float mx1 = (x + w) * static_cast<float>(in_w);
+    const float my1 = (y + h) * static_cast<float>(in_h);
+    float fx0 = (mx0 - static_cast<float>(g.pad_x)) / g.s;
+    float fy0 = (my0 - static_cast<float>(g.pad_y)) / g.s;
+    float fx1 = (mx1 - static_cast<float>(g.pad_x)) / g.s;
+    float fy1 = (my1 - static_cast<float>(g.pad_y)) / g.s;
+    const float fw_f = static_cast<float>(fr_w);
+    const float fh_f = static_cast<float>(fr_h);
+    if (fx0 < 0.0f) fx0 = 0.0f;
+    if (fy0 < 0.0f) fy0 = 0.0f;
+    if (fx1 > fw_f) fx1 = fw_f;
+    if (fy1 > fh_f) fy1 = fh_f;
+    if (fx1 <= fx0 || fy1 <= fy0) return false;
+    x = fx0 / fw_f;
+    y = fy0 / fh_f;
+    w = (fx1 - fx0) / fw_f;
+    h = (fy1 - fy0) / fh_f;
+    return true;
+}
+
 void fill_bbox_rect(std::vector<uint8_t>& mask, uint32_t fw, uint32_t fh,
                     float nx, float ny, float nw, float nh) {
     int32_t x0 = static_cast<int32_t>(nx * static_cast<float>(fw));
@@ -265,7 +328,8 @@ void fill_bbox_rect(std::vector<uint8_t>& mask, uint32_t fw, uint32_t fh,
 // assumes raw[0]=13x13; here output ORDER does not matter). Layout is C-order
 // [grid_h, grid_w, 3 anchors, 6 vals]; flat idx [gy,gx,a,v] = ((gy*gw+gx)*3+a)*6+v.
 int decode_plate_grid(const HalTensor* outs, uint32_t num_outputs,
-                      std::vector<uint8_t>& mask, uint32_t fw, uint32_t fh) {
+                      std::vector<uint8_t>& mask, uint32_t fw, uint32_t fh,
+                      const LbGeom& lb, uint32_t in_w, uint32_t in_h) {
     struct Box { float x, y, w, h, conf; };
     std::vector<Box> dets;
 
@@ -362,7 +426,12 @@ int decode_plate_grid(const HalTensor* outs, uint32_t num_outputs,
         kept.push_back(d);
         if (kept.size() >= kYv4MaxKeep) break;
     }
-    for (const auto& k : kept) fill_bbox_rect(mask, fw, fh, k.x, k.y, k.w, k.h);
+    for (auto& k : kept) {
+        float bx = k.x, by = k.y, bw = k.w, bh = k.h;
+        if (lb_unmap_rect(lb, in_w, in_h, fw, fh, bx, by, bw, bh)) {
+            fill_bbox_rect(mask, fw, fh, bx, by, bw, bh);
+        }
+    }
     return static_cast<int>(kept.size());
 }
 
@@ -797,6 +866,10 @@ void DpmWorker::offer_frame(const HalFrameBuffer* frame) {
     // Resize the CLEAN frame into every session's write buffer. This is the exact
     // 4K→model resize run_detector/run_segmenter did before — relocated pre-bake
     // onto the streaming thread so inference only ever sees clean pixels.
+    // Aspect-preserving letterbox (not stretch): a portrait 90°/270° frame
+    // squeezed into a landscape model input distorts persons beyond detector
+    // recall. The matching inverse mapping lives in lb_unmap_rect /
+    // run_segmenter (both derive the same geometry from the same dims).
     for (auto& ds : detectors_) {
         if (!ds.input_fb[ds.write_idx] || !dsp_ctx_) continue;
         // RGB-input sessions: the NV12 clean frame can't resize directly into the
@@ -807,11 +880,48 @@ void DpmWorker::offer_frame(const HalFrameBuffer* frame) {
         HalFrameBuffer* const resize_dst = ds.staging_nv12[ds.write_idx]
                                                ? ds.staging_nv12[ds.write_idx]
                                                : ds.input_fb[ds.write_idx];
-        HalDspResizeParams rp{};
-        rp.src = frame;
-        rp.dst = resize_dst;
-        rp.interpolation = HAL_DSP_INTERPOLATION_BILINEAR;
-        if (dsp_ops_->resize(dsp_ctx_, &rp) != 0) {
+        const LbGeom lb = lb_geom_for(resize_dst->width, resize_dst->height,
+                                      frame->width, frame->height);
+        if (lb.padded && !dsp_ops_->crop_and_resize) {
+            // Do not fall back to a stretched input: post-processing maps every
+            // accepted result through the letterbox inverse below, so mixing a
+            // stretch forward transform with that inverse would place masks on
+            // the wrong pixels. Hailo15 provides crop_and_resize; unsupported
+            // platforms fail closed and keep the previous mask via hysteresis.
+            static std::atomic<uint64_t> missing_letterbox_op{0};
+            if ((missing_letterbox_op.fetch_add(1, std::memory_order_relaxed) % 100u) == 0u) {
+                HAL_LOG_WARNING("DPM: crop_and_resize unavailable for letterbox input — frame dropped");
+            }
+            return;
+        }
+
+        int rrc;
+        if (!lb.padded) {
+            HalDspResizeParams rp{};
+            rp.src = frame;
+            rp.dst = resize_dst;
+            rp.interpolation = HAL_DSP_INTERPOLATION_BILINEAR;
+            rrc = dsp_ops_->resize(dsp_ctx_, &rp);
+        } else {
+            HalDspCropResizeParams crp{};
+            crp.src = frame;
+            crp.dst = resize_dst;
+            crp.crop.start_x = 0;
+            crp.crop.start_y = 0;
+            crp.crop.end_x = frame->width;
+            crp.crop.end_y = frame->height;
+            crp.interpolation = HAL_DSP_INTERPOLATION_BILINEAR;
+            crp.scaling_mode = HAL_DSP_SCALING_LETTERBOX_MIDDLE;
+            crp.letterbox_alignment = HAL_DSP_LETTERBOX_MIDDLE;
+            // Neutral NV12 pad (limited-video black). HalDspColor{} zero-fills
+            // Y/U/V, which decodes GREEN — the models would stare at two big
+            // green bars (backlog B4).
+            crp.letterbox_color.y = 16;
+            crp.letterbox_color.u = 128;
+            crp.letterbox_color.v = 128;
+            rrc = dsp_ops_->crop_and_resize(dsp_ctx_, &crp);
+        }
+        if (rrc != 0) {
             // DSP contention with the encoder (shared DSP). Drop this whole
             // capture WITHOUT advancing the seq; hysteresis holds the last mask.
             HAL_LOG_WARNING("DPM: clean-capture resize failed (DSP contention?) — frame dropped");
@@ -981,8 +1091,10 @@ bool DpmWorker::run_detector(DetectorSession& ds, std::vector<uint8_t>& mask,
     // OR the boxes into the bytemask, bypassing postproc entirely. Faithful port
     // of apps/.../parse_yolo_grid (see decode_plate_grid). The plate spec has no
     // gate_label, so boxes fill `mask` (the final bytemask) directly.
+    const LbGeom lb = lb_geom_for(ds.input_w, ds.input_h, fw, fh);
     if (ds.spec.is_grid_det) {
-        const int drawn = decode_plate_grid(outs, ds.num_outputs, mask, fw, fh);
+        const int drawn = decode_plate_grid(outs, ds.num_outputs, mask, fw, fh,
+                                            lb, ds.input_w, ds.input_h);
         for (uint32_t i = 0; i < ds.num_outputs; ++i) {
             if (outs[i].data) infer_ops_->free_tensor(&outs[i]);
         }
@@ -1025,9 +1137,13 @@ bool DpmWorker::run_detector(DetectorSession& ds, std::vector<uint8_t>& mask,
             && (d.label == ds.spec.gate_label);
         std::vector<uint8_t>& dst = routed_to_gate ? *gate_mask : mask;
 
-        // Shared fill helper (same one the grid path uses): clamps the normalized
-        // box to frame bounds and fills it solid 255.
-        fill_bbox_rect(dst, fw, fh, d.bbox.x, d.bbox.y, d.bbox.w, d.bbox.h);
+        // Shared fill helper (same one the grid path uses): the normalized box is
+        // model-input-relative, so push it back through the letterbox before
+        // filling at frame resolution (skipped when it sits entirely in the pad).
+        float bx = d.bbox.x, by = d.bbox.y, bw = d.bbox.w, bh = d.bbox.h;
+        if (lb_unmap_rect(lb, ds.input_w, ds.input_h, fw, fh, bx, by, bw, bh)) {
+            fill_bbox_rect(dst, fw, fh, bx, by, bw, bh);
+        }
     }
 
     post_ops_->free_result(&pr);
@@ -1077,12 +1193,33 @@ bool DpmWorker::run_segmenter(DetectorSession& ds, std::vector<uint8_t>& mask,
     // sets 255 (OR), so this composes with run_detector's bbox rects. Upscaling
     // runs on the worker thread, never the hot path. Threshold semantics are
     // verbatim from ai_example_v2.cpp:1525-1529 (cid==1 || cid>=128).
+    // Column mapping is the letterbox inverse (frame x -> model-input x ->
+    // seg-grid column); pad columns have no frame content behind them and stay
+    // 0. Precomputed per frame, reused by every row.
+    const LbGeom lb = lb_geom_for(ds.input_w, ds.input_h, fw, fh);
+    const float col_scale = lb.s * static_cast<float>(mw) / static_cast<float>(ds.input_w);
+    const float col_off = static_cast<float>(lb.pad_x) * static_cast<float>(mw) /
+                          static_cast<float>(ds.input_w);
+    const uint32_t mx_bad = ~0u;
+    std::vector<uint32_t> mx_col(fw, mx_bad);
+    for (uint32_t x = 0; x < fw; ++x) {
+        const float mxf = static_cast<float>(x) * col_scale + col_off;
+        if (mxf >= 0.0f && mxf < static_cast<float>(mw)) {
+            mx_col[x] = static_cast<uint32_t>(mxf);
+        }
+    }
+    const float row_scale = lb.s * static_cast<float>(mh) / static_cast<float>(ds.input_h);
+    const float row_off = static_cast<float>(lb.pad_y) * static_cast<float>(mh) /
+                          static_cast<float>(ds.input_h);
     for (uint32_t y = 0; y < fh; ++y) {
-        const uint32_t my = (y * mh) / fh;
+        const float myf = static_cast<float>(y) * row_scale + row_off;
+        if (myf < 0.0f || myf >= static_cast<float>(mh)) continue;  // pad row
+        const uint32_t my = static_cast<uint32_t>(myf);
         uint8_t* dst_row = &mask[static_cast<size_t>(y) * fw];
         const uint8_t* src_row = &seg.mask_data[static_cast<size_t>(my) * mw];
         for (uint32_t x = 0; x < fw; ++x) {
-            const uint32_t mx = (x * mw) / fw;
+            const uint32_t mx = mx_col[x];
+            if (mx == mx_bad) continue;  // pad column
             const uint8_t cid = src_row[mx];
             if (cid == kSegFgClassId || cid >= kSegProbFloor) dst_row[x] = 255;
         }
