@@ -5259,8 +5259,14 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
 
     /* 15. Connect HAL bridge callbacks (encoder + frontend) to the new medialib objects. */
     {
-        priv->encoder_auto_feed_default = true;
-        priv->encoder_auto_feed_by_stream.clear();
+        /* Keep the caller-owned feed gate across the rebuild. In particular,
+         * camera-daemon disables auto-feed before entering this function so
+         * freshly allocated frontend buffers cannot reach the rebuilt
+         * encoders until ISP/OSD state has been replayed and IDRs are armed.
+         * Resetting the state here reopened that window immediately before
+         * connect_frontend() installed the new callbacks. Hailo15MediaPriv
+         * outlives the MediaLibrary instance, so its global default and
+         * per-stream overrides are already the authoritative runtime state. */
         int ce = connect_encoders(priv);
         if (ce != HAL_OK)
         {
