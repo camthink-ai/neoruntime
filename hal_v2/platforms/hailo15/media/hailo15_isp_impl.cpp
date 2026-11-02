@@ -212,8 +212,6 @@ static void ml_sync_backlight_wdr(Hailo15MediaPriv *priv, int backlight_0_100)
  * When HAL "manual" picture tuning is on, those must be disabled (enabled=false) so V4L2 stream_params apply.
  * Mirrors hal V1 video_impl set_image_config auto-config path.
  */
-static bool s_ml_ae_cproc_aw_drv_enabled = true;
-
 static void ml_apply_isp_auto_algorithm_blocks(Hailo15MediaPriv *priv, bool enable_ae_cproc_aw_drv)
 {
     if (!priv || !priv->media_lib)
@@ -226,12 +224,6 @@ static void ml_apply_isp_auto_algorithm_blocks(Hailo15MediaPriv *priv, bool enab
      * disabled" goes stale and manual ISP writes are fought per-frame again.
      * Cost is one set_override_parameters (~30ms) per ISP update, matching the
      * webserver IspBlender::set_auto_configs flow this mirrors. */
-    /* V1 video_impl: brief delay before disabling auto blocks when entering manual (AE converge). */
-    const bool disabling_auto_blocks = s_ml_ae_cproc_aw_drv_enabled && !enable_ae_cproc_aw_drv;
-    if (disabling_auto_blocks)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    }
     try
     {
         /* Do not hold priv->mutex across MediaLibrary calls: ML may invoke callbacks that take this lock. */
@@ -243,6 +235,19 @@ static void ml_apply_isp_auto_algorithm_blocks(Hailo15MediaPriv *priv, bool enab
         }
         config_profile_t p = prof_exp.value();
         auto &aac = p.iq_settings.automatic_algorithms_config;
+        /* Derive the transition from the live profile rather than process
+         * static state. A MediaLibrary/profile rebuild can re-enable these
+         * firmware blocks while any static cache still says "disabled";
+         * skipping the quiescence waits then lets a late ACproc pass overwrite
+         * the manual V4L2 values replayed immediately afterwards. */
+        const bool auto_blocks_enabled =
+            aac.ae_e_v1.enabled || aac.a_cproc.enabled || aac.aw_drv4.enabled;
+        const bool disabling_auto_blocks = !enable_ae_cproc_aw_drv && auto_blocks_enabled;
+        if (disabling_auto_blocks)
+        {
+            /* V1 video_impl: brief delay before disabling auto blocks when entering manual (AE converge). */
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        }
         aac.ae_e_v1.disable = false;
         aac.a_cproc.disable = false;
         aac.aw_drv4.disable = false;
@@ -256,7 +261,6 @@ static void ml_apply_isp_auto_algorithm_blocks(Hailo15MediaPriv *priv, bool enab
                             static_cast<int>(r));
             return;
         }
-        s_ml_ae_cproc_aw_drv_enabled = enable_ae_cproc_aw_drv;
         if (priv->hal_media_ctx != nullptr)
         {
             std::lock_guard<std::recursive_mutex> lock(priv->mutex);
