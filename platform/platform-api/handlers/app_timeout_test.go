@@ -49,9 +49,23 @@ func TestAppStopAndRestartTimeouts(t *testing.T) {
 			want:    23,
 		},
 		{
+			name:    "stop non-positive uses default",
+			pattern: "/apps/:app_id/stop",
+			path:    "/apps/demo/stop?timeout=-4",
+			handler: func(h *APIHandlers) gin.HandlerFunc { return h.StopApp },
+			want:    10,
+		},
+		{
 			name:    "restart default",
 			pattern: "/apps/:app_id/restart",
 			path:    "/apps/demo/restart",
+			handler: func(h *APIHandlers) gin.HandlerFunc { return h.RestartApp },
+			want:    10,
+		},
+		{
+			name:    "restart zero uses default",
+			pattern: "/apps/:app_id/restart",
+			path:    "/apps/demo/restart?timeout=0",
 			handler: func(h *APIHandlers) gin.HandlerFunc { return h.RestartApp },
 			want:    10,
 		},

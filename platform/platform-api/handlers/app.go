@@ -27,6 +27,7 @@ import (
 
 	"aipc/platform/app-manager/manifest"
 	apppb "aipc/platform/app-manager/proto"
+	"aipc/platform/app-manager/stopbudget"
 	"aipc/platform/common/events"
 	"aipc/platform/common/logger"
 )
@@ -474,9 +475,10 @@ func (h *APIHandlers) StopApp(c *gin.Context) {
 			timeoutSeconds = int32(parsed)
 		}
 	}
+	timeoutSeconds = stopbudget.NormalizeGracefulTimeoutSeconds(timeoutSeconds)
 
 	client := apppb.NewAppManagerClient(h.grpcClients.AppManager)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds+35)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), stopbudget.ForAPI(timeoutSeconds))
 	defer cancel()
 
 	resp, err := client.StopApp(ctx, &apppb.StopRequest{
@@ -529,9 +531,10 @@ func (h *APIHandlers) RestartApp(c *gin.Context) {
 			timeoutSeconds = int32(parsed)
 		}
 	}
+	timeoutSeconds = stopbudget.NormalizeGracefulTimeoutSeconds(timeoutSeconds)
 
 	client := apppb.NewAppManagerClient(h.grpcClients.AppManager)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds+65)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), stopbudget.ForRestartAPI(timeoutSeconds))
 	defer cancel()
 
 	// Stop the app

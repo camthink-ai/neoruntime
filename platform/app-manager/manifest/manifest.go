@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"aipc/platform/app-manager/stopbudget"
 	"aipc/platform/common/utils"
 	"gopkg.in/yaml.v3"
 )
@@ -1052,6 +1053,11 @@ func (m *AppManifest) ValidateNetworkMode() error {
 
 // ValidateMultiContainer validates multi-container specific configuration
 func (m *AppManifest) ValidateMultiContainer() error {
+	if len(m.Spec.Containers) > stopbudget.MaxContainersPerApp {
+		return fmt.Errorf("multi-container app has %d containers, maximum is %d",
+			len(m.Spec.Containers), stopbudget.MaxContainersPerApp)
+	}
+
 	// 1. Must have exactly one main container
 	mainCount := 0
 	for name, c := range m.Spec.Containers {

@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"aipc/platform/app-manager/stopbudget"
 	"aipc/platform/common/logger"
 
 	"github.com/containerd/containerd"
@@ -996,12 +997,12 @@ func (c *Client) StartContainer(ctx context.Context, container containerd.Contai
 const (
 	// KillOpTimeout bounds each individual containerd call (Kill/Delete) in
 	// the force-kill phase.
-	KillOpTimeout = 10 * time.Second
+	KillOpTimeout = stopbudget.KillOpTimeout
 	// SigkillExitWait is how long a task is given to exit after SIGKILL
 	// before deletion is escalated to WithProcessKill.
-	SigkillExitWait = 5 * time.Second
+	SigkillExitWait = stopbudget.SigkillExitWait
 	// KillPhaseBudget is the worst-case duration of the force-kill phase.
-	KillPhaseBudget = KillOpTimeout + SigkillExitWait + KillOpTimeout
+	KillPhaseBudget = stopbudget.KillPhaseBudget
 )
 
 // killOpContext returns a fresh context for force-kill operations. It is
