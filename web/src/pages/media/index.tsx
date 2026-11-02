@@ -1,12 +1,12 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, X } from 'lucide-react';
+import { AlertTriangle } from 'lucide-react';
 import { VideoStreamPlayer } from '@/lib/videoStream/player';
 import Player from '@/components/player/player';
 import MediaSettings from './components/MediaSettings';
 import { getItem } from '@/utils/storage';
 import { useMediaStatus } from './hooks/useMedia';
-import { useStreamFallback, useHevcNoticeDismissal } from '@/hooks/useStreamFallback';
+import { isHevcSupported } from '@/lib/videoStream/hevcSupport';
 
 export default function Monitoring() {
   const { t } = useTranslation();
@@ -16,17 +16,31 @@ export default function Monitoring() {
     'main'
   );
   const [isEncoderConfiguring, setIsEncoderConfiguring] = useState(false);
-  // 用户手动关闭"浏览器不支持 H.265"提示条（localStorage 持久化，全局共享）
-  const [noticeDismissed, dismissNotice] = useHevcNoticeDismissal();
   const [isEncoderRestarting, setIsEncoderRestarting] = useState(false);
 
   const { data: mediaStatus } = useMediaStatus();
 
   const streams = mediaStatus?.streams ?? [];
 
-  const { effectiveStreamId, effectiveStreamInfo, codecNotice } =    useStreamFallback({ streams, activeStream });
+  const activeStreamInfo = streams.find(stream => stream.stream_id === activeStream);
+  const hevcSupported = useMemo(() => isHevcSupported(), []);
+  const [codecMismatch, setCodecMismatch] = useState(false);
+  const codec = activeStreamInfo?.codec?.toLowerCase();
 
-  const activeStreamInfo = effectiveStreamInfo;
+  useEffect(() => {
+    setCodecMismatch(false);
+  }, [activeStream, codec]);
+
+  useEffect(() => {
+    const handleError = (event: Event) => {
+      const { detail } = (event as CustomEvent<{ type?: string }>);
+      if (detail?.type === 'codec_mismatch') setCodecMismatch(true);
+    };
+    window.addEventListener('wv_error', handleError);
+    return () => window.removeEventListener('wv_error', handleError);
+  }, []);
+
+  const unsupportedPreview = codec === 'h265' && (!hevcSupported || codecMismatch);
 
   const handleStreamChange = (streamId: string) => {
     if (streamId === 'main' || streamId === 'sub' || streamId === 'third') {
@@ -40,8 +54,8 @@ export default function Monitoring() {
   // another stream is disabled: the backend rebuilds the remaining encoders,
   // which transiently report status 'starting' (no first frame yet) but still
   // have has_encoder === true.
-  const effectiveEnabled = !!effectiveStreamInfo
-    && !!effectiveStreamInfo.has_encoder;
+  const effectiveEnabled = !!activeStreamInfo
+    && !!activeStreamInfo.has_encoder;
 
   // Build a fresh authenticated WebSocket URL for the selected stream.
   const buildStreamUrl = useCallback((streamId: string) => {
@@ -58,9 +72,9 @@ export default function Monitoring() {
   const [playerKey, setPlayerKey] = useState(0);
   // Full codec/resolution changes rebuild the backend pipeline. Disconnect the
   // old player immediately and reconnect only after the mutation's status poll
-  // completes, using the final effective stream (including H.265 fallback).
-  const currentStreamUrl = effectiveEnabled && !isEncoderRestarting
-    ? `${buildStreamUrl(effectiveStreamId)}&reconnect=${playerKey}`
+  // completes, using the selected stream.
+  const currentStreamUrl = effectiveEnabled && !isEncoderRestarting && !unsupportedPreview
+    ? `${buildStreamUrl(activeStream)}&reconnect=${playerKey}`
     : '';
 
   const handleStreamToggleSuccess = useCallback((_streamId: string) => {
@@ -70,44 +84,28 @@ export default function Monitoring() {
     setPlayerKey(key => key + 1);
   }, []);
 
-  const noticeText = codecNotice
-    ? t(
-        `sys.monitoring.${codecNotice}`,
-        codecNotice === 'hevc_unsupported_fallback'
-          ? '当前浏览器不支持 H.265，请切换到 Chrome 或 Safari 浏览器'
-          : '当前浏览器不支持 H.265，且无可用 H.264 码流，请切换到 Chrome 或 Safari 浏览器'
-      )
-    : null;
-
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-background md:flex-row">
       {/* Main Content Area */}
       <div className="flex w-full shrink-0 flex-col items-center justify-center pt-2 pb-1 md:h-full md:min-h-0 md:flex-1 md:shrink px-4 md:py-0">
-        {noticeText && !noticeDismissed && (
-          <div className="flex w-full items-center gap-1.5 rounded-md bg-amber-500/10 px-3 py-1.5 text-xs text-amber-600 dark:text-amber-400">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            <span className="flex-1">{noticeText}</span>
-            <button
-              type="button"
-              className="shrink-0 rounded p-0.5 transition-colors hover:bg-amber-500/20"
-              onClick={() => dismissNotice()}
-              aria-label={t('common.close', '关闭')}
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        )}
         <div className="relative aspect-video w-full max-w-full overflow-hidden rounded-xl bg-black my-2 md:max-w-none md:rounded-2xl">
-          <Player
-            videoUrl={currentStreamUrl}
-            videoRendererInstance={playerRef}
-            streamWidth={activeStreamInfo?.width}
-            streamHeight={activeStreamInfo?.height}
-            objectFit="adaptive"
-            audioOverlay
-            configuring={isEncoderConfiguring}
-            streamRestarting={isEncoderRestarting}
-          />
+          {unsupportedPreview ? (
+            <div className="flex h-full items-center justify-center gap-2 px-6 text-center text-sm text-white" role="status">
+              <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>{t('sys.monitoring.hevc_preview_unsupported', '当前浏览器不支持 H.265 预览，请切换到支持 H.265 的浏览器')}</span>
+            </div>
+          ) : (
+            <Player
+              videoUrl={currentStreamUrl}
+              videoRendererInstance={playerRef}
+              streamWidth={activeStreamInfo?.width}
+              streamHeight={activeStreamInfo?.height}
+              objectFit="adaptive"
+              audioOverlay
+              configuring={isEncoderConfiguring}
+              streamRestarting={isEncoderRestarting}
+            />
+          )}
         </div>
       </div>
 
