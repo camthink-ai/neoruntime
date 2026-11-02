@@ -140,6 +140,10 @@ struct DaemonConfig {
     std::string media_config_path;
     std::string media_config_json;
     std::string backup_folder_path;  // Profile backup/restore directory
+    // Generic day-profile alias resolved per lens at config load (main.cpp
+    // apply_lens_daylight_profile): stays "Daylight_Basic" on AF-lens units,
+    // becomes "Daylight_Basic_FG2009" on FG2009 motorized-zoom units.
+    std::string media_daylight_profile = "Daylight_Basic";
 
     // Video device
     std::string device_path;
@@ -592,6 +596,10 @@ public:
     // Profile management (FROM_MEDIA mode)
     std::string get_current_profile() const;
     std::vector<std::string> list_profiles() const;
+    // Effective day profile for this unit's lens ("Daylight_Basic" on AF-lens
+    // units, the FG2009 entry on motorized-zoom units) — what the generic
+    // UI/API name resolves to at boot, on IR exit, and on UI switches.
+    const std::string& daylight_profile() const { return config_.media_daylight_profile; }
     // Switch the active medialib profile. On failure the daemon rolls back to the
     // previous profile and (when non-null) writes a human-readable cause into *message
     // (e.g. thermal restriction / unknown profile). Returns true only on a clean switch.
