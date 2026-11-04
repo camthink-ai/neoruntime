@@ -84,7 +84,7 @@ var (
 	reCMEError = regexp.MustCompile(`\+CME ERROR:\s*(\d+)`)
 	reCGSN     = regexp.MustCompile(`(?i)\+CGSN:\s*"?(\d{14,17})"?`)
 	reCIMI     = regexp.MustCompile(`(?i)\+CIMI:\s*"?(\d{14,16})"?`)
-	reCCID = regexp.MustCompile(`(?i)\+(?:Q)?CCID:\s*"?([0-9A-F]+)"?`)
+	reCCID     = regexp.MustCompile(`(?i)\+(?:Q)?CCID:\s*"?([0-9A-F]+)"?`)
 	reCNUM     = regexp.MustCompile(`\+CNUM:\s*[^,]*,"([^"]*)"`)
 	reCEREG    = regexp.MustCompile(`\+CEREG:\s*\d+,(\d+)`)
 	reQCSQ     = regexp.MustCompile(`\+QCSQ:\s*(.+)`)
