@@ -392,7 +392,7 @@ func TestCellularConnectRequiresEnabled(t *testing.T) {
 
 func TestDialerArgsQuectel(t *testing.T) {
 	args := dialerArgs("quectel_cm", CellularConfig{
-		APN: "vzwinternet", Auth: "none", PDPCID: 3, IPType: "ipv4v6",
+		APN: "vzwinternet", Auth: "none", PDPCID: 3, IPType: "ipv4v6", Usbnet: "qmi",
 	})
 	want := []string{"-s", "vzwinternet", "-4", "-6", "-n", "3"}
 	if len(args) != len(want) {
@@ -405,9 +405,55 @@ func TestDialerArgsQuectel(t *testing.T) {
 	}
 }
 
+func TestDialerArgsQuectelMBIMUsesPdpCid(t *testing.T) {
+	// -n follows Web pdp_cid for MBIM and QMI alike.
+	args := dialerArgs("quectel_cm", CellularConfig{
+		APN: "cmnet", Auth: "none", PDPCID: 1, IPType: "ipv4v6", Usbnet: "mbim",
+	})
+	want := []string{"-s", "cmnet", "-4", "-6", "-n", "1"}
+	if len(args) != len(want) {
+		t.Fatalf("args=%v want=%v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("args=%v want=%v", args, want)
+		}
+	}
+	args3 := dialerArgs("quectel_cm", CellularConfig{
+		APN: "vzwinternet", Auth: "none", PDPCID: 3, IPType: "ipv4v6", Usbnet: "mbim",
+	})
+	want3 := []string{"-s", "vzwinternet", "-4", "-6", "-n", "3"}
+	if len(args3) != len(want3) {
+		t.Fatalf("args=%v want=%v", args3, want3)
+	}
+	for i := range want3 {
+		if args3[i] != want3[i] {
+			t.Fatalf("args=%v want=%v", args3, want3)
+		}
+	}
+}
+
+func TestResolveDialAPNFromIMSI(t *testing.T) {
+	if got := resolveDialAPN("", "generic", "460026592329973"); got != "cmnet" {
+		t.Fatalf("mobile imsi: got %q", got)
+	}
+	if got := resolveDialAPN("", "generic", "46001xxxxxxxxxx"); got != "3gnet" {
+		t.Fatalf("unicom imsi: got %q", got)
+	}
+	if got := resolveDialAPN("", "generic", "46011xxxxxxxxxx"); got != "ctnet" {
+		t.Fatalf("telecom imsi: got %q", got)
+	}
+	if got := resolveDialAPN("custom", "generic", "46002xxxxxxxxxx"); got != "custom" {
+		t.Fatalf("explicit apn: got %q", got)
+	}
+	if got := resolveDialAPN("", "verizon", ""); got != "vzwinternet" {
+		t.Fatalf("verizon: got %q", got)
+	}
+}
+
 func TestDialerArgsQuectelPAP(t *testing.T) {
 	args := dialerArgs("quectel_cm", CellularConfig{
-		APN: "3gnet", User: "u1", Password: "p1", Auth: "pap", PDPCID: 1, IPType: "ipv4",
+		APN: "3gnet", User: "u1", Password: "p1", Auth: "pap", PDPCID: 1, IPType: "ipv4", Usbnet: "qmi",
 	})
 	want := []string{"-s", "3gnet", "u1", "p1", "1", "-4", "-n", "1"}
 	if len(args) != len(want) {
