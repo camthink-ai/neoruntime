@@ -48,6 +48,12 @@ DEFAULT_STREAMS = [
 ]
 DEFAULT_FRAMERATE = 30
 DEFAULT_POOL_MAX_BUFFERS = 20
+# The MediaLibrary 1.13 default is only six 4K post-ISP denoise buffers. A
+# transient producer/consumer clock skew can put all six in the downstream
+# multi-resize queue; denoise treats the resulting transient acquire miss as a
+# fatal frame error and permanently stops its GStreamer task. Twelve buffers
+# cover the normal queueing window while adding about 75 MiB at 3840x2160 NV12.
+DEFAULT_DENOISE_POOL_MAX_BUFFERS = 12
 
 
 # ---- content_hash: faithful port of medialib ConfigValidator::calculate_json_hash ----
@@ -241,13 +247,15 @@ def _strip_osd_and_static_mask(obj):
 
 
 def normalize_profile(files, profile_path):
-    """Rewrite one profile to the fixed 3-stream layout (1080P / 720P / 640x384, pool 8, 30fps,
+    """Rewrite one profile to the fixed 3-stream layout (1080P / 720P / 640x384, pool 20, 30fps,
     per-resolution bitrate).
 
     - application_input_streams.resolutions -> 3 entries.
     - encoded_output_streams -> 3 entries; sink1/sink2 get cloned encoder/masking/osd files
       (derived from sink0). Each encoder gets its dimensions + bitrate set per resolution.
     - iq_settings.dewarp.enabled forced True (lens correction on by default in every mode).
+    - iq_settings.denoise.pool-max-buffers forced to 12 so AI ISP profiles do not
+      inherit MediaLibrary's undersized six-buffer default.
     """
     if profile_path not in files:
         return
@@ -280,7 +288,12 @@ def normalize_profile(files, profile_path):
     # AI_ISP/IR): the camera ships with a fixed lens, so correction is always wanted.
     iq_ref = profile.get("iq_settings")
     if isinstance(iq_ref, str) and iq_ref in files:
-        files[iq_ref].setdefault("dewarp", {})["enabled"] = True
+        iq = files[iq_ref]
+        iq.setdefault("dewarp", {})["enabled"] = True
+        denoise = iq.get("denoise")
+        if not isinstance(denoise, dict):
+            sys.exit(f"gen_default_medialib_bundle: profile '{profile_path}' has no denoise config")
+        denoise["pool-max-buffers"] = DEFAULT_DENOISE_POOL_MAX_BUFFERS
 
     # encoded_output_streams
     eos = profile.get("encoded_output_streams")
@@ -373,7 +386,7 @@ def main():
 
     files = gather_files(search_roots, container, wanted)
 
-    # Normalize every profile to the fixed 3-stream layout (1080P / 720P / 640x384, pool 8,
+    # Normalize every profile to the fixed 3-stream layout (1080P / 720P / 640x384, pool 20,
     # 30fps). This mutates each profile + its application_settings and registers cloned
     # per-stream files (encoder/masking/osd for sink1/sink2) in `files`.
     for p in container["profiles"]:
