@@ -27,7 +27,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { ImageIcon, RotateCw } from 'lucide-react';
-import { useInfraredStatus, useSetImagingMode, useSetInfraredSettings } from '@/hooks/useDeviceControl';
+import { useInfraredStatus, useSetImagingMode, useSetInfraredSettings, useLensStatus } from '@/hooks/useDeviceControl';
 import ImageSettingsSkeleton from './ImageSettingsSkeleton';
 import {
   fetchISPConfig,
@@ -72,6 +72,9 @@ const PLAYER_RELOAD_SAFETY_MS = 15000;
 export default function ImageSettings() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  // Lens verdict decides lens-specific controls (dewarp is FG2009-only); polled
+  // by the hook so a hot lens swap reflects without a remount.
+  const { data: lensStatus } = useLensStatus();
 
   const [isp, setIsp] = useState<ISPConfig | null>(null);
   const [transform, setTransform] = useState<TransformConfig | null>(null);
@@ -919,16 +922,25 @@ export default function ImageSettings() {
                 </Select>
               </div>
 
-              {/* Dewarp */}
-              <div className="flex items-center justify-between">
-                <Label className="text-xs">
-                  {t('sys.media_settings.dewarp')}
-                </Label>
-                <Switch
-                  checked={transform?.dewarp ?? false}
-                  onCheckedChange={v => handleTransformChange('dewarp', v)}
-                />
-              </div>
+              {/* Dewarp — hidden on the AF lens: its optics have negligible
+                  distortion and the tuned profiles ship with dewarp off, so
+                  the switch would be a no-op that only needs explaining.
+                  Escape hatch: keep it visible while the persisted transform
+                  value is true (a unit that toggled it on before the hide
+                  keeps a UI path to turn it back off — the daemon preserves
+                  the manual toggle across reboots). Once turned off on an AF
+                  lens the switch disappears again. */}
+              {(lensStatus?.lens_model !== 'af0832' || transform?.dewarp) && (
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs">
+                    {t('sys.media_settings.dewarp')}
+                  </Label>
+                  <Switch
+                    checked={transform?.dewarp ?? false}
+                    onCheckedChange={v => handleTransformChange('dewarp', v)}
+                  />
+                </div>
+              )}
 
               {/* Grayscale */}
               <div className="flex items-center justify-between">
