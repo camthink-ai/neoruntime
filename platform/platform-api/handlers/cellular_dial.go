@@ -38,6 +38,7 @@ func (h *CellularHandler) dialerAvailable(cfg CellularConfig) bool {
 }
 
 func (h *CellularHandler) startDialer(bin string, cfg CellularConfig) error {
+	cfg = h.normalizeDialConfig(cfg)
 	useEcm := strings.EqualFold(cfg.Usbnet, "ecm") || probeUsbnetDriver() == "ecm"
 	if useEcm {
 		if err := h.prepareEcmPDP(cfg); err != nil {
@@ -71,6 +72,71 @@ func (h *CellularHandler) startDialer(bin string, cfg CellularConfig) error {
 
 	h.watchDialer(cmd)
 	return nil
+}
+
+// normalizeDialConfig fills dial defaults from live USB mode + IMSI when the
+// persisted config leaves APN empty.
+func (h *CellularHandler) normalizeDialConfig(cfg CellularConfig) CellularConfig {
+	if live := probeUsbnetDriver(); live != "" {
+		cfg.Usbnet = live
+	}
+	cfg.APN = resolveDialAPN(cfg.APN, cfg.CarrierProfile, h.cachedIMSI())
+	return cfg
+}
+
+func (h *CellularHandler) cachedIMSI() string {
+	atCacheMu.Lock()
+	imsi := atCache.IMSI
+	atCacheMu.Unlock()
+	if imsi != "" {
+		return imsi
+	}
+	h.lastIdentityMu.Lock()
+	imsi = h.lastIdentity.IMSI
+	h.lastIdentityMu.Unlock()
+	return imsi
+}
+
+// resolveDialAPN picks a usable APN. Empty config APN falls back to carrier /
+// China MCC-MNC defaults (cmnet/3gnet/ctnet) instead of a generic "internet".
+func resolveDialAPN(apn, carrierProfile, imsi string) string {
+	if s := strings.TrimSpace(apn); s != "" {
+		return s
+	}
+	if strings.EqualFold(strings.TrimSpace(carrierProfile), "verizon") {
+		return "vzwinternet"
+	}
+	if apn := apnFromIMSI(imsi); apn != "" {
+		return apn
+	}
+	return "internet"
+}
+
+func apnFromIMSI(imsi string) string {
+	imsi = strings.TrimSpace(imsi)
+	if len(imsi) < 5 || !strings.HasPrefix(imsi, "460") {
+		return ""
+	}
+	// China: prefer 2-digit MNC (IMSI[3:5]); common PLMNs only.
+	switch imsi[3:5] {
+	case "00", "02", "04", "07", "08": // China Mobile
+		return "cmnet"
+	case "01", "06", "09": // China Unicom
+		return "3gnet"
+	case "03", "05", "11": // China Telecom
+		return "ctnet"
+	}
+	return ""
+}
+
+// quectelCMPdn returns -n for QConnectManager, kept in sync with Web pdp_cid.
+// Note: on single-session MBIM, quectel-CM may still dial SessionId 0 even when
+// -n is non-zero; QMI honors -n as the PDP context.
+func quectelCMPdn(cfg CellularConfig) int {
+	if cfg.PDPCID >= 1 {
+		return cfg.PDPCID
+	}
+	return 1
 }
 
 func (h *CellularHandler) watchDialer(cmd *exec.Cmd) {
@@ -137,14 +203,7 @@ func (h *CellularHandler) prepareEcmPDP(cfg CellularConfig) error {
 	case "ipv6":
 		ipType = "IPV6"
 	}
-	apn := strings.TrimSpace(cfg.APN)
-	if apn == "" {
-		if cfg.CarrierProfile == "verizon" {
-			apn = "vzwinternet"
-		} else {
-			apn = "internet"
-		}
-	}
+	apn := resolveDialAPN(cfg.APN, cfg.CarrierProfile, "")
 	raw, err := atExchange(port, []string{
 		fmt.Sprintf(`AT+CGDCONT=%d,"%s","%s"`, cid, ipType, apn),
 		fmt.Sprintf("AT+CGACT=1,%d", cid),
@@ -286,21 +345,15 @@ func (h *CellularHandler) flushNetIfaces() {
 }
 
 func dialerArgs(style string, cfg CellularConfig) []string {
-	apn := cfg.APN
-	if apn == "" {
-		if cfg.CarrierProfile == "verizon" {
-			apn = "vzwinternet"
-		} else {
-			apn = "internet"
-		}
-	}
+	apn := resolveDialAPN(cfg.APN, cfg.CarrierProfile, "")
 
 	switch strings.ToLower(style) {
 	case "quectel_cm":
 		// Matches QConnectManager V1.6.x:
 		//   -s [apn [user password auth]]  auth: 1=pap, 2=chap
 		//   -4 / -6                        IP family
-		//   -n pdn                         PDP / PDN context
+		//   -n pdn                         synced from config pdp_cid
+		// Board retest: ipv4v6 (-4 -6) is fine on healthy MBIM/QMI.
 		args := []string{"-s", apn}
 		if cfg.Auth != "none" {
 			auth := "0"
@@ -320,15 +373,17 @@ func dialerArgs(style string, cfg CellularConfig) []string {
 		case "ipv4v6":
 			args = append(args, "-4", "-6")
 		}
-		if cfg.PDPCID >= 0 {
-			args = append(args, "-n", fmt.Sprintf("%d", cfg.PDPCID))
-		}
+		args = append(args, "-n", strconv.Itoa(quectelCMPdn(cfg)))
 		if pin := strings.TrimSpace(cfg.PIN); pin != "" {
 			args = append(args, "-p", pin)
 		}
 		return args
 	default: // aipc
-		args := []string{"connect", "--apn", apn, "--cid", fmt.Sprintf("%d", cfg.PDPCID), "--ip-type", cfg.IPType}
+		cid := cfg.PDPCID
+		if cid < 1 {
+			cid = 1
+		}
+		args := []string{"connect", "--apn", apn, "--cid", fmt.Sprintf("%d", cid), "--ip-type", cfg.IPType}
 		if cfg.Auth != "none" {
 			args = append(args, "--auth", cfg.Auth, "--user", cfg.User, "--password", cfg.Password)
 		}

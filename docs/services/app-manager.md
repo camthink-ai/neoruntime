@@ -701,6 +701,11 @@ spec:
 
 #### Multi-Container Application (Main/Sub)
 
+Multi-container applications support at most 16 containers. This bound keeps
+ordered synchronous stop and restart operations within their advertised API
+deadline, including graceful shutdown and force-kill fallback for every
+container.
+
 ```yaml
 apiVersion: v1
 kind: Application

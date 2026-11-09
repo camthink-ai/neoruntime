@@ -84,7 +84,7 @@ var (
 	reCMEError = regexp.MustCompile(`\+CME ERROR:\s*(\d+)`)
 	reCGSN     = regexp.MustCompile(`(?i)\+CGSN:\s*"?(\d{14,17})"?`)
 	reCIMI     = regexp.MustCompile(`(?i)\+CIMI:\s*"?(\d{14,16})"?`)
-	reCCID     = regexp.MustCompile(`\+(?:Q)?CCID:\s*(\d+)`)
+	reCCID     = regexp.MustCompile(`(?i)\+(?:Q)?CCID:\s*"?([0-9A-F]+)"?`)
 	reCNUM     = regexp.MustCompile(`\+CNUM:\s*[^,]*,"([^"]*)"`)
 	reCEREG    = regexp.MustCompile(`\+CEREG:\s*\d+,(\d+)`)
 	reQCSQ     = regexp.MustCompile(`\+QCSQ:\s*(.+)`)
@@ -344,7 +344,7 @@ func parseModemIdentity(raw string) modemIdentity {
 		id.Operator = strings.TrimSpace(m[1])
 	}
 	if m := reCCID.FindStringSubmatch(norm); len(m) == 2 {
-		id.ICCID = m[1]
+		id.ICCID = normalizeICCID(m[1])
 	}
 	if m := reCNUM.FindStringSubmatch(norm); len(m) == 2 {
 		id.MSISDN = strings.TrimSpace(m[1])
@@ -386,6 +386,28 @@ func extractIMSI(norm, skipIMEI string) string {
 		}
 	}
 	return firstBareDigits(norm, "AT+CIMI", 14, 16, skipIMEI)
+}
+
+// normalizeICCID strips BCD padding nibbles (F/f) from modem CCID responses.
+// Digits-only ICCIDs are returned unchanged.
+func normalizeICCID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		switch {
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == 'F' || r == 'f':
+			// BCD unused nibble — not part of the decimal ICCID.
+		default:
+			// Ignore quotes/spaces; reject other letters by skipping them.
+		}
+	}
+	return b.String()
 }
 
 func firstBareDigits(norm, afterCmd string, minLen, maxLen int, skip string) string {

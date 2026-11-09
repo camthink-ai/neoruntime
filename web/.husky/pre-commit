@@ -1,5 +1,12 @@
 #!/usr/bin/env sh
+# Frontend checks only when web sources are staged. Pure Go/docs commits must
+# not fail on lint-staged's "no matching staged files" exit.
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT/web" || exit 1
+
+if ! git diff --cached --name-only --diff-filter=ACM | grep -qE '^web/(src|public)/'; then
+  exit 0
+fi
+
 pnpm exec tsc -b || exit 1
 pnpm exec lint-staged

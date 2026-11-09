@@ -44,7 +44,7 @@ var streamRules = map[string]StreamValidationRule{
 		MinBitrate: 32000, MaxBitrate: 4000000,
 		MinFps: 1, MaxFps: 30,
 		MinGop: 1, MaxGop: 300,
-		AllowedCodecs: []string{"h264"},
+		AllowedCodecs: []string{"h264", "h265"},
 	},
 }
 

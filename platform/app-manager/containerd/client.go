@@ -21,10 +21,12 @@ import (
 	"syscall"
 	"time"
 
+	"aipc/platform/app-manager/stopbudget"
 	"aipc/platform/common/logger"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
@@ -988,9 +990,63 @@ func (c *Client) StartContainer(ctx context.Context, container containerd.Contai
 	return task, nil
 }
 
-// StopContainer stops a container task gracefully
+// Force-kill budgets for StopContainer. The force-kill phase runs on an
+// independent context so that a cancelled or expired caller context can never
+// prevent the kill. Callers sizing their own stop deadlines should budget for
+// graceful timeout + KillPhaseBudget in the worst case.
+const (
+	// KillOpTimeout bounds each individual containerd call (Kill/Delete) in
+	// the force-kill phase.
+	KillOpTimeout = stopbudget.KillOpTimeout
+	// SigkillExitWait is how long a task is given to exit after SIGKILL
+	// before deletion is escalated to WithProcessKill.
+	SigkillExitWait = stopbudget.SigkillExitWait
+	// KillPhaseBudget is the worst-case duration of the force-kill phase.
+	KillPhaseBudget = stopbudget.KillPhaseBudget
+)
+
+// killOpContext returns a fresh context for force-kill operations. It is
+// deliberately not derived from the caller's context: the force-kill phase
+// must complete exactly when the caller has already timed out.
+func (c *Client) killOpContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(
+		namespaces.WithNamespace(context.Background(), c.namespace),
+		KillOpTimeout,
+	)
+}
+
+// stopTask is the subset of containerd.Task used by the stop state machine.
+// Keeping the state machine behind this narrow seam lets its timeout and
+// escalation behavior be tested without a live containerd daemon.
+type stopTask interface {
+	ID() string
+	Wait(context.Context) (<-chan containerd.ExitStatus, error)
+	Kill(context.Context, syscall.Signal, ...containerd.KillOpts) error
+	Delete(context.Context, ...containerd.ProcessDeleteOpts) (*containerd.ExitStatus, error)
+}
+
+// StopContainer stops a container task in two phases.
+//
+// Graceful phase: SIGTERM is delivered to every process in the container
+// (WithKillAll) and the task is given `timeout` to exit on its own.
+//
+// Force-kill phase: SIGKILL is sent to the whole container on an independent
+// context, the exit is verified, and — if the task still has not exited —
+// task.Delete with WithProcessKill makes the shim kill whatever is left as
+// part of deletion.
+//
+// A nil return means the task is gone from containerd. A non-nil return means
+// the task could not be proven stopped; callers must not report success.
 func (c *Client) StopContainer(ctx context.Context, task containerd.Task, timeout time.Duration) error {
+	return c.stopContainer(ctx, task, timeout)
+}
+
+func (c *Client) stopContainer(ctx context.Context, task stopTask, timeout time.Duration) error {
 	ctx = namespaces.WithNamespace(ctx, c.namespace)
+
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
 
 	// Get exit channel first (before sending signal)
 	// This must be called before Kill() to properly wait for exit
@@ -998,55 +1054,82 @@ func (c *Client) StopContainer(ctx context.Context, task containerd.Task, timeou
 	if err != nil {
 		// Task might already be deleted or in invalid state
 		logger.Warn("Failed to get exit channel: %v, attempting force kill and delete", err)
-		if killErr := task.Kill(ctx, syscall.SIGKILL); killErr != nil {
+		killCtx, killCancel := c.killOpContext()
+		if killErr := task.Kill(killCtx, syscall.SIGKILL, containerd.WithKillAll); killErr != nil && !errdefs.IsNotFound(killErr) {
 			logger.Warn("Failed to send SIGKILL: %v", killErr)
 		}
+		killCancel()
 		// Try to delete task anyway
-		if _, delErr := task.Delete(ctx, containerd.WithProcessKill); delErr != nil {
+		delCtx, delCancel := c.killOpContext()
+		defer delCancel()
+		if _, delErr := task.Delete(delCtx, containerd.WithProcessKill); delErr != nil && !errdefs.IsNotFound(delErr) {
 			return fmt.Errorf("failed to delete task: %w", delErr)
 		}
 		return nil
 	}
 
-	// Send SIGTERM
-	if err := task.Kill(ctx, syscall.SIGTERM); err != nil {
-		logger.Warn("Failed to send SIGTERM: %v, sending SIGKILL", err)
-		if killErr := task.Kill(ctx, syscall.SIGKILL); killErr != nil {
-			return fmt.Errorf("failed to kill task: %w", killErr)
-		}
+	// Graceful phase: signal every process in the container, then wait.
+	if killErr := task.Kill(ctx, syscall.SIGTERM, containerd.WithKillAll); killErr != nil && !errdefs.IsNotFound(killErr) {
+		// Not fatal: the task may already be exiting, and the phases below
+		// still drive it to a verified stop.
+		logger.Warn("Failed to send SIGTERM: %v, continuing", killErr)
 	}
 
-	// Wait for exit with timeout
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	graceTimer := time.NewTimer(timeout)
+	defer graceTimer.Stop()
 
+	exited := false
+	waitBroken := false
 	select {
-	case <-waitCtx.Done():
-		// Timeout, send SIGKILL
-		logger.Warn("Task did not exit within timeout (%v), sending SIGKILL", timeout)
-		if err := task.Kill(ctx, syscall.SIGKILL); err != nil {
-			return fmt.Errorf("failed to kill task: %w", err)
-		}
-		// Wait for kill (with another timeout)
-		killCtx, killCancel := context.WithTimeout(ctx, 5*time.Second)
-		defer killCancel()
-		select {
-		case exitStatus := <-exitStatusC:
-			// Process exited after SIGKILL
-			logger.Info("Task exited after SIGKILL with status: %v", exitStatus)
-		case <-killCtx.Done():
-			logger.Warn("Task did not exit after SIGKILL, forcing delete")
-		}
 	case exitStatus := <-exitStatusC:
-		// Process exited normally
-		logger.Info("Task exited gracefully with status: %v", exitStatus)
+		if waitErr := exitStatus.Error(); waitErr != nil {
+			// The wait itself failed (e.g. the task vanished): fall through
+			// to the force-kill phase, which tolerates already-gone tasks.
+			waitBroken = true
+			logger.Warn("Task wait failed: %v, continuing with force kill", waitErr)
+		} else {
+			exited = true
+			logger.Info("Task exited gracefully with status: %v", exitStatus)
+		}
+	case <-graceTimer.C:
+		logger.Warn("Task did not exit within timeout (%v), sending SIGKILL", timeout)
+	case <-ctx.Done():
+		// The caller gave up on the graceful window; the force-kill phase
+		// below still guarantees the task is stopped.
+		logger.Warn("Stop context done before graceful exit (%v), sending SIGKILL", ctx.Err())
 	}
 
-	// Delete task (this removes the task from containerd and updates its state)
-	// IMPORTANT: task.Delete() must be called to actually remove the task
-	// Otherwise task.Status() may still show "running" even though process is dead
-	if _, err := task.Delete(ctx); err != nil {
-		return fmt.Errorf("failed to delete task: %w", err)
+	// Force-kill phase: runs on a context independent of the caller's so a
+	// caller timeout cannot leave the task running.
+	if !exited {
+		killCtx, killCancel := c.killOpContext()
+		defer killCancel()
+		if killErr := task.Kill(killCtx, syscall.SIGKILL, containerd.WithKillAll); killErr != nil && !errdefs.IsNotFound(killErr) {
+			// WithProcessKill deletion below is the remaining enforcement path.
+			logger.Warn("Failed to send SIGKILL: %v, relying on WithProcessKill delete", killErr)
+		}
+
+		if !waitBroken {
+			exitTimer := time.NewTimer(SigkillExitWait)
+			defer exitTimer.Stop()
+			select {
+			case exitStatus := <-exitStatusC:
+				logger.Info("Task exited after SIGKILL with status: %v", exitStatus)
+			case <-exitTimer.C:
+				logger.Warn("Task did not exit after SIGKILL, escalating to WithProcessKill delete")
+			}
+		}
+	}
+
+	// Delete the task so containerd stops tracking it; without this,
+	// task.Status() may still report "running" for a dead process.
+	// WithProcessKill makes the shim kill any process that is somehow still
+	// alive as part of deletion. A fresh context is used because the caller's
+	// may already be expired.
+	delCtx, delCancel := c.killOpContext()
+	defer delCancel()
+	if _, delErr := task.Delete(delCtx, containerd.WithProcessKill); delErr != nil && !errdefs.IsNotFound(delErr) {
+		return fmt.Errorf("task did not stop: force delete failed: %w", delErr)
 	}
 
 	logger.Info("Container stopped and task deleted: task=%s", task.ID())

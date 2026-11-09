@@ -2,6 +2,29 @@ package handlers
 
 import "testing"
 
+func TestUsbnetNeedsReconcile(t *testing.T) {
+	cases := []struct {
+		want, live string
+		need       bool
+	}{
+		{"mbim", "qmi", true},
+		{"mbim", "mbim", false},
+		{"qmi", "mbim", true},
+		{"ecm", "ecm", false},
+		{"ecm", "qmi", true},
+		{"mbim", "", false}, // empty live = iface not up yet
+		{"", "qmi", false},
+		{"MBIM", "QMI", true},
+		{" mbim ", " mbim ", false},
+	}
+	for _, tc := range cases {
+		got := usbnetNeedsReconcile(tc.want, tc.live)
+		if got != tc.need {
+			t.Fatalf("want=%q live=%q got=%v wantNeed=%v", tc.want, tc.live, got, tc.need)
+		}
+	}
+}
+
 func TestParseModemIdentityEM05(t *testing.T) {
 	raw := "" +
 		"ATI\nQuectel\nEM05-G\nRevision: EM05GFAR07A07M1G\n\nOK\n" +
@@ -53,6 +76,50 @@ func TestParseModemIdentityEM05(t *testing.T) {
 func TestCeregState(t *testing.T) {
 	if ceregState("5") != "roaming" {
 		t.Fatal(ceregState("5"))
+	}
+}
+
+func TestNormalizeICCID(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"89860324245920230936", "89860324245920230936"},
+		{"898600F51314F2176473", "898600513142176473"},
+		{"898600f51314f2176473", "898600513142176473"},
+		{" 898600F51314F2176473 ", "898600513142176473"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := normalizeICCID(tc.in); got != tc.want {
+			t.Fatalf("normalizeICCID(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestParseModemIdentityMobileICCIDWithFPadding(t *testing.T) {
+	raw := "" +
+		"AT+CPIN?\n+CPIN: READY\n\nOK\n" +
+		"AT+CGSN\n869283050961210\n\nOK\n" +
+		"AT+CIMI\n460026592329973\n\nOK\n" +
+		"AT+CCID\n+CCID: 898600F51314F2176473\n\nOK\n" +
+		"AT+COPS?\n+COPS: 0,0,\"CHINA MOBILE\",7\n\nOK\n"
+	id := parseModemIdentity(raw)
+	if id.ICCID != "898600513142176473" {
+		t.Fatalf("iccid=%q", id.ICCID)
+	}
+	if id.IMSI != "460026592329973" {
+		t.Fatalf("imsi=%q", id.IMSI)
+	}
+	if id.Operator != "CHINA MOBILE" {
+		t.Fatalf("operator=%q", id.Operator)
+	}
+}
+
+func TestParseModemIdentityQCCIDWithFPadding(t *testing.T) {
+	raw := "AT+QCCID\n+QCCID: 898600F51314F2176473\n\nOK\n"
+	id := parseModemIdentity(raw)
+	if id.ICCID != "898600513142176473" {
+		t.Fatalf("iccid=%q", id.ICCID)
 	}
 }
 

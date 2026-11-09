@@ -17,6 +17,8 @@ const (
 	cellularSessionStall     = 45 * time.Second
 	cellularSIMRecoverAfter  = 4 * time.Second
 	cellularSIMRecoverEvery  = 30 * time.Second
+	cellularUsbnetMinBackoff = 15 * time.Second
+	cellularUsbnetMaxBackoff = 5 * time.Minute
 )
 
 // settleAfterPowerOn waits for control nodes, then CFUN-settles if SIM is not READY.
@@ -137,6 +139,12 @@ func (h *CellularHandler) autoDialLoop() {
 			continue
 		}
 
+		// Align modem USB net mode with persisted config (boot / module swap).
+		// Must run even when a PDP is already up on the wrong driver.
+		if h.reconcileUsbnetDesired(cfg) {
+			continue
+		}
+
 		simReady, simOK := h.probeSIMReady()
 		if simOK {
 			h.handleSIMTransition(simReady)
@@ -171,12 +179,13 @@ func (h *CellularHandler) autoDialLoop() {
 			if h.sessionWaitSince.IsZero() {
 				h.sessionWaitSince = h.now()
 			} else if h.now().Sub(h.sessionWaitSince) >= cellularSessionStall {
+				// Soft restart only: CFUN=0/1 here unbinds cdc_mbim / USB and
+				// makes recovery worse. Keep RF up and re-exec the dialer.
 				logger.Warn("cellular: dialer stalled without PDP for %s; restarting",
 					cellularSessionStall)
 				_ = h.stopDialer()
 				h.sessionWaitSince = time.Time{}
 				clearATCache()
-				h.recoverRFAfterSIMInsert()
 				continue
 			} else {
 				continue
