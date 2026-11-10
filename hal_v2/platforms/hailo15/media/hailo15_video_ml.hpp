@@ -117,13 +117,24 @@ inline void refresh_all_context_configs(Hailo15MediaPriv *priv, HalMediaContext 
 
 /**
  * Updates one frontend output_resolution_t and optionally global input format, then set_override_parameters().
+ *
+ * @param keep_suspended  When true, the per-stream feed suspend flag set before
+ *                        the vendor call is NOT cleared after it returns — the
+ *                        caller (try_light_reconfigure) manages the suspend
+ *                        window for ALL streams and clears everything via its
+ *                        FeedResumeGuard. This prevents the inner per-stream
+ *                        clear from re-opening the feed while a subsequent
+ *                        iteration's vendor stop/start (which stops the ENTIRE
+ *                        pipeline) is still in flight. Default false preserves
+ *                        the standalone-call behavior (suspend → vendor → resume).
  */
 inline int apply_frontend_stream_override(const MediaLibraryPtr &ml, const std::string &stream_id,
                                           const std::optional<std::pair<uint32_t, uint32_t>> &resolution,
                                           const std::optional<uint32_t> &framerate,
                                           const std::optional<HalPixelFormat> &format,
                                           const std::optional<uint32_t> &pool_max,
-                                          Hailo15MediaPriv *priv_for_osd = nullptr)
+                                          Hailo15MediaPriv *priv_for_osd = nullptr,
+                                          bool keep_suspended = false)
 {
     auto prof_exp = ml->get_current_profile();
     if (!prof_exp)
@@ -143,9 +154,17 @@ inline int apply_frontend_stream_override(const MediaLibraryPtr &ml, const std::
         found = true;
         if (resolution.has_value())
         {
-            const auto [w, h] = resolution.value();
+            uint32_t w = resolution.value().first;
+            uint32_t h = resolution.value().second;
             if (w > 0U && h > 0U)
             {
+                /* Landscape guard (Pass B convention): config dimensions are
+                 * ALWAYS landscape; medialib swaps internally for 90/270.
+                 * Without this clamp the light path can write portrait dims
+                 * into the live profile while the heavy path (generate_config)
+                 * forces landscape for the same request — asymmetric configs
+                 * and the double-swap FEED_STALL signature. */
+                if (w < h) { std::swap(w, h); }
                 res.dimensions.destination_width = w;
                 res.dimensions.destination_height = h;
                 new_w = w;
@@ -205,16 +224,22 @@ inline int apply_frontend_stream_override(const MediaLibraryPtr &ml, const std::
         p.application_settings.application_input_streams.format = hal_pixel_to_hailo(format.value());
     }
 
-    /* On a resolution change, suspend encoder feeding for this stream around
-     * set_override_parameters(). While the pipeline is stopping/restarting the encoder is
-     * reconfigured to the new geometry; if it receives a buffer whose stride doesn't match the
-     * new geometry -> update_stride() fails (VCEnc -3, silent) -> the encoder stalls and never
-     * releases its buffers -> the frontend multi_resize_output pool can't drain -> "Timeout
-     * waiting for used buffers" + "auto_feed add_buffer failed". The suspend flag is checked by
-     * BOTH the auto-feed frontend bridge AND the manual input_frame() codec op, so feeding is
-     * paused whether the app uses auto_feed or feeds frames itself. Held suspended across the
-     * set_override_parameters() call and a short post-switch window (see below), then cleared. */
-    const bool feed_suspend = (priv_for_osd != nullptr) && (new_w > 0U) && (new_h > 0U);
+    /* On ANY light-path change (resolution OR framerate), suspend encoder
+     * feeding for this stream around set_override_parameters(). While the
+     * pipeline is stopping/restarting the encoder is reconfigured; if it
+     * receives a buffer whose stride or timing doesn't match the new state
+     * -> update_stride() fails (VCEnc -3, silent) -> the encoder stalls and
+     * never releases its buffers -> the frontend multi_resize_output pool
+     * can't drain -> "Timeout waiting for used buffers" + "auto_feed
+     * add_buffer failed". The suspend flag is checked by BOTH the auto-feed
+     * frontend bridge AND the manual input_frame() codec op, so feeding is
+     * paused whether the app uses auto_feed or feeds frames itself.
+     *
+     * Previously this only engaged for resolution changes (new_w>0 && new_h>0);
+     * a pure-fps light-path change left feeding live during the vendor's
+     * internal stop/start window — exactly the race the old UAF hit. */
+    const bool feed_suspend = (priv_for_osd != nullptr) &&
+        (resolution.has_value() || framerate.has_value());
     if (feed_suspend)
     {
         std::lock_guard<std::recursive_mutex> lock(priv_for_osd->mutex);
@@ -222,7 +247,13 @@ inline int apply_frontend_stream_override(const MediaLibraryPtr &ml, const std::
     }
     media_library_return r = ml->set_override_parameters(p);
 
-    if (feed_suspend)
+    /* Clear the suspend flag ONLY when the caller isn't managing the
+     * lifecycle. In try_light_reconfigure's batch loop, an early clear
+     * here re-opens this stream's feed while the NEXT iteration's vendor
+     * stop/start (which stops the entire pipeline, not just one stream)
+     * is still tearing down — the rapid-switch SEGV race. keep_suspended
+     * defers the clear to the caller's FeedResumeGuard. */
+    if (feed_suspend && !keep_suspended)
     {
         std::lock_guard<std::recursive_mutex> lock(priv_for_osd->mutex);
         priv_for_osd->encoder_feed_suspended[stream_id] = false;

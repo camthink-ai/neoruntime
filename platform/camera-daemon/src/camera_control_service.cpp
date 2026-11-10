@@ -145,7 +145,10 @@ grpc::Status CameraControlServiceImpl::UpdateISPSettings(
         return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
     }
 
-    HAL_LOG_INFO("[CameraControl] Update ISP: manual=%d B=%d C=%d S=%d Sh=%d AE=%d",
+    HAL_LOG_INFO("[CameraControl] Update ISP delta: present[M=%d B=%d C=%d S=%d Sh=%d AE=%d] "
+                 "values[M=%d B=%d C=%d S=%d Sh=%d AE=%d]",
+                 request->has_manual_mode(), request->has_brightness(), request->has_contrast(),
+                 request->has_saturation(), request->has_sharpness(), request->has_auto_exposure(),
                  request->manual_mode(), request->brightness(), request->contrast(),
                  request->saturation(), request->sharpness(), request->auto_exposure());
 

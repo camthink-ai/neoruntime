@@ -11,6 +11,7 @@
 #include "../include/frame_router.h"
 #include "../include/video_source.h"
 #include "../include/frame_watchdog.h"
+#include <algorithm>
 
 extern "C" {
     #include "hal_log.h"
@@ -103,6 +104,7 @@ void FrameRouter::on_frame_arrived(const std::string& stream_name, HalFrameBuffe
     {
         std::lock_guard<std::mutex> lock(frame_clock_mu_);
         ++frame_sequences_[stream_name];
+        last_frame_times_[stream_name] = std::chrono::steady_clock::now();
     }
     frame_clock_cv_.notify_all();
 
@@ -266,6 +268,52 @@ uint64_t FrameRouter::frame_sequence(const std::string& stream_name) const {
     std::lock_guard<std::mutex> lock(frame_clock_mu_);
     const auto it = frame_sequences_.find(stream_name);
     return it == frame_sequences_.end() ? 0 : it->second;
+}
+
+uint64_t FrameRouter::ms_since_last_frame(const std::string& stream_name) const {
+    std::lock_guard<std::mutex> lock(frame_clock_mu_);
+    const auto it = last_frame_times_.find(stream_name);
+    if (it == last_frame_times_.end()) return UINT64_MAX;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - it->second).count();
+    return elapsed < 0 ? 0 : static_cast<uint64_t>(elapsed);
+}
+
+RouterDebugSnapshot FrameRouter::get_debug_snapshot() const {
+    RouterDebugSnapshot out;
+    const auto now = std::chrono::steady_clock::now();
+
+    // Take the independent leaf locks separately.  The hot path never needs
+    // an aggregate snapshot, so diagnostics must not introduce a new lock
+    // ordering between subscriber, outstanding-frame and dispatch state.
+    {
+        std::lock_guard<std::mutex> lock(sub_mu_);
+        for (const auto& [name, subscribers] : subscribers_) {
+            (void)name;
+            for (const auto& subscriber : subscribers) {
+                if (subscriber.active) ++out.active_subscribers;
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(frames_mu_);
+        out.outstanding_frames = outstanding_.size();
+        for (const auto& [frame_id, frame] : outstanding_) {
+            (void)frame_id;
+            if (!frame) continue;
+            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - frame->lend_time).count();
+            if (age > 0) {
+                out.oldest_outstanding_ms = std::max(
+                    out.oldest_outstanding_ms, static_cast<uint64_t>(age));
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(dispatch_mu_);
+        out.dispatch_queue_depth = dispatch_queue_.size();
+    }
+    return out;
 }
 
 void FrameRouter::do_release(ManagedFrame* mf) {
