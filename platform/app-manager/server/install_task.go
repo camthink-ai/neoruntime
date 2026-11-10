@@ -31,11 +31,23 @@ func NewInstallTaskStore() *InstallTaskStore {
 }
 
 func (s *InstallTaskStore) Create() *InstallTask {
+	return s.CreateOperation(
+		uuid.New().String()[:8],
+		"validating",
+		0,
+		"Preparing installation...",
+	)
+}
+
+// CreateOperation creates or replaces a task with a caller-selected ID. A
+// stable ID lets synchronous lifecycle calls expose progress while their RPC
+// remains in flight (for example start-<app-id>).
+func (s *InstallTaskStore) CreateOperation(id, phase string, percent float64, message string) *InstallTask {
 	t := &InstallTask{
-		ID:        uuid.New().String()[:8],
-		Phase:     "validating",
-		Percent:   0,
-		Message:   "Preparing installation...",
+		ID:        id,
+		Phase:     phase,
+		Percent:   percent,
+		Message:   message,
 		CreatedAt: time.Now(),
 	}
 	s.mu.Lock()
@@ -60,11 +72,15 @@ func (t *InstallTask) Update(phase string, percent float64, message string) {
 }
 
 func (t *InstallTask) Complete(appID string) {
+	t.CompleteWithMessage(appID, "Installation complete")
+}
+
+func (t *InstallTask) CompleteWithMessage(appID, message string) {
 	t.mu.Lock()
 	t.Phase = "complete"
 	t.Percent = 100
 	t.AppID = appID
-	t.Message = "Installation complete"
+	t.Message = message
 	t.mu.Unlock()
 }
 
