@@ -34,13 +34,14 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
-import { useAppStats } from '@/hooks';
+import { useAppStartProgress, useAppStats } from '@/hooks';
 import type { AppTemplate, AppPermissions } from '@/services/types';
 import {
   networkModeLabelKey,
   uniqueVideoStreamIds,
   videoStreamLabelKey,
 } from '../lib/permissionLabels';
+import { translateStartProgress } from '../lib/startProgressMessage';
 
 function InlinePermissionIcons({
   permissions,
@@ -161,6 +162,9 @@ function AppTableRow({
   const [openPopover, setOpenPopover] = useState(false);
   const appId = String(app.id);
   const isRunning = app.state === 'running';
+  const isStarting = pendingActions.has(`start-${appId}`)
+    || pendingActions.has(`restart-${appId}`);
+  const { data: startProgress } = useAppStartProgress(appId, isStarting);
 
   const shouldFetchStats =    isRunning && !pendingActions.has(`uninstall-${appId}`);
   const { data: statsData } = useAppStats(shouldFetchStats ? appId : '');
@@ -175,6 +179,12 @@ function AppTableRow({
       <td className="px-6 py-4">
         <div className="font-semibold text-foreground">{app.name}</div>
         <div className="text-xs text-muted-foreground mt-1">ID: {appId}</div>
+        {isStarting && (
+          <div className="mt-1 flex items-center gap-1.5 text-xs text-primary">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            <span>{translateStartProgress(startProgress, t)}</span>
+          </div>
+        )}
         <InlinePermissionIcons permissions={app.permissions} />
       </td>
       <td className="px-6 py-4">

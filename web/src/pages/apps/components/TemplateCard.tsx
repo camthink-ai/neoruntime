@@ -29,7 +29,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
-import { useAppStats } from '@/hooks';
+import { useAppStartProgress, useAppStats } from '@/hooks';
 import type { AppTemplate, AppPermissions } from '@/services/types';
 import { Separator } from '@/components/ui/separator';
 import { getAppWebUrl } from '../lib/appWebUrl';
@@ -38,6 +38,7 @@ import {
   uniqueVideoStreamIds,
   videoStreamLabelKey,
 } from '../lib/permissionLabels';
+import { translateStartProgress } from '../lib/startProgressMessage';
 
 interface TemplateCardProps {
   app: AppTemplate;
@@ -172,6 +173,9 @@ export default function TemplateCard({
 
   const isRunning = app.state === 'running';
   const isInstalled = app.state !== undefined;
+  const isStarting = pendingActions.has(`start-${appId}`)
+    || pendingActions.has(`restart-${appId}`);
+  const { data: startProgress } = useAppStartProgress(appId, isStarting);
   const shouldFetchStats =    isRunning && !pendingActions.has(`uninstall-${appId}`);
   const { data: statsData } = useAppStats(shouldFetchStats ? appId : '');
 
@@ -264,6 +268,13 @@ export default function TemplateCard({
         <div className="text-xs font-medium text-muted-foreground">
           {t('sys.apps.import.version', '版本')} : {app.version || '-'}
         </div>
+
+        {isStarting && (
+          <div className="flex items-center gap-2 rounded-md bg-primary/5 px-3 py-2 text-xs text-primary">
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+            <span>{translateStartProgress(startProgress, t)}</span>
+          </div>
+        )}
 
         {isRunning && (
           <div className="flex items-center gap-4 text-xs text-muted-foreground">

@@ -21,6 +21,12 @@ export const appsApi = {
   // 启动应用
   start: (appId: string) => request.post(`/api/v1/apps/${appId}/start`),
 
+  // 启动阶段复用 app-manager 的任务进度接口；任务 ID 在后端按应用固定。
+  getStartProgress: (appId: string) => request.get(
+      `/api/v1/apps/install-progress/${encodeURIComponent(`start-${appId}`)}`,
+      { silent: true } as any
+    ),
+
   // 停止应用
   stop: (appId: string, timeout?: number) => request.post(`/api/v1/apps/${appId}/stop`, null, { params: { timeout } }),
 
