@@ -21,8 +21,8 @@ var (
 
 // CellularGnssStatus is GET /cellular/gnss/status.
 type CellularGnssStatus struct {
-	Enabled    bool     `json:"enabled"`  // config gnss_enabled
-	Active     bool     `json:"active"`   // modem AT+QGPS state
+	Enabled    bool     `json:"enabled"` // config gnss_enabled
+	Active     bool     `json:"active"`  // modem AT+QGPS state
 	Fix        string   `json:"fix"`     // none|2d|3d
 	Latitude   *float64 `json:"latitude"`
 	Longitude  *float64 `json:"longitude"`
