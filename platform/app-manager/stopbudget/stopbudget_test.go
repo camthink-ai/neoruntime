@@ -31,7 +31,10 @@ func TestAPIBudgetsCoverValidatedMaximum(t *testing.T) {
 	if got := ForAPI(23); got != stopBudget {
 		t.Fatalf("ForAPI(23) = %s, want %s", got, stopBudget)
 	}
-	if got := ForRestartAPI(23); got != stopBudget+restartStartBudget {
-		t.Fatalf("ForRestartAPI(23) = %s, want %s", got, stopBudget+restartStartBudget)
+	if got := ForStartAPI(); got != ImageRecoveryBudget+startOperationSlack {
+		t.Fatalf("ForStartAPI() = %s, want %s", got, ImageRecoveryBudget+startOperationSlack)
+	}
+	if got := ForRestartAPI(23); got != stopBudget+ForStartAPI() {
+		t.Fatalf("ForRestartAPI(23) = %s, want %s", got, stopBudget+ForStartAPI())
 	}
 }

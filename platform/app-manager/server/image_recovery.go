@@ -10,9 +10,18 @@ import (
 	"aipc/platform/app-manager/containerd"
 	"aipc/platform/app-manager/manifest"
 	"aipc/platform/app-manager/registry"
+	"aipc/platform/app-manager/stopbudget"
 	"aipc/platform/common/logger"
 	"aipc/platform/common/utils"
 )
+
+// imageRecoveryContext keeps recovery alive when the HTTP/gRPC caller gives
+// up, while retaining namespace and tracing values carried by the request.
+// The operation remains bounded so a wedged containerd cannot hold the
+// per-app mutation lock forever.
+func imageRecoveryContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), stopbudget.ImageRecoveryBudget)
+}
 
 // imageReferencesForApp applies the normalized image recorded at install time
 // for legacy single-container apps, then returns every image the app needs.
@@ -368,18 +377,25 @@ func (s *AppManagerServer) restoreAppImagesFromSavedTar(ctx context.Context, app
 // ensureAppImagesAvailable prefers the persistent local archive and only uses
 // the registry as a fallback. This keeps imported/private apps startable on an
 // offline device after an OS upgrade resets containerd metadata.
-func (s *AppManagerServer) ensureAppImagesAvailable(ctx context.Context, appID string, refs []string) error {
+func (s *AppManagerServer) ensureAppImagesAvailable(ctx context.Context, appID string, refs []string, progress *InstallTask) error {
+	ctx, cancel := imageRecoveryContext(ctx)
+	defer cancel()
+
+	updateStartProgress(progress, "checking_image", 5, "Checking application images...")
 	missing := s.unavailableImageReferences(ctx, refs)
 	if len(missing) == 0 {
 		// Everything is already available: this is the last moment the
 		// current image metadata can bind a legacy pre-sidecar archive.
 		s.migrateUnboundSavedArchive(ctx, appID, refs)
+		updateStartProgress(progress, "image_ready", 55, "Application images are ready")
 		return nil
 	}
 
 	logger.Warn("Images required by app %s are unavailable locally: %v", appID, missing)
+	updateStartProgress(progress, "restoring_image", 20, "Restoring application images from local storage...")
 	localErr := s.restoreAppImagesFromSavedTar(ctx, appID, refs)
 	if localErr == nil {
+		updateStartProgress(progress, "image_ready", 55, "Application images restored")
 		return nil
 	}
 	logger.Warn("[IMAGE-RECOVERY] Local recovery failed for app %s: %v", appID, localErr)
@@ -387,6 +403,7 @@ func (s *AppManagerServer) ensureAppImagesAvailable(ctx context.Context, appID s
 	missing = s.unavailableImageReferences(ctx, refs)
 	for _, ref := range missing {
 		logger.Warn("Image %s still unavailable after local recovery; attempting registry pull", ref)
+		updateStartProgress(progress, "pulling_image", 40, fmt.Sprintf("Pulling application image %s...", ref))
 		if pullErr := s.client.PullImage(ctx, ref); pullErr != nil {
 			return fmt.Errorf("image %s is unavailable; local recovery failed: %v; registry pull failed: %w", ref, localErr, pullErr)
 		}
@@ -395,6 +412,7 @@ func (s *AppManagerServer) ensureAppImagesAvailable(ctx context.Context, appID s
 	if remaining := s.unavailableImageReferences(ctx, refs); len(remaining) > 0 {
 		return fmt.Errorf("images remain unavailable after local recovery and registry pull: %v", remaining)
 	}
+	updateStartProgress(progress, "image_ready", 55, "Application images are ready")
 	return nil
 }
 

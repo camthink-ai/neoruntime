@@ -1,11 +1,41 @@
 package server
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
+
+	"aipc/platform/app-manager/stopbudget"
 )
+
+func TestImageRecoveryContextSurvivesCallerCancellation(t *testing.T) {
+	type contextKey string
+	const key contextKey = "namespace"
+
+	parent, cancelParent := context.WithCancel(context.WithValue(context.Background(), key, "aipc"))
+	cancelParent()
+
+	ctx, cancel := imageRecoveryContext(parent)
+	defer cancel()
+
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("recovery context inherited caller cancellation: %v", err)
+	}
+	if got := ctx.Value(key); got != "aipc" {
+		t.Fatalf("recovery context lost caller value: got %v", got)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("recovery context has no deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= stopbudget.ImageRecoveryBudget-time.Second || remaining > stopbudget.ImageRecoveryBudget {
+		t.Fatalf("recovery deadline remaining = %s, want approximately %s", remaining, stopbudget.ImageRecoveryBudget)
+	}
+}
 
 func TestRecoverySourceCandidates(t *testing.T) {
 	tests := []struct {

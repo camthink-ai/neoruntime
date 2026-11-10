@@ -24,8 +24,14 @@ const (
 	// phase.
 	KillPhaseBudget = KillOpTimeout + SigkillExitWait + KillOpTimeout
 
-	cleanupSlack       = 5 * time.Second
-	restartStartBudget = 30 * time.Second
+	// ImageRecoveryBudget bounds the slow path used when StartApp must import,
+	// unpack, or pull an application image before creating its container.
+	// Large application archives can take minutes on device storage, so the
+	// legacy ten-second StartApp deadline is not sufficient.
+	ImageRecoveryBudget = 10 * time.Minute
+
+	cleanupSlack        = 5 * time.Second
+	startOperationSlack = 30 * time.Second
 )
 
 // NormalizeGracefulTimeoutSeconds applies the StopApp default consistently at
@@ -59,7 +65,13 @@ func ForAPI(gracefulSeconds int32) time.Duration {
 	return ForContainers(gracefulSeconds, MaxContainersPerApp)
 }
 
+// ForStartAPI covers the bounded image-recovery slow path plus normal model
+// preload and container creation after the image becomes available.
+func ForStartAPI() time.Duration {
+	return ImageRecoveryBudget + startOperationSlack
+}
+
 // ForRestartAPI also covers the StartApp phase following a successful stop.
 func ForRestartAPI(gracefulSeconds int32) time.Duration {
-	return ForAPI(gracefulSeconds) + restartStartBudget
+	return ForAPI(gracefulSeconds) + ForStartAPI()
 }

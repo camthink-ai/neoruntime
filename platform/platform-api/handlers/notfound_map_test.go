@@ -146,6 +146,9 @@ func TestAppOps_NotFound_MapTo404(t *testing.T) {
 	})
 	h := &APIHandlers{grpcClients: &GRPCClients{AppManager: conn}}
 
+	// StartApp is excluded: it now returns 202 immediately (fire-and-poll);
+	// a 404 surfaces through the start-<appID> task progress polling, not
+	// the initial POST response.
 	cases := []struct {
 		name    string
 		method  string
@@ -153,7 +156,6 @@ func TestAppOps_NotFound_MapTo404(t *testing.T) {
 		path    string
 		handler gin.HandlerFunc
 	}{
-		{"start app", http.MethodPost, "/apps/:app_id/start", "/apps/__apitest__/start", h.StartApp},
 		{"stop app", http.MethodPost, "/apps/:app_id/stop", "/apps/__apitest__/stop", h.StopApp},
 		{"restart app", http.MethodPost, "/apps/:app_id/restart", "/apps/__apitest__/restart", h.RestartApp},
 		{"uninstall app", http.MethodDelete, "/apps/:app_id", "/apps/__apitest__", h.UninstallApp},
