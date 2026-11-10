@@ -6,7 +6,10 @@ import Player from '@/components/player/player';
 import MediaSettings from './components/MediaSettings';
 import { getItem } from '@/utils/storage';
 import { useMediaStatus } from './hooks/useMedia';
-import { useStreamFallback, useHevcNoticeDismissal } from '@/hooks/useStreamFallback';
+import {
+  useStreamFallback,
+  useHevcNoticeDismissal,
+} from '@/hooks/useStreamFallback';
 
 export default function Monitoring() {
   const { t } = useTranslation();
@@ -40,8 +43,7 @@ export default function Monitoring() {
   // another stream is disabled: the backend rebuilds the remaining encoders,
   // which transiently report status 'starting' (no first frame yet) but still
   // have has_encoder === true.
-  const effectiveEnabled = !!effectiveStreamInfo
-    && !!effectiveStreamInfo.has_encoder;
+  const effectiveEnabled =    !!effectiveStreamInfo && !!effectiveStreamInfo.has_encoder;
 
   // Build a fresh authenticated WebSocket URL for the selected stream.
   const buildStreamUrl = useCallback((streamId: string) => {
@@ -59,9 +61,9 @@ export default function Monitoring() {
   // Full codec/resolution changes rebuild the backend pipeline. Disconnect the
   // old player immediately and reconnect only after the mutation's status poll
   // completes, using the final effective stream (including H.265 fallback).
-  const currentStreamUrl = effectiveEnabled && !isEncoderRestarting
-    ? `${buildStreamUrl(effectiveStreamId)}&reconnect=${playerKey}`
-    : '';
+  const currentStreamUrl =    effectiveEnabled && !isEncoderRestarting
+      ? `${buildStreamUrl(effectiveStreamId)}&reconnect=${playerKey}`
+      : '';
 
   const handleStreamToggleSuccess = useCallback((_streamId: string) => {
     // A stream layout change recreates every encoder, even when the toggled

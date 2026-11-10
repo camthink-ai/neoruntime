@@ -12,6 +12,15 @@ export interface InstallProgress {
   error: string;
 }
 
+const initialStartProgress = (appId: string): InstallProgress => ({
+  task_id: `start-${appId}`,
+  phase: 'checking_image',
+  percent: 0,
+  message: 'Checking application images...',
+  app_id: appId,
+  error: '',
+});
+
 export interface AppManifest {
   manifest_path?: string;
   image_path?: string;
@@ -152,6 +161,12 @@ export const useStartApp = () => {
   const queryClient = useQueryClient();
 
   return useMutation({
+    onMutate: appId => {
+      queryClient.setQueryData(
+        ['app-start-progress', appId],
+        initialStartProgress(appId)
+      );
+    },
     mutationFn: async (appId: string) => {
       const response = await appsApi.start(appId);
       return response.data;
@@ -164,6 +179,24 @@ export const useStartApp = () => {
     },
   });
 };
+
+export const useAppStartProgress = (
+  appId: string | null | undefined,
+  enabled: boolean
+) => useQuery<InstallProgress>({
+    queryKey: ['app-start-progress', appId],
+    queryFn: async () => {
+      if (!appId) throw new Error('App ID is required');
+      const response = await appsApi.getStartProgress(appId);
+      return response.data as InstallProgress;
+    },
+    enabled: enabled && !!appId,
+    // The task ID is stable per app. Keep polling for the lifetime of the
+    // current mutation so a cached "complete" from an earlier start/restart
+    // cannot hide the new operation's initial phases.
+    refetchInterval: enabled ? 750 : false,
+    retry: false,
+  });
 
 export const useStopApp = () => {
   const queryClient = useQueryClient();
@@ -186,6 +219,12 @@ export const useRestartApp = () => {
   const queryClient = useQueryClient();
 
   return useMutation({
+    onMutate: appId => {
+      queryClient.setQueryData(
+        ['app-start-progress', appId],
+        initialStartProgress(appId)
+      );
+    },
     mutationFn: async (appId: string) => {
       const response = await appsApi.restart(appId);
       return response.data;

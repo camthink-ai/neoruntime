@@ -13,14 +13,16 @@ vi.mock('@/utils/storage', () => ({
 vi.mock('./hooks/useMedia', () => ({
   useMediaStatus: () => ({
     data: {
-      streams: [{
-        stream_id: 'main',
-        status: 'active',
-        has_encoder: true,
-        codec: 'h264',
-        width: 1920,
-        height: 1080,
-      }],
+      streams: [
+        {
+          stream_id: 'main',
+          status: 'active',
+          has_encoder: true,
+          codec: 'h264',
+          width: 1920,
+          height: 1080,
+        },
+      ],
     },
   }),
 }));

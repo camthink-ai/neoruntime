@@ -408,7 +408,7 @@ func (h *APIHandlers) StartApp(c *gin.Context) {
 	}
 
 	client := apppb.NewAppManagerClient(h.grpcClients.AppManager)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), stopbudget.ForStartAPI())
 	defer cancel()
 
 	resp, err := client.StartApp(ctx, &apppb.StartRequest{

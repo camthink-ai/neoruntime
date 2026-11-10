@@ -9,6 +9,7 @@ export {
   useWizardInstall,
   useUninstallApp,
   useStartApp,
+  useAppStartProgress,
   useStopApp,
   useRestartApp,
   useInstallProgress,
