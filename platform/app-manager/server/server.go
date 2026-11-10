@@ -1391,15 +1391,15 @@ func finishStartProgress(task *InstallTask, appID string, response *proto.Status
 		return
 	}
 	if rpcErr != nil {
-		task.Fail(rpcErr.Error())
+		task.FailWithLabel("Start failed", rpcErr.Error())
 		return
 	}
 	if response == nil {
-		task.Fail("Application start returned no status")
+		task.FailWithLabel("Start failed", "Application start returned no status")
 		return
 	}
 	if !response.Success {
-		task.Fail(response.Message)
+		task.FailWithLabel("Start failed", response.Message)
 		return
 	}
 	task.CompleteWithMessage(appID, "Application started")

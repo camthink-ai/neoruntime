@@ -407,50 +407,55 @@ func (h *APIHandlers) StartApp(c *gin.Context) {
 		return
 	}
 
+	// Fire-and-poll: the backend creates a start-<appID> progress task and
+	// updates it through each phase (checking_image → restoring → pulling →
+	// creating_container → starting). Return 202 immediately so the nginx
+	// proxy_read_timeout (300s) never kills the connection while a large
+	// image recovery runs under the 10-minute ImageRecoveryBudget. The web
+	// polls GET /apps/install-progress/start-<appID> for real-time status.
 	client := apppb.NewAppManagerClient(h.grpcClients.AppManager)
-	ctx, cancel := context.WithTimeout(context.Background(), stopbudget.ForStartAPI())
-	defer cancel()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), stopbudget.ForStartAPI())
+		defer cancel()
 
-	resp, err := client.StartApp(ctx, &apppb.StartRequest{
-		AppId: appID,
-	})
-	if err != nil {
-		if h.eventLogger != nil {
-			h.eventLogger.LogWithCodeAsync(
-				"app.crashed",
-				events.MessageParams{"app_id": appID, "error": err.Error()},
-				getUsernameFromContext(c),
-			)
-		}
-		Resp(c).FailMsg(CodeAppStartFailed, err.Error())
-		return
-	}
-
-	if !resp.Success {
-		if resp.Code == 404 {
-			Resp(c).FailMsg(CodeAppNotFound, resp.Message)
+		resp, err := client.StartApp(ctx, &apppb.StartRequest{
+			AppId: appID,
+		})
+		if err != nil {
+			if h.eventLogger != nil {
+				h.eventLogger.LogWithCodeAsync(
+					"app.crashed",
+					events.MessageParams{"app_id": appID, "error": err.Error()},
+					getUsernameFromContext(c),
+				)
+			}
 			return
 		}
-		if h.eventLogger != nil {
+
+		if !resp.Success && resp.Code != 404 {
+			if h.eventLogger != nil {
+				h.eventLogger.LogWithCodeAsync(
+					"app.crashed",
+					events.MessageParams{"app_id": appID, "reason": resp.Message},
+					getUsernameFromContext(c),
+				)
+			}
+			return
+		}
+
+		if resp.Success && h.eventLogger != nil {
 			h.eventLogger.LogWithCodeAsync(
-				"app.crashed",
-				events.MessageParams{"app_id": appID, "reason": resp.Message},
+				string(events.EventAppStarted),
+				events.MessageParams{"app_id": appID},
 				getUsernameFromContext(c),
 			)
 		}
-		Resp(c).FailMsg(CodeAppStartFailed, resp.Message)
-		return
-	}
+	}()
 
-	if h.eventLogger != nil {
-		h.eventLogger.LogWithCodeAsync(
-			string(events.EventAppStarted),
-			events.MessageParams{"app_id": appID},
-			getUsernameFromContext(c),
-		)
-	}
-
-	Resp(c).OK(gin.H{"message": resp.Message})
+	Resp(c).OK(gin.H{
+		"message": "Application start initiated",
+		"task_id": "start-" + appID,
+	})
 }
 
 func (h *APIHandlers) StopApp(c *gin.Context) {
