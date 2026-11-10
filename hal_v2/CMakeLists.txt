@@ -1160,4 +1160,22 @@ if(HAL_V2_BUILD_TESTS)
         NAME hailo15_async_provider_lifecycle
         COMMAND hal-hailo15-async-provider-lifecycle-test
     )
+
+    add_executable(hal-hailo15-feed-health-test
+        tests/hailo15_feed_health_test.cpp
+    )
+    target_include_directories(hal-hailo15-feed-health-test PRIVATE
+        ${HAL_V2_ROOT}/platforms/hailo15/media
+    )
+    target_link_libraries(hal-hailo15-feed-health-test PRIVATE
+        Threads::Threads
+    )
+    target_compile_options(hal-hailo15-feed-health-test PRIVATE
+        -Wall -Wextra -Werror
+    )
+
+    add_test(
+        NAME hailo15_feed_health
+        COMMAND hal-hailo15-feed-health-test
+    )
 endif()

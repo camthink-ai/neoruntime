@@ -10,6 +10,11 @@
 
 #include <hailo/media_library/media_library.hpp>
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 namespace
 {
 
@@ -164,6 +169,81 @@ bool hailo15_motion_detect_update(Hailo15MediaPriv *p, const std::string &sid,
 
 } // namespace
 
+namespace
+{
+
+/* Alarm window for uninterrupted auto-feed failures. Two seconds covers the
+ * transient misses a reinit ramp-up produces (~a few frames at 30fps) while
+ * still latching long before the daemon-side 10s encoded-gap stall monitor
+ * would, so the FEED_STALL_ALARM names the cause (encoder input rejected)
+ * ahead of the symptom (no encoded packets). */
+constexpr uint32_t kFeedStallWindowMs = 2000;
+
+/* Debug injection: set AIPC_HAL_INJECT_FEED_FAIL=<stream_id> (e.g. "sink1")
+ * to force add_buffer failures for that one stream. Optional "@<seconds>"
+ * suffix delays onset (e.g. "sink1@30" fails starting 30s after HAL load) so
+ * the stream first produces packets — exercising the daemon's encoded-gap
+ * rebuild path exactly like a real mid-stream caps/layout fault. The stream
+ * really starves while active — test-only, never ship enabled. */
+struct FeedInjectPlan
+{
+    const char *sid = nullptr;   /* nullptr: injection disabled */
+    uint64_t after_ms = 0;
+    std::chrono::steady_clock::time_point loaded_at{};
+};
+
+bool feed_fail_inject_active(const std::string &sid)
+{
+    static const FeedInjectPlan plan = []() {
+        FeedInjectPlan p;
+        p.loaded_at = std::chrono::steady_clock::now();
+        const char *raw = std::getenv("AIPC_HAL_INJECT_FEED_FAIL");
+        if (raw == nullptr || raw[0] == '\0')
+        {
+            return p;
+        }
+        /* Split "sink1@30" -> sid "sink1", onset 30s (default 0 = immediate). */
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%s", raw);
+        uint64_t delay_s = 0;
+        char *at = std::strchr(buf, '@');
+        if (at != nullptr)
+        {
+            *at = '\0';
+            delay_s = static_cast<uint64_t>(std::strtoull(at + 1, nullptr, 10));
+        }
+        static char sid_buf[64];
+        std::snprintf(sid_buf, sizeof(sid_buf), "%s", buf);
+        p.sid = sid_buf;
+        p.after_ms = delay_s * 1000;
+        return p;
+    }();
+    if (plan.sid == nullptr)
+    {
+        return false;
+    }
+    if (sid != plan.sid)
+    {
+        return false;
+    }
+    if (plan.after_ms == 0)
+    {
+        return true;
+    }
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - plan.loaded_at).count() >=
+           static_cast<int64_t>(plan.after_ms);
+}
+
+/* Steady-clock milliseconds for the streak window math. */
+uint64_t feed_steady_ms()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+} // namespace
+
 int hailo15_connect_media_priv_frontend(Hailo15MediaPriv *p)
 {
     if (!p || !p->media_lib || !p->media_lib->m_frontend)
@@ -173,6 +253,10 @@ int hailo15_connect_media_priv_frontend(Hailo15MediaPriv *p)
     FrontendCallbacksMap fe_map;
     for (const auto &sid : p->frontend_stream_ids)
     {
+        /* Feed-health entries are created here (connect is single-threaded);
+         * the callback below only touches the atomics inside them. */
+        p->feed_health.try_emplace(sid, std::make_unique<Hailo15FeedHealth>());
+        p->encoder_feed_suspended.try_emplace(sid, false);
         fe_map[sid] = [p, sid](HailoMediaLibraryBufferPtr buf, uint32_t sz) {
             (void)sz;
             if (!buf)
@@ -269,20 +353,82 @@ int hailo15_connect_media_priv_frontend(Hailo15MediaPriv *p)
 
             if (do_auto_feed)
             {
+                /* Feed-health entry is prebuilt at connect; lock-free atomics
+                 * only on this GStreamer streaming thread. */
+                auto fh_it = p->feed_health.find(sid);
+                Hailo15FeedHealth *fh = (fh_it != p->feed_health.end()) ? fh_it->second.get() : nullptr;
+
+                media_library_return mr = media_library_return::MEDIA_LIBRARY_SUCCESS;
                 auto enc_it = p->media_lib->m_encoders.find(sid);
-                if (enc_it != p->media_lib->m_encoders.end() && enc_it->second)
+                /* Debug injection (AIPC_HAL_INJECT_FEED_FAIL[=@delay_s]). */
+                const bool injected = feed_fail_inject_active(sid);
+                if (!injected && enc_it != p->media_lib->m_encoders.end() && enc_it->second)
                 {
-                    media_library_return mr = enc_it->second->add_buffer(buf);
-                    if (mr != MEDIA_LIBRARY_SUCCESS && p->feed_err_count[sid]++ < 5)
-                    {
-                        HAL_LOG_ERROR("hailo15_media: auto_feed add_buffer('%s') failed: %d",
-                                      sid.c_str(), static_cast<int>(mr));
-                    }
+                    mr = enc_it->second->add_buffer(buf);
                 }
-                else if (p->feed_err_count[sid]++ < 5)
+                else if (!injected)
                 {
-                    HAL_LOG_ERROR("hailo15_media: auto_feed: no encoder for '%s' (encoders=%zu)",
-                                  sid.c_str(), p->media_lib->m_encoders.size());
+                    /* Frames arrive but the encoder object is gone — same
+                     * user-visible starvation as a rejected buffer. Sentinel
+                     * -1 marks "no encoder" in the health snapshot. */
+                    mr = media_library_return::MEDIA_LIBRARY_ERROR;
+                    if (fh)
+                    {
+                        const bool alarm = feed_health_record_failure(*fh, -1, feed_steady_ms(),
+                                                                      kFeedStallWindowMs);
+                        /* Early-failure diagnostics keyed on the CURRENT streak
+                         * (consec), not the lifetime total — a second fault in
+                         * the same process must still get its first-3 logs. */
+                        if (alarm || fh->consecutive_failures.load(std::memory_order_relaxed) <= 3)
+                        {
+                            HAL_LOG_ERROR("hailo15_media: auto_feed: no encoder for '%s' (encoders=%zu)%s",
+                                          sid.c_str(), p->media_lib->m_encoders.size(),
+                                          alarm ? " [FEED_STALL]" : "");
+                        }
+                    }
+                    fh = nullptr; /* already accounted above */
+                }
+                else
+                {
+                    /* Injected failure: synthesize the vendor error code used
+                     * by a rejected push, without calling add_buffer. */
+                    mr = media_library_return::MEDIA_LIBRARY_ERROR;
+                }
+
+                if (fh)
+                {
+                    if (mr != media_library_return::MEDIA_LIBRARY_SUCCESS)
+                    {
+                        const uint64_t now_ms = feed_steady_ms();
+                        const uint32_t consec =
+                            fh->consecutive_failures.load(std::memory_order_relaxed) + 1;
+                        const bool alarm = feed_health_record_failure(
+                            *fh, static_cast<int32_t>(mr), now_ms, kFeedStallWindowMs);
+                        if (alarm)
+                        {
+                            HAL_LOG_ERROR("hailo15_media: FEED_STALL_ALARM stream='%s' "
+                                          "consec=%u window_ms=%u vendor_ret=%d "
+                                          "(encoder input rejected persistently — suspected "
+                                          "caps/layout mismatch)",
+                                          sid.c_str(), consec, kFeedStallWindowMs,
+                                          static_cast<int>(mr));
+                        }
+                        else if (consec <= 3)
+                        {
+                            HAL_LOG_ERROR("hailo15_media: auto_feed add_buffer('%s') failed: %d",
+                                          sid.c_str(), static_cast<int>(mr));
+                        }
+                    }
+                    else
+                    {
+                        const bool was_latched = feed_health_record_success(*fh);
+                        if (was_latched)
+                        {
+                            HAL_LOG_INFO("hailo15_media: FEED_RECOVERED stream='%s' "
+                                         "(auto-feed accepted again)",
+                                         sid.c_str());
+                        }
+                    }
                 }
             }
             (void)buf->sync_end();

@@ -1376,11 +1376,53 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 	task.Complete(appInfo.ID)
 }
 
+func startProgressTaskID(appID string) string {
+	return "start-" + appID
+}
+
+func updateStartProgress(task *InstallTask, phase string, percent float64, message string) {
+	if task != nil {
+		task.Update(phase, percent, message)
+	}
+}
+
+func finishStartProgress(task *InstallTask, appID string, response *proto.Status, rpcErr error) {
+	if task == nil {
+		return
+	}
+	if rpcErr != nil {
+		task.FailWithLabel("Start failed", rpcErr.Error())
+		return
+	}
+	if response == nil {
+		task.FailWithLabel("Start failed", "Application start returned no status")
+		return
+	}
+	if !response.Success {
+		task.FailWithLabel("Start failed", response.Message)
+		return
+	}
+	task.CompleteWithMessage(appID, "Application started")
+}
+
 // StartApp implements AppManager.StartApp
-func (s *AppManagerServer) StartApp(ctx context.Context, req *proto.StartRequest) (*proto.Status, error) {
+func (s *AppManagerServer) StartApp(ctx context.Context, req *proto.StartRequest) (response *proto.Status, rpcErr error) {
 	logger.Info("StartApp called: app_id=%s", req.AppId)
 	unlockApp := s.lockAppMutation(req.AppId)
 	defer unlockApp()
+
+	var progress *InstallTask
+	if s.taskStore != nil {
+		progress = s.taskStore.CreateOperation(
+			startProgressTaskID(req.AppId),
+			"checking_image",
+			5,
+			"Checking application images...",
+		)
+	}
+	defer func() {
+		finishStartProgress(progress, req.AppId, response, rpcErr)
+	}()
 
 	// Get app info
 	appInfo, err := s.registry.Get(req.AppId)
@@ -1423,15 +1465,15 @@ func (s *AppManagerServer) StartApp(ctx context.Context, req *proto.StartRequest
 
 	// Check if this is a multi-container application
 	if appManifest.IsMultiContainer() {
-		return s.startMultiContainerApp(ctx, req.AppId, appInfo, appManifest)
+		return s.startMultiContainerApp(ctx, req.AppId, appInfo, appManifest, progress)
 	}
 
 	// Single container mode (existing logic)
-	return s.startSingleContainerApp(ctx, req.AppId, appInfo, appManifest)
+	return s.startSingleContainerApp(ctx, req.AppId, appInfo, appManifest, progress)
 }
 
 // startSingleContainerApp starts a single-container application
-func (s *AppManagerServer) startSingleContainerApp(ctx context.Context, appID string, appInfo *registry.AppInfo, appManifest *manifest.AppManifest) (*proto.Status, error) {
+func (s *AppManagerServer) startSingleContainerApp(ctx context.Context, appID string, appInfo *registry.AppInfo, appManifest *manifest.AppManifest, progress *InstallTask) (*proto.Status, error) {
 	// IMPORTANT: Use the image reference stored in the registry (set during
 	// InstallApp) rather than re-reading from the manifest file. The registry
 	// entry contains the normalized image name that matches what containerd
@@ -1458,7 +1500,7 @@ func (s *AppManagerServer) startSingleContainerApp(ctx context.Context, appID st
 	// Create and start container via containerd
 	if s.runtime != nil {
 		ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
-		if err := s.ensureAppImagesAvailable(ctxWithNamespace, appID, appManifest.ImageReferences()); err != nil {
+		if err := s.ensureAppImagesAvailable(ctxWithNamespace, appID, appManifest.ImageReferences(), progress); err != nil {
 			return &proto.Status{
 				Success: false,
 				Message: fmt.Sprintf("Failed to restore required application images: %v", err),
@@ -1470,6 +1512,7 @@ func (s *AppManagerServer) startSingleContainerApp(ctx context.Context, appID st
 		// registration refusal (including an id/path/config collision) must
 		// stop the start — otherwise the app launches against no model or
 		// somebody else's incumbent registration.
+		updateStartProgress(progress, "preloading_models", 65, "Preloading required models...")
 		if err := s.PreloadModels(ctx, appID, appManifest); err != nil {
 			return &proto.Status{
 				Success: false,
@@ -1479,6 +1522,7 @@ func (s *AppManagerServer) startSingleContainerApp(ctx context.Context, appID st
 		}
 
 		imageName := appManifest.GetNormalizedImage()
+		updateStartProgress(progress, "creating_container", 80, "Creating application container...")
 
 		// Check if container already exists (from previous run)
 		// If exists, remove it first to avoid snapshot conflicts
@@ -1530,6 +1574,7 @@ func (s *AppManagerServer) startSingleContainerApp(ctx context.Context, appID st
 		}
 
 		// Start container
+		updateStartProgress(progress, "starting_container", 92, "Starting application container...")
 		task, err := s.runtime.StartAppContainer(ctxWithNamespace, container, appID)
 		if err != nil {
 			// Try to remove container if start failed
@@ -1604,7 +1649,7 @@ func (s *AppManagerServer) startSingleContainerApp(ctx context.Context, appID st
 }
 
 // startMultiContainerApp starts a multi-container application (Main/Sub architecture)
-func (s *AppManagerServer) startMultiContainerApp(ctx context.Context, appID string, appInfo *registry.AppInfo, appManifest *manifest.AppManifest) (*proto.Status, error) {
+func (s *AppManagerServer) startMultiContainerApp(ctx context.Context, appID string, appInfo *registry.AppInfo, appManifest *manifest.AppManifest, progress *InstallTask) (*proto.Status, error) {
 	logger.Info("Starting multi-container app: app_id=%s, containers=%d", appID, len(appManifest.Spec.Containers))
 
 	if s.runtime == nil {
@@ -1616,7 +1661,7 @@ func (s *AppManagerServer) startMultiContainerApp(ctx context.Context, appID str
 	}
 
 	ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
-	if err := s.ensureAppImagesAvailable(ctxWithNamespace, appID, imageReferencesForApp(appInfo, appManifest)); err != nil {
+	if err := s.ensureAppImagesAvailable(ctxWithNamespace, appID, imageReferencesForApp(appInfo, appManifest), progress); err != nil {
 		return &proto.Status{
 			Success: false,
 			Message: fmt.Sprintf("Failed to restore required application images: %v", err),
@@ -1628,6 +1673,7 @@ func (s *AppManagerServer) startMultiContainerApp(ctx context.Context, appID str
 	// instance. A failed restore leaves the currently running instance alone
 	// instead of tearing it down and then discovering the replacement cannot
 	// infer.
+	updateStartProgress(progress, "preloading_models", 65, "Preloading required models...")
 	if err := s.PreloadModels(ctx, appID, appManifest); err != nil {
 		return &proto.Status{
 			Success: false,
@@ -1647,6 +1693,7 @@ func (s *AppManagerServer) startMultiContainerApp(ctx context.Context, appID str
 	s.multiContainerMutex.Unlock()
 
 	// Create all containers
+	updateStartProgress(progress, "creating_container", 80, "Creating application containers...")
 	instance, err := s.runtime.CreateMultiContainerApp(
 		ctxWithNamespace,
 		appID,
@@ -1662,6 +1709,7 @@ func (s *AppManagerServer) startMultiContainerApp(ctx context.Context, appID str
 	}
 
 	// Start all containers in order
+	updateStartProgress(progress, "starting_container", 92, "Starting application containers...")
 	if err := s.runtime.StartMultiContainerApp(ctxWithNamespace, appID, instance, appManifest); err != nil {
 		// Cleanup on failure
 		s.runtime.RemoveMultiContainerApp(ctxWithNamespace, instance)

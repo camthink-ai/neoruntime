@@ -457,6 +457,12 @@ void EncodedPublisher::on_packet(const std::string& stream_name, const HalPacket
             it->second->queue_overflow_drops.fetch_add(1, std::memory_order_relaxed);
         }
         queue_.push_back(std::move(qp));
+        const size_t depth = queue_.size();
+        size_t previous = queue_high_watermark_.load(std::memory_order_relaxed);
+        while (depth > previous &&
+               !queue_high_watermark_.compare_exchange_weak(
+                   previous, depth, std::memory_order_relaxed)) {
+        }
         it->second->last_packet_seq.store(seq, std::memory_order_relaxed);
         it->second->packets_published.fetch_add(1, std::memory_order_relaxed);
         it->second->bytes_published.fetch_add(packet->size, std::memory_order_relaxed);
@@ -902,4 +908,13 @@ bool EncodedPublisher::get_stream_stats(const std::string& name, StreamDropStats
         out->clients = (uint32_t)ss.clients.size();
     }
     return true;
+}
+
+EncodedPublisher::QueueDebugStats EncodedPublisher::get_queue_debug_stats() {
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    QueueDebugStats out;
+    out.depth = queue_.size();
+    out.capacity = MAX_QUEUE_SIZE;
+    out.high_watermark = queue_high_watermark_.load(std::memory_order_relaxed);
+    return out;
 }

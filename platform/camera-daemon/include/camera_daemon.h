@@ -716,6 +716,18 @@ private:
     // stuck in "deactivating" until TimeoutStopSec/SIGKILL.
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> override_in_progress_{false};
+    // Main-loop-only liveness/recovery latch. A persistent encoded-frame gap
+    // emits one detailed pipeline snapshot. If raw frames stopped as well, the
+    // next poll performs a rate-limited supervisor restart because a failed
+    // MediaLibrary denoise task cannot be restarted in place. Normal frame flow
+    // clears the latch and reports the outage duration.
+    bool pipeline_stall_snapshot_latched_ = false;
+    bool pipeline_stall_recovery_decided_ = false;
+    std::chrono::steady_clock::time_point pipeline_stall_started_at_{};
+    // Feed-stall escalation pacing: earliest time a supervisor restart may
+    // be triggered again (one per window — a persistent caps/layout fault
+    // would otherwise flap restarts). Main-loop-only, no lock needed.
+    std::chrono::steady_clock::time_point next_feed_stall_escalation_allowed_{};
     // Effective encoder feed mode for FROM_MEDIA:
     // true  -> MediaLibrary auto-feed frontend->encoder
     // false -> manual feed via FrameRouter encoder subscriber
@@ -1014,6 +1026,11 @@ private:
     bool init_ai_overlay();
     /** Rebind VideoSource after MediaLibrary replaces its borrowed video contexts. */
     bool resync_video_source_from_media_pipeline(const char* reason);
+    /** After a full-reinit rebuild, update config_.streams / config_.encoders
+     *  dims from the (fresh) HAL video/codec contexts. Identity (names,
+     *  mapping) never changes — only geometry. Called from the transform
+     *  full-reinit tail; ReconfigurePipeline does its own full discovery. */
+    void reconcile_stream_dims_from_media_pipeline(const char* reason);
     /** Re-register EncoderManager from get_codec_list after MediaLibrary reallocates codec contexts. */
     bool resync_encoders_from_media_pipeline();
     /** Finish a partially aborted encoder teardown and restore all live HAL registrations. */
@@ -1029,6 +1046,12 @@ private:
      * verify window. Constants kVerifyPollMs / kVerifyFreshMs live in the .cpp.
      */
     bool verify_primary_stream_frames(uint64_t budget_ms, std::string* primary_out = nullptr);
+    /** One-Hz video liveness monitor with rate-limited upstream-stall recovery. */
+    void poll_pipeline_stall_diagnostics();
+    /** Emit a one-shot cross-stage snapshot after a persistent video gap. */
+    void emit_pipeline_stall_snapshot(const std::string& primary_config_name,
+                                      const std::string& primary_media_name,
+                                      uint64_t encoded_gap_ms);
     void configure_osd();
     void register_subscribers();
 

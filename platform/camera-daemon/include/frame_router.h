@@ -64,6 +64,14 @@ struct RouterStreamStats {
     uint64_t force_reclaimed = 0;
 };
 
+/** Process-wide router state captured when the video liveness monitor fires. */
+struct RouterDebugSnapshot {
+    size_t dispatch_queue_depth = 0;
+    size_t outstanding_frames = 0;
+    size_t active_subscribers = 0;
+    uint64_t oldest_outstanding_ms = 0;
+};
+
 /* ========== Frame Router ========== */
 
 class FrameRouter {
@@ -143,6 +151,10 @@ public:
     bool wait_next_frames(const std::string& stream_name, uint32_t count,
                           std::chrono::milliseconds timeout);
     uint64_t frame_sequence(const std::string& stream_name) const;
+    /** Milliseconds since the HAL delivered a raw frame (UINT64_MAX if never). */
+    uint64_t ms_since_last_frame(const std::string& stream_name) const;
+    /** Queue/reference snapshot for one-shot pipeline-stall diagnostics. */
+    RouterDebugSnapshot get_debug_snapshot() const;
 
 private:
     VideoSource*   source_;
@@ -165,6 +177,8 @@ private:
     mutable std::mutex frame_clock_mu_;
     std::condition_variable frame_clock_cv_;
     std::unordered_map<std::string, uint64_t> frame_sequences_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        last_frame_times_;
 
     // Async dispatch queue
     struct QueuedFrame {
@@ -172,7 +186,7 @@ private:
         std::vector<FrameConsumerFn>  callbacks;
     };
     static constexpr size_t MAX_DISPATCH_QUEUE = 8;
-    std::mutex dispatch_mu_;
+    mutable std::mutex dispatch_mu_;
     std::condition_variable dispatch_cv_;
     std::deque<QueuedFrame> dispatch_queue_;
     std::thread dispatch_thread_;

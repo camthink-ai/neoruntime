@@ -4,6 +4,7 @@
  */
 
 #include "../include/frame_watchdog.h"
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -66,7 +67,21 @@ void FrameWatchdog::clear_in_use(uint64_t frame_id) {
 }
 
 WatchdogStats FrameWatchdog::get_stats() const {
-    return stats_;
+    std::lock_guard<std::mutex> lock(mu_);
+    WatchdogStats out = stats_;
+    const auto now = std::chrono::steady_clock::now();
+    out.tracked_frames = tracked_.size();
+    for (const auto& [frame_id, tracked] : tracked_) {
+        (void)frame_id;
+        if (tracked.in_use > 0) ++out.in_use_frames;
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - tracked.lend_time).count();
+        if (age > 0) {
+            out.oldest_held_ms = std::max(out.oldest_held_ms,
+                static_cast<uint64_t>(age));
+        }
+    }
+    return out;
 }
 
 void FrameWatchdog::scan_loop() {

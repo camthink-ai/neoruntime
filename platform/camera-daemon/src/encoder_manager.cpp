@@ -443,6 +443,7 @@ void EncoderManager::on_packet(void* codec_ctx, const HalPacketBuffer* packet) {
         if (eit != encoders_.end()) {
             auto& slot = eit->second;
             slot.last_packet_time = std::chrono::steady_clock::now();
+            ++slot.packet_sequence;
             if (!slot.logged_first_packet) {
                 slot.logged_first_packet = true;
                 log_first = true;
@@ -762,6 +763,12 @@ bool EncoderManager::seen_first_packet(const std::string& stream_name) const {
     auto it = encoders_.find(stream_name);
     if (it == encoders_.end()) return false;
     return it->second.last_packet_time != std::chrono::steady_clock::time_point{};
+}
+
+uint64_t EncoderManager::packet_sequence(const std::string& stream_name) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto it = encoders_.find(stream_name);
+    return it == encoders_.end() ? 0 : it->second.packet_sequence;
 }
 
 bool EncoderManager::is_stream_stalled(const std::string& stream_name,

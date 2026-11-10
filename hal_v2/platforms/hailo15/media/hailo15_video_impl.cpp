@@ -675,7 +675,7 @@ static int hailo15_video_dynamic_change_framerate(void *video_ctx, uint32_t fram
         return HAL_ERR_NOT_SUPPORTED;
     }
     const int r = hailo15::video_ml::apply_frontend_stream_override(priv->media_lib, vc->video_name, std::nullopt,
-                                                                    framerate, std::nullopt, std::nullopt);
+                                                                    framerate, std::nullopt, std::nullopt, priv);
     if (r != HAL_OK)
     {
         return r;
@@ -724,7 +724,7 @@ static int hailo15_video_dynamic_change_format(void *video_ctx, HalPixelFormat f
         return HAL_ERR_NOT_SUPPORTED;
     }
     const int r = hailo15::video_ml::apply_frontend_stream_override(priv->media_lib, vc->video_name, std::nullopt,
-                                                                    std::nullopt, format, std::nullopt);
+                                                                    std::nullopt, format, std::nullopt, priv);
     if (r != HAL_OK)
     {
         return r;
@@ -778,7 +778,7 @@ static int hailo15_video_dynamic_change_pool_max_buffers(void *video_ctx, uint32
         return HAL_ERR_NOT_SUPPORTED;
     }
     const int r = hailo15::video_ml::apply_frontend_stream_override(priv->media_lib, vc->video_name, std::nullopt,
-                                                                    std::nullopt, std::nullopt, pool_max_buffers);
+                                                                    std::nullopt, std::nullopt, pool_max_buffers, priv);
     if (r != HAL_OK)
     {
         return r;

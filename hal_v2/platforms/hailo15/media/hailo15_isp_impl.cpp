@@ -136,6 +136,16 @@ static void ml_sync_flicker_period(Hailo15MediaPriv *priv, uint16_t ioctl_freq_0
         }
         config_profile_t p = prof_exp.value();
         auto &aac = p.iq_settings.automatic_algorithms_config;
+        /* Same-value skip: pushing an identical flicker_period only re-loads IQ state
+         * (transient firmware auto-algorithm restart, visible as a 1-2 frame blue/green
+         * flash). The compare is against the LIVE profile, never a cache: a pipeline
+         * rebuild reloads iq_settings and re-diverges this check, so a needed push is
+         * never skipped. */
+        if (aac.adaptive_ae.flicker_period == ioctl_freq_0_2 &&
+            aac.hdr_adaptive_ae.flicker_period == ioctl_freq_0_2)
+        {
+            return;
+        }
         aac.adaptive_ae.flicker_period = ioctl_freq_0_2;
         aac.hdr_adaptive_ae.flicker_period = ioctl_freq_0_2;
         const media_library_return r = priv->media_lib->set_override_parameters(p);
@@ -182,6 +192,12 @@ static void ml_sync_backlight_wdr(Hailo15MediaPriv *priv, int backlight_0_100)
         uint16_t wdr_max = 0;
         uint16_t wdr_min = 0;
         backlight_wdr_levels_from_percentage(mx, mn, pct, &wdr_max, &wdr_min);
+        /* Same-value skip: re-pushing identical backlight levels only re-loads IQ state
+         * (transient blue/green flash). Live-profile compare — see ml_sync_flicker_period. */
+        if (aae.wdrContrast.max == wdr_max && aae.wdrContrast.min == wdr_min)
+        {
+            return;
+        }
         p.iq_settings.automatic_algorithms_config.adaptive_ae.wdrContrast.max = wdr_max;
         p.iq_settings.automatic_algorithms_config.adaptive_ae.wdrContrast.min = wdr_min;
         const media_library_return r = priv->media_lib->set_override_parameters(p);
@@ -243,6 +259,23 @@ static void ml_apply_isp_auto_algorithm_blocks(Hailo15MediaPriv *priv, bool enab
         const bool auto_blocks_enabled =
             aac.ae_e_v1.enabled || aac.a_cproc.enabled || aac.aw_drv4.enabled;
         const bool disabling_auto_blocks = !enable_ae_cproc_aw_drv && auto_blocks_enabled;
+        /* Same-state skip: when every enabled/disabled flag in the LIVE profile already
+         * matches the requested auto-block configuration, the set_override_parameters
+         * below would only re-push identical IQ state — the firmware restarts its auto
+         * algorithms and the picture flashes blue/green for 1-2 frames. Steady-state
+         * slider commits (picture tuning already manual, or already auto) hit this path.
+         * The compare is against the live profile ON PURPOSE: a pipeline rebuild reloads
+         * iq_settings and re-enables the firmware blocks, so the check re-diverges and a
+         * needed disable push is never skipped (the stale-cache failure mode above). A
+         * contradictory profile (enabled matches but disable set) still falls through
+         * and gets healed by the push. */
+        if (aac.ae_e_v1.enabled == enable_ae_cproc_aw_drv &&
+            aac.a_cproc.enabled == enable_ae_cproc_aw_drv &&
+            aac.aw_drv4.enabled == enable_ae_cproc_aw_drv &&
+            !aac.ae_e_v1.disable && !aac.a_cproc.disable && !aac.aw_drv4.disable)
+        {
+            return;
+        }
         if (disabling_auto_blocks)
         {
             /* V1 video_impl: brief delay before disabling auto blocks when entering manual (AE converge). */
@@ -1367,10 +1400,20 @@ static bool resolve_noise_reduction_ctrl(int fd)
     return false;
 }
 
+static bool isp_read_noise_reduction(v4l2::v4l2ControlManager &m, int *out_nr);
+
 static bool isp_apply_noise_reduction(v4l2::v4l2ControlManager &m, int nr_0_100)
 {
     const int32_t v =
         std::clamp(static_cast<int32_t>(nr_0_100), static_cast<int32_t>(0), static_cast<int32_t>(100));
+    /* Same-value skip: re-writing an identical NR strength makes the ISP NR block
+     * re-sync when an unrelated field (e.g. WDR) triggers this group apply — visible
+     * as a 1-2 frame blue/green flash. Read failure falls through to the write. */
+    int nr_now = -1;
+    if (isp_read_noise_reduction(m, &nr_now) && nr_now == static_cast<int>(v))
+    {
+        return true;
+    }
     (void)safe_ext_ctrl_set_optional(m, v4l2::Video0Ctrl::NOISE_REDUCTION, static_cast<uint16_t>(v));
     auto fd_opt = m.get_fd(v4l2::Device::VIDEO0);
     if (!fd_opt.has_value())
@@ -1643,9 +1686,10 @@ static int32_t s_baseline_wdr = 0;
 static bool s_picture_baselines_loaded = false;
 
 /**
- * Webserver keeps m_baseline_stream_params fixed for the whole manual session — UI 50% maps to these values.
- * s_baseline_* can be re-read at wrong times; s_ref_* is captured once when entering manual (first apply_manual
- * after invalidate) and used for percent <-> HW until manual is turned off.
+ * Webserver keeps m_baseline_stream_params fixed while the active ISP profile is unchanged — UI 50% maps to
+ * these values.  s_baseline_* can be re-read at wrong times; s_ref_* is captured once when first entering
+ * manual and used for percent <-> HW across ordinary manual off/on toggles.  A real ISP reset/profile rebuild
+ * calls hailo15_isp_webserver_reset_state(), which invalidates both the hardware snapshot and this reference.
  */
 static int32_t s_ref_brightness = 0;
 static int32_t s_ref_contrast = 114;
@@ -1779,17 +1823,36 @@ extern "C" void hailo15_isp_webserver_reset_state(void)
 bool apply_exposure(v4l2::v4l2ControlManager &m, const HalIspExposureConfig *config, Hailo15MediaPriv *ml_priv)
 {
     bool ok = true;
-    ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AE_ENABLE, static_cast<int32_t>(config->auto_exposure ? 1 : 0));
+    /* Same-value skip: rewriting AE_ENABLE/ET/GAIN with the values already latched makes
+     * the firmware restart its exposure state machine — visible as a 1-2 frame blue/green
+     * flash when an unrelated field (WDR/NR) lands in the same set_image_config group.
+     * Read back live state and only write what differs; a failed read falls through to
+     * the write so behavior degrades to the old always-write path, never to a lost write. */
+    const int32_t ae_target = config->auto_exposure ? 1 : 0;
+    int32_t ae_now = -1;
+    if (!safe_get(m, v4l2::Video0Ctrl::AE_ENABLE, ae_now) || ae_now != ae_target)
+    {
+        ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AE_ENABLE, ae_target);
+    }
     if (!config->auto_exposure)
     {
         /* Align with V1 HAL manual exposure limits (see HAL_ISP_MANUAL_EXPOSURE_US_*). */
         const uint16_t integration =
             clamp_u16(static_cast<int64_t>(config->exposure_time_us), 2000u, 33000u);
-        ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AE_INTEGRATION_TIME, integration);
         /* UI gain -> driver register (same scaling as V1 / webserver). */
         const int32_t gain_ui = clamp_i32(config->gain, 1, 3800);
         const uint32_t reg_gain = static_cast<uint32_t>(static_cast<int64_t>(gain_ui) * 1024);
-        ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AE_GAIN, reg_gain);
+        int32_t et_now = -1;
+        if (!safe_get(m, v4l2::Video0Ctrl::AE_INTEGRATION_TIME, et_now) ||
+            et_now != static_cast<int32_t>(integration))
+        {
+            ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AE_INTEGRATION_TIME, integration);
+        }
+        int32_t g_now = -1;
+        if (!safe_get(m, v4l2::Video0Ctrl::AE_GAIN, g_now) || g_now != static_cast<int32_t>(reg_gain))
+        {
+            ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AE_GAIN, reg_gain);
+        }
     }
     else
     {
@@ -1820,8 +1883,6 @@ bool apply_manual(v4l2::v4l2ControlManager &m, const HalIspManualConfig *config)
     {
         return true;
     }
-    /* First apply in a manual session: after writes, snap refs to HW so GET matches (driver may clamp/quantize). */
-    const bool snap_refs_after_write = !s_manual_ref_valid;
     ensure_picture_baselines(m);
     if (!s_manual_ref_valid)
     {
@@ -1844,6 +1905,15 @@ bool apply_manual(v4l2::v4l2ControlManager &m, const HalIspManualConfig *config)
     const int32_t s_hw = calc_from_percent_s(saturation_p, 0, 199, s_ref_saturation);
     const uint16_t sh_down = calc_from_percent_u(sharpness_p, 0, 65535, s_ref_sharpness_down);
     const uint16_t sh_up = calc_from_percent_u(sharpness_p, 0, 30000, s_ref_sharpness_up);
+
+    HAL_LOG_DEBUG("Hailo15 ISP: manual map UI[B=%d C=%d S=%d Sh=%d] "
+                  "ref[B=%d C=%d S=%d ShD=%u ShU=%u] -> HW[B=%d C=%d S=%d ShD=%u ShU=%u]",
+                  brightness_p, contrast_p, saturation_p, sharpness_p,
+                  s_ref_brightness, s_ref_contrast, s_ref_saturation,
+                  static_cast<unsigned>(s_ref_sharpness_down),
+                  static_cast<unsigned>(s_ref_sharpness_up),
+                  b_hw, c_hw, s_hw, static_cast<unsigned>(sh_down),
+                  static_cast<unsigned>(sh_up));
 
     /* Match webserver: set BRIGHTNESS as int32_t (int8 domain) — see isp.cpp stream_params POST.
      * cproc controls go through the manager first (works on kernels that implement
@@ -1921,7 +1991,13 @@ static int hailo15_isp_set_image_config(void *video_ctx, const HalIspImageConfig
         ml_apply_isp_auto_algorithm_blocks(ml_priv, !g_manual_enabled);
         if (entering_manual || leaving_manual)
         {
-            invalidate_picture_baselines();
+            /* An ordinary mode toggle must not replace the manual reference
+             * with a momentary ACproc value sampled while automatic filters
+             * are running.  Keep s_ref_* stable so the same UI percentages
+             * map to the same V4L2 values after off -> on.  Profile/pipeline
+             * resets still invalidate the reference through
+             * hailo15_isp_webserver_reset_state(). */
+            invalidate_picture_baselines_hw_only();
         }
         s_manual_picture_mode_track = g_manual_enabled;
         /* Load WDR/NR baselines before touching those controls. */
@@ -1964,18 +2040,40 @@ static int hailo15_isp_set_image_config(void *video_ctx, const HalIspImageConfig
             const int32_t wdr_p = clamp_i32(config->wdr_value, 0, 100);
             const int32_t calib = s_manual_ref_valid ? s_ref_wdr : s_baseline_wdr;
             const int32_t wdr_hw = calc_from_percent_s(wdr_p, -1023, 1023, calib);
-            ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::WDR_CONTRAST, static_cast<int16_t>(wdr_hw));
+            /* Same-value skip: an NR-only commit must not re-latch WDR and re-sync the
+             * tone-mapping block. Live read-back; read failure falls through to the write. */
+            int32_t wdr_now = 0;
+            if (!safe_get(m, v4l2::Video0Ctrl::WDR_CONTRAST, wdr_now) || wdr_now != wdr_hw)
+            {
+                ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::WDR_CONTRAST, static_cast<int16_t>(wdr_hw));
+            }
         }
         (void)isp_apply_noise_reduction(m, config->noise_reduction);
         if (config->awb_idx >= 0)
         {
-            ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AWB_MODE, static_cast<uint16_t>(0));
-            ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AWB_ILLUM_INDEX,
-                                         static_cast<uint16_t>(config->awb_idx));
+            /* Same-value skip: rewriting AWB mode/index restarts AWB convergence — the
+             * re-convergence frames are the visible blue/green tint flash. Live compare;
+             * read failure falls through to the write. */
+            int32_t awb_mode_now = -1;
+            if (!safe_get(m, v4l2::Video0Ctrl::AWB_MODE, awb_mode_now) || awb_mode_now != 0)
+            {
+                ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AWB_MODE, static_cast<uint16_t>(0));
+            }
+            int32_t awb_idx_now = -1;
+            if (!safe_get(m, v4l2::Video0Ctrl::AWB_ILLUM_INDEX, awb_idx_now) ||
+                awb_idx_now != static_cast<int32_t>(config->awb_idx))
+            {
+                ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AWB_ILLUM_INDEX,
+                                             static_cast<uint16_t>(config->awb_idx));
+            }
         }
         else
         {
-            ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AWB_MODE, static_cast<uint16_t>(1));
+            int32_t awb_mode_now = -1;
+            if (!safe_get(m, v4l2::Video0Ctrl::AWB_MODE, awb_mode_now) || awb_mode_now != 1)
+            {
+                ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::AWB_MODE, static_cast<uint16_t>(1));
+            }
         }
         return ok ? HAL_OK : HAL_ERROR;
     }
@@ -2112,14 +2210,16 @@ static int hailo15_isp_set_manual_config(void *video_ctx, const HalIspManualConf
             g_manual_enabled = false;
             s_manual_picture_mode_track = false;
             ml_apply_isp_auto_algorithm_blocks(ml_priv, true);
-            invalidate_picture_baselines();
+            /* Automatic filters may immediately change the live controls.
+             * Re-read those controls when needed, but preserve the manual
+             * reference so reopening manual mode is idempotent. */
+            invalidate_picture_baselines_hw_only();
             return HAL_OK;
         }
         g_manual_enabled = true;
         ml_apply_isp_auto_algorithm_blocks(ml_priv, false);
         if (!s_manual_picture_mode_track)
         {
-            invalidate_picture_baselines();
             s_manual_picture_mode_track = true;
         }
         invalidate_picture_baselines_hw_only();

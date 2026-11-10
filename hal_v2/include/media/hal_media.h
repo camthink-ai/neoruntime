@@ -313,6 +313,24 @@ typedef struct {
     uint32_t                 stream_count;    /* number of streams (1-4) */
 } HalPipelineReconfig;
 
+/**
+ * Auto-feed failure health for one frontend stream (encoder input path).
+ *
+ * The frontend bridge pushes every frame into its encoder via add_buffer
+ * (encoder appsrc). When the encoder input persistently rejects buffers —
+ * the caps/layout-mismatch signature — the stream starves while raw frames
+ * keep flowing. This snapshot exposes the bridge's lock-free streak
+ * accounting so upper layers can correlate "encoder starved" with its
+ * cause and trigger recovery.
+ */
+typedef struct {
+    uint32_t consecutive_failures; /**< failures since the last accepted buffer */
+    uint32_t total_failures;       /**< failures since HAL start */
+    int32_t  last_return_code;     /**< vendor return code of the last failure (-1: no encoder object) */
+    uint64_t failing_since_ms;     /**< steady-clock ms of the streak start; 0 when healthy */
+    uint32_t stalled;              /**< 1 when the failure window latched a FEED_STALL_ALARM */
+} HalFeedHealth;
+
 /* --------------------------------------------------------------------
  * Motion detection
  * -------------------------------------------------------------------- */
@@ -889,6 +907,54 @@ typedef struct {
      */
     int (*get_codec_names)(void *media_ctx, char (*names_out)[HAL_CODEC_NAME_MAX],
                            uint32_t max_names, uint32_t *count_out);
+
+    /**
+     * @brief Destroy and recreate the MediaLibrary from the CURRENT profile.
+     *
+     * Recovery entry for feed-stall style faults: raw frames flow but an
+     * encoder input persistently rejects buffers (caps/layout mismatch), so
+     * part of the pipeline is wedged in a way no in-place call fixes. Rebuild
+     * re-creates the whole chain — encoders included — from the live config,
+     * interrupting video for the usual full-reinit window (~5-6s).
+     *
+     * CALLER CONSTRAINTS (learned the hard way — see below):
+     * - Enter WITHOUT priv->mutex held: the reinit's first step drains
+     *   in-flight frontend callbacks, and those callbacks take that mutex;
+     *   holding it across the drain deadlocks (drain timeout, half-quiesced
+     *   pipeline).
+     * - The HAL rebuild alone does NOT reattach daemon-side consumers
+     *   (encoder resync, video-source rebind, OSD/ISP replay, publisher
+     *   restart). That recovery is chained off the RPC paths' lock
+     *   discipline; calling this from a monitoring thread leaves every
+     *   stream dark (device-verified). Safe callers today: RPC-style
+     *   contexts able to run the full consumer-recovery sequence.
+     * The daemon's stall monitor therefore escalates feed stalls via the
+     * systemd supervisor restart instead of this op.
+     *
+     * Trailing op: older HAL implementations leave it NULL — callers must
+     * NULL-check and fall back (e.g. to a daemon restart).
+     *
+     * @param media_ctx Media context.
+     * @param reason    Short diagnostic tag included in logs (e.g. "feed-stall:sub").
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*force_rebuild)(void *media_ctx, const char *reason);
+
+    /**
+     * @brief Read the auto-feed failure health for one frontend stream.
+     *
+     * Lock-free snapshot of the bridge's per-stream streak counters; safe to
+     * call from any thread, including monitoring loops.
+     *
+     * Trailing op: older HAL implementations leave it NULL — callers must
+     * NULL-check and omit the data.
+     *
+     * @param media_ctx Media context.
+     * @param stream_id Frontend stream id ("sink0"...).
+     * @param out       Snapshot destination.
+     * @return 0 on success, negative HalErrorCode on failure (unknown stream).
+     */
+    int (*get_feed_health)(void *media_ctx, const char *stream_id, HalFeedHealth *out);
 } HalMediaOps;
 
 /** Platform-specific media operations (resolved at link time). */
