@@ -98,11 +98,14 @@ type CellularHandler struct {
 	simRecoverAt     time.Time
 	sessionWaitSince time.Time
 	dialerStopExpect int32 // intentional stop; skip short-exit backoff
-	lastIdentityMu   sync.Mutex
-	lastIdentity     modemIdentity
-	moduleSeenMu     sync.Mutex
-	moduleSeenAt     time.Time
-	lastModuleName   string
+	// usbnet reconcile (desired cfg vs live driver) after hotplug/boot.
+	usbnetReconcileAt      time.Time
+	usbnetReconcileBackoff time.Duration
+	lastIdentityMu         sync.Mutex
+	lastIdentity           modemIdentity
+	moduleSeenMu           sync.Mutex
+	moduleSeenAt           time.Time
+	lastModuleName         string
 
 	capMu      sync.Mutex
 	capability string

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aipc/platform/common/logger"
@@ -374,6 +375,90 @@ func (h *CellularHandler) applyModemPrefs(cfg CellularConfig) error {
 	logger.Info("cellular: applied network_mode=%s roaming=%v", cfg.NetworkMode, roamingEnabled(cfg))
 	time.Sleep(2 * time.Second)
 	return nil
+}
+
+// usbnetNeedsReconcile reports whether live USB net driver differs from the
+// desired config mode. Empty live (iface not up yet) is not a mismatch.
+func usbnetNeedsReconcile(want, live string) bool {
+	want = strings.ToLower(strings.TrimSpace(want))
+	live = strings.ToLower(strings.TrimSpace(live))
+	if want == "" || live == "" {
+		return false
+	}
+	return live != want
+}
+
+func (h *CellularHandler) usbnetReconcileBlocked() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return !h.usbnetReconcileAt.IsZero() && h.now().Before(h.usbnetReconcileAt)
+}
+
+func (h *CellularHandler) noteUsbnetReconcileFailure() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.usbnetReconcileBackoff < cellularUsbnetMinBackoff {
+		h.usbnetReconcileBackoff = cellularUsbnetMinBackoff
+	} else {
+		h.usbnetReconcileBackoff *= 2
+		if h.usbnetReconcileBackoff > cellularUsbnetMaxBackoff {
+			h.usbnetReconcileBackoff = cellularUsbnetMaxBackoff
+		}
+	}
+	h.usbnetReconcileAt = h.now().Add(h.usbnetReconcileBackoff)
+	logger.Warn("cellular: usbnet reconcile backoff %s", h.usbnetReconcileBackoff)
+}
+
+func (h *CellularHandler) clearUsbnetReconcileBackoff() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.usbnetReconcileAt = time.Time{}
+	h.usbnetReconcileBackoff = 0
+}
+
+// reconcileUsbnetDesired applies AT+QCFG usbnet when the live driver does not
+// match cfg.Usbnet (e.g. new module ships QMI while config wants MBIM).
+// Returns true if this autodial tick should skip dialing (busy / backoff /
+// just applied — wait for USB renumeration).
+func (h *CellularHandler) reconcileUsbnetDesired(cfg CellularConfig) bool {
+	want := strings.ToLower(strings.TrimSpace(cfg.Usbnet))
+	if want == "" {
+		return false
+	}
+	if atomic.LoadInt32(&h.usbnetApplyBusy) != 0 {
+		return true
+	}
+	live := probeUsbnetDriver()
+	if !usbnetNeedsReconcile(want, live) {
+		return false
+	}
+	if h.usbnetReconcileBlocked() {
+		return true
+	}
+
+	logger.Info("cellular: usbnet desired=%s live=%s; reconciling", want, live)
+	atomic.StoreInt32(&h.usbnetApplyBusy, 1)
+	_ = h.stopDialer()
+	err := h.applyUsbnetMode(want)
+	if err != nil {
+		atomic.StoreInt32(&h.usbnetApplyBusy, 0)
+		logger.Warn("cellular: usbnet reconcile apply %s: %v", want, err)
+		h.noteUsbnetReconcileFailure()
+		return true
+	}
+	ok := waitUsbnetTransition(live, want, 90*time.Second)
+	_ = waitForATPort(60 * time.Second)
+	atomic.StoreInt32(&h.usbnetApplyBusy, 0)
+	if !ok {
+		logger.Warn("cellular: usbnet reconcile timeout want=%s live=%q", want, probeUsbnetDriver())
+		h.noteUsbnetReconcileFailure()
+		return true
+	}
+	h.clearUsbnetReconcileBackoff()
+	clearATCache()
+	h.clearDialBackoff()
+	logger.Info("cellular: usbnet reconciled to %s", want)
+	return true
 }
 
 func (h *CellularHandler) applyUsbnetMode(mode string) error {

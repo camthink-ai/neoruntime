@@ -537,6 +537,7 @@
       "config": "Configuration",
       "media": "Media",
       "control": "Control",
+      "hevc_preview_unsupported": "This browser does not support H.265 preview. Please switch to a browser that supports H.265.",
       "hevc_unsupported_fallback": "The current browser doesn't support H.265. Please switch to Chrome or Safari.",
       "hevc_unsupported_no_h264": "The current browser doesn't support H.265 and no H.264 stream is available. Please switch to Chrome or Safari."
     },

@@ -537,6 +537,7 @@
       "config": "配置",
       "media": "媒体",
       "control": "控制",
+      "hevc_preview_unsupported": "当前浏览器不支持 H.265 预览，请切换到支持 H.265 的浏览器",
       "hevc_unsupported_fallback": "当前浏览器不支持 H.265，请切换到 Chrome 或 Safari 浏览器",
       "hevc_unsupported_no_h264": "当前浏览器不支持 H.265，且无可用 H.264 码流，请切换到 Chrome 或 Safari 浏览器"
     },

@@ -25,7 +25,7 @@ export function findH264Fallback(
   streams: MediaStreamStatus[],
   activeStream: string
 ): MediaStreamStatus | null {
-  const isH264 = (s: MediaStreamStatus) => (s.codec ?? 'h264').toLowerCase() === 'h264';
+  const isH264 = (s: MediaStreamStatus) => s.has_encoder && (s.codec ?? 'h264').toLowerCase() === 'h264';
   const STREAM_ORDER = ['main', 'sub', 'third'];
   return (
     streams.find(s => s.stream_id === activeStream && isH264(s))
@@ -61,8 +61,7 @@ export interface UseStreamFallbackResult {
  *   decode H.265 we proactively play an H.264 stream instead of letting the
  *   player fail with codecMismatch.
  * - In a browser without HEVC support the notice is persistent: it stays up
- *   even when the stream is (or has been switched to) H.264, explaining why
- *   the H265 option is disabled in the encoder config.
+ *   even when the stream is (or has been switched to) H.264.
  * - Reactive safety net: if the real codec probe (pickMimeCodec, using the
  *   actual SPS) fails after connect (window `wv_error` with
  *   `detail.type === 'codec_mismatch'`), fall back to an H.264 stream.
@@ -107,12 +106,11 @@ export function useStreamFallback({
       };
     }
 
-    if (selectedCodec !== 'h265') {
+    if (selectedCodec !== 'h265' || hevcSupported) {
       return {
         effectiveStreamId: activeStream,
         effectiveStreamInfo: selected,
-        // 不支持 HEVC 的浏览器持续提示（即使当前码流已是 H264/已自动切回），
-        // 与编码配置中禁用的 H265 选项相呼应；不影响播放。
+        // Keep the notice visible for unsupported browsers on pages that show it.
         codecNotice: hevcSupported
           ? null
           : ('hevc_unsupported_fallback' as CodecNotice),
