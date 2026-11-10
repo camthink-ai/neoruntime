@@ -349,7 +349,12 @@ export type CellularUsbnet = 'qmi' | 'ecm' | 'mbim';
 export type CellularNetworkMode = 'auto' | 'lte' | 'wcdma';
 
 export interface CellularConfig {
+  /** Module GPIO power (master switch). */
   enabled: boolean;
+  /** Cellular PDP / auto-dial (requires module power). */
+  data_enabled: boolean;
+  /** Quectel GNSS engine (requires module power). */
+  gnss_enabled: boolean;
   apn: string;
   user: string;
   password: string;
@@ -400,6 +405,8 @@ const CELLULAR_STORAGE_KEY = 'aipc.cellular.config';
 /** Factory defaults — keep in sync with handlers.defaultCellularConfig(). */
 const DEFAULT_CELLULAR_CONFIG: CellularConfig = {
   enabled: true,
+  data_enabled: true,
+  gnss_enabled: true,
   apn: '',
   user: '',
   password: '',
@@ -460,6 +467,43 @@ export const fetchCellularStatus = async (): Promise<CellularStatus> => {
     return { ...STUB_CELLULAR_STATUS, ...response.data, stub: false };
   } catch {
     return { ...STUB_CELLULAR_STATUS };
+  }
+};
+
+export type CellularGnssFix = 'none' | '2d' | '3d';
+
+export interface CellularGnssStatus {
+  enabled: boolean;
+  active: boolean;
+  fix: CellularGnssFix;
+  latitude: number | null;
+  longitude: number | null;
+  altitude: number | null;
+  hdop: number | null;
+  satellites: number | null;
+  utc?: string;
+  message: string;
+}
+
+const STUB_CELLULAR_GNSS_STATUS: CellularGnssStatus = {
+  enabled: false,
+  active: false,
+  fix: 'none',
+  latitude: null,
+  longitude: null,
+  altitude: null,
+  hdop: null,
+  satellites: null,
+  message: '',
+};
+
+export const fetchCellularGnssStatus = async (): Promise<CellularGnssStatus> => {
+  try {
+    const response = await request.get('/api/v1/cellular/gnss/status');
+    const data = (response as { data?: CellularGnssStatus }).data ?? response;
+    return { ...STUB_CELLULAR_GNSS_STATUS, ...(data as CellularGnssStatus) };
+  } catch {
+    return { ...STUB_CELLULAR_GNSS_STATUS };
   }
 };
 

@@ -44,3 +44,10 @@
     animation-delay: 4s;
   }
 }
+
+/* Tailwind Preflight sets img { max-width: 100% }, which collapses Leaflet
+   raster tiles to 0px width. Keep this outside @layer so it wins Preflight. */
+img.leaflet-tile {
+  max-width: none !important;
+  max-height: none !important;
+}

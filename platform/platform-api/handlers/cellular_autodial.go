@@ -115,7 +115,7 @@ func (h *CellularHandler) autoDialLoop() {
 		if err != nil {
 			cfg = defaultCellularConfig()
 		}
-		if !cfg.Enabled {
+		if !cfg.Enabled || !dataEnabled(cfg) {
 			if h.dialerRunning() {
 				_ = h.stopDialer()
 			}
@@ -232,7 +232,7 @@ func (h *CellularHandler) autoDialLoop() {
 		}
 		h.clearDialBackoff()
 		h.sessionWaitSince = h.now()
-		logger.Info("cellular: auto-dial started (enabled + module present)")
+		logger.Info("cellular: auto-dial started (module power + data enabled)")
 	}
 }
 

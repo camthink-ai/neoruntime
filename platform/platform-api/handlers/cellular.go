@@ -24,8 +24,15 @@ import (
 
 // CellularConfig is persisted user dial settings (APN/auth/usbnet/RAT).
 // Hardware binding lives in CellularHWProfile YAML, not here.
+//
+// Switch roles:
+//   - Enabled: module GPIO power (master)
+//   - DataEnabled: cellular PDP / auto-dial (requires Enabled)
+//   - GnssEnabled: Quectel GNSS engine AT+QGPS (requires Enabled)
 type CellularConfig struct {
 	Enabled        bool   `json:"enabled"`
+	DataEnabled    *bool  `json:"data_enabled"` // nil → true (legacy configs)
+	GnssEnabled    *bool  `json:"gnss_enabled"` // nil → true
 	APN            string `json:"apn"`
 	User           string `json:"user"`
 	Password       string `json:"password"`
@@ -109,6 +116,11 @@ type CellularHandler struct {
 
 	capMu      sync.Mutex
 	capability string
+
+	// Last successful GNSS fix — returned when AT is briefly busy (e.g. dial).
+	gnssCacheMu sync.Mutex
+	gnssCache   CellularGnssStatus
+	gnssCacheAt time.Time
 }
 
 // NewCellularHandler creates a CellularHandler.
@@ -146,6 +158,8 @@ func (h *CellularHandler) applyHW(hw *CellularHWProfile) {
 func defaultCellularConfig() CellularConfig {
 	return CellularConfig{
 		Enabled:        true,
+		DataEnabled:    boolPtr(true),
+		GnssEnabled:    boolPtr(true),
 		APN:            "",
 		User:           "",
 		Password:       "",
@@ -167,6 +181,22 @@ func roamingEnabled(cfg CellularConfig) bool {
 		return false
 	}
 	return *cfg.Roaming
+}
+
+// dataEnabled is the cellular data / auto-dial switch (subordinate to module power).
+func dataEnabled(cfg CellularConfig) bool {
+	if cfg.DataEnabled == nil {
+		return true
+	}
+	return *cfg.DataEnabled
+}
+
+// gnssEnabled is the GNSS engine switch (subordinate to module power).
+func gnssEnabled(cfg CellularConfig) bool {
+	if cfg.GnssEnabled == nil {
+		return true
+	}
+	return *cfg.GnssEnabled
 }
 
 func (h *CellularHandler) GetStatus(c *gin.Context) {
@@ -220,6 +250,10 @@ func (h *CellularHandler) UpdateConfig(c *gin.Context) {
 	usbnetChanged := prev.Usbnet != req.Usbnet
 	modemPrefChanged := cellularModemPrefsChanged(prev, req)
 	dialChanged := cellularDialSettingsChanged(prev, req)
+	dataWant := dataEnabled(req)
+	dataWas := dataEnabled(prev)
+	gnssWant := gnssEnabled(req)
+	gnssWas := gnssEnabled(prev)
 
 	if req.Enabled && h.capabilityState() == cellularCapUnsupported {
 		Resp(c).FailMsg(CodeServiceError,
@@ -262,6 +296,11 @@ func (h *CellularHandler) UpdateConfig(c *gin.Context) {
 		}
 	} else {
 		_ = h.stopDialer()
+		if gnssWas || gnssWant {
+			if err := h.applyGnssEnabledOrDefer(false); err != nil {
+				logger.Warn("cellular: GNSS off on module power-down: %v", err)
+			}
+		}
 		clearATCache()
 		h.clearStickyIdentity()
 		powerErr = h.ensurePower(false)
@@ -273,7 +312,7 @@ func (h *CellularHandler) UpdateConfig(c *gin.Context) {
 	wantUsbnet := strings.ToLower(strings.TrimSpace(req.Usbnet))
 	liveUsbnet := probeUsbnetDriver()
 	moduleVID, _, _ := h.findMatchedUSB()
-	needUsbnetApply := req.Enabled && powerErr == nil && wantUsbnet != "" && moduleVID != "" &&
+	needUsbnetApply := req.Enabled && dataWant && powerErr == nil && wantUsbnet != "" && moduleVID != "" &&
 		((usbnetChanged && liveUsbnet != wantUsbnet) || (liveUsbnet != "" && liveUsbnet != wantUsbnet))
 	if needUsbnetApply {
 		atomic.StoreInt32(&h.usbnetApplyBusy, 1)
@@ -288,7 +327,7 @@ func (h *CellularHandler) UpdateConfig(c *gin.Context) {
 			atomic.StoreInt32(&h.usbnetApplyBusy, 0)
 			redial = true
 		}
-	} else if usbnetChanged && req.Enabled && powerErr == nil && liveUsbnet == wantUsbnet {
+	} else if usbnetChanged && req.Enabled && dataWant && powerErr == nil && liveUsbnet == wantUsbnet {
 		logger.Info("cellular: usbnet=%s already active; skip AT apply", wantUsbnet)
 		redial = true
 	}
@@ -306,20 +345,39 @@ func (h *CellularHandler) UpdateConfig(c *gin.Context) {
 			logger.Warn("cellular: modem prefs saved; AT port not ready — apply on next dial")
 		}
 		redial = true
-	} else if dialChanged && req.Enabled && powerErr == nil {
+	} else if dialChanged && req.Enabled && dataWant && powerErr == nil {
 		_ = h.stopDialer()
 		redial = true
-	} else if req.Enabled && powerErr == nil && !redial {
+	} else if enabling && req.Enabled && dataWant && powerErr == nil && !redial {
 		redial = true
 	}
 
-	if req.Enabled && powerErr == nil && (redial || usbnetErr != nil || modemPrefErr != nil) {
+	if req.Enabled && powerErr == nil && !dataWant {
+		if h.dialerRunning() {
+			_ = h.stopDialer()
+		}
+		redial = false
+	} else if req.Enabled && powerErr == nil && dataWant && !dataWas {
+		redial = true
+	}
+
+	if req.Enabled && powerErr == nil && (redial || usbnetErr != nil || modemPrefErr != nil) && dataWant {
 		h.kickAutoDial()
+	}
+
+	var gnssErr error
+	if req.Enabled && powerErr == nil && (gnssWant != gnssWas || (enabling && gnssWant)) {
+		gnssErr = h.applyGnssEnabledOrDefer(gnssWant)
+		if gnssErr != nil {
+			logger.Warn("cellular: apply GNSS enabled=%v: %v", gnssWant, gnssErr)
+		}
 	}
 
 	if h.eventLogger != nil {
 		h.eventLogger.LogWithCodeAsync("network.cellular.config", eventLoggerPkg.MessageParams{
 			"enabled":      req.Enabled,
+			"data_enabled": dataEnabled(req),
+			"gnss_enabled": gnssWant,
 			"apn":          req.APN,
 			"profile":      req.CarrierProfile,
 			"usbnet":       req.Usbnet,
@@ -344,6 +402,11 @@ func (h *CellularHandler) UpdateConfig(c *gin.Context) {
 			"Config saved, but applying network mode/roaming failed: "+modemPrefErr.Error())
 		return
 	}
+	if gnssErr != nil {
+		Resp(c).FailMsg(CodeServiceError,
+			"Config saved, but applying GNSS failed: "+gnssErr.Error())
+		return
+	}
 	Resp(c).OK(req)
 }
 
@@ -354,7 +417,11 @@ func (h *CellularHandler) Connect(c *gin.Context) {
 		cfg = defaultCellularConfig()
 	}
 	if !cfg.Enabled {
-		Resp(c).OK(gin.H{"ok": false, "message": "Enable cellular before connecting."})
+		Resp(c).OK(gin.H{"ok": false, "message": "Enable module power before connecting."})
+		return
+	}
+	if !dataEnabled(cfg) {
+		Resp(c).OK(gin.H{"ok": false, "message": "Enable cellular data before connecting."})
 		return
 	}
 	if h.capabilityState() == cellularCapUnsupported {
@@ -452,6 +519,12 @@ func validateCellularConfig(cfg *CellularConfig) error {
 	}
 	if cfg.Roaming == nil {
 		cfg.Roaming = boolPtr(false)
+	}
+	if cfg.DataEnabled == nil {
+		cfg.DataEnabled = boolPtr(true)
+	}
+	if cfg.GnssEnabled == nil {
+		cfg.GnssEnabled = boolPtr(true)
 	}
 	if cfg.PDPCID < 1 || cfg.PDPCID > 16 {
 		return fmt.Errorf("pdp_cid must be between 1 and 16")
