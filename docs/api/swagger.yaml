@@ -5962,6 +5962,28 @@ paths:
                     data:
                       $ref: '#/components/schemas/CellularStatus'
 
+  /cellular/gnss/status:
+    get:
+      tags: [Cellular]
+      summary: Get cellular GNSS / GPS status
+      description: |
+        Live Quectel GNSS engine state and fix (WGS84). Requires module power
+        and gnss_enabled in cellular config. When the AT port is briefly busy
+        (e.g. dial), a recent cached fix may be returned.
+      operationId: getCellularGnssStatus
+      responses:
+        '200':
+          description: GNSS status
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularGnssStatus'
+
   /cellular/config:
     get:
       tags: [Cellular]
@@ -8557,6 +8579,13 @@ components:
       properties:
         enabled:
           type: boolean
+          description: Module power (GPIO). Data session and GNSS require this on.
+        data_enabled:
+          type: boolean
+          description: Cellular data session / autodial. Omitted/null treated as true for legacy configs.
+        gnss_enabled:
+          type: boolean
+          description: Quectel GNSS engine. Omitted/null treated as true for factory default.
         apn:
           type: string
         user:
@@ -8659,6 +8688,45 @@ components:
       properties:
         ok:
           type: boolean
+        message:
+          type: string
+
+    CellularGnssStatus:
+      type: object
+      description: Live Quectel GNSS engine + fix (WGS84)
+      properties:
+        enabled:
+          type: boolean
+          description: Config gnss_enabled (and module power on)
+        active:
+          type: boolean
+          description: Modem AT+QGPS session active
+        fix:
+          type: string
+          enum: [none, 2d, 3d]
+        latitude:
+          type: number
+          format: double
+          nullable: true
+        longitude:
+          type: number
+          format: double
+          nullable: true
+        altitude:
+          type: number
+          format: double
+          nullable: true
+          description: Meters
+        hdop:
+          type: number
+          format: double
+          nullable: true
+        satellites:
+          type: integer
+          nullable: true
+        utc:
+          type: string
+          description: Fix UTC from modem when available
         message:
           type: string
 
