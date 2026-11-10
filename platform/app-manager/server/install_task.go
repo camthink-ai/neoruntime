@@ -92,6 +92,16 @@ func (t *InstallTask) Fail(errMsg string) {
 	t.mu.Unlock()
 }
 
+// FailWithLabel records a failure with an operation-specific label (e.g.
+// "Start failed" for lifecycle operations that share the task store).
+func (t *InstallTask) FailWithLabel(label, errMsg string) {
+	t.mu.Lock()
+	t.Phase = "error"
+	t.Error = errMsg
+	t.Message = fmt.Sprintf("%s: %s", label, errMsg)
+	t.mu.Unlock()
+}
+
 func (t *InstallTask) Snapshot() (phase string, percent float64, message, appID, errMsg string) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
