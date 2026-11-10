@@ -11,6 +11,8 @@
 #include "media/hal_osd.h"
 #include "media/hal_video_internal.h"
 
+#include "hailo15_feed_health.hpp"
+
 #include <map>
 #include <condition_variable>
 #include <memory>
@@ -122,11 +124,6 @@ struct Hailo15MediaPriv
      *  calls, and OSD ops never acquire `mutex`. */
     std::mutex osd_state_mu;
 
-    /** Patched encoder dimensions from camera-daemon overrides (stream_id → {width, height}).
-     *  Cached at init time so rotation swaps use the correct (patched) dimensions
-     *  instead of the sensor resolution stored in the medialib profile. */
-    std::map<std::string, std::pair<uint32_t, uint32_t>> encoder_patched_dims;
-
     /** Privacy mask original polygons in normalized space (unrotated/unflipped).
      *  Keyed by mask id; values are list of (x,y) points in [0..1]. */
     std::map<std::string, std::vector<std::pair<float, float>>> privacy_mask_original;
@@ -134,6 +131,15 @@ struct Hailo15MediaPriv
     std::map<std::string, std::vector<std::pair<float, float>>> privacy_mask_last_display;
 
     bool callbacks_registered{false};
+
+    /* Timestamp of the last completed light-path reconfigure. Rapid
+     * consecutive vendor stop/start cycles (user clicking through resolution
+     * options) race dataflow threads still recovering from the previous
+     * teardown — the 2026-11-06 SEGV on 3 reconfigures in 6 seconds. The
+     * light path checks this and falls back to full reinit within the
+     * cooldown. Not thread-safe: written and read only from the HAL's
+     * serialized layout-op paths. */
+    std::chrono::steady_clock::time_point last_light_reconfigure_at{};
 
     /**
      * Frontend callback lifecycle barrier used during MediaLibrary teardown.
@@ -146,9 +152,18 @@ struct Hailo15MediaPriv
     bool callbacks_quiescing{false};
     uint32_t frontend_callbacks_inflight{0};
 
-    /* Diagnostics: per-stream counters for troubleshooting buffer pool exhaustion. */
-    std::map<std::string, size_t> enc_pkt_count;
-    std::map<std::string, size_t> feed_err_count;
+    /* Auto-feed failure streaks, updated lock-free from GStreamer streaming
+     * threads. Entries are created once at frontend-connect time; afterwards
+     * only the atomics inside each entry mutate (see hailo15_feed_health.hpp).
+     * Keyed by frontend stream id ("sink0"...). Read via the
+     * HAL_MEDIA_OPS.get_feed_health trailing op.
+     *
+     * THREAD-SAFETY INVARIANT: the map's STRUCTURE (insert/erase) may only
+     * change while frontend callbacks are guaranteed stopped — i.e. inside
+     * connect, which runs before subscribe or after reinit teardown. Never
+     * insert entries from any other context: concurrent streaming threads
+     * run find() on this map without a lock. */
+    std::map<std::string, std::unique_ptr<Hailo15FeedHealth>> feed_health;
 
     /* Thermal throttling subscription (subscribe_throttling). Guarded by mutex. */
     HalThrottlingCallback throttling_cb{nullptr};

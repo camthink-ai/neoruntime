@@ -32,6 +32,9 @@ struct WatchdogStats {
     uint64_t total_reclaimed = 0;
     uint64_t total_warnings = 0;
     uint64_t total_in_use_reclaimed = 0;
+    uint64_t tracked_frames = 0;
+    uint64_t in_use_frames = 0;
+    uint64_t oldest_held_ms = 0;
 };
 
 /** Callback to force-reclaim a frame by its ID */
