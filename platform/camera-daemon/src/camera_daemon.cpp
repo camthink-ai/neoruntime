@@ -140,6 +140,11 @@ constexpr const char* kPipelineRecoveryStatePath =
     "/run/aipc/camera-pipeline-recovery.state";
 constexpr uint64_t kPipelineRecoveryWindowSec = 10 * 60;
 constexpr size_t kPipelineRecoveryMaxAttempts = 3;
+// Feed-stall escalation pacing: a persistent encoder-input reject (caps/layout
+// fault) would otherwise loop supervisor restarts every poll. One escalation
+// per window; if the fault survives the restart it stays visible (and the
+// ledger above caps the total at kPipelineRecoveryMaxAttempts per 10min).
+constexpr auto kFeedStallEscalationCooldown = std::chrono::minutes(10);
 
 static uint64_t boottime_seconds() {
     struct timespec ts{};
@@ -1178,6 +1183,13 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
     // Initialize cache on first call (may have missed in init if HAL wasn't ready)
     if (!isp_state_initialized_) init_isp_cache();
 
+    // Turning manual picture mode back on must restore the complete cached ISP
+    // state, not just B/C/S/Sh.  While manual mode is off, the firmware's
+    // automatic AE/ACproc/Auto-WDR blocks can change exposure and WDR controls.
+    // Reapplying only the manual group would freeze those momentary values and
+    // make identical off -> on cycles produce different pictures.
+    const bool replay_dependent_groups = request.has_manual_mode() && request.manual_mode();
+
     // Apply manual tuning — use has_xxx() to detect explicitly-set fields
     // This correctly handles value=0 (e.g., brightness=0) as a valid setting
     const bool manual_requested = request.has_manual_mode() || request.has_brightness()
@@ -1205,10 +1217,11 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
     }
 
     // Apply exposure config
-    const bool exposure_requested = request.has_auto_exposure() || request.has_backlight()
+    const bool exposure_requested = replay_dependent_groups
+        || request.has_auto_exposure() || request.has_backlight()
         || request.has_exposure_time_us() || request.has_gain();
     const bool exposure_changed = exposure_requested
-        && (force_apply || isp_cache_synthetic_
+        && (force_apply || replay_dependent_groups || isp_cache_synthetic_
             || isp_exposure_group_changed(request, cached_isp_state_.exposure_config));
     if (exposure_changed) {
         HalIspExposureConfig ec = cached_isp_state_.exposure_config;
@@ -1229,10 +1242,11 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
     }
 
     // Apply full image config (noise reduction, WDR, powerline freq, AWB)
-    const bool image_requested = request.has_noise_reduction() || request.has_wdr_value()
+    const bool image_requested = replay_dependent_groups
+        || request.has_noise_reduction() || request.has_wdr_value()
         || request.has_powerline_freq() || request.has_awb_index();
     const bool image_changed = image_requested
-        && (force_apply || isp_cache_synthetic_
+        && (force_apply || replay_dependent_groups || isp_cache_synthetic_
             || isp_image_group_changed(request, cached_isp_state_));
     if (image_changed) {
         HalIspImageConfig ic = cached_isp_state_;
@@ -1642,6 +1656,11 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
         // change or boot. Same rebind-then-replay order as the stream-add
         // tail.
         resync_video_source_from_media_pipeline("transform reinit");
+        // Geometry may have changed (portrait swap) — update daemon-side
+        // config_.streams/config_.encoders dims from the fresh HAL contexts
+        // so the web UI, YAML persistence, and any subsequent reconfigure
+        // start from the real layout instead of the pre-rotation one.
+        reconcile_stream_dims_from_media_pipeline("transform reinit");
         rebuild_gate.release();  // contexts repopulated after full reinit
 #ifdef HAS_GRPC
         reapply_osd_config_after_pipeline_rebuild("transform reinit");
@@ -2152,6 +2171,31 @@ void CameraDaemon::restore_image_config_if_cached() {
         HAL_LOG_WARNING("CameraDaemon: cannot restore image config — media ops unavailable");
         return;
     }
+
+    /* Cascade guard: if the cached rotation disagrees with the pipeline's
+     * current rotation, replaying the cache through
+     * dynamic_change_image_config dispatches as a "rotation change" in the
+     * HAL and triggers a SECOND full rotation_full_reinit inside what the
+     * caller thinks is a passive state-replay step. The pipeline was just
+     * rebuilt and is authoritative — adopt its rotation into the cache and
+     * warn instead of forcing the stale value onto the fresh pipeline.
+     * (The layout-poisoning bug produced exactly this scenario: a stale
+     * rot=3 replayed onto a rot=2 pipeline, swapping all stream dims.) */
+    if (media_ops->get_current_config) {
+        HalMediaConfig cur{};
+        if (media_ops->get_current_config(media_ctx_, &cur) == 0) {
+            if (cur.image_config.rotation_angle != last_image_config_.rotation_angle) {
+                HAL_LOG_WARNING("CameraDaemon: restore_image_config_if_cached: cached rot=%d "
+                                "!= pipeline rot=%d — adopting pipeline value to avoid "
+                                "cascading rotation_full_reinit (stale cache from a "
+                                "pre-rebuild state)",
+                                (int)last_image_config_.rotation_angle,
+                                (int)cur.image_config.rotation_angle);
+                last_image_config_.rotation_angle = cur.image_config.rotation_angle;
+            }
+        }
+    }
+
     int ret = media_ops->dynamic_change_image_config(media_ctx_, &last_image_config_);
     if (ret < 0) {
         HAL_LOG_ERROR("CameraDaemon: restore image config after reinit failed: %d", ret);
@@ -5645,6 +5689,104 @@ bool CameraDaemon::resync_video_source_from_media_pipeline(const char* reason) {
     return true;
 }
 
+void CameraDaemon::reconcile_stream_dims_from_media_pipeline(const char* reason) {
+    /* After a transform full-reinit, the HAL rebuilt every video/codec context
+     * with (potentially swapped) dims. The daemon's config_.streams /
+     * config_.encoders still hold the PRE-rebuild geometry — stale state that
+     * feeds the web UI, YAML persistence, and any subsequent reconfigure
+     * (garbage-in-garbage-out). This walks the HAL contexts and updates dims
+     * in place. Stream identity (names, mapping) never changes in a transform
+     * rebuild, so no naming/inheritance logic is needed here — unlike
+     * ReconfigurePipeline, which does full discovery because streams may be
+     * added/removed.
+     *
+     * CONCURRENCY: must be called with op_mu_ NOT held (this function takes it
+     * exclusive below). The raw HAL context pointers from get_video_list /
+     * get_codec_list are valid only while no concurrent rebuild frees them —
+     * op_mu_ exclusive serializes against every RPC path that could
+     * reconfigure/destroy the pipeline. The caller (set_transform_config's
+     * full-reinit tail) releases op_mu_ before this point, so we acquire it
+     * here. */
+    auto* media_ops = hal_loader_ ? hal_loader_->media() : nullptr;
+    if (!media_ops || !media_ctx_) return;
+
+    std::unique_lock<std::shared_mutex> op_lock(op_mu_);
+    /* Update config_.streams from video contexts */
+    if (video_source_ && media_ops->get_video_list) {
+        void* video_list = nullptr;
+        uint32_t video_count = 0;
+        if (media_ops->get_video_list(media_ctx_, &video_list, &video_count) == 0 &&
+            video_list && video_count > 0) {
+            void** vlist = static_cast<void**>(video_list);
+            for (uint32_t i = 0; i < video_count; i++) {
+                auto* vc = static_cast<HalVideoContext*>(vlist[i]);
+                if (!vc) continue;
+                for (auto& sc : config_.streams) {
+                    if (sc.name == vc->video_name) {
+                        if (sc.width != vc->config.width || sc.height != vc->config.height ||
+                            sc.fps != vc->config.framerate) {
+                            HAL_LOG_INFO("CameraDaemon: %s: stream '%s' dims updated "
+                                         "%ux%u@%u -> %ux%u@%u",
+                                         reason ? reason : "reconcile",
+                                         sc.name.c_str(), sc.width, sc.height, sc.fps,
+                                         vc->config.width, vc->config.height, vc->config.framerate);
+                            sc.width = vc->config.width;
+                            sc.height = vc->config.height;
+                            sc.fps = vc->config.framerate;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Update config_.encoders from codec contexts */
+    if (media_ops->get_codec_list) {
+        void* codec_list = nullptr;
+        uint32_t codec_count = 0;
+        if (media_ops->get_codec_list(media_ctx_, &codec_list, &codec_count) == 0 &&
+            codec_list && codec_count > 0) {
+            /* Build media_name -> codec context lookup */
+            std::unordered_map<std::string, HalCodecContext*> codec_by_media;
+            void** clist = static_cast<void**>(codec_list);
+            for (uint32_t i = 0; i < codec_count; i++) {
+                auto* cc = static_cast<HalCodecContext*>(clist[i]);
+                if (cc) codec_by_media[cc->codec_name] = cc;
+            }
+
+            /* config_name -> media_name from encoder_name_map_ */
+            std::unordered_map<std::string, std::string> config_to_media;
+            {
+                std::lock_guard<std::mutex> map_lock(enc_name_mu_);
+                for (const auto& [media_name, config_name] : encoder_name_map_) {
+                    config_to_media[config_name] = media_name;
+                }
+            }
+
+            for (auto& ec : config_.encoders) {
+                auto mit = config_to_media.find(ec.stream_name);
+                if (mit == config_to_media.end()) continue;
+                auto cit = codec_by_media.find(mit->second);
+                if (cit == codec_by_media.end()) continue;
+                HalCodecContext* cc = cit->second;
+
+                if (ec.width != cc->config.width || ec.height != cc->config.height ||
+                    ec.fps != cc->config.framerate) {
+                    HAL_LOG_INFO("CameraDaemon: %s: encoder '%s' dims updated "
+                                 "%ux%u@%u -> %ux%u@%u",
+                                 reason ? reason : "reconcile",
+                                 ec.stream_name.c_str(), ec.width, ec.height, ec.fps,
+                                 cc->config.width, cc->config.height, cc->config.framerate);
+                    ec.width = cc->config.width;
+                    ec.height = cc->config.height;
+                    ec.fps = cc->config.framerate;
+                }
+            }
+        }
+    }
+}
+
 bool CameraDaemon::resync_encoders_from_media_pipeline() {
     if (!encoder_mgr_ || !hal_loader_) return false;
     auto* media_ops = hal_loader_->media();
@@ -8892,6 +9034,9 @@ void CameraDaemon::poll_pipeline_stall_diagnostics() {
 
     std::string primary_config_name;
     std::string primary_media_name;
+    /* All enabled (config_name, media_name) pairs — the feed-stall path below
+     * must see secondary streams a healthy primary would otherwise mask. */
+    std::vector<std::pair<std::string, std::string>> enabled_streams;
     {
         // config_.encoders and the media-name map can be rebuilt by live RPCs.
         // Snapshot only the primary identity under the normal lock order, then
@@ -8900,8 +9045,8 @@ void CameraDaemon::poll_pipeline_stall_diagnostics() {
         if (!op_lock.owns_lock()) return;
         for (const auto& encoder : config_.encoders) {
             if (!encoder.enabled) continue;
-            primary_config_name = encoder.stream_name;
-            break;
+            if (primary_config_name.empty()) primary_config_name = encoder.stream_name;
+            enabled_streams.emplace_back(encoder.stream_name, std::string());
         }
         if (primary_config_name.empty() && !config_.encoders.empty()) {
             primary_config_name = config_.encoders.front().stream_name;
@@ -8911,7 +9056,12 @@ void CameraDaemon::poll_pipeline_stall_diagnostics() {
         for (const auto& [media_name, config_name] : encoder_name_map_) {
             if (config_name == primary_config_name) {
                 primary_media_name = media_name;
-                break;
+            }
+            for (auto& [cfg, media] : enabled_streams) {
+                if (cfg == config_name) {
+                    media = media_name;
+                    break;
+                }
             }
         }
     }
@@ -8924,6 +9074,67 @@ void CameraDaemon::poll_pipeline_stall_diagnostics() {
     const uint64_t encoded_gap_ms =
         encoder_mgr_->ms_since_last_packet(primary_media_name);
     const auto now = std::chrono::steady_clock::now();
+
+    /* Feed-stall recovery: raw frames flow but some enabled stream's encoded
+     * output has been silent past the snapshot threshold — the persistent
+     * add_buffer-reject signature (frontend callback runs, encoder input
+     * refused; the HAL names the cause via FEED_STALL_ALARM). Rebuild the
+     * pipeline (re-creates the encoder appsrc chain), paced by a cooldown
+     * because the same caps/layout fault would otherwise loop rebuilds.
+     * Checked before the primary-only latch logic so a healthy primary
+     * cannot mask a starved secondary. The four op mutexes taken at entry
+     * serialize this against concurrent switch/reconfigure/transform. */
+    {
+        std::string feed_stalled_config;
+        uint64_t feed_stalled_gap_ms = 0;
+        for (const auto& [cfg_name, media_name] : enabled_streams) {
+            if (media_name.empty() || !encoder_mgr_->seen_first_packet(media_name)) {
+                continue;
+            }
+            const uint64_t gap = encoder_mgr_->ms_since_last_packet(media_name);
+            if (gap >= kPipelineStallSnapshotMs && gap > feed_stalled_gap_ms) {
+                feed_stalled_gap_ms = gap;
+                feed_stalled_config = cfg_name;
+            }
+        }
+        if (!feed_stalled_config.empty() && now >= next_feed_stall_escalation_allowed_) {
+            /* Raw sanity: escalate only when raw frames still arrive — a full
+             * raw+encoded outage is the vendor pipeline-death signature whose
+             * supervisor-restart path below handles it. */
+            const uint64_t feed_raw_gap_ms = frame_router_
+                ? frame_router_->ms_since_last_frame(feed_stalled_config) : UINT64_MAX;
+            const uint64_t primary_raw_gap_ms = frame_router_
+                ? frame_router_->ms_since_last_frame(primary_config_name) : UINT64_MAX;
+            if (feed_raw_gap_ms != UINT64_MAX &&
+                feed_raw_gap_ms < kPipelineStallSnapshotMs &&
+                primary_raw_gap_ms != UINT64_MAX &&
+                primary_raw_gap_ms < kPipelineStallSnapshotMs) {
+                /* Escalate to the supervisor restart rather than an in-place
+                 * HAL rebuild: the rebuild destroys the whole MediaLibrary
+                 * anyway (same all-streams outage), but the daemon-side
+                 * consumer recovery it requires (encoder resync, video-source
+                 * rebind, OSD/ISP replay, publisher restart) is chained off
+                 * the RPC paths' lock discipline and is not safe to replicate
+                 * from this monitor thread — a half-recovered rebuild left
+                 * every stream dark in device testing. A fresh process
+                 * rebuilds the world the same way boot does (verified
+                 * 15-20s end-to-end recovery). */
+                HAL_LOG_ERROR("CameraDaemon: FEED_STALL_RESTART stream=%s "
+                              "encoded_gap_ms=%lu raw_gap_ms=%llu — encoder input "
+                              "starved while raw flows; supervisor restart",
+                              feed_stalled_config.c_str(),
+                              static_cast<unsigned long>(feed_stalled_gap_ms),
+                              static_cast<unsigned long long>(feed_raw_gap_ms));
+                /* Feed cooldown first (a persistent fault must not flap):
+                 * one escalation per window, then the ledger below caps the
+                 * total at kPipelineRecoveryMaxAttempts per 10min. */
+                next_feed_stall_escalation_allowed_ = now + kFeedStallEscalationCooldown;
+                if (!reserve_pipeline_recovery_attempt()) return;
+                std::fflush(nullptr);
+                std::_Exit(EXIT_FAILURE);
+            }
+        }
+    }
 
     if (!pipeline_stall_snapshot_latched_) {
         if (encoded_gap_ms < kPipelineStallSnapshotMs) return;
@@ -8988,6 +9199,9 @@ void CameraDaemon::emit_pipeline_stall_snapshot(
         std::string media_name;
         bool enabled = false;
     };
+    /* Trailing-op query used per stream below; NULL on older HALs (fields
+     * simply print zero). */
+    auto* media_ops = hal_loader_ ? hal_loader_->media() : nullptr;
     std::vector<StreamIdentity> streams;
     {
         std::shared_lock<std::shared_mutex> op_lock(op_mu_);
@@ -9076,12 +9290,21 @@ void CameraDaemon::emit_pipeline_stall_snapshot(
             publisher.packets_published > 0
                 ? publisher.bytes_published / publisher.packets_published : 0;
 
+        /* Auto-feed health (trailing HAL op; older HALs omit the fields).
+         * Distinguishes "encoder starved because its input rejects buffers"
+         * (feed_fail>0) from an upstream/raw outage in one glance. */
+        HalFeedHealth feed{};
+        const bool have_feed = media_ops && media_ops->get_feed_health &&
+            media_ops->get_feed_health(media_ctx_,
+                                       stream.media_name.c_str(), &feed) == HAL_OK;
+
         HAL_LOG_ERROR("CameraDaemon: PIPELINE_STALL_STREAM config=%s media=%s "
                       "enabled=%d raw_seq=%lu raw_gap_ms=%lld raw_received=%lu "
                       "raw_dropped=%lu raw_reclaimed=%lu encoded_seq=%lu "
                       "encoded_gap_ms=%lld pub_packets=%lu pub_keyframes=%lu "
                       "avg_packet_bytes=%lu pub_queue_drops=%lu "
-                      "client_drops=%lu client_failures=%lu clients=%u",
+                      "client_drops=%lu client_failures=%lu clients=%u "
+                      "feed_fail=%u feed_ret=%d feed_stalled=%u",
                       stream.config_name.c_str(), stream.media_name.c_str(),
                       stream.enabled ? 1 : 0,
                       static_cast<unsigned long>(raw_sequence),
@@ -9099,7 +9322,10 @@ void CameraDaemon::emit_pipeline_stall_snapshot(
                       static_cast<unsigned long>(publisher.queue_overflow_drops),
                       static_cast<unsigned long>(publisher.client_send_drops),
                       static_cast<unsigned long>(publisher.client_send_failures),
-                      publisher.clients);
+                      publisher.clients,
+                      have_feed ? feed.consecutive_failures : 0u,
+                      have_feed ? static_cast<int>(feed.last_return_code) : 0,
+                      (have_feed && feed.stalled) ? 1u : 0u);
     }
 
     dump_pipeline_thread_wait_snapshot();

@@ -724,6 +724,10 @@ private:
     bool pipeline_stall_snapshot_latched_ = false;
     bool pipeline_stall_recovery_decided_ = false;
     std::chrono::steady_clock::time_point pipeline_stall_started_at_{};
+    // Feed-stall escalation pacing: earliest time a supervisor restart may
+    // be triggered again (one per window — a persistent caps/layout fault
+    // would otherwise flap restarts). Main-loop-only, no lock needed.
+    std::chrono::steady_clock::time_point next_feed_stall_escalation_allowed_{};
     // Effective encoder feed mode for FROM_MEDIA:
     // true  -> MediaLibrary auto-feed frontend->encoder
     // false -> manual feed via FrameRouter encoder subscriber
@@ -1022,6 +1026,11 @@ private:
     bool init_ai_overlay();
     /** Rebind VideoSource after MediaLibrary replaces its borrowed video contexts. */
     bool resync_video_source_from_media_pipeline(const char* reason);
+    /** After a full-reinit rebuild, update config_.streams / config_.encoders
+     *  dims from the (fresh) HAL video/codec contexts. Identity (names,
+     *  mapping) never changes — only geometry. Called from the transform
+     *  full-reinit tail; ReconfigurePipeline does its own full discovery. */
+    void reconcile_stream_dims_from_media_pipeline(const char* reason);
     /** Re-register EncoderManager from get_codec_list after MediaLibrary reallocates codec contexts. */
     bool resync_encoders_from_media_pipeline();
     /** Finish a partially aborted encoder teardown and restore all live HAL registrations. */
