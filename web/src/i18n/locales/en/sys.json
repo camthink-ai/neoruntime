@@ -1329,6 +1329,17 @@
         "install_failed": "Failed to install app",
         "confirm_uninstall": "Are you sure you want to uninstall this app?"
       },
+      "start_progress": {
+        "checking_image": "Checking application image...",
+        "restoring_image": "Restoring application image from local storage...",
+        "pulling_image": "Downloading application image...",
+        "image_ready": "Application image is ready",
+        "preloading_models": "Preloading AI models...",
+        "creating_container": "Creating application container...",
+        "starting_container": "Starting application container...",
+        "complete": "Application started",
+        "error": "Application start failed"
+      },
       "empty": {
         "templates": "No app templates available",
         "installed": "No apps installed"

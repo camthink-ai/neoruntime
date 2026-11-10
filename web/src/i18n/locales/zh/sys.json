@@ -1248,6 +1248,17 @@
         "install_failed": "应用安装失败",
         "confirm_uninstall": "确定要卸载此应用吗？"
       },
+      "start_progress": {
+        "checking_image": "正在检查应用镜像...",
+        "restoring_image": "正在从本地恢复应用镜像...",
+        "pulling_image": "正在下载应用镜像...",
+        "image_ready": "应用镜像已就绪",
+        "preloading_models": "正在预加载 AI 模型...",
+        "creating_container": "正在创建应用容器...",
+        "starting_container": "正在启动应用容器...",
+        "complete": "应用已启动",
+        "error": "应用启动失败"
+      },
       "empty": {
         "templates": "暂无可用的应用模板",
         "installed": "暂无已安装的应用"

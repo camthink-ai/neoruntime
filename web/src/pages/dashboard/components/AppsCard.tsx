@@ -19,6 +19,8 @@ import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { getAppWebUrl } from '@/pages/apps/lib/appWebUrl';
+import { translateStartProgress } from '@/pages/apps/lib/startProgressMessage';
+import { useAppStartProgress } from '@/hooks';
 
 interface AppsCardProps {
   stats: {
@@ -98,6 +100,16 @@ export default function AppsCard({ stats }: AppsCardProps) {
   });
 
   const startAppMutation = useMutation({
+    onMutate: (appId: string) => {
+      queryClient.setQueryData(['app-start-progress', appId], {
+        task_id: `start-${appId}`,
+        phase: 'checking_image',
+        percent: 0,
+        message: 'Checking application images...',
+        app_id: appId,
+        error: '',
+      });
+    },
     mutationFn: (appId: string) => appsApi.start(appId),
     onSuccess: () => {
       queryClient.invalidateQueries({
@@ -207,6 +219,11 @@ export default function AppsCard({ stats }: AppsCardProps) {
     stats: AppStats | null;
   }) {
     const isRunning = app.state === 'running';
+    const isStarting = pendingActions.has(`start-${app.id}`);
+    const { data: startProgress } = useAppStartProgress(
+      String(app.id),
+      isStarting
+    );
     const isLoading =      pendingActions.has(`start-${app.id}`)
       || pendingActions.has(`stop-${app.id}`);
     const webUrl = getAppWebUrl(app as any);
@@ -230,6 +247,11 @@ export default function AppsCard({ stats }: AppsCardProps) {
           <span className="text-sm font-medium text-foreground truncate block">
             {app.name}
           </span>
+          {isStarting && (
+            <span className="block truncate text-[10px] text-primary">
+              {translateStartProgress(startProgress, t)}
+            </span>
+          )}
         </div>
 
         <span

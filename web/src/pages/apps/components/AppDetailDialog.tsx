@@ -25,6 +25,7 @@ import type { AppTemplate, AppPermissions } from '@/services/types';
 import {
   useInstallApp,
   useStartApp,
+  useAppStartProgress,
   useStopApp,
   useRestartApp,
   useAppStats,
@@ -33,6 +34,7 @@ import {
 import { getAppWebUrl } from '../lib/appWebUrl';
 import { apiErrorText } from '../lib/apiErrorText';
 import { uniqueVideoStreamIds, videoStreamLabelKey } from '../lib/permissionLabels';
+import { translateStartProgress } from '../lib/startProgressMessage';
 
 function PermissionsPanel({ permissions }: { permissions: AppPermissions }) {
   const { t } = useTranslation();
@@ -179,6 +181,10 @@ export default function AppDetailDialog({
   const startMutation = useStartApp();
   const stopMutation = useStopApp();
   const restartMutation = useRestartApp();
+
+  const progressAppID = app?.id == null ? null : String(app.id);
+  const isStarting = startMutation.isPending || restartMutation.isPending;
+  const { data: startProgress } = useAppStartProgress(progressAppID, isStarting);
 
   const isZh = i18n.language === 'zh' || i18n.language === 'zh-CN';
   const isInstalled = app?.state !== undefined;
@@ -356,6 +362,13 @@ export default function AppDetailDialog({
             <PermissionsPanel permissions={permissions} />
           )}
         </div>
+
+        {isStarting && (
+          <div className="flex items-center gap-2 px-6 pb-3 text-sm text-primary">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            <span>{translateStartProgress(startProgress, t)}</span>
+          </div>
+        )}
 
         {/* Actions — mirrors the models detail dialog footer: pinned outside
             the scroll area, right-aligned, Loader2 while an action is pending */}
