@@ -121,6 +121,8 @@ type CellularHandler struct {
 	gnssCacheMu sync.Mutex
 	gnssCache   CellularGnssStatus
 	gnssCacheAt time.Time
+	// 1 after AT+QGPS=1 succeeded this module presence; cleared on USB loss / power off.
+	gnssEngineApplied int32
 }
 
 // NewCellularHandler creates a CellularHandler.

@@ -317,7 +317,8 @@ Use this offline recovery procedure:
 
 1. Back up all required content from `/data` (legacy `p3`) to another host.
 2. Publish the matching `fitImage`, SWUpdate init image, and
-   `hailo-update-image-hailo15-ne503.swu` to the recovery/TFTP server.
+   `hailo-update-image-core-hailo15-ne503.swu` (core) or
+   `hailo-update-image-dev-hailo15-ne503.swu` (dev) to the recovery/TFTP server.
 3. Boot to the U-Boot menu and select **eMMC AB Board Init**. The configured
    update modes are `init-partitions-dual,init-scu-bl,copy-a`.
 4. Boot copy A and verify that `p1` through `p5` exist.

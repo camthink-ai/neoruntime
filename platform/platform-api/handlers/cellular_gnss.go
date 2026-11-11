@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"aipc/platform/common/logger"
@@ -126,6 +127,8 @@ func (h *CellularHandler) readGnssFromModem(st CellularGnssStatus) CellularGnssS
 	}
 	st.Active = active
 	if !active {
+		// Allow boot/reconcile to retry AT+QGPS=1 (flag can be stale after CFUN/USB).
+		atomic.StoreInt32(&h.gnssEngineApplied, 0)
 		h.clearGnssCache()
 		st.Message = "GNSS enabled in config; engine not started yet."
 		return st
@@ -205,6 +208,43 @@ func parseQGPSLOC(raw string, st *CellularGnssStatus) bool {
 func floatPtr(v float64) *float64 { return &v }
 func gnssIntPtr(v int) *int       { return &v }
 
+func (h *CellularHandler) markGnssEngineApplied(on bool) {
+	if on {
+		atomic.StoreInt32(&h.gnssEngineApplied, 1)
+	} else {
+		atomic.StoreInt32(&h.gnssEngineApplied, 0)
+		h.clearGnssCache()
+	}
+}
+
+// reconcileGnssEngine starts the modem GNSS session when config wants it.
+// Quectel does not persist AT+QGPS across reboot; UpdateConfig alone is not enough.
+// Caller should ensure the module is present and the AT port is available.
+func (h *CellularHandler) reconcileGnssEngine(cfg CellularConfig) {
+	want := gnssEnabled(cfg)
+	if !want {
+		if atomic.LoadInt32(&h.gnssEngineApplied) != 1 {
+			return
+		}
+		if err := h.applyGnssEnabledWait(false, 3*time.Second); err != nil {
+			if !errors.Is(err, errATPortBusy) {
+				logger.Warn("cellular: reconcile GNSS off: %v", err)
+			}
+		}
+		return
+	}
+	if atomic.LoadInt32(&h.gnssEngineApplied) == 1 {
+		return
+	}
+	if err := h.applyGnssEnabledWait(true, 3*time.Second); err != nil {
+		if !errors.Is(err, errATPortBusy) && !strings.Contains(err.Error(), "no AT port") {
+			logger.Warn("cellular: reconcile GNSS on: %v", err)
+		}
+		return
+	}
+	logger.Info("cellular: GNSS engine started (boot/reconcile)")
+}
+
 // applyGnssEnabled starts or stops the Quectel GNSS engine.
 // EM05: ON = AT+QGPS=1, OFF = AT+QGPSEND (AT+QGPS=0 is invalid → CME 501).
 func (h *CellularHandler) applyGnssEnabled(on bool) error {
@@ -220,6 +260,7 @@ func (h *CellularHandler) applyGnssEnabledWait(on bool, lockWait time.Duration) 
 	port := findATPort()
 	if port == "" {
 		if !on {
+			h.markGnssEngineApplied(false)
 			return nil
 		}
 		return fmt.Errorf("no AT port")
@@ -236,6 +277,7 @@ func (h *CellularHandler) applyGnssEnabledWait(on bool, lockWait time.Duration) 
 		up := strings.ToUpper(raw)
 		// 504 = session already ongoing
 		if strings.Contains(up, "OK") || strings.Contains(up, "ERROR: 504") {
+			h.markGnssEngineApplied(true)
 			logger.Info("cellular: GNSS enabled")
 			return nil
 		}
@@ -249,6 +291,7 @@ func (h *CellularHandler) applyGnssEnabledWait(on bool, lockWait time.Duration) 
 	up := strings.ToUpper(raw)
 	// 505 = session not active (already off)
 	if strings.Contains(up, "OK") || strings.Contains(up, "ERROR: 505") {
+		h.markGnssEngineApplied(false)
 		logger.Info("cellular: GNSS disabled")
 		return nil
 	}
@@ -276,11 +319,11 @@ func (h *CellularHandler) retryGnssApply(on bool) {
 		if err != nil || !cfg.Enabled || gnssEnabled(cfg) != on {
 			return
 		}
-		if err := h.applyGnssEnabledWait(on, 8*time.Second); err == nil {
-			return
-		} else {
+		if err := h.applyGnssEnabledWait(on, 8*time.Second); err != nil {
 			logger.Warn("cellular: GNSS retry %d/12: %v", i+1, err)
+			continue
 		}
+		return
 	}
 	logger.Warn("cellular: GNSS apply gave up after retries (want=%v)", on)
 }
