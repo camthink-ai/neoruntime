@@ -2051,6 +2051,20 @@
         "mic_input": "麦克风输入",
         "speaker_output": "扬声器输出"
       }
+    },
+    "lens": {
+      "auto_iris": "自动光圈",
+      "auto_iris_exposure": "曝光时间",
+      "auto_iris_aperture": "光圈 ADC/目标",
+      "auto_iris_state": "状态",
+      "auto_iris_state_inactive": "未启用",
+      "auto_iris_state_max": "最大光圈",
+      "auto_iris_state_sunny": "晴天已收光圈",
+      "auto_iris_state_paused_ir": "红外模式暂停",
+      "auto_iris_state_paused_manual": "手动曝光暂停",
+      "auto_iris_state_paused_lens": "镜头未就绪",
+      "auto_iris_hint": "晴天(曝光 < 2ms)自动缩小光圈,弱光自动回最大;关闭即恢复最大光圈。",
+      "auto_iris_toggle_failed": "切换自动光圈失败"
     }
   }
 }

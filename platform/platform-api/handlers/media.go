@@ -3399,3 +3399,81 @@ func mergeFloat32SliceJSONAlias(name string, snake, camel []float32) ([]float32,
 	}
 	return camel, nil
 }
+
+// GetAutoIrisStatus returns the live auto-iris controller state: the toggle,
+// the hardware AE integration time (not the UI intent cache), the commanded
+// iris target and the live Hall ADC readback. Polled by the web UI for the
+// before/after comparison while the user flips the switch.
+// GET /api/v1/media/auto-iris-status
+func (h *MediaHandlers) GetAutoIrisStatus(c *gin.Context) {
+	if h.cameraClient == nil {
+		Resp(c).FailMsg(CodeCameraError, "Camera control service is not available")
+		return
+	}
+
+	client := camerapb.NewCameraControlClient(h.cameraClient)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	resp, err := client.GetAutoIrisStatus(ctx, &camerapb.Empty{})
+	if err != nil {
+		Resp(c).FailMsg(CodeCameraError, err.Error())
+		return
+	}
+
+	c.Header("Cache-Control", "no-store")
+	Resp(c).OK(gin.H{
+		"enabled":           resp.GetEnabled(),
+		"exposure_time_us":  resp.GetExposureTimeUs(),
+		"gain":              resp.GetGain(),
+		"iris_target":       resp.GetIrisTarget(),
+		"iris_adc":          resp.GetIrisAdc(),
+		"state":             resp.GetState(),
+		"reason":            resp.GetReason(),
+	})
+}
+
+// SetAutoIrisEnabled toggles the auto-iris controller. Disabling reopens the
+// aperture to the factory default (maximum) immediately.
+// PUT /api/v1/media/auto-iris
+func (h *MediaHandlers) SetAutoIrisEnabled(c *gin.Context) {
+	if h.cameraClient == nil {
+		Resp(c).FailMsg(CodeCameraError, "Camera control service is not available")
+		return
+	}
+
+	var req struct {
+		Enabled *bool `json:"enabled" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body")
+		return
+	}
+
+	client := camerapb.NewCameraControlClient(h.cameraClient)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	resp, err := client.SetAutoIrisEnabled(ctx, &camerapb.AutoIrisEnableRequest{
+		Enabled: *req.Enabled,
+	})
+	if err != nil {
+		Resp(c).FailMsg(CodeCameraError, err.Error())
+		return
+	}
+	if !resp.GetSuccess() {
+		Resp(c).FailMsg(CodeCameraError, resp.GetMessage())
+		return
+	}
+
+	st := resp.GetStatus()
+	Resp(c).OK(gin.H{
+		"enabled":           st.GetEnabled(),
+		"exposure_time_us":  st.GetExposureTimeUs(),
+		"gain":              st.GetGain(),
+		"iris_target":       st.GetIrisTarget(),
+		"iris_adc":          st.GetIrisAdc(),
+		"state":             st.GetState(),
+		"reason":            st.GetReason(),
+	})
+}

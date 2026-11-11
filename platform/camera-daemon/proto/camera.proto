@@ -52,6 +52,31 @@ message ISPConfigResponse {
   ISPUpdateRequest current = 3;
 }
 
+// Auto iris (AF0832 physical aperture): closes the iris in bright light so the
+// AE does not have to run at the shortest exposures; reopens to the default
+// (maximum aperture, target 0) when light drops, when disabled, or in modes
+// where the statistic is meaningless.
+message AutoIrisStatus {
+  bool enabled = 1;                  // feature toggle (persisted across reboots)
+  uint32 exposure_time_us = 2;       // live AE integration time (hardware, not the UI cache)
+  uint32 gain = 3;                   // live AE gain (UI units)
+  uint32 iris_target = 4;            // last commanded closed-loop target [0..1023]
+  uint32 iris_adc = 5;               // live Hall ADC position [0..1023]
+  // inactive | max_aperture | sunny_closed | paused_infrared | paused_manual_exposure | paused_lens_not_ready
+  string state = 6;
+  string reason = 7;                 // human-readable detail for the current state
+}
+
+message AutoIrisEnableRequest {
+  bool enabled = 1;
+}
+
+message AutoIrisEnableResponse {
+  bool success = 1;
+  string message = 2;
+  AutoIrisStatus status = 3;
+}
+
 // Transform controls (via HAL_MEDIA_OPS.dynamic_change_image_config)
 message TransformConfig {
   uint32 rotation = 1;     // 0/1/2/3 → 0°/90°/180°/270°
@@ -604,6 +629,10 @@ service CameraControl {
 
   // Get current ISP configuration
   rpc GetISPConfig(Empty) returns (ISPConfigResponse);
+
+  // Auto iris (AF0832 physical aperture)
+  rpc GetAutoIrisStatus(Empty) returns (AutoIrisStatus);
+  rpc SetAutoIrisEnabled(AutoIrisEnableRequest) returns (AutoIrisEnableResponse);
 
   // Get current transform configuration (rotation, flip, dewarp, grayscale)
   rpc GetTransformConfig(Empty) returns (TransformConfig);

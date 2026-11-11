@@ -381,6 +381,19 @@ public:
      */
     bool get_isp_config(aipc::camera::ISPConfigResponse& response);
 
+    // Auto iris (AF0832 aperture) control surface for the gRPC layer.
+    struct AutoIrisPublicState {
+        bool enabled = false;
+        std::string state;
+        std::string reason;
+        uint32_t exposure_time_us = 0;
+        uint32_t gain = 0;
+        uint16_t iris_target = 0;
+        uint16_t iris_adc = 0;
+    };
+    bool get_auto_iris_status(AutoIrisPublicState* out);
+    bool set_auto_iris_enabled(bool enabled, std::string* error);
+
     /**
      * @brief Get current transform configuration (rotation, flip, dewarp, grayscale)
      */
@@ -820,6 +833,46 @@ private:
     mutable std::mutex ir_preset_mu_;
     std::vector<IrPresetEntry> ir_presets_cache_;
     bool ir_presets_loaded_ = false;
+
+    // ── Auto iris (AF0832 physical aperture) ─────────────────────────────
+    // Closes the iris in bright light (AE exposure below the sunny threshold)
+    // so the AE stops running at the shortest exposures; reopens to the
+    // default maximum (target 0) when light drops, when disabled, or in modes
+    // where the AE statistic is meaningless (infrared, manual exposure).
+    // Mirrors the light-monitor pattern: daemon thread + hysteresis policy +
+    // persisted toggle at /data/aipc/etc/auto_iris.json.
+    struct AutoIrisConfig {
+        uint32_t sample_interval_ms = 500;
+        uint32_t sunny_exposure_us  = 2000;  // et below → close the iris
+        uint32_t dark_exposure_us   = 10000; // et above → reopen
+        uint32_t sunny_confirm      = 5;     // consecutive samples (×interval) to close
+        uint32_t dark_confirm       = 20;    // … to reopen (asymmetric: prevents flapping)
+        uint16_t sunny_target       = 600;   // closed-loop target when sunny [0..1023]
+    };
+    struct AutoIrisState {
+        bool enabled = false;             // user toggle (persisted)
+        std::string state = "inactive";   // machine state for the UI
+        std::string reason;               // human-readable detail
+        uint32_t exposure_time_us = 0;    // last live AE sample (hardware)
+        uint32_t gain = 0;                // last live AE gain (UI units)
+        uint16_t iris_target = 0;         // last commanded target
+        uint16_t iris_adc = 0;            // last Hall ADC readback
+        bool closed = false;              // current aperture regime
+        uint32_t below_count = 0;         // consecutive samples below sunny threshold
+        uint32_t above_count = 0;         // consecutive samples above dark threshold
+        bool paused_latched = false;      // a hard pause already reopened the iris
+    };
+    AutoIrisConfig auto_iris_cfg_;
+    mutable std::mutex auto_iris_mu_;
+    AutoIrisState auto_iris_;
+    std::thread auto_iris_thread_;
+    std::atomic<bool> auto_iris_stop_{true};
+    void auto_iris_load_config();         // json mirror: toggle + optional overrides
+    void auto_iris_persist_locked();      // caller holds auto_iris_mu_
+    bool auto_iris_apply_target_locked(uint16_t target, const char* why);  // caller holds mu (HAL I/O outside)
+    void start_auto_iris();
+    void stop_auto_iris(bool reopen);
+    void auto_iris_loop();
 
 #ifdef HAS_GRPC
     std::unique_ptr<CameraControlServiceImpl> camera_control_service_;

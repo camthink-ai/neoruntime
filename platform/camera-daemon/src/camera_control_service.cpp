@@ -176,6 +176,59 @@ grpc::Status CameraControlServiceImpl::GetISPConfig(
     return grpc::Status::OK;
 }
 
+grpc::Status CameraControlServiceImpl::GetAutoIrisStatus(
+    grpc::ServerContext* context,
+    const aipc::camera::Empty* request,
+    aipc::camera::AutoIrisStatus* response) {
+
+    if (!daemon_) {
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    CameraDaemon::AutoIrisPublicState st;
+    if (!daemon_->get_auto_iris_status(&st)) {
+        return grpc::Status(grpc::StatusCode::INTERNAL, "auto-iris status unavailable");
+    }
+    response->set_enabled(st.enabled);
+    response->set_exposure_time_us(st.exposure_time_us);
+    response->set_gain(st.gain);
+    response->set_iris_target(st.iris_target);
+    response->set_iris_adc(st.iris_adc);
+    response->set_state(st.state);
+    response->set_reason(st.reason);
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::SetAutoIrisEnabled(
+    grpc::ServerContext* context,
+    const aipc::camera::AutoIrisEnableRequest* request,
+    aipc::camera::AutoIrisEnableResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    std::string error;
+    const bool ok = daemon_->set_auto_iris_enabled(request->enabled(), &error);
+    response->set_success(ok);
+    response->set_message(ok ? (request->enabled() ? "auto-iris enabled" : "auto-iris disabled (iris reopened)")
+                             : error);
+    CameraDaemon::AutoIrisPublicState st;
+    if (daemon_->get_auto_iris_status(&st)) {
+        aipc::camera::AutoIrisStatus* out = response->mutable_status();
+        out->set_enabled(st.enabled);
+        out->set_exposure_time_us(st.exposure_time_us);
+        out->set_gain(st.gain);
+        out->set_iris_target(st.iris_target);
+        out->set_iris_adc(st.iris_adc);
+        out->set_state(st.state);
+        out->set_reason(st.reason);
+    }
+    return grpc::Status::OK;
+}
+
 grpc::Status CameraControlServiceImpl::GetTransformConfig(
     grpc::ServerContext* context,
     const aipc::camera::Empty* request,
