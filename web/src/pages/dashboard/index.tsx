@@ -13,6 +13,9 @@ import StreamPreview from './components/StreamPreview';
 import DeviceStatusCard from './components/DeviceStatusCard';
 import AppsCard from './components/AppsCard';
 import GyroCalibrationCard from './components/GyroCalibrationCard';
+import LocationMapCard, {
+  useCellularModulePresent,
+} from './components/LocationMapCard';
 
 const defaultStats = {
   cpu: { usage: 0, cores: 0 },
@@ -56,6 +59,7 @@ export default function Dashboard() {
   const { data: stats } = useDashboardStats();
   const { data: sysInfo } = useSystemInfo();
   const { data: platformStats } = usePlatformStats();
+  const { data: showLocation } = useCellularModulePresent();
 
   const safeStats = stats || defaultStats;
   const safeSysInfo = sysInfo || defaultSysInfo;
@@ -130,11 +134,16 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Row 4: 监控趋势(9) + 设备信息(3) */}
+        {/* Row 4: 监控趋势 + 定位(可选) + 设备信息 */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
-          <div className="lg:col-span-9">
+          <div className={showLocation ? 'lg:col-span-5' : 'lg:col-span-9'}>
             <ResourceTrendCard className="h-full" />
           </div>
+          {showLocation && (
+            <div className="lg:col-span-4 min-h-[280px]">
+              <LocationMapCard />
+            </div>
+          )}
           <div className="lg:col-span-3">
             <SystemInfoCard info={safeSysInfo} />
           </div>

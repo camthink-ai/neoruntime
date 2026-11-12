@@ -26,6 +26,7 @@ export type GnssMapProps = {
   latitude?: number | null;
   longitude?: number | null;
   className?: string;
+  mapClassName?: string;
 };
 
 type BasemapCrs = 'wgs84' | 'gcj02';
@@ -119,6 +120,7 @@ export default function GnssMap({
   latitude,
   longitude,
   className,
+  mapClassName,
 }: GnssMapProps) {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -272,6 +274,7 @@ export default function GnssMap({
       <div
         className={cn(
           'h-[220px] w-full bg-muted/40',
+          mapClassName,
           (!enabled || !fixed) && 'grayscale-[0.35]'
         )}
       >

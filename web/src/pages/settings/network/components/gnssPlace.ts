@@ -15,8 +15,8 @@ type BigDataCloudResp = {
   };
 };
 
-function placeLang(uiLang: string): 'zh' | 'en' {
-  return uiLang.toLowerCase().startsWith('zh') ? 'zh' : 'en';
+function placeLang(uiLang: string): string {
+  return uiLang.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en';
 }
 
 function formatPlace(d: BigDataCloudResp): string {

@@ -114,6 +114,7 @@
       "memory_usage": "Memory Usage",
       "storage": "Storage",
       "device_info": "Device Info",
+      "location": "Location",
       "device_time": "Device Status",
       "device_temp": "Device Temp",
       "temp_monitor": "Temperature",
