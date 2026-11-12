@@ -385,7 +385,7 @@ func TestCellularConnectRequiresEnabled(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "Enable cellular") {
+	if !strings.Contains(w.Body.String(), "Enable module power") {
 		t.Fatalf("body=%s", w.Body.String())
 	}
 }

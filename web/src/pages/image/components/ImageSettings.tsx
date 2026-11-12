@@ -41,15 +41,11 @@ import {
 } from '@/services/settings';
 
 // Client-side allowlist mirroring camera-daemon's SwitchProfile guard. The
-// device returns the full profile list (Daylight/HDR/detection variants…); we
-// only surface the three AI ISP Basic profiles for UI switching.
+// device returns the full profile list (Daylight/HDR/detection variants…);
+// we only treat the AI ISP Basic profiles as "AI ISP on". The UI surfaces a
+// single toggle that always targets Gen3 (the Gen profiles are iterations,
+// not selectable modes).
 const AI_ISP_PROFILE_RE = /^AI_ISP_Gen([123])_Basic$/;
-
-const AI_ISP_GEN_LABEL_KEY: Record<string, string> = {
-  '1': 'sys.media_settings.isp_profile_gen1',
-  '2': 'sys.media_settings.isp_profile_gen2',
-  '3': 'sys.media_settings.isp_profile_gen3',
-};
 
 const AWB_OPTIONS = [
   { value: '-1', labelKey: 'sys.media_settings.awb_auto' },
@@ -121,16 +117,10 @@ export default function ImageSettings() {
     }
   }, [infrared]);
 
-  // Remembers the last AI ISP Gen profile the user had active so toggling
-  // AI ISP off→on restores it instead of always jumping to the default. Set
-  // whenever the device lands on an AI ISP profile (load + switch success).
-  const lastAiGenRef = useRef<string>('');
+  // AI ISP is on whenever the active profile is one of the Gen entries — this
+  // includes units still sitting on Gen1/Gen2 from before the dropdown was
+  // removed: the toggle shows on, and turning it off→on lands them on Gen3.
   const aiEnabled = AI_ISP_PROFILE_RE.test(currentProfile);
-  useEffect(() => {
-    if (aiEnabled) {
-      lastAiGenRef.current = currentProfile;
-    }
-  }, [aiEnabled, currentProfile]);
 
   const loadData = useCallback(async () => {
     try {
@@ -485,7 +475,12 @@ export default function ImageSettings() {
                 <Switch
                   id="ai-isp-enable"
                   checked={aiEnabled}
-                  disabled={infraredActive || switching || aiProfiles.length === 0}
+                  disabled={
+                    infraredActive
+                    || switching
+                    || playerReloading
+                    || aiProfiles.length === 0
+                  }
                   onCheckedChange={checked => {
                     if (isInSwitchCooldown()) {
                       toast.warning(
@@ -494,11 +489,10 @@ export default function ImageSettings() {
                       return;
                     }
                     if (checked) {
-                      // Restore the last Gen profile the user had, else default
-                      // to Gen3 (highest quality) when available, else the first
-                      // AI ISP profile the device exposes.
-                      const target =                        lastAiGenRef.current
-                        || aiProfiles.find(p => p.includes('Gen3'))
+                      // The Gen profiles are iterations, not modes — the product
+                      // ships Gen3 only. Defensive fallback for devices whose
+                      // bundle somehow lacks it: first exposed AI ISP profile.
+                      const target =                        aiProfiles.find(p => p.includes('Gen3'))
                         || aiProfiles[0];
                       if (target) setPendingProfile(target);
                     } else {
@@ -508,50 +502,13 @@ export default function ImageSettings() {
                 />
               </div>
             </div>
-            {aiEnabled && (
-              <>
-                <p className="text-xs text-muted-foreground">
-                  {t('sys.media_settings.isp_profile_hint')}
-                </p>
-                <div className="space-y-1.5">
-                  <Label className="text-xs">
-                    {t('sys.media_settings.isp_profile_label')}
-                  </Label>
-                  {aiProfiles.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">
-                      {t('sys.media_settings.isp_profile_unavailable')}
-                    </p>
-                  ) : (
-                    <Select
-                      value={currentProfile}
-                      onValueChange={v => {
-                        if (isInSwitchCooldown()) {
-                          toast.warning(
-                            t('sys.media_settings.isp_profile_switch_cooldown')
-                          );
-                          return;
-                        }
-                        setPendingProfile(v);
-                      }}
-                      disabled={switching || playerReloading}
-                    >
-                      <SelectTrigger className="w-full">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {aiProfiles.map(p => {
-                          const gen = p.match(AI_ISP_PROFILE_RE)?.[1] ?? '';
-                          return (
-                            <SelectItem key={p} value={p}>
-                              {t(AI_ISP_GEN_LABEL_KEY[gen] ?? '')}
-                            </SelectItem>
-                          );
-                        })}
-                      </SelectContent>
-                    </Select>
-                  )}
-                </div>
-              </>
+            <p className="text-xs text-muted-foreground">
+              {t('sys.media_settings.isp_profile_hint')}
+            </p>
+            {aiProfiles.length === 0 && (
+              <p className="text-xs text-muted-foreground">
+                {t('sys.media_settings.isp_profile_unavailable')}
+              </p>
             )}
           </CardContent>
         </Card>
