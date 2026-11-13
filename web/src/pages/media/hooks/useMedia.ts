@@ -3,6 +3,7 @@ import {
   disableStream,
   enableStream,
   getPtzState,
+  getMediaConfig,
   reconfigureEncoder,
   setRtspEnabled,
   updateAiOverlay,
@@ -80,9 +81,23 @@ export const useUpdateEncoderConfig = () => {
  * Hot reload: Toggle RTSP server without restart
  * 通过 PUT /api/v1/media/rtsp
  */
-export const useSetRtspEnabled = () => useMutation({
+export const useRtspEnabled = () => useQuery({
+    queryKey: ['mediaRtspEnabled'],
+    queryFn: async () => {
+      const response = await getMediaConfig();
+      const enabled = response?.data?.rtsp?.enabled;
+      if (typeof enabled !== 'boolean') throw new Error('Invalid RTSP configuration');
+      return enabled;
+    },
+    refetchOnMount: 'always',
+  });
+
+export const useSetRtspEnabled = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
     mutationFn: (enabled: boolean) => setRtspEnabled(enabled),
     onSuccess: (_resp, enabled) => {
+      queryClient.setQueryData(['mediaRtspEnabled'], enabled);
       toast.success(enabled ? 'RTSP 已启用' : 'RTSP 已停止');
     },
     onError: (err: any) => {
@@ -91,6 +106,7 @@ export const useSetRtspEnabled = () => useMutation({
       );
     },
   });
+};
 
 /**
  * Hot reload: Update AI overlay config without restart
