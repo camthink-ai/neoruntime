@@ -265,7 +265,7 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         # FORCE: the profile list is source-managed (nothing overrides it via
         # -D); without FORCE a stale CMakeCache value silently keeps old
         # profiles out of the bundle on incremental builds.
-        set(HAL_V2_DEFAULT_MEDIALIB_PROFILES "Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic,Infrared_Basic,Infrared_Basic_FG2009" CACHE STRING "Profiles embedded in the default medialib config" FORCE)
+        set(HAL_V2_DEFAULT_MEDIALIB_PROFILES "Daylight_Basic,Daylight_Basic_FG2009,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic,Infrared_Basic,Infrared_Basic_FG2009" CACHE STRING "Profiles embedded in the default medialib config" FORCE)
         set(HAL_V2_DEFAULT_MEDIALIB_SCRATCH_ROOT "/var/tmp/hal_medialib_default" CACHE STRING "Runtime scratch dir for the embedded default medialib config")
         set(HAL_V2_DEFAULT_MEDIALIB_WS_CFG "etc/imaging/cfg/medialib_configs/webserver_medialib_config.json" CACHE STRING "Webserver medialib config path (relative to SDK sysroot)")
         get_filename_component(_HAL_SDK_SYSROOT "${HAILO_MEDIALIB_INC_DIR}/../../.." ABSOLUTE)
@@ -1159,5 +1159,23 @@ if(HAL_V2_BUILD_TESTS)
     add_test(
         NAME hailo15_async_provider_lifecycle
         COMMAND hal-hailo15-async-provider-lifecycle-test
+    )
+
+    add_executable(hal-hailo15-feed-health-test
+        tests/hailo15_feed_health_test.cpp
+    )
+    target_include_directories(hal-hailo15-feed-health-test PRIVATE
+        ${HAL_V2_ROOT}/platforms/hailo15/media
+    )
+    target_link_libraries(hal-hailo15-feed-health-test PRIVATE
+        Threads::Threads
+    )
+    target_compile_options(hal-hailo15-feed-health-test PRIVATE
+        -Wall -Wextra -Werror
+    )
+
+    add_test(
+        NAME hailo15_feed_health
+        COMMAND hal-hailo15-feed-health-test
     )
 endif()

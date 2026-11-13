@@ -42,12 +42,26 @@ import sys
 # pool_max_buffers is DEFAULT_POOL_MAX_BUFFERS for every stream. target_bitrate scales
 # roughly with pixel count so each stream gets a sensible H264 default.
 DEFAULT_STREAMS = [
-    ("sink0", 1920, 1080, 6_000_000),  # 1080P ~6 Mbps
-    ("sink1", 1280, 720,  3_000_000),  # 720P   ~3 Mbps
-    ("sink2", 640, 384,   1_000_000),  # low    ~1 Mbps
+    ("sink0", 3840, 2160, 16_000_000),  # 4K ~16 Mbps (native-resolution main)
+    ("sink1", 1280, 720,   3_000_000),  # 720P   ~3 Mbps
+    ("sink2", 640, 384,    1_000_000),  # low    ~1 Mbps
 ]
 DEFAULT_FRAMERATE = 30
 DEFAULT_POOL_MAX_BUFFERS = 20
+# The MediaLibrary 1.13 default is only six 4K post-ISP denoise buffers. A
+# transient producer/consumer clock skew can put all six in the downstream
+# multi-resize queue; denoise treats the resulting transient acquire miss as a
+# fatal frame error and permanently stops its GStreamer task. Twelve buffers
+# cover the normal queueing window while adding about 75 MiB at 3840x2160 NV12.
+DEFAULT_DENOISE_POOL_MAX_BUFFERS = 12
+
+# Profiles whose iq_settings carries its own dewarp decision. Everything else has
+# dewarp forced on (see normalize_profile); the AF-lens daylight entry is tuned
+# without the correction pass, so the flag from its json is preserved. Matched as
+# a path suffix — profile_path is the container's absolute /etc/imaging/... ref.
+DEWARP_OPT_OUT_PROFILE_SUFFIXES = (
+    "profiles/daylight/webserver_daylight/webserver_daylight_basic_profile.json",
+)
 
 
 # ---- content_hash: faithful port of medialib ConfigValidator::calculate_json_hash ----
@@ -241,13 +255,15 @@ def _strip_osd_and_static_mask(obj):
 
 
 def normalize_profile(files, profile_path):
-    """Rewrite one profile to the fixed 3-stream layout (1080P / 720P / 640x384, pool 8, 30fps,
+    """Rewrite one profile to the fixed 3-stream layout (1080P / 720P / 640x384, pool 20, 30fps,
     per-resolution bitrate).
 
     - application_input_streams.resolutions -> 3 entries.
     - encoded_output_streams -> 3 entries; sink1/sink2 get cloned encoder/masking/osd files
       (derived from sink0). Each encoder gets its dimensions + bitrate set per resolution.
     - iq_settings.dewarp.enabled forced True (lens correction on by default in every mode).
+    - iq_settings.denoise.pool-max-buffers forced to 12 so AI ISP profiles do not
+      inherit MediaLibrary's undersized six-buffer default.
     """
     if profile_path not in files:
         return
@@ -278,9 +294,19 @@ def normalize_profile(files, profile_path):
 
     # Force lens dewarp (anti-distortion) on by default in every mode (daylight/HDR/
     # AI_ISP/IR): the camera ships with a fixed lens, so correction is always wanted.
+    # Exception: the AF-lens daylight profile is retuned with dewarp off (the bench
+    # tuning for that lens was done without the correction pass), so its own value
+    # is honoured instead of being overridden.
     iq_ref = profile.get("iq_settings")
     if isinstance(iq_ref, str) and iq_ref in files:
-        files[iq_ref].setdefault("dewarp", {})["enabled"] = True
+        iq = files[iq_ref]
+        dewarp = iq.setdefault("dewarp", {})
+        if not profile_path.endswith(DEWARP_OPT_OUT_PROFILE_SUFFIXES):
+            dewarp["enabled"] = True
+        denoise = iq.get("denoise")
+        if not isinstance(denoise, dict):
+            sys.exit(f"gen_default_medialib_bundle: profile '{profile_path}' has no denoise config")
+        denoise["pool-max-buffers"] = DEFAULT_DENOISE_POOL_MAX_BUFFERS
 
     # encoded_output_streams
     eos = profile.get("encoded_output_streams")
@@ -373,7 +399,7 @@ def main():
 
     files = gather_files(search_roots, container, wanted)
 
-    # Normalize every profile to the fixed 3-stream layout (1080P / 720P / 640x384, pool 8,
+    # Normalize every profile to the fixed 3-stream layout (1080P / 720P / 640x384, pool 20,
     # 30fps). This mutates each profile + its application_settings and registers cloned
     # per-stream files (encoder/masking/osd for sink1/sink2) in `files`.
     for p in container["profiles"]:

@@ -72,9 +72,20 @@ export function StatusChip({
   );
 }
 
-export function SectionTitle({ children }: { children: ReactNode }) {
+export function SectionTitle({
+  children,
+  action,
+}: {
+  children: ReactNode;
+  action?: ReactNode;
+}) {
   return (
-    <div className="mb-3 text-sm font-semibold text-foreground">{children}</div>
+    <div className="mb-3 flex items-center justify-between gap-3">
+      <div className="min-w-0 text-sm font-semibold text-foreground">
+        {children}
+      </div>
+      {action ? <div className="shrink-0">{action}</div> : null}
+    </div>
   );
 }
 

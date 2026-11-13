@@ -106,6 +106,14 @@ public:
     };
     bool get_stream_stats(const std::string& name, StreamDropStats* out);
 
+    struct QueueDebugStats {
+        size_t depth = 0;
+        size_t capacity = 0;
+        size_t high_watermark = 0;
+    };
+    /** Copy-queue state used by the one-shot pipeline-stall snapshot. */
+    QueueDebugStats get_queue_debug_stats();
+
     // Encoder-health thresholds (check_encoder_health): a stream that has
     // published this many packets without a single keyframe, or whose last
     // keyframe is older than kHealthMaxIdrGapMs while packets keep flowing, is
@@ -182,6 +190,7 @@ private:
     std::condition_variable queue_cv_;
     std::deque<std::unique_ptr<QueuedPacket>> queue_;
     std::unordered_map<std::string, uint64_t> next_seq_;  // per-stream seq, under queue_mu_
+    std::atomic<size_t> queue_high_watermark_{0};
 
     std::mutex listeners_mu_;
     std::vector<LocalCallback> local_listeners_;

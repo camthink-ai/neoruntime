@@ -119,6 +119,7 @@ func (h *CellularHandler) autoDialLoop() {
 			if h.dialerRunning() {
 				_ = h.stopDialer()
 			}
+			h.markGnssEngineApplied(false)
 			continue
 		}
 		if atomic.LoadInt32(&h.usbnetApplyBusy) != 0 {
@@ -130,12 +131,24 @@ func (h *CellularHandler) autoDialLoop() {
 			if h.dialerRunning() {
 				_ = h.stopDialer()
 			}
+			h.markGnssEngineApplied(false)
 			h.clearDialBackoff()
 			h.resetSIMWatch()
 			continue
 		}
 
 		if !h.hasModemControl() {
+			continue
+		}
+
+		// GNSS session does not survive reboot; apply desired state even when
+		// cellular data is off (map can work without a PDP).
+		h.reconcileGnssEngine(cfg)
+
+		if !dataEnabled(cfg) {
+			if h.dialerRunning() {
+				_ = h.stopDialer()
+			}
 			continue
 		}
 
@@ -232,7 +245,7 @@ func (h *CellularHandler) autoDialLoop() {
 		}
 		h.clearDialBackoff()
 		h.sessionWaitSince = h.now()
-		logger.Info("cellular: auto-dial started (enabled + module present)")
+		logger.Info("cellular: auto-dial started (module power + data enabled)")
 	}
 }
 

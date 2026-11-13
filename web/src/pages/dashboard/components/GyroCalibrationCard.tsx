@@ -8,6 +8,9 @@ import {
   WebGLRenderer,
   Clock,
   PlaneGeometry,
+  BoxGeometry,
+  CylinderGeometry,
+  SphereGeometry,
   MeshStandardMaterial,
   Mesh,
   Group,
@@ -15,143 +18,249 @@ import {
   AmbientLight,
   DirectionalLight,
   GridHelper,
-  Sprite,
-  SpriteMaterial,
-  MeshBasicMaterial,
+  LineSegments,
+  EdgesGeometry,
+  LineBasicMaterial,
   Quaternion,
   Vector3,
   MathUtils,
   SRGBColorSpace,
+  DoubleSide,
+  type Material,
+  type BufferGeometry,
 } from 'three';
 
 /**
- * 陀螺仪校准可视化（精简 three.js）
- *
- * 姿态只表达为两轴倾角，不含偏航（Z 轴）：
- *   - pitch  前后倾角（°），正值 = 前倾（+X 侧下沉）
- *   - roll   左右倾角（°），正值 = 右倾（+Y 侧下沉）
- * 薄板只在前后/左右两轴上倾斜，永不绕 Z 轴旋转。
- *
- * 坐标约定（Z-up 世界系，与后端一致）：
- *   +X = 前 / -X = 后 / +Y = 右 / -Y = 左 / +Z = 上
- *
- * 数据来源：GyroSSE（GET /api/v1/monitor/gyro/attitude）。
- * 端点不可用或首帧超时时回退 MockGyro，保证可视化始终有姿态数据。
+ * 陀螺仪校准可视化：仅 pitch/roll（无 yaw）。
+ * +X 前 / +Y 右 / +Z 上；数据来自 GyroSSE，不可用时可选 MockGyro。
  */
 
-// 设备水平容差：综合倾角 <= 该值视为水平
 const LEVEL_TOLERANCE_DEG = 2;
-
-// 倾角有效范围（后端同样钳制到此区间）
 const MAX_TILT_DEG = 90;
 
-// ---- 平面纹理（单面文字）----
-// PlaneGeometry 默认在 XY 平面、法线 +Z；纹理 +X(右)=+X、+Y(上)=+Y
-function makeFaceTexture(label: string, bg: string) {
-  const size = 512;
+type Disposable = { dispose: () => void };
+
+function makeLabelTexture(
+  label: string,
+  bg: string,
+  opts?: { w?: number; h?: number; fontPx?: number; fg?: string }
+) {
+  const w = opts?.w ?? 512;
+  const h = opts?.h ?? 512;
   const cvs = document.createElement('canvas');
-  cvs.width = size;
-  cvs.height = size;
+  cvs.width = w;
+  cvs.height = h;
   const ctx = cvs.getContext('2d')!;
   ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, size, size);
-  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
-  ctx.lineWidth = 10;
-  ctx.strokeRect(6, 6, size - 12, size - 12);
-  ctx.fillStyle = 'rgba(255,255,255,0.92)';
-  ctx.font = 'bold 110px sans-serif';
+  ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = opts?.fg ?? 'rgba(255,255,255,0.92)';
+  ctx.font = `bold ${opts?.fontPx ?? 120}px sans-serif`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(label, size / 2, size / 2);
+  ctx.fillText(label, w / 2, h / 2);
   const tex = new CanvasTexture(cvs);
   tex.anisotropy = 4;
   tex.colorSpace = SRGBColorSpace;
   return tex;
 }
 
-// ---- 四向倾角标（始终面向相机的文字精灵）----
-// key/fallback 供语言切换时重绘纹理；pos 为场景坐标（+X=前 / -X=后 / +Y=右 / -Y=左）
-const DIR_LABEL_DEFS = [
-  { key: 'sys.gyro.front', fallback: '前倾', pos: [2.3, 0, 0] },
-  { key: 'sys.gyro.back', fallback: '后倾', pos: [-2.3, 0, 0] },
-  { key: 'sys.gyro.right', fallback: '右倾', pos: [0, 2.3, 0] },
-  { key: 'sys.gyro.left', fallback: '左倾', pos: [0, -2.3, 0] },
-] as const;
+/** NE503 bullet IPC：机身 + 顶雨罩 + 水平颈/球头 + 壁挂底板（俯视 T）。 */
+function buildIpcDevice(): { root: Group; disposables: Disposable[] } {
+  const root = new Group();
+  const disposables: Disposable[] = [];
+  const track = (...items: Disposable[]) => {
+    disposables.push(...items);
+  };
+  const mat = (
+    color: number,
+    roughness?: number,
+    metalness?: number,
+    side?: typeof DoubleSide
+  ) => {
+    const m = new MeshStandardMaterial({
+      color,
+      roughness: roughness ?? 0.45,
+      metalness: metalness ?? 0.28,
+      side,
+    });
+    track(m);
+    return m;
+  };
+  const add = (
+    parent: Group,
+    geo: BufferGeometry,
+    material: Material | Material[],
+    opts?: { x?: number; y?: number; z?: number; rx?: number; ry?: number; rz?: number }
+  ) => {
+    const mesh = new Mesh(geo, material);
+    if (opts?.x != null) mesh.position.x = opts.x;
+    if (opts?.y != null) mesh.position.y = opts.y;
+    if (opts?.z != null) mesh.position.z = opts.z;
+    if (opts?.rx != null) mesh.rotation.x = opts.rx;
+    if (opts?.ry != null) mesh.rotation.y = opts.ry;
+    if (opts?.rz != null) mesh.rotation.z = opts.rz;
+    parent.add(mesh);
+    track(geo);
+    return mesh;
+  };
 
-// 画布按文字实际宽度定尺寸，长文案（如 "Front tilt"）不裁切。
-interface DirLabelTheme {
-  fg: string;
+  const shell = mat(0x4a535e, 0.5, 0.22);
+  const shellDark = mat(0x3a424c, 0.52, 0.18);
+  const hoodMat = mat(0x3a424c, 0.52, 0.18, DoubleSide);
+  const metal = mat(0x6a727c, 0.32, 0.55);
+  const screwSilver = mat(0xd0d5dc, 0.22, 0.8);
+  const black = mat(0x14181e, 0.4, 0.25);
+
+  const barrelR = 0.56;
+  const barrelLen = 2.15;
+  const baseFace = 0.98;
+  const baseDepth = 0.42;
+  const ballR = 0.14;
+
+  const baseX = -1.95;
+  const baseFrontX = baseX + baseDepth / 2;
+  const stubLen = 0.14;
+  const ballX = baseFrontX + stubLen + ballR * 0.35;
+  const armLen = 0.28;
+  const armMidX = ballX + ballR * 0.55 + armLen / 2;
+  const barrelRearX = ballX + ballR * 0.55 + armLen;
+  const barrelX = barrelRearX + barrelLen / 2;
+
+  const base = new Group();
+  base.position.set(baseX, 0, 0);
+  root.add(base);
+  const baseBox = add(base, new BoxGeometry(baseDepth, baseFace, baseFace), shell);
+  {
+    const eg = new EdgesGeometry(baseBox.geometry);
+    const lines = new LineSegments(
+      eg,
+      new LineBasicMaterial({ color: 0x6a727c, transparent: true, opacity: 0.28 })
+    );
+    base.add(lines);
+    track(eg, lines.material);
+  }
+  {
+    const tex = makeLabelTexture('TOP', '#3a424c', {
+      w: 256,
+      h: 128,
+      fontPx: 72,
+      fg: 'rgba(255,255,255,0.9)',
+    });
+    track(tex);
+    const m = new MeshStandardMaterial({ map: tex, roughness: 0.6, metalness: 0.1 });
+    track(m);
+    add(base, new PlaneGeometry(0.22, 0.12), m, { z: baseFace / 2 + 0.002 });
+  }
+  add(base, new BoxGeometry(0.06, 0.04, 0.1), metal, {
+    y: -baseFace / 2 - 0.015,
+    z: 0.1,
+  });
+  add(base, new BoxGeometry(0.06, 0.04, 0.1), metal, {
+    y: -baseFace / 2 - 0.015,
+    z: -0.1,
+  });
+  add(base, new BoxGeometry(0.06, baseFace * 0.92, baseFace * 0.92), shellDark, {
+    x: baseDepth / 2 - 0.02,
+  });
+
+  add(root, new CylinderGeometry(0.13, 0.15, stubLen, 20), shellDark, {
+    x: baseFrontX + stubLen / 2,
+    rz: Math.PI / 2,
+  });
+  add(root, new SphereGeometry(ballR, 22, 16), metal, { x: ballX });
+  add(root, new CylinderGeometry(0.12, 0.14, armLen, 20), shell, {
+    x: armMidX,
+    rz: Math.PI / 2,
+  });
+  add(root, new CylinderGeometry(0.2, 0.22, 0.1, 20), shellDark, {
+    x: barrelRearX,
+    rz: Math.PI / 2,
+  });
+
+  add(root, new CylinderGeometry(barrelR, barrelR, barrelLen, 48), shell, {
+    x: barrelX,
+    rz: Math.PI / 2,
+  });
+  add(root, new CylinderGeometry(barrelR * 0.98, barrelR * 0.98, 0.05, 36), shellDark, {
+    x: barrelRearX + 0.03,
+    rz: Math.PI / 2,
+  });
+
+  // Thin top hood; front rim arched (crown forward, sides pull back)
+  const hoodR = barrelR * 1.08;
+  const hoodSpan = Math.PI * 1.02;
+  const hoodStart = -hoodSpan / 2;
+  const hoodLen = barrelLen + 0.14;
+  const hoodX = barrelRearX + hoodLen / 2 - 0.02;
+  {
+    const geo = new CylinderGeometry(hoodR, hoodR, hoodLen, 56, 14, true, hoodStart, hoodSpan);
+    geo.rotateZ(Math.PI / 2);
+    const pos = geo.attributes.position;
+    const half = hoodLen / 2;
+    const zone = 0.4;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i);
+      const z = pos.getZ(i);
+      if (x < half - zone) continue;
+      const t = (x - (half - zone)) / zone;
+      const elev = Math.max(0, Math.min(1, z / hoodR));
+      pos.setX(i, x - t * t * (1 - elev * elev) * 0.22);
+    }
+    pos.needsUpdate = true;
+    geo.computeVertexNormals();
+    const mesh = new Mesh(geo, hoodMat);
+    mesh.position.set(hoodX, 0, 0);
+    root.add(mesh);
+    track(geo);
+  }
+
+  const screwX = barrelX - 0.05;
+  add(root, new BoxGeometry(0.16, 0.13, 0.022), shellDark, {
+    x: screwX,
+    z: hoodR,
+  });
+  add(root, new CylinderGeometry(0.048, 0.048, 0.012, 18), screwSilver, {
+    x: screwX,
+    z: hoodR + 0.008,
+    rx: Math.PI / 2,
+  });
+  add(root, new BoxGeometry(0.052, 0.006, 0.003), black, {
+    x: screwX,
+    z: hoodR + 0.015,
+  });
+
+  const frontX = barrelRearX + barrelLen - 0.02;
+  add(root, new CylinderGeometry(barrelR * 0.96, barrelR * 0.96, 0.05, 40), black, {
+    x: frontX,
+    rz: Math.PI / 2,
+  });
+  {
+    const glassMat = new MeshStandardMaterial({
+      color: 0x151c28,
+      roughness: 0.15,
+      metalness: 0.8,
+      emissive: 0x081018,
+      emissiveIntensity: 0.3,
+    });
+    track(glassMat);
+    add(root, new BoxGeometry(0.04, 0.44, 0.3), black, { x: frontX + 0.02 });
+    add(root, new BoxGeometry(0.03, 0.36, 0.22), glassMat, { x: frontX + 0.035 });
+  }
+
+  root.position.set(0.35, 0, 0.08);
+  return { root, disposables };
 }
 
-const DIR_LABEL_HEIGHT = 0.36;
-
-function themeColor(name: string, fallback: string): string {
-  const raw = getComputedStyle(document.documentElement)
-    .getPropertyValue(name)
-    .trim();
-  if (!raw) return fallback;
-  return /^\d/.test(raw) && raw.includes('%') ? `hsl(${raw})` : raw;
-}
-
-function drawDirLabelTexture(text: string, theme: DirLabelTheme) {
-  const font = 'bold 84px sans-serif';
-  const padX = 44;
-  const padY = 20;
-  const H = 84 + padY * 2;
-  const measure = document.createElement('canvas').getContext('2d')!;
-  measure.font = font;
-  const W = Math.ceil(measure.measureText(text).width) + padX * 2;
-  const cvs = document.createElement('canvas');
-  cvs.width = W;
-  cvs.height = H;
-  const ctx = cvs.getContext('2d')!;
-  ctx.fillStyle = theme.fg;
-  ctx.font = font;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, W / 2, H / 2);
-  const tex = new CanvasTexture(cvs);
-  tex.anisotropy = 4;
-  tex.colorSpace = SRGBColorSpace;
-  return tex;
-}
-
-// 精灵宽高比必须跟随纹理，否则文字被拉伸/压扁
-function dirLabelAspect(sp: Sprite) {
-  const img = sp.material.map?.image as HTMLCanvasElement | undefined;
-  return img && img.width > 0 ? img.width / img.height : 2;
-}
-
-function applyDirLabelScale(sp: Sprite) {
-  sp.scale.set(DIR_LABEL_HEIGHT * dirLabelAspect(sp), DIR_LABEL_HEIGHT, 1);
-}
-
-function makeDirLabel(text: string, theme: DirLabelTheme) {
-  const sp = new Sprite(
-    new SpriteMaterial({ map: drawDirLabelTexture(text, theme), transparent: true }),
-  );
-  applyDirLabelScale(sp);
-  return sp;
-}
-
-/**
- * 由两轴倾角构建 yaw 锁死的姿态四元数（世界轴旋转）。
- * pitch>0 前倾（+X 下沉），roll>0 右倾（+Y 下沉）。
- */
+/** pitch>0 前倾，roll>0 右倾；yaw 锁死。 */
 const AXIS_Y = new Vector3(0, 1, 0);
 const AXIS_X = new Vector3(1, 0, 0);
 function tiltToQuaternion(pitchDeg: number, rollDeg: number, out: Quaternion) {
   const qPitch = new Quaternion().setFromAxisAngle(AXIS_Y, MathUtils.degToRad(pitchDeg));
   const qRoll = new Quaternion().setFromAxisAngle(AXIS_X, -MathUtils.degToRad(rollDeg));
-  // 先 pitch 后 roll（均绕世界轴），等价于 yaw 恒为 0
   out.multiplyQuaternions(qRoll, qPitch);
   return out;
 }
 
-/**
- * 模拟陀螺仪数据（仅前后/左右两轴，无偏航）。
- * 后端 SSE 接入后由真实数据驱动 setOrientation。
- */
 class MockGyro {
   onTilt: (pitch: number, roll: number) => void;
 
@@ -181,9 +290,7 @@ class MockGyro {
   private loop = () => {
     if (!this.running) return;
     this.t += 0.01;
-    const pitch = Math.sin(this.t * 0.7) * 15;
-    const roll = Math.cos(this.t * 0.5) * 12;
-    this.onTilt(pitch, roll);
+    this.onTilt(Math.sin(this.t * 0.7) * 15, Math.cos(this.t * 0.5) * 12);
     this.raf = requestAnimationFrame(this.loop);
   };
 }
@@ -195,12 +302,7 @@ export default function GyroCalibrationCard() {
   const rollRef = useRef<HTMLSpanElement>(null);
   const statusTextRef = useRef<HTMLSpanElement>(null);
   const statusDotRef = useRef<HTMLSpanElement>(null);
-  // 初始化 effect 只跑一次，渲染循环里的文案（水平/未水平）经 tRef 取最新翻译
   const tRef = useRef(t);
-  const dirLabelsRef = useRef<Sprite[]>([]);
-  const dirLabelThemeRef = useRef<DirLabelTheme>({
-    fg: 'rgba(255,255,255,0.92)',
-  });
 
   useEffect(() => {
     tRef.current = t;
@@ -211,7 +313,6 @@ export default function GyroCalibrationCard() {
     if (!canvas) return;
     const container = canvas.parentElement!;
 
-    // ---- 渲染器 ----
     const renderer = new WebGLRenderer({ canvas, antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     const w = container.clientWidth || 1;
@@ -219,22 +320,15 @@ export default function GyroCalibrationCard() {
     renderer.setSize(w, h, false);
     renderer.outputColorSpace = SRGBColorSpace;
 
-    // ---- 场景 / 相机（固定俯视视角）----
     const scene = new Scene();
     scene.background = null;
 
     const camera = new PerspectiveCamera(40, w / h, 0.1, 100);
-    // Z-up world：+Z 向上，相机在 +X 侧 20° 俯视（高度 = 水平距离 × tan20°）。
     camera.up.set(0, 0, 1);
-    camera.position.set(8, 0, 8 * Math.tan(MathUtils.degToRad(20)));
-    camera.lookAt(0, 0, 0);
-
-    // ---- 拖拽轨道（Z-up 球坐标）----
-    // 极角 theta 自 +Z 起算；方位角 phi 绕 +Z（+X 侧 phi=0）。初始 20° 俯视 → theta=70°。
     const orbit = {
-      radius: Math.hypot(8, 8 * Math.tan(MathUtils.degToRad(20))),
-      theta: MathUtils.degToRad(70),
-      phi: 0,
+      radius: 7.2,
+      theta: MathUtils.degToRad(68),
+      phi: MathUtils.degToRad(48),
     };
     const applyOrbit = () => {
       const { radius, theta, phi } = orbit;
@@ -245,6 +339,7 @@ export default function GyroCalibrationCard() {
       );
       camera.lookAt(0, 0, 0);
     };
+    applyOrbit();
 
     let dragging = false;
     let lastX = 0;
@@ -266,11 +361,9 @@ export default function GyroCalibrationCard() {
       const dy = e.clientY - lastY;
       lastX = e.clientX;
       lastY = e.clientY;
-      const sens = 0.006;
-      orbit.phi -= dx * sens;
-      // 极角限制在 5°..89°，避免越过天顶或贴地翻转
+      orbit.phi -= dx * 0.006;
       orbit.theta = MathUtils.clamp(
-        orbit.theta - dy * sens,
+        orbit.theta - dy * 0.006,
         MathUtils.degToRad(5),
         MathUtils.degToRad(89),
       );
@@ -291,81 +384,31 @@ export default function GyroCalibrationCard() {
     canvas.addEventListener('pointerup', onPointerUp);
     canvas.addEventListener('pointercancel', onPointerUp);
 
-    // ---- 灯光 ----
-    scene.add(new AmbientLight(0xffffff, 0.7));
-    const key = new DirectionalLight(0xffffff, 1.0);
+    scene.add(new AmbientLight(0xffffff, 1.05));
+    const key = new DirectionalLight(0xffffff, 1.35);
     key.position.set(6, 2, 4);
     scene.add(key);
-    const fill = new DirectionalLight(0x88aaff, 0.3);
+    const fill = new DirectionalLight(0xc8d0dc, 0.65);
     fill.position.set(-5, -4, -3);
     scene.add(fill);
+    const rim = new DirectionalLight(0xffffff, 0.55);
+    rim.position.set(-2, 8, 4);
+    scene.add(rim);
 
-    // ---- 平面薄板（上面 TOP / 下面 BOTTOM，法线 +Z = 设备顶面）----
-    const plate = new Group();
-    const plateGeo = new PlaneGeometry(3, 3);
-    // 上面：法线 +Z，FrontSide 仅从上方可见
-    const topMesh = new Mesh(
-      plateGeo,
-      new MeshStandardMaterial({
-        map: makeFaceTexture('TOP', '#d29922'),
-        roughness: 0.5,
-        metalness: 0.1,
-      }),
-    );
-    topMesh.position.z = 0.01;
-    plate.add(topMesh);
-    // 下面：绕 Y 旋转 180° 使法线朝 -Z，纹理 +Y 仍对齐世界 +Y，从下方可正常阅读
-    const bottomMesh = new Mesh(
-      plateGeo,
-      new MeshStandardMaterial({
-        map: makeFaceTexture('BOTTOM', '#6e7681'),
-        roughness: 0.5,
-        metalness: 0.1,
-      }),
-    );
-    bottomMesh.rotation.y = Math.PI;
-    bottomMesh.position.z = -0.01;
-    plate.add(bottomMesh);
+    const { root: plate, disposables: ipcDisposables } = buildIpcDevice();
+    plate.scale.setScalar(1.35);
     scene.add(plate);
 
-    // ---- 地面网格（XY 平面，水平基准面）----
     const grid = new GridHelper(20, 20, 0x30363d, 0x21262d);
     grid.rotation.x = Math.PI / 2;
-    grid.position.z = -2;
+    grid.position.z = -2.4;
     scene.add(grid);
 
-    // ---- 水平参考系（始终水平的参考网格 + 四向倾角标）----
-    // +X=前 / -X=后 / +Y=右 / -Y=左；薄板某侧下沉即对应方向倾角
-    const refGrid = new Mesh(
-      new PlaneGeometry(3.4, 3.4, 8, 8),
-      new MeshBasicMaterial({
-        color: 0x00d9ff,
-        wireframe: true,
-        transparent: true,
-        opacity: 0.9,
-      }),
-    );
-    scene.add(refGrid);
-    // 前后/左右四向倾角标的文字跟随主题。
-    const labelTheme: DirLabelTheme = {
-      fg: themeColor('--foreground', 'rgba(255,255,255,0.92)'),
-    };
-    dirLabelThemeRef.current = labelTheme;
-    const dirLabels = DIR_LABEL_DEFS.map((d) => {
-      const sp = makeDirLabel(t(d.key, d.fallback), labelTheme);
-      sp.position.set(d.pos[0], d.pos[1], d.pos[2]);
-      scene.add(sp);
-      return sp;
-    });
-    dirLabelsRef.current = dirLabels;
-
-    // ---- 姿态接口（双角度，yaw 锁死）----
-    // target 由数据源写入；current 每帧平滑插值，抑制抖动。
     let targetPitch = 0;
     let targetRoll = 0;
     let currentPitch = 0;
     let currentRoll = 0;
-    const plateQuat = new Quaternion();
+    const deviceQuat = new Quaternion();
     const deviceUp = new Vector3();
 
     const setOrientation = (pitchDeg: number, rollDeg: number) => {
@@ -373,13 +416,10 @@ export default function GyroCalibrationCard() {
       targetRoll = MathUtils.clamp(rollDeg, -MAX_TILT_DEG, MAX_TILT_DEG);
     };
 
-    // ---- HUD ----
     const updateHud = (pitchDeg: number, rollDeg: number) => {
-      // 综合倾角：由当前姿态法线与世界 +Z 的夹角得到（精确）
-      tiltToQuaternion(pitchDeg, rollDeg, plateQuat);
-      deviceUp.set(0, 0, 1).applyQuaternion(plateQuat);
-      const uz = MathUtils.clamp(deviceUp.z, -1, 1);
-      const tiltDeg = MathUtils.radToDeg(Math.acos(uz));
+      tiltToQuaternion(pitchDeg, rollDeg, deviceQuat);
+      deviceUp.set(0, 0, 1).applyQuaternion(deviceQuat);
+      const tiltDeg = MathUtils.radToDeg(Math.acos(MathUtils.clamp(deviceUp.z, -1, 1)));
       const level = tiltDeg <= LEVEL_TOLERANCE_DEG;
       const signed = (deg: number) => (deg >= 0 ? '+' : '') + deg.toFixed(2);
       if (pitchRef.current) pitchRef.current.textContent = signed(pitchDeg);
@@ -394,27 +434,26 @@ export default function GyroCalibrationCard() {
       }
     };
 
-    // ---- 渲染循环 ----
     const clock = new Clock();
     let rafId = 0;
     const animate = () => {
       rafId = requestAnimationFrame(animate);
       const dt = clock.getDelta();
-      // 角度线性插值（yaw 锁死，无需四元数 slerp）
       const k = 1 - 0.001 ** dt;
       currentPitch += (targetPitch - currentPitch) * k;
       currentRoll += (targetRoll - currentRoll) * k;
-      tiltToQuaternion(currentPitch, currentRoll, plateQuat);
-      plate.quaternion.copy(plateQuat);
+      tiltToQuaternion(currentPitch, currentRoll, deviceQuat);
+      plate.quaternion.copy(deviceQuat);
       updateHud(currentPitch, currentRoll);
       renderer.render(scene, camera);
     };
     animate();
 
-    // ---- 数据源：优先 SSE 实时姿态，不可用则回退 MockGyro ----
-    // Data source: prefer real SSE attitude data.
-    // Mock data is opt-in for local demos only; otherwise a static device would appear to tilt.
-    const enableMock = import.meta.env.DEV && new URLSearchParams(window.location.search).get('gyroMock') === '1';
+    // SSE first; MockGyro only in DEV with ?gyroMock=1 after grace period
+    const enableMock = (
+      import.meta.env.DEV
+      && new URLSearchParams(window.location.search).get('gyroMock') === '1'
+    );
     const mock = new MockGyro(setOrientation);
     let sseDelivered = false;
     let usingMock = false;
@@ -425,7 +464,6 @@ export default function GyroCalibrationCard() {
       mock.start();
     };
 
-    // Give the SSE stream a short grace period before optional demo fallback.
     const fallbackTimer = window.setTimeout(() => {
       if (!sseDelivered) useMock();
     }, 3000);
@@ -443,13 +481,11 @@ export default function GyroCalibrationCard() {
         setOrientation(a.pitch, a.roll);
       },
       onError: () => {
-        // EventSource retries transient errors; use mock only after the stream closes.
         if (sse.closed) useMock();
       },
     });
     sse.start();
 
-    // ---- 自适应（容器尺寸，而非 window）----
     const ro = new ResizeObserver(() => {
       const cw = container.clientWidth || 1;
       const ch = container.clientHeight || 1;
@@ -469,52 +505,14 @@ export default function GyroCalibrationCard() {
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerup', onPointerUp);
       canvas.removeEventListener('pointercancel', onPointerUp);
-      plateGeo.dispose();
-      for (const m of [topMesh.material, bottomMesh.material] as MeshStandardMaterial[]) {
-        m.map?.dispose();
-        m.dispose();
-      }
+      for (const d of ipcDisposables) d.dispose();
       grid.dispose();
-      refGrid.geometry.dispose();
-      (refGrid.material as MeshBasicMaterial).dispose();
-      for (const sp of dirLabels) {
-        sp.material.map?.dispose();
-        sp.material.dispose();
-      }
-      dirLabelsRef.current = [];
       renderer.dispose();
     };
   }, []);
 
-  // 语言或主题变化时重绘纹理，并同步文字宽度。
-  useEffect(() => {
-    const updateLabels = () => {
-      const theme: DirLabelTheme = {
-        fg: themeColor('--foreground', 'rgba(255,255,255,0.92)'),
-      };
-      dirLabelThemeRef.current = theme;
-      DIR_LABEL_DEFS.forEach((d, i) => {
-        const sp = dirLabelsRef.current[i];
-        if (!sp) return;
-        const prev = sp.material.map;
-        sp.material.map = drawDirLabelTexture(t(d.key, d.fallback), theme);
-        sp.material.needsUpdate = true;
-        applyDirLabelScale(sp);
-        prev?.dispose();
-      });
-    };
-    updateLabels();
-    const observer = new MutationObserver(updateLabels);
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ['class', 'data-theme', 'data-color-theme', 'style'],
-    });
-    return () => observer.disconnect();
-  }, [t]);
-
   return (
     <div className="bg-card rounded-2xl p-5 shadow-sm border border-border h-full max-lg:max-h-80 flex flex-col overflow-hidden">
-      {/* Header */}
       <div className="flex items-center justify-between mb-4 shrink-0">
         <h3 className="text-base font-bold text-foreground flex items-center gap-2">
           <Compass className="w-4 h-4 text-primary" />
@@ -522,13 +520,10 @@ export default function GyroCalibrationCard() {
         </h3>
       </div>
 
-      {/* 3D 场景 + 姿态读数 */}
       <div className="relative flex-1 min-h-0 rounded-xl overflow-hidden bg-secondary/20">
         <canvas ref={canvasRef} className="block w-full h-full" style={{ touchAction: 'none' }} />
 
-        {/* 左侧：前后 / 左右 倾角（自上而下纵向排列） */}
         <div className="absolute top-2 left-2 flex flex-col gap-1.5">
-          {/* 前后（pitch，正值=前倾） */}
           <div className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg border border-border bg-card/80 backdrop-blur-sm">
             <span className="text-muted-foreground text-[11px]">
               {t('sys.gyro.frontBack', '前后')}
@@ -538,7 +533,6 @@ export default function GyroCalibrationCard() {
             </span>
             <span className="text-muted-foreground text-[11px]">°</span>
           </div>
-          {/* 左右（roll，正值=右倾） */}
           <div className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg border border-border bg-card/80 backdrop-blur-sm">
             <span className="text-muted-foreground text-[11px]">
               {t('sys.gyro.leftRight', '左右')}
@@ -550,7 +544,6 @@ export default function GyroCalibrationCard() {
           </div>
         </div>
 
-        {/* 右侧：水平判定 */}
         <div className="absolute top-2 right-2 flex items-center gap-1.5 px-2 py-1.5 rounded-lg border border-border bg-card/80 backdrop-blur-sm">
           <span
             ref={statusDotRef}

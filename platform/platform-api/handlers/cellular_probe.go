@@ -96,7 +96,7 @@ func (h *CellularHandler) probeStatus(cfg CellularConfig) CellularStatus {
 		st.Firmware = ""
 		st.SignalRSRP = nil
 		st.SignalRSRQ = nil
-		st.Message = "Cellular is disabled."
+		st.Message = "Module power is off."
 		return st
 	}
 
@@ -117,6 +117,12 @@ func (h *CellularHandler) probeStatus(cfg CellularConfig) CellularStatus {
 		st.Message = "Module re-enumerating on USB…"
 	case !hasControl:
 		st.Message = "Module on USB but no AT/QMI/MBIM control device."
+	case !dataEnabled(cfg):
+		st.Connected = false
+		st.Iface = ""
+		st.IPv4 = ""
+		st.IPv6 = ""
+		st.Message = "Cellular data is off."
 	case !st.DialerReady:
 		st.Message = "Module detected. Dialer binary from hardware profile is not installed yet."
 	case !st.Connected:

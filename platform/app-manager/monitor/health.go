@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -211,13 +212,25 @@ func (h *HealthChecker) checkHTTP(ctx context.Context, container containerdclien
 		url = fmt.Sprintf("http://%s%s", containerIP, healthcheck.Path)
 	}
 
-	// Use curl or http client to check
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(healthcheck.TimeoutSeconds)*time.Second)
+	timeout := time.Duration(healthcheck.TimeoutSeconds) * time.Second
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "curl", "-f", "-s", "--max-time", fmt.Sprintf("%d", healthcheck.TimeoutSeconds), url)
-	if err := cmd.Run(); err != nil {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
 		return false, fmt.Errorf("HTTP health check failed for %s: %w", url, err)
+	}
+
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("HTTP health check failed for %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	// Match curl -f: treat HTTP status >= 400 as failure.
+	if resp.StatusCode >= http.StatusBadRequest {
+		return false, fmt.Errorf("HTTP health check failed for %s: status %d", url, resp.StatusCode)
 	}
 
 	return true, nil

@@ -16,6 +16,7 @@ import {
 import {
   applyCarrierProfile,
   fetchCellularConfig,
+  fetchCellularGnssStatus,
   fetchCellularStatus,
   updateCellularConfig,
   type CellularAuth,
@@ -31,14 +32,19 @@ import {
   Building2,
   CardSim,
   CircuitBoard,
+  Compass,
   Cpu,
+  Crosshair,
   Globe,
   Hash,
   Loader2,
+  MapPin,
+  Mountain,
   Network,
   Phone,
   Power,
   Radio,
+  Satellite,
   Save,
 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -52,12 +58,18 @@ import {
   dash,
   processStatusText,
 } from './cellularPanelUi';
+import GnssMap from './GnssMap';
+import { parseGnssFix } from './gnssGeo';
+import { fetchGnssPlaceName } from './gnssPlace';
+
+type SaveKind = 'power' | 'data' | 'gnss' | 'other';
 
 export default function CellularPanel() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
 
   const [form, setForm] = useState<CellularConfig | null>(null);
+  const [saveKind, setSaveKind] = useState<SaveKind>('other');
 
   const statusQuery = useQuery({
     queryKey: ['cellularStatus'],
@@ -81,6 +93,13 @@ export default function CellularPanel() {
       setForm(saved);
       queryClient.setQueryData(['cellularConfig'], saved);
       await queryClient.refetchQueries({ queryKey: ['cellularStatus'] });
+      // Session saves must not force a GNSS AT re-probe.
+      if (!saved.gnss_enabled || !saved.enabled) {
+        queryClient.removeQueries({ queryKey: ['cellularGnssStatus'] });
+        queryClient.removeQueries({ queryKey: ['cellularGnssPlace'] });
+      } else if (saveKind === 'gnss' || saveKind === 'power') {
+        await queryClient.refetchQueries({ queryKey: ['cellularGnssStatus'] });
+      }
       toast.success(t('common.success'));
     },
     onError: async (err: Error) => {
@@ -109,6 +128,40 @@ export default function CellularPanel() {
         .refetchQueries({ queryKey: ['cellularStatus'] })
         .catch(() => undefined);
     },
+  });
+
+  const saving = saveMutation.isPending;
+  const savingPower = saving && saveKind === 'power';
+  const savingData = saving && saveKind === 'data';
+  const savingGnss = saving && saveKind === 'gnss';
+
+  // Backend returns last fix when AT is busy; pause polls only during dial saves.
+  const gnssQuery = useQuery({
+    queryKey: ['cellularGnssStatus'],
+    queryFn: fetchCellularGnssStatus,
+    enabled: Boolean(form?.enabled && form?.gnss_enabled),
+    placeholderData: prev => prev,
+    refetchInterval: savingData ? false : 3_000,
+  });
+
+  // ~100 m bucket so place refetch does not thrash on GNSS jitter.
+  const gnssFix = parseGnssFix(
+    gnssQuery.data?.latitude,
+    gnssQuery.data?.longitude
+  );
+  const placeBucket = gnssFix
+    ? `${gnssFix.lat.toFixed(3)},${gnssFix.lon.toFixed(3)}`
+    : null;
+
+  const placeQuery = useQuery({
+    queryKey: ['cellularGnssPlace', placeBucket, i18n.language],
+    queryFn: ({ signal }) => {
+      if (!gnssFix) throw new Error('no gnss fix');
+      return fetchGnssPlaceName(gnssFix.lat, gnssFix.lon, i18n.language, signal);
+    },
+    enabled: Boolean(form?.enabled && form?.gnss_enabled && gnssFix),
+    staleTime: 30 * 60_000,
+    retry: 1,
   });
 
   useEffect(() => {
@@ -156,17 +209,19 @@ export default function CellularPanel() {
         module: '',
         module_present: false,
       };
-      if (!enabled) {
-        return {
-          ...cleared,
-          message: 'Cellular is disabled.',
-        };
-      }
       return {
         ...cleared,
-        message: 'Powering module…',
+        message: enabled ? 'Powering module…' : 'Cellular is disabled.',
       };
     });
+  };
+
+  const saveConfig = (kind: SaveKind, next: CellularConfig) => {
+    if (saving) return;
+    setForm(next);
+    setSaveKind(kind);
+    if (kind === 'power') applyEnableOptimisticStatus(next.enabled);
+    saveMutation.mutate(next);
   };
 
   if (configQuery.isLoading || !form) {
@@ -179,18 +234,32 @@ export default function CellularPanel() {
   }
 
   const status = statusQuery.data;
+  const gnss = gnssQuery.data;
 
-  const enablingPending = saveMutation.isPending && form.enabled;
+  const enablingPending = savingPower && form.enabled;
   const modulePresent = Boolean(status?.module_present);
   const moduleOk = (modulePresent || enablingPending) && form.enabled;
   const displayModel = modulePresent ? status?.module || '' : '';
   const simOk = Boolean(status?.sim_ready);
   const showAuthFields = form.auth !== 'none';
-  const process = saveMutation.isPending
+  const process = saving
     ? {
-        text: form.enabled
-          ? t('sys.cellular.process_powering', 'Powering module…')
-          : t('sys.cellular.process_powering_down', 'Powering down…'),
+        text:
+          saveKind === 'data' && form.data_enabled
+            ? t('sys.cellular.process_dialing', 'Preparing data session…')
+            : saveKind === 'data' && !form.data_enabled
+              ? t(
+                  'sys.cellular.process_data_stopping',
+                  'Stopping cellular data…'
+                )
+              : saveKind === 'gnss'
+                ? t('sys.cellular.process_gnss', 'Applying GNSS…')
+                : form.enabled
+                  ? t('sys.cellular.process_powering', 'Powering module…')
+                  : t(
+                      'sys.cellular.process_powering_down',
+                      'Powering down…'
+                    ),
         busy: true,
       }
     : processStatusText(status, form.enabled, t);
@@ -209,7 +278,7 @@ export default function CellularPanel() {
             {t('sys.cellular.title', 'Cellular')}
           </h2>
         </div>
-        {form.enabled || saveMutation.isPending ? (
+        {form.enabled || saving ? (
           <div className="flex min-w-0 flex-col gap-1.5 sm:items-end sm:max-w-[min(100%,28rem)]">
             <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:justify-end">
               <StatusChip
@@ -259,143 +328,232 @@ export default function CellularPanel() {
         ) : null}
       </div>
 
-      <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3.5">
-        <div className="flex min-w-0 items-center gap-3 pr-2">
-          <div
-            className={cn(
-              'flex size-8 shrink-0 items-center justify-center rounded-md',
-              form.enabled ? 'bg-emerald-500/10' : 'bg-muted/60'
-            )}
-          >
-            <Power
+      <div className="rounded-lg border border-border px-4 py-3.5">
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex min-w-0 items-center gap-3 pr-2">
+            <div
               className={cn(
-                'size-4',
-                form.enabled
-                  ? 'text-emerald-600 dark:text-emerald-400'
-                  : 'text-muted-foreground'
+                'flex size-8 shrink-0 items-center justify-center rounded-md',
+                form.enabled ? 'bg-emerald-500/10' : 'bg-muted/60'
               )}
-            />
-          </div>
-          <div className="min-w-0">
-            <div className="font-medium leading-tight">
-              {t('sys.cellular.enable', 'Enable cellular')}
+            >
+              <Power
+                className={cn(
+                  'size-4',
+                  form.enabled
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : 'text-muted-foreground'
+                )}
+              />
             </div>
-            <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed">
-              {t(
-                'sys.cellular.enable_hint',
-                'Powers the module and auto-dials when it appears on USB.'
-              )}
-            </p>
+            <div className="min-w-0">
+              <div className="font-medium leading-tight">
+                {t('sys.cellular.enable', 'Module power')}
+              </div>
+              <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed">
+                {t(
+                  'sys.cellular.enable_hint',
+                  'Powers the Quectel module. Cellular data and GNSS need this on.'
+                )}
+              </p>
+            </div>
           </div>
+          <Switch
+            checked={form.enabled}
+            loading={savingPower}
+            onCheckedChange={enabled => saveConfig('power', { ...form, enabled })}
+          />
         </div>
-        <Switch
-          checked={form.enabled}
-          disabled={saveMutation.isPending}
-          onCheckedChange={enabled => {
-            if (saveMutation.isPending) return;
-            const next = { ...form, enabled };
-            setForm(next);
-            applyEnableOptimisticStatus(enabled);
-            saveMutation.mutate(next);
-          }}
-        />
+        {form.enabled ? (
+          <div className="mt-3 grid grid-cols-1 gap-2.5 border-t border-border/60 pt-3 sm:grid-cols-3">
+            <Metric
+              label={t('sys.cellular.model', 'Model')}
+              icon={CircuitBoard}
+            >
+              {dash(displayModel)}
+            </Metric>
+            <Metric label={t('sys.cellular.imei', 'IMEI')} icon={Hash}>
+              {dash(status?.imei)}
+            </Metric>
+            <Metric
+              label={t('sys.cellular.firmware', 'Firmware')}
+              icon={Cpu}
+            >
+              {dash(status?.firmware)}
+            </Metric>
+          </div>
+        ) : null}
       </div>
 
       {form.enabled ? (
         <>
           <div className="mt-5 mb-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
             <div className="rounded-xl border border-border p-4">
-              <SectionTitle>
-                {t('sys.cellular.section_session', 'Session')}
+              <SectionTitle
+                action={(
+                  <Switch
+                    checked={form.data_enabled}
+                    disabled={!form.enabled}
+                    loading={savingData}
+                    aria-label={t(
+                      'sys.cellular.data_enable',
+                      'Cellular data'
+                    )}
+                    onCheckedChange={data_enabled => saveConfig('data', { ...form, data_enabled })}
+                  />
+                )}
+              >
+                {t('sys.cellular.section_session_sim', 'Session & SIM')}
               </SectionTitle>
-              <div className="grid grid-cols-2 gap-2.5">
-                <Metric
-                  label={t('sys.cellular.operator', 'Operator')}
-                  icon={Building2}
-                >
-                  {dash(status?.operator)}
-                </Metric>
-                <Metric
-                  label={t('sys.cellular.network', 'Network')}
-                  icon={Radio}
-                >
-                  <span className="flex items-center gap-2">
-                    <span>{dash(status?.network)}</span>
-                    {status?.reg_state && status.reg_state !== 'unknown' ? (
-                      <span className="text-[10px] font-normal uppercase tracking-wide text-muted-foreground">
-                        {status.reg_state.replace(/_/g, ' ')}
+              {form.data_enabled ? (
+                <>
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <Metric
+                      label={t('sys.cellular.operator', 'Operator')}
+                      icon={Building2}
+                    >
+                      {dash(status?.operator)}
+                    </Metric>
+                    <Metric
+                      label={t('sys.cellular.network', 'Network')}
+                      icon={Radio}
+                    >
+                      <span className="flex items-center gap-2">
+                        <span>{dash(status?.network)}</span>
+                        {status?.reg_state && status.reg_state !== 'unknown' ? (
+                          <span className="text-[10px] font-normal uppercase tracking-wide text-muted-foreground">
+                            {status.reg_state.replace(/_/g, ' ')}
+                          </span>
+                        ) : null}
                       </span>
-                    ) : null}
-                  </span>
-                </Metric>
-                <Metric label={t('sys.cellular.signal', 'Signal')}>
-                  <div className="flex flex-col gap-1">
-                    <div className="flex items-center gap-2">
-                      <SignalBars rsrp={status?.signal_rsrp} />
-                      <span className="tabular-nums whitespace-nowrap">
-                        {status?.signal_rsrp != null
-                          ? `${status.signal_rsrp} dBm`
-                          : '—'}
-                      </span>
-                    </div>
-                    {status?.signal_rsrq != null ? (
-                      <span className="text-xs font-medium text-muted-foreground tabular-nums whitespace-nowrap">
-                        RSRQ {status.signal_rsrq} dB
-                      </span>
-                    ) : null}
+                    </Metric>
+                    <Metric label={t('sys.cellular.signal', 'Signal')}>
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-2">
+                          <SignalBars rsrp={status?.signal_rsrp} />
+                          <span className="tabular-nums whitespace-nowrap">
+                            {status?.signal_rsrp != null
+                              ? `${status.signal_rsrp} dBm`
+                              : '—'}
+                          </span>
+                        </div>
+                        {status?.signal_rsrq != null ? (
+                          <span className="text-xs font-medium text-muted-foreground tabular-nums whitespace-nowrap">
+                            RSRQ {status.signal_rsrq} dB
+                          </span>
+                        ) : null}
+                      </div>
+                    </Metric>
+                    <Metric
+                      label={t('sys.cellular.iface', 'Interface')}
+                      icon={Network}
+                    >
+                      {dash(status?.iface)}
+                    </Metric>
+                    <Metric label={t('sys.cellular.ipv4', 'IPv4')} icon={Globe}>
+                      {dash(status?.ipv4)}
+                    </Metric>
+                    <Metric label={t('sys.cellular.ipv6', 'IPv6')} icon={Globe}>
+                      {dash(status?.ipv6)}
+                    </Metric>
                   </div>
-                </Metric>
-                <Metric
-                  label={t('sys.cellular.iface', 'Interface')}
-                  icon={Network}
-                >
-                  {dash(status?.iface)}
-                </Metric>
-                <Metric label={t('sys.cellular.ipv4', 'IPv4')} icon={Globe}>
-                  {dash(status?.ipv4)}
-                </Metric>
-                <Metric label={t('sys.cellular.ipv6', 'IPv6')} icon={Globe}>
-                  {dash(status?.ipv6)}
-                </Metric>
-              </div>
+                  <div className="mt-3 space-y-0 border-t border-border/60 pt-1">
+                    <DetailRow
+                      label={t('sys.cellular.msisdn', 'Phone')}
+                      value={status?.msisdn}
+                      icon={Phone}
+                    />
+                    <DetailRow
+                      label={t('sys.cellular.iccid', 'ICCID')}
+                      value={status?.iccid}
+                      icon={CardSim}
+                    />
+                    <DetailRow
+                      label={t('sys.cellular.imsi', 'IMSI')}
+                      value={status?.imsi}
+                      icon={Hash}
+                    />
+                  </div>
+                </>
+              ) : null}
             </div>
 
             <div className="rounded-xl border border-border p-4">
-              <SectionTitle>
-                {t('sys.cellular.section_sim', 'SIM & module')}
+              <SectionTitle
+                action={(
+                  <Switch
+                    checked={form.gnss_enabled}
+                    disabled={!form.enabled}
+                    loading={savingGnss}
+                    aria-label={t('sys.cellular.gnss_enable', 'GNSS')}
+                    onCheckedChange={gnss_enabled => saveConfig('gnss', { ...form, gnss_enabled })}
+                  />
+                )}
+              >
+                {t('sys.cellular.section_gnss', 'GNSS / GPS')}
               </SectionTitle>
-              <div className="space-y-0">
-                <DetailRow
-                  label={t('sys.cellular.model', 'Model')}
-                  value={displayModel}
-                  icon={CircuitBoard}
-                />
-                <DetailRow
-                  label={t('sys.cellular.msisdn', 'Phone')}
-                  value={status?.msisdn}
-                  icon={Phone}
-                />
-                <DetailRow
-                  label={t('sys.cellular.iccid', 'ICCID')}
-                  value={status?.iccid}
-                  icon={CardSim}
-                />
-                <DetailRow
-                  label={t('sys.cellular.imsi', 'IMSI')}
-                  value={status?.imsi}
-                  icon={Hash}
-                />
-                <DetailRow
-                  label={t('sys.cellular.imei', 'IMEI')}
-                  value={status?.imei}
-                  icon={CircuitBoard}
-                />
-                <DetailRow
-                  label={t('sys.cellular.firmware', 'Firmware')}
-                  value={status?.firmware}
-                  icon={Cpu}
-                />
-              </div>
+              {form.gnss_enabled ? (
+                <>
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <Metric
+                      label={t('sys.cellular.gnss_fix', 'Fix')}
+                      icon={Crosshair}
+                    >
+                      {gnss?.fix === '3d'
+                        ? t('sys.cellular.gnss_fix_3d', '3D fix')
+                        : gnss?.fix === '2d'
+                          ? t('sys.cellular.gnss_fix_2d', '2D fix')
+                          : t('sys.cellular.gnss_fix_none', 'No fix')}
+                    </Metric>
+                    <Metric
+                      label={t('sys.cellular.gnss_sats', 'Satellites')}
+                      icon={Satellite}
+                    >
+                      {gnss?.satellites != null ? gnss.satellites : '—'}
+                    </Metric>
+                    <Metric
+                      label={t('sys.cellular.gnss_latitude', 'Latitude')}
+                      icon={MapPin}
+                    >
+                      {gnss?.latitude != null
+                        ? gnss.latitude.toFixed(6)
+                        : '—'}
+                    </Metric>
+                    <Metric
+                      label={t('sys.cellular.gnss_longitude', 'Longitude')}
+                      icon={Compass}
+                    >
+                      {gnss?.longitude != null
+                        ? gnss.longitude.toFixed(6)
+                        : '—'}
+                    </Metric>
+                    <Metric
+                      label={t('sys.cellular.gnss_altitude', 'Altitude')}
+                      icon={Mountain}
+                    >
+                      {gnss?.altitude != null
+                        ? `${gnss.altitude.toFixed(1)} m`
+                        : '—'}
+                    </Metric>
+                    <Metric
+                      label={t('sys.cellular.gnss_hdop', 'HDOP')}
+                      icon={Radio}
+                    >
+                      {gnss?.hdop != null ? gnss.hdop.toFixed(1) : '—'}
+                    </Metric>
+                  </div>
+                  {(placeQuery.data?.trim() || gnss?.message) && (
+                    <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+                      {placeQuery.data?.trim() || gnss?.message}
+                    </p>
+                  )}
+                  <GnssMap
+                    enabled={form.gnss_enabled}
+                    latitude={gnss?.latitude}
+                    longitude={gnss?.longitude}
+                  />
+                </>
+              ) : null}
             </div>
           </div>
 
@@ -597,15 +755,15 @@ export default function CellularPanel() {
               <Button
                 variant="carbon"
                 className="gap-2"
-                disabled={saveMutation.isPending}
-                onClick={() => saveMutation.mutate(form)}
+                disabled={saving}
+                onClick={() => saveConfig('other', form)}
               >
-                {saveMutation.isPending ? (
+                {saving ? (
                   <Loader2 className="size-4 animate-spin" />
                 ) : (
                   <Save className="size-4" />
                 )}
-                {saveMutation.isPending
+                {saving
                   ? t('common.saving', 'Saving...')
                   : t('sys.cellular.save', 'Save')}
               </Button>

@@ -68,7 +68,7 @@ const longTimeTaskMap: Record<string, number> = {
   '/api/v1/system/os-upgrade/install': 1800000, // 30 min — install
   '/api/v1/apps/upload-image': 1800000, // 30 min — image upload
   '/api/v1/apps/upload-package': 1800000, // 30 min — .neoapp package upload
-  '/api/v1/apps': 300000, // 5 min — install
+  '/api/v1/apps': 660000, // 11 min — install may import and unpack large images
   '/api/v1/debug-logs/export': 300000,
   '/api/v1/device/lens/reset-zero': 40000, // 40s — lens calibration
   '/api/v1/media/config/import-bundle': 60000, // 1 min — bundle import

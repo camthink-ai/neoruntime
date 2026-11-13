@@ -898,6 +898,7 @@ func (s *PlatformAPIServer) setupRoutes() {
 		cellular := api.Group("/cellular")
 		cellular.GET("/capability", cellularHandler.GetCapability)
 		cellular.GET("/status", cellularHandler.GetStatus)
+		cellular.GET("/gnss/status", cellularHandler.GetGnssStatus)
 		cellular.GET("/config", cellularHandler.GetConfig)
 		cellular.PUT("/config", cellularHandler.UpdateConfig)
 		cellular.POST("/connect", cellularHandler.Connect)

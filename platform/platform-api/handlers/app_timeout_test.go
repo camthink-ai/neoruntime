@@ -4,16 +4,19 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"google.golang.org/grpc"
 
 	apppb "aipc/platform/app-manager/proto"
+	"aipc/platform/app-manager/stopbudget"
 )
 
 type timeoutRecordingAppManager struct {
 	apppb.UnimplementedAppManagerServer
 	stopRequests chan *apppb.StopRequest
+	startBudgets chan time.Duration
 }
 
 func (f *timeoutRecordingAppManager) StopApp(_ context.Context, req *apppb.StopRequest) (*apppb.Status, error) {
@@ -22,8 +25,35 @@ func (f *timeoutRecordingAppManager) StopApp(_ context.Context, req *apppb.StopR
 	return &apppb.Status{Success: true}, nil
 }
 
-func (f *timeoutRecordingAppManager) StartApp(context.Context, *apppb.StartRequest) (*apppb.Status, error) {
+func (f *timeoutRecordingAppManager) StartApp(ctx context.Context, _ *apppb.StartRequest) (*apppb.Status, error) {
+	if f.startBudgets != nil {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			f.startBudgets <- 0
+		} else {
+			f.startBudgets <- time.Until(deadline)
+		}
+	}
 	return &apppb.Status{Success: true}, nil
+}
+
+func TestAppStartUsesImageRecoveryBudget(t *testing.T) {
+	fake := &timeoutRecordingAppManager{startBudgets: make(chan time.Duration, 1)}
+	conn := newBufconnServer(t, func(s *grpc.Server) {
+		apppb.RegisterAppManagerServer(s, fake)
+	})
+	h := &APIHandlers{grpcClients: &GRPCClients{AppManager: conn}}
+
+	w := performRoute(t, http.MethodPost, "/apps/:app_id/start", "/apps/demo/start", h.StartApp)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d (%s), want 200", w.Code, w.Body.String())
+	}
+
+	remaining := <-fake.startBudgets
+	want := stopbudget.ForStartAPI()
+	if remaining <= want-time.Second || remaining > want {
+		t.Fatalf("StartApp deadline remaining = %s, want approximately %s", remaining, want)
+	}
 }
 
 func TestAppStopAndRestartTimeouts(t *testing.T) {
