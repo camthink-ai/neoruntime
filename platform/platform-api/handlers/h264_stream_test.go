@@ -106,6 +106,53 @@ func TestStreamHandlersForceKeyframe_NilManagerIsSafe(t *testing.T) {
 	h.ForceKeyframe("main") // must not panic
 }
 
+// TestTrackKeyframes_GOPWatchdogViewerGated verifies the periodic GOP-based IDR
+// request only fires while WS viewers are connected: with zero clients nothing
+// is written to the UDS socket (no pointless IDR forcing / log flood); with a
+// viewer the control byte is sent, and a natural keyframe still resets the
+// tracker so no request follows it.
+func TestTrackKeyframes_GOPWatchdogViewerGated(t *testing.T) {
+	// Non-IDR slice (nal_unit_type=1) and IDR slice (nal_unit_type=5), Annex-B.
+	pFrame := []byte{0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x00, 0x05}
+	idrFrame := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00}
+
+	fc := &fakeConn{}
+	s := &H264Stream{
+		StreamID:         "sub",
+		conn:             fc,
+		keyframeInterval: 2,
+	}
+
+	// No viewers: interval exceeded, nothing must be written.
+	if s.trackKeyframes(pFrame, false, false, 1) {
+		t.Fatalf("P-frame reported as keyframe")
+	}
+	s.trackKeyframes(pFrame, false, false, 2) // seq-last(0)=2 ≥ interval → gated off
+	if got := fc.bytes(); len(got) != 0 {
+		t.Fatalf("expected no keyframe request without viewers, got %v", got)
+	}
+
+	// Viewer joins: same distance must now write the control byte.
+	wc := &websocket.Conn{}
+	s.ClientsMux.Lock()
+	s.Clients = map[*websocket.Conn]*clientSender{wc: {}}
+	s.ClientsMux.Unlock()
+	s.trackKeyframes(pFrame, false, false, 4) // 4-2=2 ≥ interval → request
+	got := fc.bytes()
+	if len(got) != 1 || got[0] != ctrlRequestKeyframe {
+		t.Fatalf("expected single control byte 0x4B with viewers, got %v", got)
+	}
+
+	// A natural keyframe still resets the tracker (no request on the next P).
+	if !s.trackKeyframes(idrFrame, false, false, 10) {
+		t.Fatalf("IDR frame not detected as keyframe")
+	}
+	s.trackKeyframes(pFrame, false, false, 11) // 11-10=1 < interval
+	if got := fc.bytes(); len(got) != 1 {
+		t.Fatalf("expected no extra request right after a keyframe, got %v", got)
+	}
+}
+
 func TestStreamHandlersReserveWSClientReplacesOldest(t *testing.T) {
 	h := &StreamHandlers{wsClientsByIP: make(map[string][]*wsClientRef)}
 	const ip = "192.168.93.9"
