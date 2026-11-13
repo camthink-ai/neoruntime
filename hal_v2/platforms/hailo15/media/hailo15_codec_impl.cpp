@@ -230,6 +230,18 @@ static ConfigManagerInteractor **find_gst_mode_interactor_slot()
     return nullptr;
 }
 
+/*
+ * F5 remediation: a pipeline reconfigure (reconfigure_pipeline) rebuilds the
+ * GStreamer graph inside the vendor plugin and nulls the plugin's
+ * gst_mode_config_manager_interactor slot, but our registration stays alive in
+ * the vendor registry for the whole process (first-call-wins, never freed — a
+ * second create() only trips validate_sensor_index_uniqueness). Keep our own
+ * reference and re-attach it to the slot instead of re-creating: the registry
+ * holding the registration guarantees the object outlives every rebuild.
+ */
+std::mutex g_standalone_interactor_mu;
+ConfigManagerInteractor *g_standalone_interactor = nullptr;
+
 static bool ensure_standalone_encoder_interactor(std::string *err_out)
 {
     auto fail = [&](const std::string &msg) {
@@ -241,10 +253,23 @@ static bool ensure_standalone_encoder_interactor(std::string *err_out)
         return false;
     };
 
+    std::lock_guard<std::mutex> lock(g_standalone_interactor_mu);
+
     ConfigManagerInteractor **slot = find_gst_mode_interactor_slot();
     if (slot == nullptr)
     {
         return fail("gst_mode_config_manager_interactor not found (medialib plugin not loaded)");
+    }
+    if (g_standalone_interactor != nullptr)
+    {
+        /* Reconfigure nulled the slot (or another owner overwrote it) while our
+         * registration lives on in the vendor registry — re-attach it. */
+        if (*slot != g_standalone_interactor)
+        {
+            *slot = g_standalone_interactor;
+            HAL_LOG_INFO("hailo15_codec: re-attached standalone encoder interactor after pipeline rebuild");
+        }
+        return true;
     }
     if (*slot != nullptr)
     {
@@ -334,7 +359,8 @@ static bool ensure_standalone_encoder_interactor(std::string *err_out)
         return fail("ConfigManagerInteractor::create failed (" +
                     std::to_string(static_cast<int>(interactor_exp.error())) + ")");
     }
-    *slot = interactor_exp.value().release();
+    g_standalone_interactor = interactor_exp.value().release();
+    *slot = g_standalone_interactor;
     HAL_LOG_INFO("hailo15_codec: standalone encoder interactor registered (profile HAL_STANDALONE, sensor 1)");
     return true;
 }
