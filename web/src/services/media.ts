@@ -5,6 +5,8 @@ import type { PtzState, PtzMoveRequest } from '@/types/media';
 // Media Status API
 export const getMediaStatus = () => request.get('/api/v1/media/status');
 
+export const getMediaConfig = () => request.get('/api/v1/media/config', { silent: true });
+
 // Encoder config hot reload API (no restart required)
 export const updateEncoderConfig = (data: {
   stream_name: string;

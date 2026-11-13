@@ -1,5 +1,6 @@
 import {
   useMediaStatus,
+  useRtspEnabled,
   useSetRtspEnabled,
   useUpdateEncoderConfig,
   useReconfigureEncoder,
@@ -137,8 +138,7 @@ export default function MediaSettings({
     setActiveStreamState(streamList[0]!.id);
   }, [activeStreamState, controlledActiveStream, streamList]);
 
-  // RTSP enabled 状态后端不在 /media/status 返回，前端保持本地状态
-  const [rtspEnabled, setRtspEnabled] = useState(true);
+  const { data: rtspEnabled, isFetching: isFetchingRtsp, isError: rtspError, refetch: refetchRtsp } = useRtspEnabled();
 
   // 码流编辑状态
   const [editingStream, setEditingStream] = useState<string | null>(null);
@@ -183,7 +183,7 @@ export default function MediaSettings({
   >({});
 
   // Hot reload mutations
-  const { mutate: setRtsp } = useSetRtspEnabled();
+  const { mutate: setRtsp, isPending: isSettingRtsp } = useSetRtspEnabled();
   const { mutate: updateEncoderConfig, isPending: isUpdatingEncoder } =    useUpdateEncoderConfig();
   const { mutate: reconfigureEncoder, isPending: isReconfiguringEncoder } =    useReconfigureEncoder();
 
@@ -356,7 +356,6 @@ export default function MediaSettings({
   // 保存 RTSP 配置（hot reload）
   const handleToggleRtsp = useCallback(
     (enabled: boolean) => {
-      setRtspEnabled(enabled);
       setRtsp(enabled);
     },
     [setRtsp]
@@ -1229,10 +1228,21 @@ export default function MediaSettings({
                   {t('sys.media_settings.rtsp_enabled', 'Enable RTSP Stream')}
                 </div>
                 <Switch
-                  checked={rtspEnabled}
+                  checked={rtspEnabled ?? false}
+                  disabled={isFetchingRtsp || isSettingRtsp || rtspError || rtspEnabled === undefined}
+                  aria-label={t('sys.media_settings.rtsp_enabled', 'Enable RTSP Stream')}
                   onCheckedChange={handleToggleRtsp}
                 />
               </div>
+
+              {rtspError && (
+                <div className="flex items-center gap-2 text-xs text-red-500" role="alert">
+                  {t('sys.media_settings.load_failed', 'Failed to load config')}
+                  <Button type="button" variant="outline" size="sm" onClick={() => { refetchRtsp(); }}>
+                    {t('common.retry', 'Retry')}
+                  </Button>
+                </div>
+              )}
 
               <p className="text-xs text-muted-foreground">
                 {t(
