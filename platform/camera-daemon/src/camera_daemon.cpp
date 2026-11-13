@@ -6129,6 +6129,9 @@ bool CameraDaemon::auto_iris_apply_target_locked(uint16_t target, const char* wh
 }
 
 void CameraDaemon::start_auto_iris() {
+    // Same lifecycle lock as stop: two concurrent enables must not both pass
+    // the joinable check and assign to the same std::thread.
+    std::lock_guard<std::mutex> lifecycle(auto_iris_lifecycle_mu_);
     stop_auto_iris(/*reopen=*/false);
     if (config_.lens_model != "af0832") {
         HAL_LOG_INFO("CameraDaemon: auto-iris not available (lens=%s)", config_.lens_model.c_str());
@@ -6140,17 +6143,28 @@ void CameraDaemon::start_auto_iris() {
 }
 
 void CameraDaemon::stop_auto_iris(bool reopen) {
+    // Lifecycle lock: start/stop manipulate auto_iris_thread_; two concurrent
+    // toggles must not race the join/assign (std::thread double-assign can
+    // invoke std::terminate). Held across join + the reopen write so the
+    // state lock ordering stays auto_iris_lifecycle_mu_ -> auto_iris_mu_.
+    std::lock_guard<std::mutex> lifecycle(auto_iris_lifecycle_mu_);
     auto_iris_stop_.store(true, std::memory_order_release);
     if (auto_iris_thread_.joinable()) {
         auto_iris_thread_.join();
     }
     if (reopen && config_.lens_model == "af0832") {
         // "Off" restores the factory behavior: maximum aperture (target 0).
+        // A failed write keeps the last reason and reports failure so the
+        // caller knows the aperture may still be closed.
         std::lock_guard<std::mutex> lk(auto_iris_mu_);
-        if (auto_iris_.iris_target != 0) {
-            auto_iris_apply_target_locked(0, "auto-iris disabled");
-        }
         auto_iris_.closed = false;
+        if (auto_iris_.iris_target != 0) {
+            if (!auto_iris_apply_target_locked(0, "auto-iris disabled")) {
+                auto_iris_.state = "error";
+                // reason already carries the iris write failure detail
+                return;
+            }
+        }
         auto_iris_.state = "inactive";
         auto_iris_.reason = "disabled";
     }
@@ -6181,16 +6195,25 @@ void CameraDaemon::auto_iris_loop() {
 
             // Infrared mode: a closed iris would starve the IR illumination —
             // reopen once and stand by until back on the daylight profile.
+            // Latch only on success and reset the regime so the controller
+            // can re-close when back on daylight (a stale closed=true would
+            // block the sunny branch on return; a failed write must retry).
             if (illumination_controller_ &&
                 illumination_controller_->status().mode == ImagingMode::Infrared) {
                 std::lock_guard<std::mutex> lk(auto_iris_mu_);
                 auto_iris_.state = "paused_infrared";
                 auto_iris_.reason = "infrared mode";
                 auto_iris_.below_count = auto_iris_.above_count = 0;
-                if (!auto_iris_.paused_latched && auto_iris_.iris_target != 0) {
-                    auto_iris_apply_target_locked(0, "infrared pause");
+                if (auto_iris_.iris_target != 0) {
+                    if (auto_iris_apply_target_locked(0, "infrared pause")) {
+                        auto_iris_.closed = false;
+                        auto_iris_.paused_latched = true;
+                    }
+                    // On failure: leave latch clear so the next cycle retries.
+                } else {
+                    auto_iris_.closed = false;
+                    auto_iris_.paused_latched = true;
                 }
-                auto_iris_.paused_latched = true;
                 return;
             }
 
@@ -6213,14 +6236,20 @@ void CameraDaemon::auto_iris_loop() {
 
             if (!ec.auto_exposure) {
                 // Manual exposure: the AE statistic is the operator's intent,
-                // not a light-level signal.
+                // not a light-level signal. Same latch-on-success contract as
+                // the infrared pause above.
                 auto_iris_.state = "paused_manual_exposure";
                 auto_iris_.reason = "manual exposure";
                 auto_iris_.below_count = auto_iris_.above_count = 0;
-                if (!auto_iris_.paused_latched && auto_iris_.iris_target != 0) {
-                    auto_iris_apply_target_locked(0, "manual-exposure pause");
+                if (auto_iris_.iris_target != 0) {
+                    if (auto_iris_apply_target_locked(0, "manual-exposure pause")) {
+                        auto_iris_.closed = false;
+                        auto_iris_.paused_latched = true;
+                    }
+                } else {
+                    auto_iris_.closed = false;
+                    auto_iris_.paused_latched = true;
                 }
-                auto_iris_.paused_latched = true;
                 return;
             }
 
@@ -6307,6 +6336,14 @@ bool CameraDaemon::set_auto_iris_enabled(bool enabled, std::string* error) {
         start_auto_iris();
     } else {
         stop_auto_iris(/*reopen=*/true);
+        // Propagate a failed reopen so the caller knows the aperture may
+        // still be physically closed (the controller already set state=error
+        // and reason=iris write failure detail in stop_auto_iris).
+        std::lock_guard<std::mutex> lk(auto_iris_mu_);
+        if (auto_iris_.state == "error") {
+            if (error) *error = auto_iris_.reason;
+            return false;
+        }
     }
     return true;
 }

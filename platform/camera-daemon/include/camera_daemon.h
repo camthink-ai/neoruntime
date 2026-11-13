@@ -865,6 +865,10 @@ private:
     AutoIrisConfig auto_iris_cfg_;
     mutable std::mutex auto_iris_mu_;
     AutoIrisState auto_iris_;
+    // Serializes the thread start/stop transition (two concurrent toggles
+    // must not race the join/assign on auto_iris_thread_). Lock ordering:
+    // auto_iris_lifecycle_mu_ -> auto_iris_mu_.
+    std::mutex auto_iris_lifecycle_mu_;
     std::thread auto_iris_thread_;
     std::atomic<bool> auto_iris_stop_{true};
     void auto_iris_load_config();         // json mirror: toggle + optional overrides
