@@ -2051,6 +2051,20 @@
         "mic_input": "Mic Input",
         "speaker_output": "Speaker Output"
       }
+    },
+    "lens": {
+      "auto_iris": "Auto Iris",
+      "auto_iris_exposure": "Exposure",
+      "auto_iris_aperture": "Aperture ADC/Target",
+      "auto_iris_state": "State",
+      "auto_iris_state_inactive": "Inactive",
+      "auto_iris_state_max": "Max aperture",
+      "auto_iris_state_sunny": "Sunny (iris closed)",
+      "auto_iris_state_paused_ir": "Paused (infrared)",
+      "auto_iris_state_paused_manual": "Paused (manual exposure)",
+      "auto_iris_state_paused_lens": "Paused (lens not ready)",
+      "auto_iris_hint": "Closes the iris in bright light (exposure < 2 ms); reopens automatically in low light. Off = maximum aperture.",
+      "auto_iris_toggle_failed": "Failed to toggle auto iris"
     }
   }
 }

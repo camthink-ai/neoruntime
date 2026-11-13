@@ -432,3 +432,27 @@ export const useCapabilities = () => useQuery<DeviceCapabilities>({
     },
     staleTime: 60000,
   });
+
+// Auto iris (AF0832 aperture) — live status poll (1s) + enable toggle.
+export const useAutoIrisStatus = () => useQuery({
+    queryKey: ['media', 'auto-iris'],
+    queryFn: async () => {
+      const { fetchAutoIrisStatus } = await import('@/services/settings');
+      return fetchAutoIrisStatus();
+    },
+    refetchInterval: 1000,
+    retry: false,
+  });
+
+export const useSetAutoIris = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (enabled: boolean) => {
+      const { setAutoIrisEnabled } = await import('@/services/settings');
+      return setAutoIrisEnabled(enabled);
+    },
+    onSuccess: data => {
+      queryClient.setQueryData(['media', 'auto-iris'], data);
+    },
+  });
+};

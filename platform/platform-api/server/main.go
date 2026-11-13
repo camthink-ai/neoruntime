@@ -945,6 +945,8 @@ func (s *PlatformAPIServer) setupRoutes() {
 	mediaGroup.POST("/profile/backup", mediaHandler.BackupProfile)
 	mediaGroup.POST("/pipeline/reconfigure", mediaHandler.ReconfigurePipeline)
 	mediaGroup.GET("/status", mediaHandler.GetStreamStatus)
+	mediaGroup.GET("/auto-iris-status", mediaHandler.GetAutoIrisStatus)
+	mediaGroup.PUT("/auto-iris", mediaHandler.SetAutoIrisEnabled)
 	mediaGroup.POST("/streams", mediaHandler.AddStream)
 	mediaGroup.DELETE("/streams/:name", mediaHandler.RemoveStream)
 	// Stream enable/disable via ReconfigurePipeline (real pipeline-level control)
