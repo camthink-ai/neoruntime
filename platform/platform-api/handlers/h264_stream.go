@@ -316,7 +316,8 @@ func (s *H264Stream) connectAndRead() error {
 				s.StreamID, seq, pts, dts, int64(pts)-int64(dts), isKeyframe)
 		}
 
-		// Always track keyframes for periodic IDR requests (works even without clients)
+		// Always run keyframe detection (broadcast needs it); the periodic IDR
+		// request inside is viewer-gated — see trackKeyframes.
 		isKeyframeFinal := s.trackKeyframes(payload, isKeyframe, (flags&0x01) != 0, seq)
 
 		// Check if we have clients before broadcasting
@@ -381,7 +382,11 @@ func min(a, b int) int {
 }
 
 // trackKeyframes tracks keyframe/IDR frames and requests periodic IDR frames from encoder
-// This runs even without clients to ensure encoder generates IDR frames at regular intervals
+// Keyframe detection runs on every frame (broadcast needs it); the periodic IDR
+// request is viewer-gated: with zero WS clients a forced IDR reaches nobody —
+// it only spikes encoder bitrate and floods the log (e.g. sub stream gop=60
+// trips the default 30-frame interval forever). Viewer join still gets an
+// immediate IDR via connectAndRead / AddClient.
 // Returns: isKeyframe (true if this frame is an IDR or keyframe)
 func (s *H264Stream) trackKeyframes(data []byte, isKeyframe bool, isKeyframeFromFlags bool, seq uint64) bool {
 	nals := splitNALUnits(data)
@@ -409,6 +414,12 @@ func (s *H264Stream) trackKeyframes(data []byte, isKeyframe bool, isKeyframeFrom
 		isKeyframe = hasIDR
 	}
 
+	// Snapshot viewer count before taking keyframeMu so the two locks never nest
+	// (broadcastNAL holds ClientsMux while fans use it).
+	s.ClientsMux.RLock()
+	hasViewers := len(s.Clients) > 0
+	s.ClientsMux.RUnlock()
+
 	// Request keyframe periodically if we don't see natural keyframes
 	// This ensures we get IDR frames at regular intervals for MSE to handle GOP>0 correctly
 	s.keyframeMu.Lock()
@@ -418,8 +429,12 @@ func (s *H264Stream) trackKeyframes(data []byte, isKeyframe bool, isKeyframeFrom
 	if isKeyframe {
 		s.lastKeyframeSeq = seq
 	} else if seq-s.lastKeyframeSeq >= uint64(s.keyframeInterval) {
-		// Haven't seen a keyframe in GOP interval, request one
-		s.requestKeyframe()
+		// Haven't seen a keyframe in GOP interval, request one — only with
+		// viewers connected. Reset the tracker either way so the request
+		// cadence is unchanged once a viewer joins.
+		if hasViewers {
+			s.requestKeyframe()
+		}
 		s.lastKeyframeSeq = seq
 	}
 	s.keyframeMu.Unlock()
@@ -517,7 +532,9 @@ func (s *H264Stream) requestKeyframe() {
 		if err != nil {
 			logger.Warn("H264 UDS: failed to request keyframe for %s: %v", s.StreamID, err)
 		} else {
-			logger.Info("H264 UDS: requested keyframe for %s", s.StreamID)
+			// Routine control traffic (every viewer join / UDS reconnect / GOP
+			// watchdog tick) — Debug, or it floods the log at 1+/sec per stream.
+			logger.Debug("H264 UDS: requested keyframe for %s", s.StreamID)
 		}
 	}
 }
