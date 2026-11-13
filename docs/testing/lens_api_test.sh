@@ -179,12 +179,14 @@ if should_run "zoom"; then
 
     sleep 0.3
 
+    # speed=0 被 binding "required" 拒绝(零值=缺失)—— zoom/focus 无停止命令;
+    # (对比: iris 的 speed=0 合法,不对称已登记 API 评审项)
     api_test POST "/zoom" '{"speed": 0}' \
-        "POST /device/zoom speed=0 (zoom stop)" \
-        "success"
+        "POST /device/zoom speed=0 (无停止语义, 应拒绝)" \
+        "fail_400"
 
     # 2.2 绝对定位
-    api_test POST "/zoom" '{"speed": 0}' "" "ignore" > /dev/null 2>&1  # 先停
+    api_test POST "/zoom" '{"speed": 0}' "" "ignore" > /dev/null 2>&1  # 先停(实际被拒, 见上)
     sleep 0.5
 
     api_test POST "/lens/status" '' "" "ignore" > /dev/null 2>&1  # 停
@@ -216,17 +218,17 @@ if should_run "zoom"; then
         "success"
 
     api_test POST "/zoom" '{"speed": 0}' \
-        "POST /device/zoom speed=0 (停止)" \
-        "success"
+        "POST /device/zoom speed=0 (无停止语义, 应拒绝)" \
+        "fail_400"
 
     # 2.4 无效参数
     api_test POST "/zoom" '{"speed": 101}' \
         "POST /device/zoom speed=101 (超出范围)" \
-        "success"  # 服务端不做限制，HAL 层会 clamp
+        "fail_400"  # binding min=-100,max=100 → 服务端 1001 拒绝
 
     api_test POST "/zoom" '{}' \
         "POST /device/zoom {} (缺少 speed)" \
-        "success"  # speed 默认 0 → stop
+        "fail_400"  # binding required → 1001 拒绝
 
     # 停止
     api_test POST "/zoom" '{"speed": 0}' "" "ignore" > /dev/null 2>&1
@@ -253,8 +255,8 @@ if should_run "focus"; then
     sleep 0.3
 
     api_test POST "/focus" '{"speed": 0}' \
-        "POST /device/focus speed=0 (focus stop)" \
-        "success"
+        "POST /device/focus speed=0 (无停止语义, 应拒绝)" \
+        "fail_400"
 
     # 3.2 绝对焦点 level
     api_test POST "/focus" '{"speed": 0}' "" "ignore" > /dev/null 2>&1  # 先停
@@ -306,13 +308,19 @@ if should_run "autofocus"; then
         "POST /device/autofocus enable=true" \
         "success"
 
-    # 验证状态中 autofocus_enabled=true
+    # autofocus_enabled 是"连续 AF"状态位; SetAutofocus(enable=true) 实际排队
+    # 一次 AF 任务(返回成功), 不置位该标志(实测确认)——只要求状态接口返回
+    # 有效镜头数据, 标志值原样记录
     echo "── 验证 autofocus 状态 ────"
     RESP=$(curl -s -H "$AUTH" "${BASE}/lens/status" 2>&1)
-    if echo "$RESP" | grep -q '"autofocus_enabled":true\|"AutofocusEnabled":true'; then
-        pass "lens/status 返回 autofocus_enabled=true"
+    if echo "$RESP" | grep -q '"zoom_pos"\|"focus_pos"\|"zoom_state"\|"ZoomState"\|"ZoomPos"'; then
+        if echo "$RESP" | grep -q '"autofocus_enabled":true\|"AutofocusEnabled":true'; then
+            pass "lens/status 有效 (autofocus_enabled=true)"
+        else
+            pass "lens/status 有效 (autofocus_enabled 未置位——oneshot 排队语义)"
+        fi
     else
-        fail "lens/status 未返回 autofocus_enabled=true"
+        fail "lens/status 无有效镜头数据"
         echo "     $RESP" | head -c 300
     fi
     echo
