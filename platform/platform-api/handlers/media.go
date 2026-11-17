@@ -1001,10 +1001,37 @@ func (h *MediaHandlers) UpdateEncoderConfig(c *gin.Context) {
 		return
 	}
 
+	// Zero-valued optional fields mean "no change": validation skips them,
+	// camera-daemon reads a wire-zero as absent, and writeStreamHotReload
+	// would otherwise persist literal zeros into the YAML. Normalize once so
+	// routing, the hot-reload RPC and persistence all agree on "not set".
+	req.BitrateBps = nonZeroU32(req.BitrateBps)
+	req.Framerate = nonZeroU32(req.Framerate)
+	req.Gop = nonZeroU32(req.Gop)
+
 	// Route FPS changes to pipeline reconfigure (requires restart for ISP buffer pool resize).
 	// Bitrate and GOP-only changes use the faster hot-reload path below.
-	if req.Framerate != nil {
+	// Compare against the running FPS, not field presence: the frontend always
+	// sends the framerate field on save, so a presence-only check turned every
+	// bitrate-only edit into a full pipeline rebuild (viewer black screen /
+	// decoder artifacts while waiting for the post-rebuild IDR).
+	if req.Framerate != nil && h.fpsChanged(req.StreamName, *req.Framerate) {
 		h.fpsPipelineReconfigure(c, req.StreamName, req.BitrateBps, req.Framerate, req.Gop)
+		return
+	}
+
+	// FPS-only request whose value already matches the running stream: the
+	// hot-reload RPC below carries no bitrate/gop (framerate is never sent on
+	// this path) and camera-daemon rejects an all-zero update, so report a
+	// successful no-op instead of a spurious CodeCameraError. Persist the
+	// matching FPS anyway — the YAML can lag live state (an ONVIF
+	// reconfigure whose best-effort persistence failed leaves exactly this
+	// divergence), and without this a restart would restore the stale value.
+	if req.BitrateBps == nil && req.Gop == nil {
+		if req.Framerate != nil {
+			h.writeStreamHotReload(req.StreamName, nil, req.Framerate, nil)
+		}
+		Resp(c).OK(gin.H{"message": "Encoder config already up to date", "stream": req.StreamName})
 		return
 	}
 
@@ -1040,7 +1067,7 @@ func (h *MediaHandlers) UpdateEncoderConfig(c *gin.Context) {
 	}
 
 	// Persist hot-reload changes to YAML so they survive restart
-	h.writeStreamHotReload(req.StreamName, req.BitrateBps, nil, req.Gop)
+	h.writeStreamHotReload(req.StreamName, req.BitrateBps, req.Framerate, req.Gop)
 	// Update in-memory config and clear SPS/PPS cache so frontend
 	// gets fresh init segments after bitrate/GOP changes.
 	if h.streamReloader != nil {
@@ -1052,6 +1079,22 @@ func (h *MediaHandlers) UpdateEncoderConfig(c *gin.Context) {
 	}
 
 	Resp(c).OK(gin.H{"message": "Encoder config updated successfully", "stream": req.StreamName})
+}
+
+// fpsChanged reports whether the stream's FPS actually differs from wantFPS.
+// Mirrors fpsPipelineReconfigure's source order: running pipeline first, YAML
+// fallback second. When neither source knows the stream, assume changed so the
+// request still reaches the (rebuild-capable) pipeline path.
+func (h *MediaHandlers) fpsChanged(streamName string, wantFPS uint32) bool {
+	if running := h.getRunningStreamParams(streamName); running != nil {
+		return running.Fps != wantFPS
+	}
+	for _, ye := range extractEncodersFromFile(h.configPath) {
+		if ye.StreamName == streamName {
+			return ye.Fps != wantFPS
+		}
+	}
+	return true
 }
 
 // fpsPipelineReconfigure handles FPS changes via full pipeline reconfigure.
@@ -1122,6 +1165,10 @@ func (h *MediaHandlers) fpsPipelineReconfigure(c *gin.Context, streamName string
 	h.writeStreamHotReload(streamName, bitrateBps, framerate, gop)
 	if h.streamReloader != nil {
 		h.streamReloader.UpdateStreamFromApplied(streamName, 0, 0, "", safeU32(bitrateBps), safeU32(framerate), safeU32(gop))
+		// Mirror the hot-reload path: the rebuilt encoder starts a fresh
+		// reference chain, so force an IDR before existing clients resume
+		// decoding transitional P-frames against the old one.
+		h.streamReloader.ForceKeyframe(streamName)
 	}
 
 	if h.eventLogger != nil {
@@ -1136,6 +1183,16 @@ func safeU32(p *uint32) uint32 {
 		return *p
 	}
 	return 0
+}
+
+// nonZeroU32 returns p unless it points at zero — the optional-field "no
+// change" encoding — in which case nil, so downstream nil checks hold for
+// both an absent field and an explicit zero.
+func nonZeroU32(p *uint32) *uint32 {
+	if p != nil && *p == 0 {
+		return nil
+	}
+	return p
 }
 
 // writeStreamHotReload persists hot-reload parameters to YAML without touching other fields.
