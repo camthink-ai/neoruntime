@@ -12,9 +12,11 @@ import {
 } from 'lucide-react';
 import {
   useAutofocusStatus,
+  useAutoIrisStatus,
   useLensGotoZoomRatio,
   useLensStatus,
   useOneshotAutofocus,
+  useSetAutoIris,
   useSetFocusLevel,
   useStartZoomFollow,
 } from '@/hooks/useDeviceControl';
@@ -22,6 +24,7 @@ import type { LensStatus } from '@/services/api/device';
 import { MotorState } from '@/services/api/device';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { Switch } from '@/components/ui/switch';
 // import { Separator } from '@/components/ui/separator';
 import { LensControlSkeleton } from './DeviceControlSkeletons';
 import {
@@ -413,7 +416,33 @@ export default function LensControl() {
           canDecrement={canFocusNear}
           canIncrement={canFocusFar}
         />
+
+        {/* Auto iris — AF0832 only (the FG2009 lens has no physical iris) */}
+        {!isFg2009 && <AutoIrisSection />}
       </CardContent>
     </Card>
+  );
+}
+
+function AutoIrisSection() {
+  const { t } = useTranslation();
+  const { data: autoIris } = useAutoIrisStatus();
+  const setAutoIris = useSetAutoIris();
+
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-sm text-muted-foreground">
+        {t('sys.lens.auto_iris', 'Auto Iris')}
+      </span>
+      <Switch
+        checked={autoIris?.enabled ?? false}
+        disabled={setAutoIris.isPending}
+        onCheckedChange={checked => {
+          setAutoIris.mutate(checked, {
+            onError: () => toast.error(t('sys.lens.auto_iris_toggle_failed')),
+          });
+        }}
+      />
+    </div>
   );
 }

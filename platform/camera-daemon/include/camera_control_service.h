@@ -49,6 +49,16 @@ public:
         const aipc::camera::Empty* request,
         aipc::camera::ISPConfigResponse* response) override;
 
+    grpc::Status GetAutoIrisStatus(
+        grpc::ServerContext* context,
+        const aipc::camera::Empty* request,
+        aipc::camera::AutoIrisStatus* response) override;
+
+    grpc::Status SetAutoIrisEnabled(
+        grpc::ServerContext* context,
+        const aipc::camera::AutoIrisEnableRequest* request,
+        aipc::camera::AutoIrisEnableResponse* response) override;
+
     grpc::Status GetTransformConfig(
         grpc::ServerContext* context,
         const aipc::camera::Empty* request,

@@ -98,6 +98,28 @@ public:
         motion_listener_ = std::move(listener);
     }
 
+    int iris_write_target(uint16_t target) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (fg2009_) return HAL_ERR_NOT_SUPPORTED;
+        if (!initialized_ || !sym_.iris_target_set) return HAL_ERR_NOT_INITIALIZED;
+        const int ret = sym_.iris_target_set(1, static_cast<int>(target));
+        if (ret != HAL_OK) {
+            consecutive_errors_++;
+            if (consecutive_errors_ >= 3) try_auto_reinit();
+        } else {
+            consecutive_errors_ = 0;
+        }
+        return ret;
+    }
+
+    int iris_read_adc(uint16_t* adc) override {
+        if (!adc) return HAL_ERR_INVALID_ARG;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (fg2009_) return HAL_ERR_NOT_SUPPORTED;
+        if (!initialized_ || !sym_.iris_adc_get) return HAL_ERR_NOT_INITIALIZED;
+        return sym_.iris_adc_get(1, adc);
+    }
+
     bool autofocus_operation_active() const override {
         return af_operation_active_.load();
     }
