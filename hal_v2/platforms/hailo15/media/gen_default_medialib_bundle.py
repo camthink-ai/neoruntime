@@ -61,6 +61,7 @@ DEFAULT_DENOISE_POOL_MAX_BUFFERS = 12
 # a path suffix — profile_path is the container's absolute /etc/imaging/... ref.
 DEWARP_OPT_OUT_PROFILE_SUFFIXES = (
     "profiles/daylight/webserver_daylight/webserver_daylight_basic_profile.json",
+    "profiles/IR/AF_IR/AF_IR_profile.json",
 )
 
 
