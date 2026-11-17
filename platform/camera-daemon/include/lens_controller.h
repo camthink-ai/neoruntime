@@ -61,4 +61,13 @@ public:
     // init/bootstrap parking, so a restore archive cannot be clobbered by the
     // boot park. Same contract as the observer: mutex held, no call-backs.
     virtual void set_motion_listener(std::function<void()> /*listener*/) {}
+
+    // Auto iris (AF0832 physical aperture): write the MS41908M Hall
+    // closed-loop target [0..1023] and read back the live ADC position.
+    // The run/stop RPCs keep the closed loop clocked; the target write alone
+    // moves the aperture. Default no-op keeps tests/tools source-compatible
+    // (same contract as the observers above). FG2009 has no iris and fails
+    // with NOT_SUPPORTED.
+    virtual int iris_write_target(uint16_t /*target*/) { return -1; }
+    virtual int iris_read_adc(uint16_t* /*adc*/) { return -1; }
 };

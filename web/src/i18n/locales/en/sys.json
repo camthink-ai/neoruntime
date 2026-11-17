@@ -2176,6 +2176,10 @@
         "mic_input": "Mic Input",
         "speaker_output": "Speaker Output"
       }
+    },
+    "lens": {
+      "auto_iris": "Auto Iris",
+      "auto_iris_toggle_failed": "Failed to toggle auto iris"
     }
   }
 }

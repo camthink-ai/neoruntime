@@ -323,6 +323,10 @@ constexpr const char* kIspConfigPath = "/data/aipc/etc/isp_config.json";
 // (KISS) to match the C++ side's /data/aipc/etc default-root convention.
 constexpr const char* kProfileConfigPath = "/data/aipc/etc/profile_config.json";
 
+// Auto-iris toggle + tuning-override mirror (plain-string JSON, same
+// /data/aipc/etc persistence convention as the mirrors above).
+constexpr const char* kAutoIrisConfigPath = "/data/aipc/etc/auto_iris.json";
+
 // Last user-settled lens position (zoom/focus motor positions + ratio).
 // Same persistence convention as the profile mirror: /data/aipc/etc/*.json
 // survives restarts and deploys. The recorder only rewrites it after the
@@ -1477,6 +1481,11 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
     // stalling the data path and the AB-BA with on_packet — same dance as
     // switch_profile.
     std::unique_lock<std::shared_mutex> lock(op_mu_);
+    // The transform reinit below can rebuild the medialib pipeline and
+    // reallocate the video context the auto-iris monitor samples exposure
+    // through — pause it for the whole function (RAII: every exit path,
+    // including the ones that rebind AF, resumes it).
+    AutoIrisMediaPause auto_iris_media_pause(this);
 
     // Preserve privacy-mask and other image settings. The transform request
     // only owns rotation/flip/dewarp/grayscale/DIS/EIS; zero-initializing this
@@ -2967,6 +2976,14 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
         bool need_pipeline_restart = has_dimension_change ||
                                      (request.fps() > 0 && request.fps() != target_before.fps) ||
                                      !request.codec().empty();
+        // Pipeline stop-start reallocates the video context the auto-iris
+        // monitor samples exposure through — pause it across the rebuild
+        // (RAII: the failure returns that rebind AF resume it too). Hot
+        // bitrate/GOP-only changes keep the monitor running.
+        std::unique_ptr<AutoIrisMediaPause> auto_iris_media_pause;
+        if (need_pipeline_restart) {
+            auto_iris_media_pause = std::make_unique<AutoIrisMediaPause>(this);
+        }
         std::vector<std::string> feed_stream_ids;
         if (encoder_auto_feed_enabled_.load()) {
             feed_stream_ids.reserve(config_.encoders.size());
@@ -4819,6 +4836,21 @@ void CameraDaemon::start_grpc_server() {
         std::lock_guard<std::mutex> lk(daynight_mu_);
         selected_mode_ = (config_.infrared.default_mode == "infrared")
                              ? SelectedMode::Infrared : SelectedMode::Day;
+    }
+
+    // Auto iris (AF0832 only): the toggle and tuning overrides outlive
+    // restarts via the mirror file; default-off on fresh units. The loop
+    // itself waits for the lens bootstrap before touching the aperture.
+    auto_iris_load_config();
+    {
+        std::lock_guard<std::mutex> lk(auto_iris_mu_);
+        HAL_LOG_INFO("CameraDaemon: auto-iris %s (sunny<%uus target=%u, reopen>%uus x%u)",
+                     auto_iris_.enabled ? "enabled" : "disabled",
+                     auto_iris_cfg_.sunny_exposure_us, auto_iris_cfg_.sunny_target,
+                     auto_iris_cfg_.dark_exposure_us, auto_iris_cfg_.dark_confirm);
+    }
+    if (auto_iris_.enabled) {
+        start_auto_iris();
     }
 
     // Lens position archive: loaded before the autofocus wiring so both the
@@ -6794,6 +6826,375 @@ void CameraDaemon::light_monitor_loop() {
     }
 }
 
+// ── Auto iris (AF0832 physical aperture) ─────────────────────────────────
+
+void CameraDaemon::auto_iris_load_config() {
+    std::ifstream in(kAutoIrisConfigPath);
+    std::ostringstream ss;
+    if (in.is_open()) {
+        ss << in.rdbuf();
+    }
+    const std::string text = ss.str();
+    auto find_bool = [&text](const char* key, bool def) {
+        const std::string pat = std::string("\"") + key + "\"";
+        const auto p = text.find(pat);
+        if (p == std::string::npos) return def;
+        const auto v = text.find(':', p + pat.size());
+        if (v == std::string::npos) return def;
+        const auto s = text.find_first_not_of(" \t\r\n", v + 1);
+        if (s == std::string::npos) return def;
+        if (text.compare(s, 4, "true") == 0) return true;
+        if (text.compare(s, 5, "false") == 0) return false;
+        return def;
+    };
+    auto find_u32 = [&text](const char* key, uint32_t def) {
+        const std::string pat = std::string("\"") + key + "\"";
+        const auto p = text.find(pat);
+        if (p == std::string::npos) return def;
+        const auto v = text.find(':', p + pat.size());
+        if (v == std::string::npos) return def;
+        const auto s = text.find_first_not_of(" \t\r\n", v + 1);
+        if (s == std::string::npos || text[s] < '0' || text[s] > '9') return def;
+        return static_cast<uint32_t>(strtoul(text.c_str() + s, nullptr, 10));
+    };
+
+    std::lock_guard<std::mutex> lk(auto_iris_mu_);
+    auto_iris_.enabled = find_bool("enabled", false);
+    auto_iris_cfg_.sunny_exposure_us =
+        std::max(1u, find_u32("sunny_exposure_us", auto_iris_cfg_.sunny_exposure_us));
+    auto_iris_cfg_.dark_exposure_us = std::max(
+        auto_iris_cfg_.sunny_exposure_us + 1u,
+        find_u32("dark_exposure_us", auto_iris_cfg_.dark_exposure_us));
+    auto_iris_cfg_.sunny_confirm =
+        std::max(1u, find_u32("sunny_confirm", auto_iris_cfg_.sunny_confirm));
+    auto_iris_cfg_.dark_confirm =
+        std::max(1u, find_u32("dark_confirm", auto_iris_cfg_.dark_confirm));
+    auto_iris_cfg_.sunny_target = static_cast<uint16_t>(
+        std::min(1023u, find_u32("sunny_target", auto_iris_cfg_.sunny_target)));
+    auto_iris_cfg_.sample_interval_ms =
+        std::max(100u, find_u32("sample_interval_ms", auto_iris_cfg_.sample_interval_ms));
+}
+
+void CameraDaemon::auto_iris_persist_locked() {
+    const std::string json =
+        "{\n"
+        "  \"enabled\": " + std::string(auto_iris_.enabled ? "true" : "false") + ",\n"
+        "  \"sunny_exposure_us\": " + std::to_string(auto_iris_cfg_.sunny_exposure_us) + ",\n"
+        "  \"dark_exposure_us\": " + std::to_string(auto_iris_cfg_.dark_exposure_us) + ",\n"
+        "  \"sunny_confirm\": " + std::to_string(auto_iris_cfg_.sunny_confirm) + ",\n"
+        "  \"dark_confirm\": " + std::to_string(auto_iris_cfg_.dark_confirm) + ",\n"
+        "  \"sunny_target\": " + std::to_string(auto_iris_cfg_.sunny_target) + ",\n"
+        "  \"sample_interval_ms\": " + std::to_string(auto_iris_cfg_.sample_interval_ms) + "\n"
+        "}\n";
+    const std::string tmp = std::string(kAutoIrisConfigPath) + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::out | std::ios::trunc);
+        if (!out.is_open()) {
+            HAL_LOG_WARNING("CameraDaemon: auto-iris persist: open(%s) failed", tmp.c_str());
+            return;
+        }
+        out << json;
+        out.flush();
+        if (!out.good()) {
+            ::unlink(tmp.c_str());
+            HAL_LOG_WARNING("CameraDaemon: auto-iris persist: write failed");
+            return;
+        }
+    }
+    if (std::rename(tmp.c_str(), kAutoIrisConfigPath) != 0) {
+        ::unlink(tmp.c_str());
+        HAL_LOG_WARNING("CameraDaemon: auto-iris persist: rename failed");
+    }
+}
+
+bool CameraDaemon::auto_iris_apply_target_locked(uint16_t target, const char* why) {
+    if (!lens_controller_) return false;
+    const int ret = lens_controller_->iris_write_target(target);
+    if (ret != 0) {
+        auto_iris_.reason = std::string("iris write failed: ") + std::to_string(ret);
+        HAL_LOG_WARNING("CameraDaemon: auto-iris: write target %u failed (%d)", target, ret);
+        return false;
+    }
+    auto_iris_.iris_target = target;
+    uint16_t adc = 0;
+    if (lens_controller_->iris_read_adc(&adc) == 0) {
+        auto_iris_.iris_adc = adc;
+    }
+    HAL_LOG_INFO("CameraDaemon: auto-iris: target -> %u (%s), adc=%u",
+                 target, why, auto_iris_.iris_adc);
+    return true;
+}
+
+void CameraDaemon::start_auto_iris() {
+    // Shutdown latch: a media-rebuild guard can drain inside stop_grpc_server()
+    // after shutdown() already stopped the monitor — never resurrect it then.
+    if (auto_iris_shutdown_.load(std::memory_order_acquire)) {
+        HAL_LOG_WARNING("CameraDaemon: auto-iris start refused during shutdown");
+        return;
+    }
+    // Same lifecycle lock as stop: two concurrent enables must not both pass
+    // the joinable check and assign to the same std::thread.
+    std::lock_guard<std::mutex> lifecycle(auto_iris_lifecycle_mu_);
+    // In-place restart: the locked variant — stop_auto_iris() re-locks the
+    // lifecycle mutex and would self-deadlock here (non-recursive mutex).
+    stop_auto_iris_locked(/*reopen=*/false);
+    if (config_.lens_model != "af0832") {
+        HAL_LOG_INFO("CameraDaemon: auto-iris not available (lens=%s)", config_.lens_model.c_str());
+        return;
+    }
+    auto_iris_stop_.store(false, std::memory_order_release);
+    auto_iris_thread_ = std::thread([this] { auto_iris_loop(); });
+    HAL_LOG_INFO("CameraDaemon: auto-iris monitor started");
+}
+
+void CameraDaemon::stop_auto_iris(bool reopen) {
+    std::lock_guard<std::mutex> lifecycle(auto_iris_lifecycle_mu_);
+    stop_auto_iris_locked(reopen);
+}
+
+void CameraDaemon::stop_auto_iris_locked(bool reopen) {
+    // Lifecycle lock: start/stop manipulate auto_iris_thread_; two concurrent
+    // toggles must not race the join/assign (std::thread double-assign can
+    // invoke std::terminate). Held across join + the reopen write so the
+    // state lock ordering stays auto_iris_lifecycle_mu_ -> auto_iris_mu_.
+    // Caller must hold auto_iris_lifecycle_mu_.
+    auto_iris_stop_.store(true, std::memory_order_release);
+    if (auto_iris_thread_.joinable()) {
+        auto_iris_thread_.join();
+    }
+    if (reopen && config_.lens_model == "af0832") {
+        // "Off" restores the factory behavior: maximum aperture (target 0).
+        // The reopen write is unconditional: a nonzero target set through the
+        // manual iris API (or the boot replay) is invisible to this
+        // controller's cache — fail-open must not depend on the controller
+        // having been the one that closed the iris. A failed write keeps the
+        // last reason and reports failure so the caller knows the aperture
+        // may still be closed.
+        std::lock_guard<std::mutex> lk(auto_iris_mu_);
+        auto_iris_.closed = false;
+        if (!auto_iris_apply_target_locked(0, "auto-iris disabled")) {
+            auto_iris_.state = "error";
+            // reason already carries the iris write failure detail
+            return;
+        }
+        auto_iris_.state = "inactive";
+        auto_iris_.reason = "disabled";
+    }
+}
+
+void CameraDaemon::pause_auto_iris_for_media_rebuild() {
+    // The media rebuild frees the FROM_MEDIA context this monitor samples
+    // exposure through; pause the thread across the rebuild, same protocol
+    // as the autofocus stop/rebind around those paths. reopen=false keeps
+    // the aperture parked; the resumed loop re-evaluates from live AE.
+    stop_auto_iris(/*reopen=*/false);
+}
+
+void CameraDaemon::resume_auto_iris_after_media_rebuild() {
+    if (auto_iris_shutdown_.load(std::memory_order_acquire)) return;
+    bool enabled = false;
+    {
+        std::lock_guard<std::mutex> lk(auto_iris_mu_);
+        enabled = auto_iris_.enabled;
+    }
+    // auto_iris_mu_ must be released before start_auto_iris(): the lifecycle
+    // -> state lock ordering only allows auto_iris_mu_ under the lifecycle
+    // lock, never the other way around.
+    if (enabled) start_auto_iris();
+}
+
+CameraDaemon::AutoIrisMediaPause::AutoIrisMediaPause(CameraDaemon* daemon)
+    : daemon_(daemon) {
+    if (daemon_) daemon_->pause_auto_iris_for_media_rebuild();
+}
+
+CameraDaemon::AutoIrisMediaPause::~AutoIrisMediaPause() {
+    if (daemon_) daemon_->resume_auto_iris_after_media_rebuild();
+}
+
+void CameraDaemon::auto_iris_loop() {
+    while (!auto_iris_stop_.load(std::memory_order_acquire)) {
+        AutoIrisConfig cfg;
+        {
+            std::lock_guard<std::mutex> lk(auto_iris_mu_);
+            cfg = auto_iris_cfg_;
+        }
+
+        // One policy pass; every early exit is a plain return.
+        auto evaluate = [this, &cfg]() {
+            // The boot lens probe disturbs the iris (target ±400): wait for
+            // the AF0832 bootstrap before touching the aperture. Also covers
+            // a lens swap landing on a model with no iris.
+            if (config_.lens_model != "af0832" || !lens_controller_ ||
+                !lens_controller_->initialized() ||
+                !lens_controller_->af0832_bootstrapped()) {
+                std::lock_guard<std::mutex> lk(auto_iris_mu_);
+                auto_iris_.state = "paused_lens_not_ready";
+                auto_iris_.reason = "lens bootstrap pending";
+                auto_iris_.below_count = auto_iris_.above_count = 0;
+                return;
+            }
+
+            // Infrared mode: a closed iris would starve the IR illumination —
+            // reopen once and stand by until back on the daylight profile.
+            // Latch only on success and reset the regime so the controller
+            // can re-close when back on daylight (a stale closed=true would
+            // block the sunny branch on return; a failed write must retry).
+            if (illumination_controller_ &&
+                illumination_controller_->status().mode == ImagingMode::Infrared) {
+                std::lock_guard<std::mutex> lk(auto_iris_mu_);
+                auto_iris_.state = "paused_infrared";
+                auto_iris_.reason = "infrared mode";
+                auto_iris_.below_count = auto_iris_.above_count = 0;
+                // Unconditional fail-open on pause entry: the manual iris API
+                // (or the boot replay) can hold the aperture closed while this
+                // controller's cache still reads zero — the reopen must not
+                // depend on the controller having been the one that closed it.
+                // The latch keeps it one write per pause episode; a failed
+                // write leaves it clear so the next cycle retries.
+                if (!auto_iris_.paused_latched) {
+                    if (auto_iris_apply_target_locked(0, "infrared pause")) {
+                        auto_iris_.closed = false;
+                        auto_iris_.paused_latched = true;
+                    }
+                }
+                return;
+            }
+
+            // Live AE sample (hardware values, not the UI intent cache).
+            auto* isp_ops = hal_loader_ ? hal_loader_->isp() : nullptr;
+            void* ctx = video_source_ ? video_source_->video_ctx() : nullptr;
+            HalIspExposureConfig ec{};
+            if (!isp_ops || !ctx || !isp_ops->get_current_exposure_config ||
+                isp_ops->get_current_exposure_config(ctx, &ec) != 0) {
+                std::lock_guard<std::mutex> lk(auto_iris_mu_);
+                auto_iris_.state = "paused_lens_not_ready";
+                auto_iris_.reason = "AE read failed";
+                return;
+            }
+
+            std::lock_guard<std::mutex> lk(auto_iris_mu_);
+            auto_iris_.exposure_time_us = static_cast<uint32_t>(ec.exposure_time_us);
+            auto_iris_.gain = static_cast<uint32_t>(ec.gain);
+
+            if (!ec.auto_exposure) {
+                // Manual exposure: the AE statistic is the operator's intent,
+                // not a light-level signal. Same unconditional fail-open /
+                // latch-once contract as the infrared pause above (the cache
+                // may not know the manual API closed the aperture).
+                auto_iris_.state = "paused_manual_exposure";
+                auto_iris_.reason = "manual exposure";
+                auto_iris_.below_count = auto_iris_.above_count = 0;
+                if (!auto_iris_.paused_latched) {
+                    if (auto_iris_apply_target_locked(0, "manual-exposure pause")) {
+                        auto_iris_.closed = false;
+                        auto_iris_.paused_latched = true;
+                    }
+                }
+                return;
+            }
+
+            // Auto exposure: a fresh cycle clears any pause latch so the next
+            // infrared/manual pause episode re-arms its one-shot reopen. The
+            // clear lives AFTER the manual branch — that path must keep its
+            // latch across cycles or it would rewrite target 0 every pass.
+            auto_iris_.paused_latched = false;
+
+            // AF scan: aperture motion mid-scan corrupts the focus metric.
+            // Soft skip — keep the current aperture, resume when AF is idle.
+            if (lens_controller_->autofocus_operation_active()) {
+                auto_iris_.state = auto_iris_.closed ? "sunny_closed" : "max_aperture";
+                auto_iris_.reason = "autofocus active";
+                return;
+            }
+
+            // Hysteresis policy. Asymmetric confirm prevents flapping: the
+            // iris itself moves the exposure, so the reopen threshold must
+            // sit far above the close threshold.
+            if (auto_iris_.exposure_time_us < cfg.sunny_exposure_us) {
+                auto_iris_.below_count++;
+                auto_iris_.above_count = 0;
+            } else if (auto_iris_.exposure_time_us > cfg.dark_exposure_us) {
+                auto_iris_.above_count++;
+                auto_iris_.below_count = 0;
+            } else {
+                auto_iris_.below_count = auto_iris_.above_count = 0;
+            }
+
+            if (!auto_iris_.closed && auto_iris_.below_count >= cfg.sunny_confirm) {
+                if (auto_iris_apply_target_locked(cfg.sunny_target, "sunny")) {
+                    auto_iris_.closed = true;
+                    auto_iris_.state = "sunny_closed";
+                    auto_iris_.reason.clear();
+                }
+            } else if (auto_iris_.closed && auto_iris_.above_count >= cfg.dark_confirm) {
+                if (auto_iris_apply_target_locked(0, "light dropped")) {
+                    auto_iris_.closed = false;
+                    auto_iris_.state = "max_aperture";
+                    auto_iris_.reason.clear();
+                }
+            } else {
+                auto_iris_.state = auto_iris_.closed ? "sunny_closed" : "max_aperture";
+                if (auto_iris_.reason == "autofocus active") auto_iris_.reason.clear();
+            }
+        };
+        evaluate();
+
+        for (uint32_t waited = 0;
+             waited < cfg.sample_interval_ms && !auto_iris_stop_.load(std::memory_order_acquire);
+             waited += 20) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(std::min(20u, cfg.sample_interval_ms - waited)));
+        }
+    }
+}
+
+bool CameraDaemon::get_auto_iris_status(AutoIrisPublicState* out) {
+    if (!out) return false;
+    std::lock_guard<std::mutex> lk(auto_iris_mu_);
+    out->enabled = auto_iris_.enabled;
+    out->state = auto_iris_.state;
+    out->reason = auto_iris_.reason;
+    out->exposure_time_us = auto_iris_.exposure_time_us;
+    out->gain = auto_iris_.gain;
+    out->iris_target = auto_iris_.iris_target;
+    // Fresh ADC readback for the UI (best-effort).
+    if (config_.lens_model == "af0832" && lens_controller_) {
+        uint16_t adc = 0;
+        if (lens_controller_->iris_read_adc(&adc) == 0) {
+            out->iris_adc = adc;
+            auto_iris_.iris_adc = adc;
+        }
+    }
+    return true;
+}
+
+bool CameraDaemon::set_auto_iris_enabled(bool enabled, std::string* error) {
+    if (enabled && config_.lens_model != "af0832") {
+        if (error) *error = "lens has no iris";
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(auto_iris_mu_);
+        auto_iris_.enabled = enabled;
+        auto_iris_persist_locked();
+    }
+    if (enabled) {
+        start_auto_iris();
+    } else {
+        stop_auto_iris(/*reopen=*/true);
+        // Propagate a failed reopen so the caller knows the aperture may
+        // still be physically closed (the controller already set state=error
+        // and reason=iris write failure detail in stop_auto_iris).
+        std::lock_guard<std::mutex> lk(auto_iris_mu_);
+        if (auto_iris_.state == "error") {
+            if (error) *error = auto_iris_.reason;
+            return false;
+        }
+    }
+    return true;
+}
+
 bool CameraDaemon::set_selected_mode(const std::string& mode, std::string* message) {
     const SelectedMode sel = parse_selected_mode(mode);
     if (sel == SelectedMode::Auto) {
@@ -7362,6 +7763,10 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
                 response.set_message("keyframe request wedged in the encoder; re-enable aborted, retry after recovery");
                 return;
             }
+            // The re-enable reinits the pipeline below (encoder override
+            // rebuild) and reallocates the video context — pause the
+            // auto-iris monitor across it, RAII to the branch's returns.
+            AutoIrisMediaPause auto_iris_media_pause(this);
             ec.enabled = true;
 
             // Build encoder override that includes this stream and reinit pipeline
@@ -7675,6 +8080,11 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
             response.set_message("keyframe request wedged in the encoder; stream add aborted, retry after recovery");
             return;
         }
+
+        // The add tears down and rebuilds the medialib pipeline (resync below
+        // rebinds the video context); pause the auto-iris monitor across it —
+        // RAII so the failure-recovery path that rebinds AF resumes it too.
+        AutoIrisMediaPause auto_iris_media_pause(this);
 
         auto recover_stream_add = [&]() {
             const bool rebound =
@@ -8050,6 +8460,12 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
         response.set_message("keyframe request wedged in the encoder; stream removal aborted, retry after recovery");
         return;
     }
+
+    // The removal reconfigures the media pipeline below (encoder teardown +
+    // stream remove rebuild) and can reallocate the video context — pause
+    // the auto-iris monitor across it (RAII: the abort/rollback paths that
+    // restore the encoders resume it too).
+    AutoIrisMediaPause auto_iris_media_pause(this);
 
     // Find and remove from config
     bool found = false;
@@ -8448,6 +8864,12 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
     }
     std::unique_lock<std::shared_mutex> lock(op_mu_);
     auto* media_ops = hal_loader_ ? hal_loader_->media() : nullptr;
+    // The profile switch can fully reinit medialib and reallocate the video
+    // context the auto-iris monitor samples exposure through — pause it for
+    // the whole switch (RAII: the verify/rollback exits resume it too; this
+    // also spans the set_imaging_mode callers, which drive this three times
+    // per day/night transition).
+    AutoIrisMediaPause auto_iris_media_pause(this);
 
     if (!media_ops || !media_ctx_) {
         HAL_LOG_ERROR("CameraDaemon: Cannot switch profile without media pipeline");
@@ -9592,6 +10014,11 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
         return false;
     }
 
+    // Full medialib rebuild below reallocates the video context the
+    // auto-iris monitor samples exposure through — pause it across the
+    // rebuild (RAII: the failure-restart paths that rebind AF resume it).
+    AutoIrisMediaPause auto_iris_media_pause(this);
+
     if (autofocus_controller_) {
         autofocus_controller_->stop();
         autofocus_controller_->invalidate_anchor("media pipeline rebuilt");
@@ -10002,10 +10429,17 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
 
 void CameraDaemon::shutdown() {
     HAL_LOG_INFO("CameraDaemon: Shutting down...");
+    // Latch before anything is stopped: an in-flight media rebuild draining
+    // inside stop_grpc_server() below must not restart the auto-iris monitor
+    // after the explicit stop that follows.
+    auto_iris_shutdown_.store(true, std::memory_order_release);
 
     // Stop the light-sensor auto monitor first so it cannot fire a mode switch
-    // (which touches illumination/media) during teardown.
+    // (which touches illumination/media) during teardown. Same ordering for the
+    // auto-iris monitor: it writes the aperture through the lens service that
+    // the gRPC teardown below destroys.
     stop_light_monitor();
+    stop_auto_iris(/*reopen=*/true);
 
 #ifdef HAS_GRPC
     stop_grpc_server();

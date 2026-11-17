@@ -590,3 +590,27 @@ export function applyCarrierProfile(
     pdp_cid: current.pdp_cid === 3 ? 1 : current.pdp_cid,
   };
 }
+
+// ==================== Auto Iris (AF0832 aperture) API ====================
+
+export interface AutoIrisStatus {
+  enabled: boolean;
+  exposure_time_us: number;
+  gain: number;
+  iris_target: number;
+  iris_adc: number;
+  state: string;
+  reason: string;
+}
+
+export const fetchAutoIrisStatus = async (): Promise<AutoIrisStatus> => {
+  const response = await request.get('/api/v1/media/auto-iris-status');
+  return response.data;
+};
+
+export const setAutoIrisEnabled = async (
+  enabled: boolean
+): Promise<AutoIrisStatus> => {
+  const response = await request.put('/api/v1/media/auto-iris', { enabled });
+  return response.data;
+};
