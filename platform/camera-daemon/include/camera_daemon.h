@@ -895,12 +895,34 @@ private:
     std::mutex auto_iris_lifecycle_mu_;
     std::thread auto_iris_thread_;
     std::atomic<bool> auto_iris_stop_{true};
+    // Latched at the top of shutdown(): after this, no path may (re)start
+    // the monitor — a media-rebuild guard draining inside stop_grpc_server()
+    // would otherwise resurrect the thread mid-teardown.
+    std::atomic<bool> auto_iris_shutdown_{false};
     void auto_iris_load_config();         // json mirror: toggle + optional overrides
     void auto_iris_persist_locked();      // caller holds auto_iris_mu_
     bool auto_iris_apply_target_locked(uint16_t target, const char* why);  // caller holds mu (HAL I/O outside)
     void start_auto_iris();
     void stop_auto_iris(bool reopen);
+    void stop_auto_iris_locked(bool reopen);  // caller holds auto_iris_lifecycle_mu_
+    // Media rebuilds free the FROM_MEDIA context the monitor samples exposure
+    // through; pause across the rebuild (same protocol as the AF stop/rebind
+    // around those paths), resume when the new context is live.
+    void pause_auto_iris_for_media_rebuild();
+    void resume_auto_iris_after_media_rebuild();
     void auto_iris_loop();
+
+    // RAII pairing for pause/resume across a media rebuild — every exit path
+    // (including the failure returns that rebind AF) resumes the monitor.
+    class AutoIrisMediaPause {
+    public:
+        explicit AutoIrisMediaPause(CameraDaemon* daemon);
+        ~AutoIrisMediaPause();
+        AutoIrisMediaPause(const AutoIrisMediaPause&) = delete;
+        AutoIrisMediaPause& operator=(const AutoIrisMediaPause&) = delete;
+    private:
+        CameraDaemon* daemon_;
+    };
 
 #ifdef HAS_GRPC
     std::unique_ptr<CameraControlServiceImpl> camera_control_service_;
