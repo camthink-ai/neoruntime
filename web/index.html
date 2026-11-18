@@ -2,6 +2,107 @@
 <html lang="en">
   <head>
     <script>
+      // Embedded-host blur guard.
+      //
+      // WebView2 composition hosts (e.g. the NeoLinker desktop app) fire a
+      // transient window blur -> focus pair on every mouse press: the input
+      // HWND focus dance is invisible to the user but reaches the page as
+      // real events. Radix overlays (Select, Popover, DropdownMenu) close on
+      // window blur, so in that environment every dropdown dies on the first
+      // item click. Delay blur delivery by 30ms and cancel it when focus
+      // returns within the window; genuine blurs (switching apps) are simply
+      // delivered 30ms late, which nothing here depends on.
+      //
+      // Must run before the app bundle registers any blur listener, hence a
+      // blocking inline script at the top of <head>.
+      (function () {
+        const realAdd = window.addEventListener.bind(window);
+        const realRemove = window.removeEventListener.bind(window);
+        // Per-listener state: a stable wrapper identity (so a later
+        // removeEventListener finds the stored function) and its own debounce
+        // timer (so multiple blur listeners cannot cancel each other — a
+        // shared timer silently swallowed every listener but the last one
+        // registered). All pending timers are cancelled together when focus
+        // returns within the window.
+        const wrapperOf = new WeakMap(); // listener -> wrapper
+        const timerOf = new WeakMap();   // wrapper -> pending timeout id
+        const regOptsOf = new WeakMap(); // wrapper -> options used at registration
+        const onceOf = new WeakSet();    // wrappers registered with once
+        const activeTimers = new Set();  // every pending timeout id
+        window.addEventListener = function (type, listener, options) {
+          if (type !== 'blur') return realAdd(type, listener, options);
+          // Debounce both listener forms — function and {handleEvent} — so an
+          // object-form listener cannot bypass the guard.
+          const invoke =
+            typeof listener === 'function'
+              ? listener
+              : function (event) {
+                  listener.handleEvent(event);
+                };
+          let wrapper = wrapperOf.get(listener);
+          if (!wrapper) {
+            wrapper = function (event) {
+              const prev = timerOf.get(wrapper);
+              if (prev !== undefined) {
+                window.clearTimeout(prev);
+                activeTimers.delete(prev);
+              }
+              const id = window.setTimeout(function () {
+                timerOf.delete(wrapper);
+                activeTimers.delete(id);
+                // Deliver with window as `this`, like a native handler.
+                // (event.currentTarget is unavoidably null by then — native
+                // dispatch has ended — which no listener in this app reads.)
+                invoke.call(window, event);
+                if (onceOf.has(wrapper)) {
+                  onceOf.delete(wrapper);
+                  realRemove('blur', wrapper, regOptsOf.get(wrapper));
+                }
+              }, 30);
+              timerOf.set(wrapper, id);
+              activeTimers.add(id);
+            };
+            wrapperOf.set(listener, wrapper);
+          }
+          // `once` must take effect when delivery actually happens: applied
+          // natively to the wrapper, a transient blur would consume the
+          // registration and the imminent focus would cancel the delivery.
+          const once =
+            !!options && typeof options === 'object' && !!options.once;
+          const regOpts = once
+            ? Object.assign({}, options, { once: false })
+            : options;
+          regOptsOf.set(wrapper, regOpts);
+          if (once) onceOf.add(wrapper);
+          return realAdd('blur', wrapper, regOpts);
+        };
+        window.removeEventListener = function (type, listener, options) {
+          if (type !== 'blur') return realRemove(type, listener, options);
+          const wrapper = wrapperOf.get(listener);
+          if (wrapper) {
+            const id = timerOf.get(wrapper);
+            if (id !== undefined) {
+              window.clearTimeout(id);
+              activeTimers.delete(id);
+              timerOf.delete(wrapper);
+            }
+            return realRemove('blur', wrapper, options);
+          }
+          return realRemove('blur', listener, options);
+        };
+        realAdd(
+          'focus',
+          function () {
+            activeTimers.forEach(function (id) {
+              window.clearTimeout(id);
+            });
+            activeTimers.clear();
+          },
+          true
+        );
+      })();
+    </script>
+    <script>
       (function () {
         let saved = null;
         try {
