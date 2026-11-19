@@ -36,8 +36,12 @@ func accelTiltDegrees(accel [3]float64, mount [9]float64) (pitchDeg, rollDeg flo
 	}
 
 	const deg = 180 / math.Pi
+	// The accelerometer reads world-up in the BODY frame (R^T * (0,0,g)) while
+	// the card convention wants the body +Z normal in the WORLD frame (R*(0,0,1))
+	// — inverse rotations, so both axes flip sign. roll needs the same minus
+	// pitch has; without it right-down reads negative (left/right mirrored).
 	pitchDeg = math.Atan2(-accel[0], math.Sqrt(accel[1]*accel[1]+accel[2]*accel[2])) * deg
-	rollDeg = math.Atan2(accel[1], accel[2]) * deg
+	rollDeg = math.Atan2(-accel[1], accel[2]) * deg
 	return clampTiltDeg(pitchDeg), clampTiltDeg(rollDeg), true
 }
 
