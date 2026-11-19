@@ -325,10 +325,14 @@ export default function GyroCalibrationCard() {
 
     const camera = new PerspectiveCamera(40, w / h, 0.1, 100);
     camera.up.set(0, 0, 1);
+    // Default azimuth 318° (bench-calibration posture decided empirically on
+    // the 93.72 unit: 48° read centrally symmetric to a lens-facing operator,
+    // 228° was one quarter-turn short — +90° CW lands on the matching view).
+    // The pitch/roll numbers themselves follow the doc convention regardless.
     const orbit = {
       radius: 7.2,
       theta: MathUtils.degToRad(68),
-      phi: MathUtils.degToRad(48),
+      phi: MathUtils.degToRad(318),
     };
     const applyOrbit = () => {
       const { radius, theta, phi } = orbit;
