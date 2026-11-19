@@ -39,6 +39,22 @@ func (h *CellularHandler) dialerAvailable(cfg CellularConfig) bool {
 
 func (h *CellularHandler) startDialer(bin string, cfg CellularConfig) error {
 	cfg = h.normalizeDialConfig(cfg)
+	if !h.qlogProcessAlive() {
+		h.ensureDbgctlForDial()
+	}
+	if !isVerizonProfile(cfg.CarrierProfile) {
+		p := strings.TrimSpace(cfg.CarrierProfile)
+		if (p == "" || strings.EqualFold(p, "generic")) && h.probeVerizonMBNActive() {
+			logger.Info("cellular: Verizon MBN active; using PDP#%d", verizonDataCID)
+			cfg.CarrierProfile = "verizon"
+			cfg = h.normalizeDialConfig(cfg)
+		}
+	}
+	if isVerizonProfile(cfg.CarrierProfile) {
+		if err := h.prepareVerizonCarrier(cfg); err != nil {
+			logger.Warn("cellular: Verizon prep: %v (continuing to dial)", err)
+		}
+	}
 	useEcm := strings.EqualFold(cfg.Usbnet, "ecm") || probeUsbnetDriver() == "ecm"
 	if useEcm {
 		if err := h.prepareEcmPDP(cfg); err != nil {
@@ -71,30 +87,78 @@ func (h *CellularHandler) startDialer(bin string, cfg CellularConfig) error {
 	logger.Info("cellular: dialer started bin=%s style=%s pid=%d args=%v", bin, style, cmd.Process.Pid, args)
 
 	h.watchDialer(cmd)
+	if cfg.MTU > 0 {
+		go h.ensureIfaceMTU(cfg)
+	}
 	return nil
 }
 
-// normalizeDialConfig fills dial defaults from live USB mode + IMSI when the
-// persisted config leaves APN empty.
-func (h *CellularHandler) normalizeDialConfig(cfg CellularConfig) CellularConfig {
-	if live := probeUsbnetDriver(); live != "" {
-		cfg.Usbnet = live
+func (h *CellularHandler) ensureIfaceMTU(cfg CellularConfig) {
+	if cfg.MTU < 576 || cfg.MTU > 1500 || h.hw == nil {
+		return
 	}
-	cfg.APN = resolveDialAPN(cfg.APN, cfg.CarrierProfile, h.cachedIMSI())
+	mtu := strconv.Itoa(cfg.MTU)
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, name := range h.hw.Net.Ifaces {
+			if name == "" {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(h.sysfsNet, name)); err != nil {
+				continue
+			}
+			out, err := h.command("ip", "-4", "-o", "addr", "show", "dev", name).Output()
+			if err != nil || !strings.Contains(string(out), "inet ") {
+				continue
+			}
+			if err := h.command("ip", "link", "set", "dev", name, "mtu", mtu).Run(); err != nil {
+				logger.Warn("cellular: set mtu %s on %s: %v", mtu, name, err)
+				return
+			}
+			logger.Info("cellular: set mtu=%s on %s", mtu, name)
+			return
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// normalizeDialConfig applies dial defaults; Verizon auto-detect does not persist.
+func (h *CellularHandler) normalizeDialConfig(cfg CellularConfig) CellularConfig {
+	imsi, operator := h.cachedSIMHints()
+	if shouldUseVerizonDial(cfg.CarrierProfile, imsi, operator, false) {
+		if !isVerizonProfile(cfg.CarrierProfile) {
+			logger.Info("cellular: Verizon auto-detected (imsi=%q operator=%q); using PDP#%d",
+				imsi, operator, verizonDataCID)
+		}
+		cfg.CarrierProfile = "verizon"
+	}
+	normalizeVerizonConfig(&cfg)
+	if live := probeUsbnetDriver(); live != "" {
+		if !(isVerizonProfile(cfg.CarrierProfile) && strings.EqualFold(cfg.Usbnet, "qmi") &&
+			strings.EqualFold(live, "mbim")) {
+			cfg.Usbnet = live
+		}
+	}
+	cfg.APN = resolveDialAPN(cfg.APN, cfg.CarrierProfile, imsi)
 	return cfg
 }
 
-func (h *CellularHandler) cachedIMSI() string {
+func (h *CellularHandler) cachedSIMHints() (imsi, operator string) {
 	atCacheMu.Lock()
-	imsi := atCache.IMSI
+	imsi, operator = atCache.IMSI, atCache.Operator
 	atCacheMu.Unlock()
-	if imsi != "" {
-		return imsi
+	if imsi != "" && operator != "" {
+		return
 	}
 	h.lastIdentityMu.Lock()
-	imsi = h.lastIdentity.IMSI
+	if imsi == "" {
+		imsi = h.lastIdentity.IMSI
+	}
+	if operator == "" {
+		operator = h.lastIdentity.Operator
+	}
 	h.lastIdentityMu.Unlock()
-	return imsi
+	return
 }
 
 // resolveDialAPN picks a usable APN. Empty config APN falls back to carrier /
@@ -103,8 +167,8 @@ func resolveDialAPN(apn, carrierProfile, imsi string) string {
 	if s := strings.TrimSpace(apn); s != "" {
 		return s
 	}
-	if strings.EqualFold(strings.TrimSpace(carrierProfile), "verizon") {
-		return "vzwinternet"
+	if isVerizonProfile(carrierProfile) || isVerizonIMSI(imsi) {
+		return verizonInternetAPN
 	}
 	if apn := apnFromIMSI(imsi); apn != "" {
 		return apn
@@ -239,6 +303,9 @@ func (h *CellularHandler) startEcmDialerLocked(cfg CellularConfig) error {
 	_ = h.writePID("cellular-dialer.pid", cmd.Process.Pid)
 	logger.Info("cellular: ECM dialer started udhcpc pid=%d iface=%s apn=%s", cmd.Process.Pid, iface, cfg.APN)
 	h.watchDialer(cmd)
+	if cfg.MTU > 0 {
+		go h.ensureIfaceMTU(cfg)
+	}
 	return nil
 }
 
@@ -349,11 +416,7 @@ func dialerArgs(style string, cfg CellularConfig) []string {
 
 	switch strings.ToLower(style) {
 	case "quectel_cm":
-		// Matches QConnectManager V1.6.x:
-		//   -s [apn [user password auth]]  auth: 1=pap, 2=chap
-		//   -4 / -6                        IP family
-		//   -n pdn                         synced from config pdp_cid
-		// Board retest: ipv4v6 (-4 -6) is fine on healthy MBIM/QMI.
+		// QConnectManager: -s apn [user password auth] -4/-6 -n <pdn>
 		args := []string{"-s", apn}
 		if cfg.Auth != "none" {
 			auth := "0"

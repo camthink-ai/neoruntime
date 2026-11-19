@@ -6033,6 +6033,36 @@ paths:
                     data:
                       $ref: '#/components/schemas/CellularConfig'
 
+  /cellular/mbn:
+    get:
+      tags: [Cellular]
+      summary: List Quectel MBN profiles
+      description: |
+        Returns AT+QMBNCFG="List" entries for advanced dial MBN selection.
+        Soft failures return HTTP 200 with data.ok=false and an empty entries list.
+      operationId: listCellularMBN
+      responses:
+        '200':
+          description: MBN profile list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        ok:
+                          type: boolean
+                        message:
+                          type: string
+                        entries:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/CellularMBNEntry'
+
   /cellular/connect:
     post:
       tags: [Cellular]
@@ -6054,6 +6084,183 @@ paths:
                   properties:
                     data:
                       $ref: '#/components/schemas/CellularConnectResult'
+
+  /cellular/debug/at:
+    post:
+      tags: [Cellular]
+      summary: Send one modem AT command
+      description: Accepts a single AT command (must start with AT). Soft failures return HTTP 200 with data.ok=false.
+      operationId: debugCellularAT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command:
+                  type: string
+                  maxLength: 256
+                  example: AT+CGDCONT?
+      responses:
+        '200':
+          description: AT exchange result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularDebugATResult'
+
+  /cellular/debug/ping:
+    post:
+      tags: [Cellular]
+      summary: ICMP ping
+      description: Optionally bind to a network iface (e.g. wwan0). Soft failures return HTTP 200 with data.ok=false.
+      operationId: debugCellularPing
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                host:
+                  type: string
+                  description: Hostname or IP (default 8.8.8.8)
+                  example: 8.8.8.8
+                count:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                  description: Echo count (default 4)
+                iface:
+                  type: string
+                  description: Optional source interface (e.g. wwan0)
+      responses:
+        '200':
+          description: Ping result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularDebugPingResult'
+
+  /cellular/debug/qlog:
+    get:
+      tags: [Cellular]
+      summary: QLog capture status
+      description: Returns whether Quectel QLog is available/running and on-disk log size.
+      operationId: getCellularQLogStatus
+      responses:
+        '200':
+          description: QLog status
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularQLogStatus'
+
+  /cellular/debug/qlog/start:
+    post:
+      tags: [Cellular]
+      summary: Start QLog capture
+      description: Starts Quectel QLog on the modem DM port (prefers /usr/bin/qlog).
+      operationId: startCellularQLog
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                port:
+                  type: string
+                  description: DM port (default auto)
+                  example: /dev/ttyUSB0
+                max_mb:
+                  type: integer
+                  description: Max size per file in MB (default 32)
+                max_files:
+                  type: integer
+                  description: Max retained files (default 8)
+      responses:
+        '200':
+          description: Start result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularQLogActionResult'
+
+  /cellular/debug/qlog/stop:
+    post:
+      tags: [Cellular]
+      summary: Stop QLog capture
+      operationId: stopCellularQLog
+      responses:
+        '200':
+          description: Stop result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularQLogActionResult'
+
+  /cellular/debug/qlog/export:
+    get:
+      tags: [Cellular]
+      summary: Export QLog files as tar.gz
+      operationId: exportCellularQLog
+      responses:
+        '200':
+          description: tar.gz archive of captured QLog files
+          content:
+            application/gzip:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: No QLog files available
+
+  /cellular/debug/qlog/clear:
+    post:
+      tags: [Cellular]
+      summary: Clear captured QLog files
+      description: Refuses while capture is running.
+      operationId: clearCellularQLog
+      responses:
+        '200':
+          description: Clear result
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/CellularQLogActionResult'
 
   # ==================== Device Info ====================
   /device-info:
@@ -8664,6 +8871,33 @@ components:
           type: string
           description: Numeric SIM PIN, at most 8 digits
           maxLength: 8
+        plmn:
+          type: string
+          description: Locked PLMN (MCC+MNC). Empty = automatic.
+          pattern: '^([0-9]{5,6})?$'
+        lte_bands:
+          type: string
+          description: Comma-separated LTE bands. Empty = unchanged.
+        mtu:
+          type: integer
+          description: WWAN MTU after connect. 0 = default; else 576–1500.
+          minimum: 0
+          maximum: 1500
+        mbn:
+          type: string
+          description: QMBNCFG profile name. Empty = AutoSel.
+
+    CellularMBNEntry:
+      type: object
+      properties:
+        index:
+          type: integer
+        selected:
+          type: boolean
+        activated:
+          type: boolean
+        name:
+          type: string
 
     CellularCapability:
       type: object
@@ -8735,6 +8969,78 @@ components:
           type: boolean
         message:
           type: string
+
+    CellularDebugATResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+        response:
+          type: string
+
+    CellularDebugPingResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+        output:
+          type: string
+        iface:
+          type: string
+          description: Cellular netdev used for -I (never eth0/default route)
+
+    CellularQLogStatus:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        available:
+          type: boolean
+          description: Whether qlog binary is present
+        running:
+          type: boolean
+        binary:
+          type: string
+        port:
+          type: string
+          description: Active DM port while capturing
+        dm_port:
+          type: string
+          description: Auto-detected DM port candidate
+        dir:
+          type: string
+        files:
+          type: integer
+        bytes:
+          type: integer
+          format: int64
+        started_at:
+          type: string
+          format: date-time
+        message:
+          type: string
+
+    CellularQLogActionResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+        running:
+          type: boolean
+        port:
+          type: string
+        dir:
+          type: string
+        binary:
+          type: string
+        removed:
+          type: integer
 
     CellularGnssStatus:
       type: object

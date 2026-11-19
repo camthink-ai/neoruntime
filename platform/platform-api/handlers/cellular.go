@@ -44,6 +44,10 @@ type CellularConfig struct {
 	NetworkMode    string `json:"network_mode"`    // auto|lte|wcdma
 	Roaming        *bool  `json:"roaming"`         // nil → false
 	PIN            string `json:"pin"`
+	PLMN           string `json:"plmn"`
+	LTEBands       string `json:"lte_bands"`
+	MTU            int    `json:"mtu"`
+	MBN            string `json:"mbn"`
 }
 
 // CellularStatus is the runtime view returned by GET /cellular/status.
@@ -123,6 +127,11 @@ type CellularHandler struct {
 	gnssCacheAt time.Time
 	// 1 after AT+QGPS=1 succeeded this module presence; cleared on USB loss / power off.
 	gnssEngineApplied int32
+
+	qlogMu        sync.Mutex
+	qlogCmd       *exec.Cmd
+	qlogPort      string
+	qlogStartedAt time.Time
 }
 
 // NewCellularHandler creates a CellularHandler.
@@ -173,6 +182,10 @@ func defaultCellularConfig() CellularConfig {
 		NetworkMode:    "auto",
 		Roaming:        boolPtr(false),
 		PIN:            "",
+		PLMN:           "",
+		LTEBands:       "",
+		MTU:            0,
+		MBN:            "",
 	}
 }
 
@@ -367,6 +380,10 @@ func (h *CellularHandler) UpdateConfig(c *gin.Context) {
 		h.kickAutoDial()
 	}
 
+	if req.Enabled && dataWant && powerErr == nil && req.MTU > 0 {
+		go h.ensureIfaceMTU(req)
+	}
+
 	var gnssErr error
 	if req.Enabled && powerErr == nil && (gnssWant != gnssWas || (enabling && gnssWant)) {
 		gnssErr = h.applyGnssEnabledOrDefer(gnssWant)
@@ -486,7 +503,10 @@ func cellularDialSettingsChanged(prev, next CellularConfig) bool {
 
 func cellularModemPrefsChanged(prev, next CellularConfig) bool {
 	return strings.ToLower(strings.TrimSpace(prev.NetworkMode)) != strings.ToLower(strings.TrimSpace(next.NetworkMode)) ||
-		roamingEnabled(prev) != roamingEnabled(next)
+		roamingEnabled(prev) != roamingEnabled(next) ||
+		strings.TrimSpace(prev.PLMN) != strings.TrimSpace(next.PLMN) ||
+		normalizeLTEBandsInput(prev.LTEBands) != normalizeLTEBandsInput(next.LTEBands) ||
+		strings.TrimSpace(prev.MBN) != strings.TrimSpace(next.MBN)
 }
 
 func validateCellularConfig(cfg *CellularConfig) error {
@@ -534,6 +554,9 @@ func validateCellularConfig(cfg *CellularConfig) error {
 	cfg.APN = strings.TrimSpace(cfg.APN)
 	cfg.User = strings.TrimSpace(cfg.User)
 	cfg.PIN = strings.TrimSpace(cfg.PIN)
+	cfg.PLMN = strings.TrimSpace(cfg.PLMN)
+	cfg.LTEBands = normalizeLTEBandsInput(cfg.LTEBands)
+	cfg.MBN = strings.TrimSpace(cfg.MBN)
 	if len(cfg.PIN) > 8 {
 		return fmt.Errorf("pin must be at most 8 digits")
 	}
@@ -542,6 +565,28 @@ func validateCellularConfig(cfg *CellularConfig) error {
 			return fmt.Errorf("pin must be numeric")
 		}
 	}
+	if cfg.PLMN != "" {
+		if len(cfg.PLMN) < 5 || len(cfg.PLMN) > 6 {
+			return fmt.Errorf("plmn must be 5–6 digits (MCC+MNC)")
+		}
+		for _, r := range cfg.PLMN {
+			if r < '0' || r > '9' {
+				return fmt.Errorf("plmn must be numeric")
+			}
+		}
+	}
+	if cfg.LTEBands != "" {
+		if _, err := parseLTEBands(cfg.LTEBands); err != nil {
+			return err
+		}
+	}
+	if cfg.MTU < 0 || (cfg.MTU > 0 && (cfg.MTU < 576 || cfg.MTU > 1500)) {
+		return fmt.Errorf("mtu must be 0 (default) or 576–1500")
+	}
+	if len(cfg.MBN) > 64 {
+		return fmt.Errorf("mbn name too long")
+	}
+	normalizeVerizonConfig(cfg)
 	return nil
 }
 

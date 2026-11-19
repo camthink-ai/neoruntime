@@ -370,6 +370,17 @@ export interface CellularConfig {
   roaming: boolean;
   /** SIM PIN when the card requires unlock (optional). */
   pin: string;
+  plmn: string;
+  lte_bands: string;
+  mtu: number;
+  mbn: string;
+}
+
+export interface CellularMBNEntry {
+  index: number;
+  selected: boolean;
+  activated: boolean;
+  name: string;
 }
 
 export type CellularCapability = 'pending' | 'supported' | 'unsupported';
@@ -418,6 +429,10 @@ const DEFAULT_CELLULAR_CONFIG: CellularConfig = {
   network_mode: 'auto',
   roaming: false,
   pin: '',
+  plmn: '',
+  lte_bands: '',
+  mtu: 0,
+  mbn: '',
 };
 
 function readLocalCellularConfig(): CellularConfig {
@@ -534,6 +549,17 @@ export const fetchCellularConfig = async (): Promise<CellularConfig> => {
   }
 };
 
+export const fetchCellularMBN = async (): Promise<CellularMBNEntry[]> => {
+  try {
+    const response = await request.get('/api/v1/cellular/mbn');
+    const data = (response as { data?: { entries?: CellularMBNEntry[] } }).data ?? response;
+    const { entries } = (data as { entries?: CellularMBNEntry[] });
+    return Array.isArray(entries) ? entries : [];
+  } catch {
+    return [];
+  }
+};
+
 function cellularApiErrorMessage(err: unknown): string | null {
   // request.ts rejects either AxiosError or the bare response object.
   const anyErr = err as {
@@ -582,6 +608,7 @@ export function applyCarrierProfile(
       pdp_cid: 3,
       ip_type: 'ipv4v6',
       auth: 'none',
+      usbnet: current.usbnet === 'ecm' ? 'ecm' : 'qmi',
     };
   }
   return {
@@ -590,6 +617,152 @@ export function applyCarrierProfile(
     pdp_cid: current.pdp_cid === 3 ? 1 : current.pdp_cid,
   };
 }
+
+export interface CellularDebugATResult {
+  ok: boolean;
+  message: string;
+  response: string;
+}
+
+export interface CellularDebugPingResult {
+  ok: boolean;
+  message: string;
+  output: string;
+  iface: string;
+}
+
+export const sendCellularAT = async (
+  command: string
+): Promise<CellularDebugATResult> => {
+  const response = await request.post('/api/v1/cellular/debug/at', { command });
+  const data = ((response as { data?: CellularDebugATResult }).data
+    ?? response) as Partial<CellularDebugATResult>;
+  return {
+    ok: Boolean(data.ok),
+    message: data.message ?? '',
+    response: data.response ?? '',
+  };
+};
+
+export const sendCellularPing = async (opts: {
+  host?: string;
+  count?: number;
+  iface?: string;
+}): Promise<CellularDebugPingResult> => {
+  const response = await request.post('/api/v1/cellular/debug/ping', opts);
+  const data = ((response as { data?: CellularDebugPingResult }).data
+    ?? response) as Partial<CellularDebugPingResult>;
+  return {
+    ok: Boolean(data.ok),
+    message: data.message ?? '',
+    output: data.output ?? '',
+    iface: data.iface ?? '',
+  };
+};
+
+export interface CellularQLogStatus {
+  ok: boolean;
+  available: boolean;
+  running: boolean;
+  binary: string;
+  port: string;
+  dm_port: string;
+  dir: string;
+  files: number;
+  bytes: number;
+  started_at: string;
+  message: string;
+}
+
+export interface CellularQLogActionResult {
+  ok: boolean;
+  message: string;
+  running?: boolean;
+  port?: string;
+  dir?: string;
+  binary?: string;
+  removed?: number;
+}
+
+export const fetchCellularQLogStatus =  async (): Promise<CellularQLogStatus> => {
+    const response = await request.get('/api/v1/cellular/debug/qlog');
+    const data = ((response as { data?: CellularQLogStatus }).data
+      ?? response) as Partial<CellularQLogStatus>;
+    return {
+      ok: Boolean(data.ok),
+      available: Boolean(data.available),
+      running: Boolean(data.running),
+      binary: data.binary ?? '',
+      port: data.port ?? '',
+      dm_port: data.dm_port ?? '',
+      dir: data.dir ?? '',
+      files: Number(data.files ?? 0),
+      bytes: Number(data.bytes ?? 0),
+      started_at: data.started_at ?? '',
+      message: data.message ?? '',
+    };
+  };
+
+export const startCellularQLog = async (opts?: {
+  port?: string;
+  max_mb?: number;
+  max_files?: number;
+}): Promise<CellularQLogActionResult> => {
+  const response = await request.post(
+    '/api/v1/cellular/debug/qlog/start',
+    opts ?? {}
+  );
+  const data = ((response as { data?: CellularQLogActionResult }).data
+    ?? response) as Partial<CellularQLogActionResult>;
+  return {
+    ok: Boolean(data.ok),
+    message: data.message ?? '',
+    running: data.running,
+    port: data.port,
+    dir: data.dir,
+    binary: data.binary,
+  };
+};
+
+export const stopCellularQLog =  async (): Promise<CellularQLogActionResult> => {
+    const response = await request.post('/api/v1/cellular/debug/qlog/stop');
+    const data = ((response as { data?: CellularQLogActionResult }).data
+      ?? response) as Partial<CellularQLogActionResult>;
+    return {
+      ok: Boolean(data.ok),
+      message: data.message ?? '',
+      running: data.running,
+    };
+  };
+
+export const clearCellularQLog =  async (): Promise<CellularQLogActionResult> => {
+    const response = await request.post('/api/v1/cellular/debug/qlog/clear');
+    const data = ((response as { data?: CellularQLogActionResult }).data
+      ?? response) as Partial<CellularQLogActionResult>;
+    return {
+      ok: Boolean(data.ok),
+      message: data.message ?? '',
+      removed: data.removed,
+    };
+  };
+
+export const downloadCellularQLog = async (): Promise<void> => {
+  const result = await request.get('/api/v1/cellular/debug/qlog/export', {
+    responseType: 'blob',
+  });
+  const blob = result as unknown as Blob;
+  if (!blob || blob.size === 0) {
+    throw new Error('Received empty QLog archive');
+  }
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `cellular-qlog-${new Date().toISOString().slice(0, 10)}.tar.gz`;
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+  document.body.removeChild(a);
+};
 
 // ==================== Auto Iris (AF0832 aperture) API ====================
 

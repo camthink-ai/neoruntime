@@ -22,6 +22,7 @@ var (
 	atCache    modemIdentity
 	atCacheTTL = 20 * time.Second
 	atPortMu   sync.Mutex
+	lastATPort string
 
 	// Filled from CellularHWProfile (single in-process handler).
 	cellularPreferredATPorts []string
@@ -109,11 +110,24 @@ func listATPortCandidates() []string {
 }
 
 func findATPort() string {
-	for _, p := range listATPortCandidates() {
-		if raw, err := atExchangeWait(p, []string{"AT"}, 150*time.Millisecond, 200*time.Millisecond); err == nil && strings.Contains(raw, "OK") {
+	candidates := listATPortCandidates()
+	if last := lastATPort; last != "" {
+		ordered := make([]string, 0, len(candidates)+1)
+		ordered = append(ordered, last)
+		for _, p := range candidates {
+			if p != last {
+				ordered = append(ordered, p)
+			}
+		}
+		candidates = ordered
+	}
+	for _, p := range candidates {
+		if raw, err := atExchangeWait(p, []string{"AT"}, 120*time.Millisecond, 120*time.Millisecond); err == nil && strings.Contains(raw, "OK") {
+			lastATPort = p
 			return p
 		}
 	}
+	lastATPort = ""
 	return ""
 }
 
@@ -357,24 +371,138 @@ func (h *CellularHandler) applyModemPrefs(cfg CellularConfig) error {
 	if pin := strings.TrimSpace(cfg.PIN); pin != "" {
 		cmds = append(cmds, fmt.Sprintf(`AT+CPIN="%s"`, pin))
 	}
-	raw, err := atExchange(port, cmds, 800*time.Millisecond)
+	raw, err := atExchange(port, cmds, 1200*time.Millisecond)
 	if err != nil {
 		return err
 	}
 	if !strings.Contains(raw, "OK") {
 		return fmt.Errorf("modem rejected network prefs (%s)", strings.TrimSpace(raw))
 	}
-	if _, err := atExchange(port, []string{"AT+CFUN=0"}, 3*time.Second); err != nil {
-		logger.Warn("cellular: CFUN=0 after prefs: %v", err)
+
+	if _, err := atExchange(port, []string{"AT+CFUN=4"}, 3*time.Second); err != nil {
+		logger.Warn("cellular: CFUN=4 before band/mbn: %v", err)
+		if _, err := atExchange(port, []string{"AT+CFUN=0"}, 3*time.Second); err != nil {
+			logger.Warn("cellular: CFUN=0 fallback: %v", err)
+		}
 	}
 	time.Sleep(1500 * time.Millisecond)
+
+	if bands := strings.TrimSpace(cfg.LTEBands); bands != "" {
+		bandCmd, err := h.buildLTEBandAT(port, bands)
+		if err != nil {
+			return err
+		}
+		bandRaw, err := atExchange(port, []string{bandCmd}, 1200*time.Millisecond)
+		if err != nil {
+			return fmt.Errorf("lte_bands apply: %w", err)
+		}
+		if !strings.Contains(bandRaw, "OK") || strings.Contains(bandRaw, "ERROR") {
+			return fmt.Errorf("lte_bands rejected (%s)", strings.TrimSpace(bandRaw))
+		}
+	}
+	if err := h.applyMBNPreference(port, cfg.MBN); err != nil {
+		return err
+	}
+
 	if _, err := atExchange(port, []string{"AT+CFUN=1"}, 3*time.Second); err != nil {
 		logger.Warn("cellular: CFUN=1 after prefs: %v", err)
 	}
-	clearATCache()
-	logger.Info("cellular: applied network_mode=%s roaming=%v", cfg.NetworkMode, roamingEnabled(cfg))
 	time.Sleep(2 * time.Second)
+	if err := h.applyPLMNPreference(port, cfg.PLMN); err != nil {
+		logger.Warn("cellular: PLMN apply: %v", err)
+	}
+	clearATCache()
+	logger.Info("cellular: applied network_mode=%s roaming=%v plmn=%q lte_bands=%q mbn=%q",
+		cfg.NetworkMode, roamingEnabled(cfg), cfg.PLMN, cfg.LTEBands, cfg.MBN)
+	time.Sleep(1 * time.Second)
 	return nil
+}
+
+func (h *CellularHandler) buildLTEBandAT(port, bands string) (string, error) {
+	parsed, err := parseLTEBands(bands)
+	if err != nil {
+		return "", err
+	}
+	gsm, tds := "0", "0"
+	if raw, err := atExchange(port, []string{`AT+QCFG="band"`}, 800*time.Millisecond); err == nil {
+		if g, _, t, ok := parseQCFGBandTriple(raw); ok {
+			gsm, tds = g, t
+		}
+	}
+	lte := lteBandMaskHex(parsed)
+	return fmt.Sprintf(`AT+QCFG="band",%s,%s,%s`, gsm, lte, tds), nil
+}
+
+func (h *CellularHandler) applyPLMNPreference(port, plmn string) error {
+	plmn = strings.TrimSpace(plmn)
+	if plmn == "" {
+		if raw, err := atExchange(port, []string{"AT+COPS?"}, 2*time.Second); err == nil {
+			if strings.Contains(raw, "+COPS: 0") {
+				return nil
+			}
+		}
+		for _, cmd := range []string{"AT+COPS=0", "AT+COPS=0,0", "AT+COPS=2"} {
+			raw, err := atExchange(port, []string{cmd}, 8*time.Second)
+			if err != nil {
+				continue
+			}
+			if strings.Contains(raw, "OK") && !strings.Contains(raw, "ERROR") {
+				if cmd == "AT+COPS=2" {
+					_, _ = atExchange(port, []string{"AT+COPS=0"}, 8*time.Second)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("COPS auto rejected")
+	}
+	_, _ = atExchange(port, []string{"AT+COPS=3,2"}, 2*time.Second)
+	cmd := fmt.Sprintf(`AT+COPS=1,2,"%s"`, plmn)
+	raw, err := atExchange(port, []string{cmd}, 8*time.Second)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(raw, "OK") || strings.Contains(raw, "ERROR") {
+		return fmt.Errorf("COPS rejected (%s)", strings.TrimSpace(raw))
+	}
+	return nil
+}
+
+func (h *CellularHandler) applyMBNPreference(port, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		raw, err := atExchange(port, []string{`AT+QMBNCFG="AutoSel",1`}, 800*time.Millisecond)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(raw, "ERROR") {
+			logger.Info("cellular: QMBNCFG AutoSel unsupported/rejected")
+		}
+		return nil
+	}
+	if _, err := atExchange(port, []string{`AT+QMBNCFG="AutoSel",0`}, 800*time.Millisecond); err != nil {
+		logger.Warn("cellular: QMBNCFG AutoSel=0: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	raw, err := atExchange(port, []string{fmt.Sprintf(`AT+QMBNCFG="Select","%s"`, name)}, 60*time.Second)
+	if err == nil && strings.Contains(raw, "OK") && !strings.Contains(raw, "ERROR") {
+		return nil
+	}
+	for i := 0; i < 12; i++ {
+		time.Sleep(time.Second)
+		listRaw, listErr := atExchange(port, []string{`AT+QMBNCFG="List"`}, 5*time.Second)
+		if listErr != nil {
+			continue
+		}
+		for _, e := range parseMBNList(listRaw) {
+			if e.Name == name && e.Selected {
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("MBN select %q: %w", name, err)
+	}
+	return fmt.Errorf("MBN select %q rejected (%s)", name, strings.TrimSpace(raw))
 }
 
 // usbnetNeedsReconcile reports whether live USB net driver differs from the

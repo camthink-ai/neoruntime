@@ -17,6 +17,7 @@ import {
   applyCarrierProfile,
   fetchCellularConfig,
   fetchCellularGnssStatus,
+  fetchCellularMBN,
   fetchCellularStatus,
   updateCellularConfig,
   type CellularAuth,
@@ -31,6 +32,8 @@ import {
   Antenna,
   Building2,
   CardSim,
+  ChevronDown,
+  ChevronRight,
   CircuitBoard,
   Compass,
   Cpu,
@@ -44,6 +47,7 @@ import {
   Phone,
   Power,
   Radio,
+  RefreshCw,
   Satellite,
   Save,
 } from 'lucide-react';
@@ -59,6 +63,7 @@ import {
   processStatusText,
 } from './cellularPanelUi';
 import GnssMap from './GnssMap';
+import CellularDebugPanel from './CellularDebugPanel';
 import { parseGnssFix } from './gnssGeo';
 import { fetchGnssPlaceName } from './gnssPlace';
 
@@ -70,6 +75,7 @@ export default function CellularPanel() {
 
   const [form, setForm] = useState<CellularConfig | null>(null);
   const [saveKind, setSaveKind] = useState<SaveKind>('other');
+  const [advancedDialOpen, setAdvancedDialOpen] = useState(false);
 
   const statusQuery = useQuery({
     queryKey: ['cellularStatus'],
@@ -81,6 +87,13 @@ export default function CellularPanel() {
   const configQuery = useQuery({
     queryKey: ['cellularConfig'],
     queryFn: fetchCellularConfig,
+  });
+
+  const mbnQuery = useQuery({
+    queryKey: ['cellularMBN'],
+    queryFn: fetchCellularMBN,
+    enabled: Boolean(form?.enabled && advancedDialOpen),
+    staleTime: 30_000,
   });
 
   useEffect(() => {
@@ -751,6 +764,120 @@ export default function CellularPanel() {
               </div>
             </div>
 
+            <div className="mt-6 border-t border-border pt-4">
+              <button
+                type="button"
+                className="flex w-full items-center gap-1.5 text-left text-sm font-medium text-foreground transition-colors hover:text-foreground/80"
+                onClick={() => setAdvancedDialOpen(v => !v)}
+                aria-expanded={advancedDialOpen}
+              >
+                {advancedDialOpen ? (
+                  <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
+                ) : (
+                  <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+                )}
+                {t('sys.cellular.section_advanced_dial', 'Advanced dial options')}
+              </button>
+
+              {advancedDialOpen ? (
+                <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="space-y-2">
+                    <Label>{t('sys.cellular.plmn', 'PLMN lock')}</Label>
+                    <Input
+                      inputMode="numeric"
+                      placeholder={t(
+                        'sys.cellular.plmn_placeholder',
+                        'e.g. 46011'
+                      )}
+                      value={form.plmn || ''}
+                      onChange={e => setForm({
+                          ...form,
+                          plmn: e.target.value.replace(/\D/g, '').slice(0, 6),
+                        })}
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>{t('sys.cellular.lte_bands', 'LTE bands')}</Label>
+                    <Input
+                      placeholder={t(
+                        'sys.cellular.lte_bands_placeholder',
+                        'e.g. 1,3,5,8,41'
+                      )}
+                      value={form.lte_bands || ''}
+                      onChange={e => setForm({ ...form, lte_bands: e.target.value })}
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>{t('sys.cellular.mtu', 'WWAN MTU')}</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={1500}
+                      placeholder={t('sys.cellular.mtu_placeholder', '0')}
+                      value={form.mtu ?? 0}
+                      onChange={e => {
+                        const n = Number(e.target.value);
+                        setForm({
+                          ...form,
+                          mtu: Number.isFinite(n) ? Math.max(0, Math.min(1500, n)) : 0,
+                        });
+                      }}
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>{t('sys.cellular.mbn', 'MBN profile')}</Label>
+                    <div className="flex items-center gap-2">
+                      <Select
+                        value={form.mbn || '__auto__'}
+                        onValueChange={v => setForm({
+                            ...form,
+                            mbn: v === '__auto__' ? '' : v,
+                          })}
+                      >
+                        <SelectTrigger className="w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="__auto__">
+                            {t('sys.cellular.mbn_auto', 'Auto (AutoSel)')}
+                          </SelectItem>
+                          {(mbnQuery.data || []).map(e => (
+                            <SelectItem key={`${e.index}-${e.name}`} value={e.name}>
+                              {e.name}
+                              {e.activated ? ' ●' : e.selected ? ' ○' : ''}
+                            </SelectItem>
+                          ))}
+                          {form.mbn
+                          && !(mbnQuery.data || []).some(e => e.name === form.mbn) ? (
+                            <SelectItem value={form.mbn}>{form.mbn}</SelectItem>
+                          ) : null}
+                        </SelectContent>
+                      </Select>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        className="size-9 shrink-0"
+                        title={t('sys.cellular.mbn_refresh', 'Refresh list')}
+                        disabled={mbnQuery.isFetching}
+                        onClick={() => mbnQuery.refetch()}
+                      >
+                        <RefreshCw
+                          className={cn(
+                            'size-4',
+                            mbnQuery.isFetching && 'animate-spin'
+                          )}
+                        />
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
             <div className="mt-6 flex justify-end">
               <Button
                 variant="carbon"
@@ -769,6 +896,11 @@ export default function CellularPanel() {
               </Button>
             </div>
           </div>
+
+          <CellularDebugPanel
+            iface={status?.iface}
+            disabled={!form.enabled || saving}
+          />
         </>
       ) : null}
     </Card>

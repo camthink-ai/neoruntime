@@ -901,7 +901,15 @@ func (s *PlatformAPIServer) setupRoutes() {
 		cellular.GET("/gnss/status", cellularHandler.GetGnssStatus)
 		cellular.GET("/config", cellularHandler.GetConfig)
 		cellular.PUT("/config", cellularHandler.UpdateConfig)
+		cellular.GET("/mbn", cellularHandler.ListMBN)
 		cellular.POST("/connect", cellularHandler.Connect)
+		cellular.POST("/debug/at", cellularHandler.DebugAT)
+		cellular.POST("/debug/ping", cellularHandler.DebugPing)
+		cellular.GET("/debug/qlog", cellularHandler.DebugQLogStatus)
+		cellular.POST("/debug/qlog/start", cellularHandler.DebugQLogStart)
+		cellular.POST("/debug/qlog/stop", cellularHandler.DebugQLogStop)
+		cellular.GET("/debug/qlog/export", cellularHandler.DebugQLogExport)
+		cellular.POST("/debug/qlog/clear", cellularHandler.DebugQLogClear)
 	} else {
 		logger.Info("cellular: no capabilities.cellular.hw_profile; cellular API not registered")
 	}

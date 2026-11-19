@@ -449,6 +449,9 @@ func TestResolveDialAPNFromIMSI(t *testing.T) {
 	if got := resolveDialAPN("", "verizon", ""); got != "vzwinternet" {
 		t.Fatalf("verizon: got %q", got)
 	}
+	if got := resolveDialAPN("", "generic", "311480123456789"); got != "vzwinternet" {
+		t.Fatalf("verizon imsi on generic: got %q", got)
+	}
 }
 
 func TestDialerArgsQuectelPAP(t *testing.T) {
