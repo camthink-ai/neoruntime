@@ -188,6 +188,13 @@ data/
 models/hef/*.hef
 models/onnx/*.onnx
 models/trt/*.trt
+# Trusted factory-preload models that ship in-tree so a bare
+# `make pack-release` (even offline) produces a DPM-complete bundle.
+# The zoo builds of these files are NOT interchangeable with the factory
+# builds — see the pinned digest in scripts/download_models.sh.
+!models/segmentation/linknet_mbv1_ss_dpm_256.hef
+!models/detection/hailo_yolov8n_384_640.hef
+!models/detection/tiny_yolov4_license_plates.hef
 # Container images
 *.img
 *.iso

@@ -3,7 +3,7 @@
 .PHONY: all build-go build-native build-web build-ci clean distclean test test-unit test-basic test-smoke test-verify verify test-integration proto \
   proto-inference proto-device proto-event proto-camera proto-app proto-lens proto-discovery \
   hal-v2 platform ai-runtime device-control event-bus app-manager platform-api \
-  device-discovery os-updater onvif-device camera-daemon web aipc-cli tools mcu-firmware pack pack-release \
+  device-discovery os-updater onvif-device camera-daemon web aipc-cli tools mcu-firmware pack pack-release models \
   ensure-mcu-toolchain docker-pack-release _pack-stage _pack-internal fmt lint help \
   postprocess-schema postprocess-schema-check
 
@@ -118,6 +118,19 @@ build-ci: build-go build-web
 	@echo "=== CI build complete: Go services + web ==="
 
 proto: proto-inference proto-device proto-event proto-camera proto-app proto-lens proto-discovery
+
+# Populate the repo-root models/ tree that pack-release stages into the
+# bundle. The DPM-critical linknet ships in-tree (models/segmentation, the
+# factory preload build — the public zoo build is a different compile that
+# silently breaks the person channel, so it is never fetched); everything
+# else comes from the Hailo model zoo via download_models.sh. GenAI (~3GB)
+# is opt-in: make models WITH_GENAI=1.
+models:
+	@WITH_GENAI=0 bash scripts/download_models.sh --dest models
+	@if [ "$(WITH_GENAI)" = "1" ]; then \
+		bash scripts/download_models.sh --with-genai --dest models || exit 1; \
+	fi
+	@echo "models tree ready under ./models (see make pack-release)"
 ifeq ($(HAL_PLATFORM),hailo15)
 	@if [ -n "$(SDK_PATH)" ]; then ./scripts/generate_proto_arm.sh --sdk-path "$(SDK_PATH)"; fi
 endif
@@ -525,6 +538,12 @@ _pack-stage:
 	@[ -d web/dist ] && cp -r web/dist/* "$(STAGE_DIR)/opt/aipc/web/" && echo "  + web console" || true
 	@cp -f platform/platform-api/swagger-ui/* "$(STAGE_DIR)/opt/aipc/swagger-ui/" 2>/dev/null || true
 	@cp -f docs/api/swagger.yaml "$(STAGE_DIR)/opt/aipc/etc/swagger.yaml" 2>/dev/null || true
+	@# Models: the four DPM-critical files are committed in-tree, so a bare
+	@# `make pack-release` — even offline — stages a DPM-complete bundle. The
+	@# optional set is fetched best-effort into models/ (incremental, SKIPs
+	@# existing files); a fetch failure never blocks the build.
+	@bash scripts/download_models.sh --dest models \
+		|| echo "  - optional model fetch unavailable (offline?); staging committed models only"
 	@staged_models=0; \
 	for cat in detection classification segmentation keypoint clip depth ocr genai; do \
 		mkdir -p "$(STAGE_DIR)/opt/aipc/models/$$cat"; \
@@ -536,6 +555,22 @@ _pack-stage:
 		done; \
 	done; \
 	[ "$$staged_models" -eq 1 ] || echo "  - models/ source tree absent; device must run download_models.sh"
+	@# Release gate: the four DPM-critical files must be in the staged bundle.
+	@# They are committed in-tree, so this normally holds even offline; it only
+	@# trips when someone strips the tree (historical bundles shipped empty
+	@# model skeletons and devices had no trusted online source for linknet).
+	@# Set MODELS_REQUIRED=0 to intentionally build a slim bundle without them.
+	@if [ "$(MODELS_REQUIRED)" != "0" ]; then \
+		missing=0; \
+		for f in detection/hailo_yolov8n_384_640.hef detection/hailo_yolov8n_384_640.json \
+		         segmentation/linknet_mbv1_ss_dpm_256.hef detection/tiny_yolov4_license_plates.hef; do \
+			[ -f "$(STAGE_DIR)/opt/aipc/models/$$f" ] || { echo "  ! MISSING core model: $$f"; missing=1; }; \
+		done; \
+		if [ "$$missing" -eq 1 ]; then \
+			echo "ERROR: DPM-critical models absent from the bundle (run 'make models' or set MODELS_REQUIRED=0)" >&2; \
+			exit 1; \
+		fi; \
+	fi
 	@printf '%s\n' \
 		"version=$(VERSION)" \
 		"build_date=$$(date +%Y%m%d-%H%M%S)" \
