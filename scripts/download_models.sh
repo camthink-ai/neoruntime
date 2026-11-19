@@ -89,7 +89,8 @@ verify_hef() {
 # magic check alone proves nothing — pin the factory build. Update this
 # digest together with the factory preload manifest when the model is
 # ever re-released.
-LINKNET_MD5="a8384d45f5fe057673f0e76a2402133a"
+# Env-overridable so the unit test can pin a fixture digest.
+LINKNET_MD5="${LINKNET_MD5:-a8384d45f5fe057673f0e76a2402133a}"
 verify_linknet() {
     local f="$1"
     verify_hef "$f" || return 1
