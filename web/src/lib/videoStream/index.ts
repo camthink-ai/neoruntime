@@ -3,11 +3,9 @@
  * Unified video player interface supporting multiple streaming protocols
  */
 
-// Legacy exports (for backward compatibility)
-export { default as H264Player } from './MSE/msePlayer';
-
-// 新的协议无关播放器封装
-export { VideoStreamPlayer } from './player';
+// 协议无关播放器封装 — delegates to the vendored CT player engine
+// (WebCodecs → MSE → WASM software decode fallback chain).
+export { VideoStreamPlayer, deviceAdapter } from './player';
 export type {
   StreamPlayerOptions,
   StreamPlayerStats,

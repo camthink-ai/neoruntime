@@ -11,6 +11,7 @@ import {
 import { useTranslation } from 'react-i18next';
 import { VideoStreamPlayer } from '@/lib/videoStream/player';
 import Player from '@/components/player/player';
+import { SoftwareHevcNotice, useSoftwareHevcNotice } from '@/components/player/software-hevc-notice';
 import { useStreams } from '@/hooks/useStreams';
 import { getItem } from '@/utils/storage';
 import { Link } from 'react-router-dom';
@@ -18,6 +19,7 @@ import { Link } from 'react-router-dom';
 export default function VideoPreview() {
   const { t } = useTranslation();
   const playerRef = useRef<VideoStreamPlayer | null>(null);
+  const softwareNotice = useSoftwareHevcNotice();
   const { data: streams } = useStreams();
   const [selectedStreamId, setSelectedStreamId] = useState<string>('main');
 
@@ -94,9 +96,11 @@ export default function VideoPreview() {
       </div>
 
       {/* Video Area - 16:9 aspect ratio */}
+      {softwareNotice.visible && <SoftwareHevcNotice onDismiss={softwareNotice.dismiss} />}
       <div className="flex-1  relative">
         <div className="aspect-video w-full h-full flex items-center justify-center">
           <Player
+            onSoftwareHevcChange={softwareNotice.onChange}
             videoUrl={videoUrl}
             videoRendererInstance={playerRef}
             enableDoubleClickFullscreen={false}

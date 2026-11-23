@@ -24,8 +24,6 @@ type PlayerPanelProps = {
   captureAvailable?: boolean;
   /** Talk session is live (PC mic → device speaker). */
   talking?: boolean;
-  /** 0..1 live PC-mic input level while talking — drives the speaking halo. */
-  talkLevel?: number;
   /** Click-to-toggle talk on/off. */
   onToggleTalk?: () => void;
   /** Device playback (speaker) HW is on — gates the talk switch. */
@@ -46,7 +44,6 @@ export default function PlayerPanel({
   onVolumeChange,
   captureAvailable = false,
   talking = false,
-  talkLevel = 0,
   onToggleTalk,
   playbackEnabled = false,
   className,
@@ -149,7 +146,7 @@ export default function PlayerPanel({
                   capture is off (see capture-off hint below). */}
               <div
                 className={cn(
-                  'pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 flex flex-col items-center gap-1 rounded-lg bg-black/80 px-2 py-3 opacity-0 transition-opacity',
+                  'pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 flex w-10 flex-col items-center gap-1 rounded-lg bg-black/80 px-1 py-2 opacity-0 transition-opacity',
                   captureAvailable
                     && 'group-hover/vol:pointer-events-auto group-hover/vol:opacity-100'
                 )}
@@ -202,27 +199,8 @@ export default function PlayerPanel({
               <button
                 disabled={!playbackEnabled}
                 onClick={onToggleTalk}
-                className={cn(
-                  'relative md:w-7 w-6 md:h-7 h-6 flex items-center justify-center rounded-full disabled:opacity-50 disabled:pointer-events-none transition-colors',
-                  talking ? 'bg-red-600/90' : 'hover:bg-transparent'
-                )}
+                className="relative md:w-7 w-6 md:h-7 h-6 flex items-center justify-center rounded-full bg-transparent disabled:opacity-50 disabled:pointer-events-none transition-colors"
               >
-                {/* Speaking halo — only while talking. A ring that expands and
-                    brightens with the live PC-mic level so the user can SEE
-                    their voice being captured. Bare mic = mic is LIVE; the
-                    slashed mic rendered when off = mic is OFF (classic mute
-                    semantics). CSS transition smooths per-frame level ticks. */}
-                {talking && (
-                  <span
-                    aria-hidden
-                    className="pointer-events-none absolute inset-0 rounded-full border-2 border-red-300"
-                    style={{
-                      transform: `scale(${1 + Math.min(talkLevel, 1) * 0.5})`,
-                      opacity: 0.25 + Math.min(talkLevel, 1) * 0.5,
-                      transition: 'transform 80ms linear, opacity 80ms linear',
-                    }}
-                  />
-                )}
                 <SvgIcon
                   icon={talking ? 'microphone' : 'microphone-off'}
                   className={cn(

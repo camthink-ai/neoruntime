@@ -9,6 +9,7 @@ export interface StreamPlayerStats {
 }
 
 export interface StreamPlayerOptions {
+  objectFit?: 'contain' | 'cover';
   /**
    * 播放协议类型，当前仅实现 mse-h264，预留 webrtc / hls
    */

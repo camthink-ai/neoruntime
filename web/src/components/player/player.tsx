@@ -40,6 +40,11 @@ type PlayerProps = {
    * instance that owns audio (Media page) — other players stay engine-free.
    */
   audioOverlay?: boolean;
+  /**
+   * Notifies when the engine switches to (or back from) WASM software HEVC
+   * decoding (fired as `aipc:software-hevc` on the video element).
+   */
+  onSoftwareHevcChange?: (active: boolean) => void;
 };
 
 const STREAM_STATS_KEY = 'deviceToolStreamStatsVisible';
@@ -58,6 +63,7 @@ export default function Player({
   configuring = false,
   onFrameSizeChange,
   audioOverlay = false,
+  onSoftwareHevcChange,
 }: PlayerProps) {
   const [loading, setLoading] = useState(false);
   const { t } = useTranslation();
@@ -115,7 +121,7 @@ export default function Player({
   // useAudioTalk owns the click-to-toggle talk engine (PC mic → device
   // speaker) + device audio-status sync (captureAvailable / playbackEnabled),
   // refreshed on mount, window-focus, and cross-page Peripheral events.
-  const { talking, level, toggleTalk } = useAudioTalk({
+  const { talking, toggleTalk } = useAudioTalk({
     enabled: audioOverlay,
   });
 
@@ -277,7 +283,9 @@ export default function Player({
       });
       if (isCancelled) return;
 
-      videoRendererInstance.current = new VideoStreamPlayer();
+      videoRendererInstance.current = new VideoStreamPlayer({
+        objectFit: objectFit === 'cover' ? 'cover' : 'contain',
+      });
       videoRendererInstance.current.initPlayer(video);
       const dims = snapshotDimsRef.current;
       if (dims) {
@@ -308,7 +316,24 @@ export default function Player({
         audioPlayerRef.current = null;
       }
     };
-  }, [videoUrl]);
+  }, [videoUrl, objectFit]);
+
+  // Forward WASM software-HEVC status (dispatched on the video element by the
+  // engine facade when stats report h265 decoding via wasm) to the host page,
+  // which shows a performance notice. Cleanup reports inactive.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const onSoftwareHevc = (event: Event) => {
+      const active = (event as CustomEvent<boolean>).detail;
+      onSoftwareHevcChange?.(active);
+    };
+    video.addEventListener('aipc:software-hevc', onSoftwareHevc);
+    return () => {
+      video.removeEventListener('aipc:software-hevc', onSoftwareHevc);
+      onSoftwareHevcChange?.(false);
+    };
+  }, [onSoftwareHevcChange]);
 
   // Autoplay fallback. Audio starts on mount in the effect above, but if this
   // is a cold page-load with no prior user activation in the document the
@@ -372,8 +397,11 @@ export default function Player({
   }, [isShowStreamStats]);
 
   const handleReload = () => {
+    // Loading is intentionally NOT cleared here: under the CT engine the
+    // loading overlay only clears on real playback (wv_work after
+    // state:'playing'), so a reload shows the connecting state until the
+    // stream actually renders again.
     videoRendererInstance.current?.resetStartState().start(videoUrl);
-    setLoading(false);
   };
 
   // Keep latest handleReload in a ref so the global reload listener (subscribed
@@ -692,7 +720,6 @@ export default function Player({
             onVolumeChange={setVolume}
             captureAvailable={captureAvailable}
             talking={talking}
-            talkLevel={level}
             onToggleTalk={toggleTalk}
             playbackEnabled={playbackEnabled}
           />

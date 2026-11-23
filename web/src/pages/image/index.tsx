@@ -3,6 +3,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { VideoStreamPlayer } from '@/lib/videoStream/player';
 import Player from '@/components/player/player';
+import {
+  SoftwareHevcNotice,
+  useSoftwareHevcNotice,
+} from '@/components/player/software-hevc-notice';
 import { getItem } from '@/utils/storage';
 import ImagingControls from './components/ImagingControls';
 import ImageSettings from './components/ImageSettings';
@@ -42,14 +46,15 @@ export default function Image() {
   // so switching tabs unmounted+remounted the player and re-initialized the
   // websocket/decoder. Lifted here so only the sidebar + overlay layers swap.
   const playerRef = useRef<VideoStreamPlayer | null>(null);
+  const softwareNotice = useSoftwareHevcNotice();
   const [playbackFrameSize, setPlaybackFrameSize] = useState<{
     width: number;
     height: number;
   } | null>(null);
-  const { effectiveStreamId, effectiveStreamInfo, codecNotice } =    useStreamFallback({
-      streams,
-      activeStream,
-    });
+  const { effectiveStreamId, effectiveStreamInfo } = useStreamFallback({
+    streams,
+    activeStream,
+  });
   const frameWidth = playbackFrameSize?.width ?? effectiveStreamInfo?.width;
   const frameHeight = playbackFrameSize?.height ?? effectiveStreamInfo?.height;
 
@@ -83,15 +88,6 @@ export default function Image() {
     setCurrentStreamUrl(getCurrentStreamUrl());
   }, [effectiveStreamId]);
 
-  const noticeText = codecNotice
-    ? t(
-        `sys.monitoring.${codecNotice}`,
-        codecNotice === 'hevc_unsupported_fallback'
-          ? '当前浏览器不支持 H.265 解码，已切换为 H.264 播放'
-          : '当前浏览器不支持 H.265 解码，且无可用 H.264 码流'
-      )
-    : null;
-
   const handleStreamChange = (streamId: string) => {
     if (streamId === 'main' || streamId === 'sub' || streamId === 'third') {
       setActiveStream(streamId as StreamName);
@@ -108,10 +104,8 @@ export default function Image() {
     <div className="flex h-full w-full flex-col overflow-hidden bg-background md:flex-row">
       {/* Main Content Area — player persists across tab switches */}
       <div className="flex w-full shrink-0 flex-col items-center justify-center px-3 pt-2 pb-1 md:h-full md:min-h-0 md:flex-1 md:shrink md:px-4 md:pb-4">
-        {noticeText && (
-          <div className="w-full pb-1 text-[11px] leading-tight text-muted-foreground/70">
-            {noticeText}
-          </div>
+        {softwareNotice.visible && (
+          <SoftwareHevcNotice onDismiss={softwareNotice.dismiss} />
         )}
         <div
           className="relative aspect-video w-full max-w-full overflow-hidden rounded-xl bg-black md:max-w-none md:rounded-2xl"
@@ -133,6 +127,7 @@ export default function Image() {
             enableDoubleClickFullscreen={false}
             enableAudio={false}
             objectFit="adaptive"
+            onSoftwareHevcChange={softwareNotice.onChange}
           />
           {/* Overlay interaction layers — only on the overlay tab, drawn over
               the same persistent player (WYSIWYG). Off-tab the stream is clean. */}

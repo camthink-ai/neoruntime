@@ -7,7 +7,11 @@ import {
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useMediaStatus } from '@/hooks/useMediaStatus';
-import { useStreamFallback } from '@/hooks/useStreamFallback';
+import {
+  useStreamFallback,
+  findH264Fallback,
+} from '@/hooks/useStreamFallback';
+import { selectPreviewStream } from './previewStream';
 import { getItem } from '@/utils/storage';
 import { useState, useRef, useEffect, useCallback } from 'react';
 import Player from '@/components/player/player';
@@ -32,9 +36,12 @@ export default function StreamPreview() {
 
   const { data: mediaStatus, isLoading, error } = useMediaStatus();
   const streams = mediaStatus?.streams ?? [];
-  const { effectiveStreamId, codecNotice } = useStreamFallback({
+  // Prefer the smallest enabled stream for the low-power dashboard preview
+  // instead of hardcoding 'sub'.
+  const previewStreamId = selectPreviewStream(streams);
+  const { effectiveStreamId } = useStreamFallback({
     streams,
-    activeStream: 'sub',
+    activeStream: previewStreamId,
   });
 
   const getStreamUrl = useCallback((streamId: string) => {
@@ -89,7 +96,7 @@ export default function StreamPreview() {
       const { detail } = e as CustomEvent<{ type?: string }>;
       if (
         detail?.type === 'codec_mismatch'
-        && streams.some(stream => stream.codec.toLowerCase() === 'h264')
+        && findH264Fallback(streams, previewStreamId) !== null
       ) {
         codecFallbackPendingRef.current = true;
         setStatus('loading');
@@ -106,7 +113,7 @@ export default function StreamPreview() {
       window.removeEventListener('wv_close', handleClose);
       window.removeEventListener('wv_error', handleError);
     };
-  }, [videoUrl, streams]);
+  }, [videoUrl, streams, previewStreamId]);
 
   const getStatusContent = () => {
     switch (status) {
@@ -156,14 +163,6 @@ export default function StreamPreview() {
       </div>
 
       <div className="flex-1 min-h-0 min-w-0 relative bg-secondary/20 rounded-lg overflow-hidden">
-        {codecNotice === 'hevc_unsupported_fallback' && (
-          <div className="absolute left-2 right-2 top-2 z-10 rounded bg-black/60 px-2 py-1 text-[11px] text-white/80">
-            {t(
-              'sys.monitoring.hevc_unsupported_fallback',
-              'H.265 is unsupported; switched to H.264 playback'
-            )}
-          </div>
-        )}
         {isLoading ? (
           <div className="absolute inset-0 flex items-center justify-center">
             <Loading fullHeight={false} size="sm" />

@@ -2,6 +2,10 @@ import { useCallback, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { VideoStreamPlayer } from '@/lib/videoStream/player';
 import Player from '@/components/player/player';
+import {
+  SoftwareHevcNotice,
+  useSoftwareHevcNotice,
+} from '@/components/player/software-hevc-notice';
 import MediaSettings from './components/MediaSettings';
 import { getItem } from '@/utils/storage';
 import { useMediaStatus } from './hooks/useMedia';
@@ -10,6 +14,7 @@ import { useStreamFallback } from '@/hooks/useStreamFallback';
 export default function Monitoring() {
   const { t } = useTranslation();
   const playerRef = useRef<VideoStreamPlayer | null>(null);
+  const softwareNotice = useSoftwareHevcNotice();
 
   const [activeStream, setActiveStream] = useState<'main' | 'sub' | 'third'>(
     'main'
@@ -20,7 +25,10 @@ export default function Monitoring() {
 
   const streams = mediaStatus?.streams ?? [];
 
-  const { effectiveStreamId, effectiveStreamInfo, codecNotice } =    useStreamFallback({ streams, activeStream });
+  const { effectiveStreamId, effectiveStreamInfo } = useStreamFallback({
+    streams,
+    activeStream,
+  });
 
   const activeStreamInfo = effectiveStreamInfo;
 
@@ -64,23 +72,12 @@ export default function Monitoring() {
     [effectiveStreamId]
   );
 
-  const noticeText = codecNotice
-    ? t(
-        `sys.monitoring.${codecNotice}`,
-        codecNotice === 'hevc_unsupported_fallback'
-          ? '当前浏览器不支持 H.265 解码，已切换为 H.264 播放'
-          : '当前浏览器不支持 H.265 解码，且无可用 H.264 码流'
-      )
-    : null;
-
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-background md:flex-row">
       {/* Main Content Area */}
       <div className="flex w-full shrink-0 flex-col items-center justify-center pt-2 pb-1 md:h-full md:min-h-0 md:flex-1 md:shrink px-4 md:py-0">
-        {noticeText && (
-          <div className="w-full pb-1 text-[11px] leading-tight text-muted-foreground/70">
-            {noticeText}
-          </div>
+        {softwareNotice.visible && (
+          <SoftwareHevcNotice onDismiss={softwareNotice.dismiss} />
         )}
         <div className="relative aspect-video w-full max-w-full overflow-hidden rounded-xl bg-black my-2 md:max-w-none md:rounded-2xl">
           <Player
@@ -92,6 +89,7 @@ export default function Monitoring() {
             objectFit="adaptive"
             audioOverlay
             configuring={isEncoderConfiguring}
+            onSoftwareHevcChange={softwareNotice.onChange}
           />
         </div>
       </div>
