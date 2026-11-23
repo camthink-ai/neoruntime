@@ -1,11 +1,13 @@
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, Info, Lock } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, Info, Lock } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import type { ModelFieldDef } from '@/hooks/useModels';
 import { POSTPROCESS_ONLY_FIELDS } from '../../lib/modelImportFlow';
 import ModelSchemaField from './ModelSchemaField';
+import RawTensorPreview from './RawTensorPreview';
 
 export interface OutputSectionProps {
   outputMode: string;
@@ -26,6 +28,9 @@ export interface OutputSectionProps {
   errorFor: (field: string) => string | undefined;
   onBlurField: (key: string) => void;
   onConfigChange: (key: string, value: unknown) => void;
+  /** Parsed HEF's vstream info — feeds the raw tensor preview card in raw
+   *  mode (hidden when unparseable or absent, e.g. detail-page edit mode). */
+  vstreamInfo?: string | null;
 }
 
 /**
@@ -50,8 +55,10 @@ export default function OutputSection({
   errorFor,
   onBlurField,
   onConfigChange,
+  vstreamInfo,
 }: OutputSectionProps) {
   const { t } = useTranslation();
+  const [recordOpen, setRecordOpen] = useState(false);
   const isRaw = outputMode === 'raw';
   const outputModeError = errorFor('outputMode');
 
@@ -59,6 +66,22 @@ export default function OutputSection({
   const editableFields = postprocessFields.filter(
     field => !POSTPROCESS_ONLY_FIELDS.includes(field.key)
   );
+
+  // Platform mode: consumed knobs stay first-class; advisory/metadata ones
+  // (the registry says the runtime ignores them) fold away behind a toggle
+  // so the grid answers "what changes inference results" at a glance. A
+  // submit-marked error on a folded field forces it open — the validation
+  // gate must never point at an invisible input.
+  const activeFields = postprocessFields.filter(
+    field => field.effect !== 'advisory' && field.effect !== 'metadata'
+  );
+  const recordkeepingFields = postprocessFields.filter(
+    field => field.effect === 'advisory' || field.effect === 'metadata'
+  );
+  const recordkeepingHasError = recordkeepingFields.some(
+    field => errorFor(`config_${field.key}`) !== undefined
+  );
+  const recordkeepingOpen = recordOpen || recordkeepingHasError;
 
   const renderField = (field: ModelFieldDef, inert: boolean) => (
     <ModelSchemaField
@@ -178,6 +201,11 @@ export default function OutputSection({
         </p>
       </section>
 
+      {/* Raw mode: show what the consumer will actually receive — the HEF's
+          output streams, straight from the parse info. Sits before the
+          parameter groups because it explains why they are locked. */}
+      {isRaw && <RawTensorPreview vstreamInfo={vstreamInfo} />}
+
       {typeMismatch && (
         <div className="flex items-start justify-between gap-2 rounded-md border border-blue-500/60 bg-blue-500/10 p-3 text-sm text-blue-700 dark:text-blue-400">
           <div className="flex items-start gap-2">
@@ -265,9 +293,54 @@ export default function OutputSection({
               )}
             </>
           ) : (
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              {postprocessFields.map(field => renderField(field, false))}
-            </div>
+            <>
+              {activeFields.length > 0 && (
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  {activeFields.map(field => renderField(field, false))}
+                </div>
+              )}
+              {recordkeepingFields.length > 0 && (
+                <div className="rounded-md border">
+                  <button
+                    type="button"
+                    onClick={() => setRecordOpen(prev => !prev)}
+                    aria-expanded={recordkeepingOpen}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    {recordkeepingOpen ? (
+                      <ChevronDown className="h-4 w-4 shrink-0" />
+                    ) : (
+                      <ChevronRight className="h-4 w-4 shrink-0" />
+                    )}
+                    <span>
+                      {t(
+                        'sys.ai_models.wizard.recordkeeping_group',
+                        'Record-only parameters'
+                      )}
+                    </span>
+                    <Badge
+                      variant="secondary"
+                      className="px-1.5 py-0 text-[10px] leading-4"
+                    >
+                      {recordkeepingFields.length}
+                    </Badge>
+                  </button>
+                  {recordkeepingOpen && (
+                    <div className="space-y-3 border-t border-border px-3 py-3">
+                      <p className="text-xs text-muted-foreground">
+                        {t(
+                          'sys.ai_models.wizard.recordkeeping_hint',
+                          'The runtime does not read these keys — they are kept as record/compatibility metadata only.'
+                        )}
+                      </p>
+                      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                        {recordkeepingFields.map(field => renderField(field, false))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
           )}
         </section>
       )}

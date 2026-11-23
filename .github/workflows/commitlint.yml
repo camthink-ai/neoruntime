@@ -12,10 +12,9 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
-        with: { node-version: '20' }
+        with: { node-version: '20', cache: npm }
+      - name: Install pinned commitlint
+        run: npm ci --no-audit --no-fund
       - name: Validate commits on the PR
         run: |
-          npx -y \
-            -p @commitlint/cli@20 \
-            -p @commitlint/config-conventional@20 \
-            commitlint --from origin/${{ github.base_ref }} --to HEAD
+          npx commitlint --from origin/${{ github.base_ref }} --to HEAD

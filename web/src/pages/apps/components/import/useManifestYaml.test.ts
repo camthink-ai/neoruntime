@@ -103,6 +103,31 @@ describe('useManifestYaml', () => {
     expect(onApplied).not.toHaveBeenCalled();
   });
 
+  it('carries the original package manifest path on every YAML flush', async () => {
+    uploadManifest.mockResolvedValue({
+      data: { path: '/staging/edited/app.yaml', metadata: { id: 'demo' } },
+    } as never);
+    const { result } = renderHook(() => useManifestYaml({ onApplied: vi.fn() }));
+
+    act(() => {
+      result.current.attachUpload(fileOf('id: demo\nversion: 1\n'), {
+        identityBasePath: '/staging/original/app.yaml',
+      });
+    });
+    await waitFor(() => expect(result.current.manifestText).toContain('demo'));
+    act(() => {
+      result.current.setManifestText('id: demo\nversion: 2\n');
+    });
+    await act(async () => {
+      await result.current.flushYaml();
+    });
+
+    expect(uploadManifest).toHaveBeenCalledWith(
+      expect.any(File),
+      '/staging/original/app.yaml'
+    );
+  });
+
   it('reset clears upload tracking — flush becomes a no-op again', async () => {
     const { result } = renderHook(() => useManifestYaml({ onApplied: vi.fn() }));
 
@@ -238,7 +263,9 @@ describe('useManifestYaml live sync', () => {
     });
 
     // Assert — recognized as our own write; no hydration round-trip
-    await new Promise(r => { setTimeout(r, 10); });
+    await new Promise(r => {
+      setTimeout(r, 10);
+    });
     expect(onLiveParse).not.toHaveBeenCalled();
   });
 });

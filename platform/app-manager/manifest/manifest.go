@@ -256,6 +256,11 @@ type AutoRestart struct {
 // it must be a valid environment variable name fragment.
 var modelAliasPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// envNamePattern mirrors the POSIX-style identifier accepted by OCI
+// runtimes. Rejecting malformed names here avoids generating ambiguous
+// NAME=value entries later in ToContainerEnv.
+var envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 // reservedModelAliases names that would shadow or be confused with
 // platform-injected container env names (AIPC_HOST_PREFIX, APP_ID, APP_ROLE,
 // CONTAINER_NAME). Refusing them keeps the container environment unambiguous.
@@ -352,10 +357,10 @@ func (m *AppManifest) Validate() error {
 	if m.Metadata.ID == "" {
 		return fmt.Errorf("metadata.id is required")
 	}
-	if m.Metadata.Name == "" {
+	if strings.TrimSpace(m.Metadata.Name) == "" {
 		return fmt.Errorf("metadata.name is required")
 	}
-	if m.Metadata.Version == "" {
+	if strings.TrimSpace(m.Metadata.Version) == "" {
 		return fmt.Errorf("metadata.version is required")
 	}
 
@@ -378,6 +383,24 @@ func (m *AppManifest) Validate() error {
 	// Validate resources
 	if err := m.Spec.Resources.Validate(); err != nil {
 		return fmt.Errorf("resources validation failed: %w", err)
+	}
+
+	// These fields are editable by the import wizard. Validate them at the
+	// shared parser choke point so YAML upload, PATCH, wizard install and the
+	// app-manager worker all enforce the same contract.
+	if err := validateEnv("spec.env", m.Spec.Env); err != nil {
+		return fmt.Errorf("environment validation failed: %w", err)
+	}
+	if err := validateVolumes("spec.volumes", m.Spec.Volumes); err != nil {
+		return fmt.Errorf("volumes validation failed: %w", err)
+	}
+	policy, err := normalizeRestartPolicy(m.Spec.RestartPolicy)
+	if err != nil {
+		return fmt.Errorf("restart policy validation failed: %w", err)
+	}
+	m.Spec.RestartPolicy = policy
+	if err := validatePermissions("spec.permissions", m.Spec.Permissions); err != nil {
+		return fmt.Errorf("permissions validation failed: %w", err)
 	}
 
 	// Validate plugin
@@ -526,6 +549,135 @@ func (r *Resources) Validate() error {
 		}
 	}
 
+	return nil
+}
+
+// normalizeRestartPolicy accepts legacy aliases while exposing one canonical
+// value to runtime consumers. Empty means the platform default.
+func normalizeRestartPolicy(policy string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "":
+		return "", nil
+	case "always":
+		return "always", nil
+	case "on-failure", "on_failure":
+		return "on-failure", nil
+	case "no", "never":
+		return "no", nil
+	default:
+		return "", fmt.Errorf("restart_policy must be 'always', 'on-failure', or 'no', got %q", policy)
+	}
+}
+
+func validateEnv(field string, env []EnvVar) error {
+	seen := make(map[string]bool, len(env))
+	for i, item := range env {
+		if !envNamePattern.MatchString(item.Name) {
+			return fmt.Errorf("%s[%d].name %q must match %s", field, i, item.Name, envNamePattern.String())
+		}
+		if seen[item.Name] {
+			return fmt.Errorf("%s contains duplicate name %q", field, item.Name)
+		}
+		seen[item.Name] = true
+	}
+	return nil
+}
+
+func validateAbsoluteCleanPath(field, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if !filepath.IsAbs(value) || filepath.Clean(value) != value {
+		return fmt.Errorf("%s must be an absolute clean path (got %q)", field, value)
+	}
+	return nil
+}
+
+func validateVolumes(field string, volumes []Volume) error {
+	destinations := make(map[string]bool, len(volumes))
+	for i, volume := range volumes {
+		if err := validateAbsoluteCleanPath(fmt.Sprintf("%s[%d].host", field, i), volume.Host); err != nil {
+			return err
+		}
+		if err := validateAbsoluteCleanPath(fmt.Sprintf("%s[%d].container", field, i), volume.Container); err != nil {
+			return err
+		}
+		if destinations[volume.Container] {
+			return fmt.Errorf("%s contains duplicate container destination %q", field, volume.Container)
+		}
+		destinations[volume.Container] = true
+	}
+	return nil
+}
+
+func validateContainerVolumes(field string, volumes []VolumeMount) error {
+	destinations := make(map[string]bool, len(volumes))
+	for i, volume := range volumes {
+		if strings.TrimSpace(volume.Name) == "" {
+			return fmt.Errorf("%s[%d].name is required", field, i)
+		}
+		if err := validateAbsoluteCleanPath(fmt.Sprintf("%s[%d].container", field, i), volume.Container); err != nil {
+			return err
+		}
+		if destinations[volume.Container] {
+			return fmt.Errorf("%s contains duplicate container destination %q", field, volume.Container)
+		}
+		destinations[volume.Container] = true
+	}
+	return nil
+}
+
+func validateStringList(field string, values []string) error {
+	seen := make(map[string]bool, len(values))
+	for i, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s[%d] must not be empty", field, i)
+		}
+		if seen[value] {
+			return fmt.Errorf("%s contains duplicate value %q", field, value)
+		}
+		seen[value] = true
+	}
+	return nil
+}
+
+func validatePorts(field string, ports []int) error {
+	seen := make(map[int]bool, len(ports))
+	for i, port := range ports {
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("%s[%d] must be between 1 and 65535 (got %d)", field, i, port)
+		}
+		if seen[port] {
+			return fmt.Errorf("%s contains duplicate port %d", field, port)
+		}
+		seen[port] = true
+	}
+	return nil
+}
+
+func validatePermissions(field string, permissions Permissions) error {
+	if permissions.Inference.MaxQPS < 0 {
+		return fmt.Errorf("%s.inference.max_qps must be zero or greater", field)
+	}
+	if permissions.Inference.MaxConcurrent < 0 {
+		return fmt.Errorf("%s.inference.max_concurrent must be zero or greater", field)
+	}
+	if err := validateStringList(field+".events.publish", permissions.Events.Publish); err != nil {
+		return err
+	}
+	if err := validateStringList(field+".events.subscribe", permissions.Events.Subscribe); err != nil {
+		return err
+	}
+	if err := validatePorts(field+".network.inbound", permissions.Network.Inbound); err != nil {
+		return err
+	}
+	mode := permissions.Network.Mode
+	if mode != "" && mode != "isolated" && mode != "host" {
+		return fmt.Errorf("%s.network.mode must be 'isolated' or 'host', got %q", field, mode)
+	}
+	if mode != "host" && len(permissions.Network.Inbound) > 0 {
+		return fmt.Errorf("%s.network.inbound requires network.mode=host", field)
+	}
 	return nil
 }
 
@@ -911,6 +1063,28 @@ func (m *AppManifest) ValidateMultiContainer() error {
 		default:
 			return fmt.Errorf("container %q has invalid role %q, must be 'main' or 'sub'", name, c.Role)
 		}
+		if err := c.Resources.Validate(); err != nil {
+			return fmt.Errorf("container %q resources validation failed: %w", name, err)
+		}
+		if err := validateEnv(fmt.Sprintf("spec.containers.%s.env", name), c.Env); err != nil {
+			return err
+		}
+		if err := validateContainerVolumes(fmt.Sprintf("spec.containers.%s.volumes", name), c.Volumes); err != nil {
+			return err
+		}
+		if err := validatePermissions(fmt.Sprintf("spec.containers.%s.permissions", name), c.Permissions); err != nil {
+			return err
+		}
+		seenPorts := make(map[int]bool, len(c.Ports))
+		for i, port := range c.Ports {
+			if port.ContainerPort < 1 || port.ContainerPort > 65535 {
+				return fmt.Errorf("spec.containers.%s.ports[%d].containerPort must be between 1 and 65535", name, i)
+			}
+			if seenPorts[port.ContainerPort] {
+				return fmt.Errorf("spec.containers.%s.ports contains duplicate port %d", name, port.ContainerPort)
+			}
+			seenPorts[port.ContainerPort] = true
+		}
 	}
 
 	if mainCount == 0 {
@@ -955,6 +1129,22 @@ func (m *AppManifest) ValidateMultiContainer() error {
 			return fmt.Errorf("networking.mode must be 'internal', 'bridge', or 'host', got %q", m.Spec.Networking.Mode)
 		}
 	}
+	seenIngressPorts := make(map[int]bool, len(m.Spec.Networking.Ingress))
+	for i, ingress := range m.Spec.Networking.Ingress {
+		if ingress.Port < 1 || ingress.Port > 65535 {
+			return fmt.Errorf("networking.ingress[%d].port must be between 1 and 65535", i)
+		}
+		if seenIngressPorts[ingress.Port] {
+			return fmt.Errorf("networking.ingress contains duplicate port %d", ingress.Port)
+		}
+		seenIngressPorts[ingress.Port] = true
+	}
+
+	policy, err := normalizeRestartPolicy(m.Spec.Lifecycle.RestartPolicy)
+	if err != nil {
+		return fmt.Errorf("lifecycle restart policy validation failed: %w", err)
+	}
+	m.Spec.Lifecycle.RestartPolicy = policy
 
 	return nil
 }

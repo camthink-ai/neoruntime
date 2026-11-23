@@ -10,36 +10,13 @@ import {
 } from '@/components/ui/select';
 import type { WizardConfig } from '@/services/types';
 import { memoryOptionsFor } from '../../lib/formFieldOptions';
-
-/** backing 仍为 `N%`，输入框仅展示数字 0–100 */
-function cpuPercentToInputValue(cpu: string | undefined): string {
-  if (!cpu?.trim()) return '';
-  const t = cpu.trim();
-  const m = t.match(/^(\d{1,3})\s*%$/);
-  if (m) {
-    const n = Math.min(100, Math.max(0, parseInt(m[1], 10)));
-    return String(n);
-  }
-  const plain = t.match(/^(\d{1,3})$/);
-  if (plain) {
-    const n = Math.min(100, Math.max(0, parseInt(plain[1], 10)));
-    return String(n);
-  }
-  return '';
-}
-
-function inputDigitsToCpuPercent(raw: string): string {
-  const digits = raw.replace(/\D/g, '');
-  if (digits === '') return '0%';
-  let n = parseInt(digits, 10);
-  if (Number.isNaN(n) || n < 0) n = 0;
-  if (n > 100) n = 100;
-  return `${n}%`;
-}
+import type { InstallIssue } from '../../lib/importFlow';
+import InlineValidation from './InlineValidation';
 
 export interface ResourcesSectionProps {
   config: WizardConfig;
   onChange: (next: WizardConfig) => void;
+  issues: InstallIssue[];
 }
 
 /**
@@ -50,6 +27,7 @@ export interface ResourcesSectionProps {
 export default function ResourcesSection({
   config,
   onChange,
+  issues,
 }: ResourcesSectionProps) {
   const { t } = useTranslation();
 
@@ -58,26 +36,29 @@ export default function ResourcesSection({
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <div>
           <Label>{t('sys.apps.import.cpu_limit')}</Label>
-          <div className="mt-2 flex items-center gap-2">
-            <Input
-              inputMode="numeric"
-              autoComplete="off"
-              maxLength={3}
-              placeholder="50"
-              className="flex-1 min-w-0"
-              value={cpuPercentToInputValue(config.resources?.cpu)}
-              onChange={e => onChange({
-                  ...config,
-                  resources: {
-                    ...config.resources!,
-                    cpu: inputDigitsToCpuPercent(e.target.value),
-                  },
-                })}
-            />
-            <span className="shrink-0 text-sm text-muted-foreground tabular-nums">
-              %
-            </span>
-          </div>
+          <Input
+            autoComplete="off"
+            placeholder="0.5 / 50%"
+            className="mt-2"
+            value={config.resources?.cpu ?? ''}
+            aria-invalid={
+              issues.some(
+                issue => issue.field === 'resources.cpu'
+                  && issue.severity === 'error'
+              ) || undefined
+            }
+            onChange={e => onChange({
+                ...config,
+                resources: {
+                  ...config.resources!,
+                  // Preserve the representation the user entered. Both core
+                  // counts (0.5, 1.5) and percentages (50%) are valid manifest
+                  // formats and are normalized only by the runtime quota parser.
+                  cpu: e.target.value,
+                },
+              })}
+          />
+          <InlineValidation issues={issues} field="resources.cpu" />
         </div>
 
         <div>
@@ -89,7 +70,15 @@ export default function ResourcesSection({
                 resources: { ...config.resources!, memory: value },
               })}
           >
-            <SelectTrigger className="mt-2">
+            <SelectTrigger
+              className="mt-2"
+              aria-invalid={
+                issues.some(
+                  issue => issue.field === 'resources.memory'
+                    && issue.severity === 'error'
+                ) || undefined
+              }
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -100,6 +89,7 @@ export default function ResourcesSection({
               ))}
             </SelectContent>
           </Select>
+          <InlineValidation issues={issues} field="resources.memory" />
         </div>
       </div>
     </div>

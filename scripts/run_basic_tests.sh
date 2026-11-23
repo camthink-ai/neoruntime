@@ -80,6 +80,16 @@ else
   failed=1
 fi
 
+# Generated postprocess schema artifacts must match the registry — the
+# single-source drift guard. The generator's -check mode renders in memory
+# and byte-compares; it never writes, so the check cannot flag a legitimate
+# uncommitted regen as drift nor restore-discard it (review 2026-09-21).
+if command -v go >/dev/null 2>&1; then
+  if ! go run ./platform/postprocess/gen -check; then
+    failed=1
+  fi
+fi
+
 if [ "$failed" -eq 0 ]; then
   echo "Basic checks passed."
 else

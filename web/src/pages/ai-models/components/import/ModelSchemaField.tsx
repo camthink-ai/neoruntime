@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next';
+import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
@@ -10,6 +11,27 @@ import {
 } from '@/components/ui/select';
 import type { ModelFieldDef } from '@/hooks/useModels';
 import { visibleSelectOptions } from '../../lib/modelImportFlow';
+
+/** Non-consumed effects get a badge naming their real semantics — the
+ *  P2 registry says which values reach the decoder, and a form that shows a
+ *  knob without saying it is inert reintroduces the silent-noop trap the
+ *  effect metadata exists to close. consumed is the default: no badge.
+ *  Exported for the detail dialog's effective-config panel, which shows the
+ *  same truth read-only. */
+export function EffectBadge({ effect }: { effect?: ModelFieldDef['effect'] }) {
+  const { t } = useTranslation();
+  if (effect !== 'advisory' && effect !== 'metadata') return null;
+  return (
+    <Badge
+      variant="outline"
+      className="ml-1.5 px-1.5 py-0 text-[10px] font-normal leading-4 text-muted-foreground"
+    >
+      {effect === 'advisory'
+        ? t('sys.ai_models.form.field_effect_advisory', 'no effect')
+        : t('sys.ai_models.form.field_effect_metadata', 'metadata only')}
+    </Badge>
+  );
+}
 
 export interface ModelSchemaFieldProps {
   field: ModelFieldDef;
@@ -57,7 +79,10 @@ export default function ModelSchemaField({
         : (field.step ?? 1);
       return (
         <div className="grid gap-2">
-          <Label htmlFor={field.key}>{label}</Label>
+          <Label htmlFor={field.key}>
+            {label}
+            <EffectBadge effect={field.effect} />
+          </Label>
           <Input
             id={field.key}
             type="number"
@@ -81,9 +106,15 @@ export default function ModelSchemaField({
     case 'select': {
       const val = String(value ?? '');
       const hint = t(`sys.ai_models.form.${field.key}_hint`, '');
+      // Per-option explanation card (postprocess profiles carry their
+      // decoder's hardwired story here); absent key → hidden.
+      const optionNote = t(`sys.ai_models.form.${field.key}_${val}_note`, '');
       return (
         <div className="grid gap-2">
-          <Label htmlFor={field.key}>{label}</Label>
+          <Label htmlFor={field.key}>
+            {label}
+            <EffectBadge effect={field.effect} />
+          </Label>
           <Select
             value={val}
             onValueChange={v => onChange(field.key, v)}
@@ -109,6 +140,11 @@ export default function ModelSchemaField({
             </SelectContent>
           </Select>
           {error && <p className="text-sm text-destructive">{error}</p>}
+          {optionNote && (
+            <p className="rounded-md border bg-muted/40 px-2.5 py-2 text-xs leading-relaxed text-muted-foreground">
+              {optionNote}
+            </p>
+          )}
           {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
         </div>
       );
@@ -126,6 +162,7 @@ export default function ModelSchemaField({
           />
           <Label htmlFor={field.key} className="font-normal">
             {label}
+            <EffectBadge effect={field.effect} />
           </Label>
         </div>
       );
@@ -137,7 +174,10 @@ export default function ModelSchemaField({
       const example = t(`sys.ai_models.form.${field.key}_placeholder`, '');
       return (
         <div className="grid gap-2 sm:col-span-2">
-          <Label htmlFor={field.key}>{label}</Label>
+          <Label htmlFor={field.key}>
+            {label}
+            <EffectBadge effect={field.effect} />
+          </Label>
           <Input
             id={field.key}
             type="text"

@@ -96,6 +96,9 @@ export function useManifestYaml({
   /** Echo guard: the text this hook last wrote itself. */
   const lastSyncedTextRef = useRef('');
   const parseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Initial manifest extracted from a .neoapp. YAML re-uploads carry this
+   * immutable baseline so the server can protect package identity. */
+  const identityBasePathRef = useRef('');
 
   // A pending debounce firing after unmount would set state on a dead hook.
   useEffect(
@@ -179,8 +182,9 @@ export function useManifestYaml({
 
   /** Capture the text of a manifest file the shell just uploaded. */
   const attachUpload = useCallback(
-    (file: File) => {
+    (file: File, opts?: { identityBasePath?: string }) => {
       hasUploadRef.current = true;
+      identityBasePathRef.current = opts?.identityBasePath ?? '';
       let alive = true;
       file.text().then(text => {
         if (!alive) return;
@@ -218,7 +222,10 @@ export function useManifestYaml({
         const file = new File([manifestText], 'app.yaml', {
           type: 'application/x-yaml',
         });
-        const res = await appsApi.uploadManifest(file);
+        const res = await appsApi.uploadManifest(
+          file,
+          identityBasePathRef.current || undefined
+        );
         const data = res?.data;
         if (!data?.path) throw new Error('upload-manifest returned no path');
         uploadedPathsRef.current = [...uploadedPathsRef.current, data.path];
@@ -265,6 +272,7 @@ export function useManifestYaml({
     hasUploadRef.current = false;
     uploadedPathsRef.current = [];
     lastSyncedTextRef.current = '';
+    identityBasePathRef.current = '';
   }, [setTextState]);
 
   return {

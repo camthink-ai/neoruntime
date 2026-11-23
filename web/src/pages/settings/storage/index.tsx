@@ -1,9 +1,10 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { useBlocker } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { monitorApi, storageApi } from '@/services/api/system';
 import { RefreshCw } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   AlertDialog,
   AlertDialogContent,
@@ -19,6 +20,7 @@ import { StorageSkeleton } from './components/StorageSkeleton';
 import InternalStorageCard from './components/InternalStorageCard';
 import RemovableStorageCard from './components/RemovableStorageCard';
 import EmptySlotCard from './components/EmptySlotCard';
+import SystemLoadingMask from '@/components/system-loading-mask';
 import { groupPartitionsByDevice } from './lib/groupDevices';
 import ErrorState from '@/components/ErrorState';
 import type { StorageDevice } from '@/services/types';
@@ -73,6 +75,24 @@ export default function Storage() {
     );
     if (mounted) unmountMutation.mutate(mounted.mountpoint);
   };
+
+  // Formatting runs a synchronous mkfs on the device — minutes on a large SD
+  // card. Keep the operator on this page while it is in flight: the mask
+  // blocks all UI (sidebar included), the blocker denies SPA navigation
+  // (including browser back), and beforeunload guards tab close / reload.
+  const isFormatting = formatMutation.isPending;
+  const blocker = useBlocker(isFormatting);
+  useEffect(() => {
+    if (blocker.state === 'blocked') blocker.reset();
+  }, [blocker]);
+  useEffect(() => {
+    if (!isFormatting) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [isFormatting]);
 
   const handleFormat = () => {
     if (!selectedDevice) return;
@@ -233,6 +253,12 @@ export default function Storage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      {/* Format-in-progress lock: full-screen mask keeps the user on the page */}
+      <SystemLoadingMask
+        open={isFormatting}
+        message={t('sys.storage.formatting', '格式化中...')}
+        hint={t('sys.storage.formatting_hint')}
+      />
     </div>
   );
 }

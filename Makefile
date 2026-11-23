@@ -4,7 +4,8 @@
   proto-inference proto-device proto-event proto-camera proto-app proto-lens proto-discovery \
   hal-v2 platform ai-runtime device-control event-bus app-manager platform-api \
   device-discovery os-updater onvif-device camera-daemon web aipc-cli tools mcu-firmware pack pack-release \
-  ensure-mcu-toolchain docker-pack-release _pack-stage _pack-internal fmt lint help
+  ensure-mcu-toolchain docker-pack-release _pack-stage _pack-internal fmt lint help \
+  postprocess-schema postprocess-schema-check
 
 -include Makefile.local
 
@@ -18,14 +19,38 @@ SDK_PATH ?= $(or $(HAILO_SDK_PATH),/opt/hailo-sdk)
 DOCKER_RELEASE_IMAGE ?= camthink/ne503-dev:v1.0
 DOCKER_RELEASE_WORKDIR ?= /ne503
 DOCKER_RELEASE_SDK_PATH ?= /opt/hailo-sdk
+# Optional external SDK for docker-pack-release: host directory of an
+# extracted Poky SDK, mounted over the image's baked-in SDK. The poky
+# installer bakes its install-time absolute path into every toolchain
+# binary (PT_INTERP/RPATH) and into environment-setup-*; when that prefix
+# differs from the in-container mount point we bind the same directory at
+# both paths so the loader resolves either one. Uses --mount (not -v):
+# a missing host path is a hard error instead of a silently created empty
+# directory shadowing the baked-in SDK.
+DOCKER_RELEASE_SDK_HOST_DIR ?=
+ifeq ($(strip $(DOCKER_RELEASE_SDK_HOST_DIR)),)
+DOCKER_RELEASE_SDK_MOUNT :=
+else
+DOCKER_RELEASE_SDK_PREFIX := $(shell sed -n 's/^export OECORE_NATIVE_SYSROOT="\([^"]*\)\/sysroots\/x86_64-pokysdk-linux"/\1/p' $(DOCKER_RELEASE_SDK_HOST_DIR)/environment-setup-*-poky-linux 2>/dev/null)
+DOCKER_RELEASE_SDK_MOUNT := --mount type=bind,source=$(DOCKER_RELEASE_SDK_HOST_DIR),target=$(DOCKER_RELEASE_SDK_PATH),readonly
+ifneq ($(strip $(DOCKER_RELEASE_SDK_PREFIX)),)
+ifneq ($(DOCKER_RELEASE_SDK_PREFIX),$(DOCKER_RELEASE_SDK_PATH))
+DOCKER_RELEASE_SDK_MOUNT += --mount type=bind,source=$(DOCKER_RELEASE_SDK_HOST_DIR),target=$(DOCKER_RELEASE_SDK_PREFIX),readonly
+endif
+endif
+endif
 DOCKER_RELEASE_NODE_VERSION ?= 24.18.0
 DOCKER_RELEASE_PNPM_VERSION ?= 10.34.5
 DOCKER_PULL ?= 1
-AIPC_OS_VERSION ?= 1.12.0
+AIPC_OS_VERSION ?= 1.13.0
 AIPC_MIN_OS_VERSION ?= $(AIPC_OS_VERSION)
 AIPC_MAX_OS_VERSION ?= $(AIPC_OS_VERSION)
-AIPC_COMPAT_LEVEL ?= 1
+# Backward-compatible single-schema default. Release callers that support a
+# migration window should set AIPC_SUPPORTED_DATA_SCHEMAS and
+# AIPC_TARGET_DATA_SCHEMA explicitly (for example "1, 2" and "2").
 AIPC_DATA_SCHEMA ?= 1
+AIPC_SUPPORTED_DATA_SCHEMAS ?= $(AIPC_DATA_SCHEMA)
+AIPC_TARGET_DATA_SCHEMA ?= $(AIPC_DATA_SCHEMA)
 AIPC_MACHINE ?= hailo15-ne503
 AIPC_PRODUCT ?= ne503
 # Factory-fitted lens baked into product.yaml at pack time: af0832 | fg2009.
@@ -234,15 +259,27 @@ tools:
 docker-pack-release:
 	@echo "==> Building Hailo-15 release package in Docker"
 	@echo "    image: $(DOCKER_RELEASE_IMAGE)"
+	@if [ -n "$(strip $(DOCKER_RELEASE_SDK_HOST_DIR))" ] && [ ! -d "$(DOCKER_RELEASE_SDK_HOST_DIR)" ]; then \
+		echo "ERROR: DOCKER_RELEASE_SDK_HOST_DIR $(DOCKER_RELEASE_SDK_HOST_DIR) does not exist on this machine."; \
+		echo "       The poky SDK must be extracted on this runner first; refusing to build with the image's baked-in SDK shadowed by an empty bind."; \
+		exit 1; \
+	fi
 	@if [ "$(DOCKER_PULL)" = "1" ]; then docker pull "$(DOCKER_RELEASE_IMAGE)"; fi
 	docker run --rm -t \
 		--entrypoint /bin/bash \
 		--user root \
 		-v "$(CURDIR):$(DOCKER_RELEASE_WORKDIR)" \
+		$(DOCKER_RELEASE_SDK_MOUNT) \
 		-w "$(DOCKER_RELEASE_WORKDIR)" \
 		-e SDK_PATH="$(DOCKER_RELEASE_SDK_PATH)" \
 		-e HAILO_SDK_PATH="$(DOCKER_RELEASE_SDK_PATH)" \
 		-e BUILD_MCU_FW="$(BUILD_MCU_FW)" \
+		-e AIPC_MACHINE="$(AIPC_MACHINE)" \
+		-e AIPC_PRODUCT="$(AIPC_PRODUCT)" \
+		-e AIPC_MIN_OS_VERSION="$(AIPC_MIN_OS_VERSION)" \
+		-e AIPC_MAX_OS_VERSION="$(AIPC_MAX_OS_VERSION)" \
+		-e AIPC_SUPPORTED_DATA_SCHEMAS="$(AIPC_SUPPORTED_DATA_SCHEMAS)" \
+		-e AIPC_TARGET_DATA_SCHEMA="$(AIPC_TARGET_DATA_SCHEMA)" \
 		-e HOST_UID="$$(id -u)" \
 		-e HOST_GID="$$(id -g)" \
 		-e DOCKER_RELEASE_NODE_VERSION="$(DOCKER_RELEASE_NODE_VERSION)" \
@@ -275,7 +312,12 @@ docker-pack-release:
 			corepack enable; \
 			corepack prepare "pnpm@$$DOCKER_RELEASE_PNPM_VERSION" --activate; \
 			pnpm -v; \
-			make pack-release SDK_PATH="$$SDK_PATH" HAILO_SDK_PATH="$$HAILO_SDK_PATH" VERSION="$(VERSION)" BUILD_MCU_FW="$$BUILD_MCU_FW" LENS_PRODUCT="$(LENS_PRODUCT)"'
+			make pack-release SDK_PATH="$$SDK_PATH" HAILO_SDK_PATH="$$HAILO_SDK_PATH" \
+				VERSION="$(VERSION)" BUILD_MCU_FW="$$BUILD_MCU_FW" LENS_PRODUCT="$(LENS_PRODUCT)" \
+				AIPC_MACHINE="$$AIPC_MACHINE" AIPC_PRODUCT="$$AIPC_PRODUCT" \
+				AIPC_MIN_OS_VERSION="$$AIPC_MIN_OS_VERSION" AIPC_MAX_OS_VERSION="$$AIPC_MAX_OS_VERSION" \
+				AIPC_SUPPORTED_DATA_SCHEMAS="$$AIPC_SUPPORTED_DATA_SCHEMAS" \
+				AIPC_TARGET_DATA_SCHEMA="$$AIPC_TARGET_DATA_SCHEMA"'
 
 ensure-mcu-toolchain:
 	@if ! command -v arm-none-eabi-gcc >/dev/null 2>&1; then \
@@ -328,6 +370,33 @@ endif
 
 _pack-stage:
 	@echo "==> Packaging release [$(VERSION), platform=$(HAL_PLATFORM)]"
+	@if [ -z "$(AIPC_MACHINE)" ] || [ -z "$(AIPC_PRODUCT)" ]; then \
+		echo "ERROR: AIPC_MACHINE and AIPC_PRODUCT must be non-empty"; \
+		exit 1; \
+	fi
+	@if ! printf '%s\n' "$(AIPC_MIN_OS_VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$' || \
+		! printf '%s\n' "$(AIPC_MAX_OS_VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "ERROR: AIPC_MIN_OS_VERSION and AIPC_MAX_OS_VERSION must use strict x.y.z form"; \
+		exit 1; \
+	fi
+	@if [ "$$(printf '%s\n' "$(AIPC_MIN_OS_VERSION)" "$(AIPC_MAX_OS_VERSION)" | sort -V | head -1)" != "$(AIPC_MIN_OS_VERSION)" ]; then \
+		echo "ERROR: AIPC_MIN_OS_VERSION ($(AIPC_MIN_OS_VERSION)) exceeds AIPC_MAX_OS_VERSION ($(AIPC_MAX_OS_VERSION))"; \
+		exit 1; \
+	fi
+	@if ! printf '%s\n' "$(AIPC_SUPPORTED_DATA_SCHEMAS)" | \
+		grep -Eq '^[[:space:]]*[1-9][0-9]*([[:space:]]*,[[:space:]]*[1-9][0-9]*)*[[:space:]]*$$'; then \
+		echo "ERROR: AIPC_SUPPORTED_DATA_SCHEMAS must be a comma-separated list of positive integers"; \
+		exit 1; \
+	fi
+	@if ! printf '%s\n' "$(AIPC_TARGET_DATA_SCHEMA)" | grep -Eq '^[1-9][0-9]*$$'; then \
+		echo "ERROR: AIPC_TARGET_DATA_SCHEMA must be a positive integer"; \
+		exit 1; \
+	fi
+	@if ! printf '%s\n' "$(AIPC_SUPPORTED_DATA_SCHEMAS)" | tr ',' '\n' | tr -d '[:space:]' | \
+		grep -qx "$(AIPC_TARGET_DATA_SCHEMA)"; then \
+		echo "ERROR: target data schema $(AIPC_TARGET_DATA_SCHEMA) is not in supported set [$(AIPC_SUPPORTED_DATA_SCHEMAS)]"; \
+		exit 1; \
+	fi
 	@missing=""; \
 	for b in camera-daemon ai-runtime device-control event-bus platform-api app-manager aipc-cli device-discovery onvif-device aipc-os-updater; do \
 		[ -x "$(BUILD_DIR)/$$b" ] || missing="$$missing $$b"; \
@@ -477,9 +546,8 @@ _pack-stage:
 		'  "product": "$(AIPC_PRODUCT)",' \
 		'  "min_os_version": "$(AIPC_MIN_OS_VERSION)",' \
 		'  "max_os_version": "$(AIPC_MAX_OS_VERSION)",' \
-		'  "required_compat_level": $(AIPC_COMPAT_LEVEL),' \
-		'  "supported_data_schema": [$(AIPC_DATA_SCHEMA)],' \
-		'  "target_data_schema": $(AIPC_DATA_SCHEMA)' \
+		'  "supported_data_schema": [$(AIPC_SUPPORTED_DATA_SCHEMAS)],' \
+		'  "target_data_schema": $(AIPC_TARGET_DATA_SCHEMA)' \
 		'}' > "$(STAGE_DIR)/opt/aipc/app-manifest.json"
 	@if [ "$(SKIP_STAGE_TARBALL)" != "1" ]; then \
 		mkdir -p "$(RELEASE_DIR)"; \
@@ -520,6 +588,18 @@ test-unit: proto
 
 test-basic:
 	./scripts/run_basic_tests.sh
+
+# Regenerate the checked-in postprocess schema artifacts (JSON + C++ header)
+# from the single-source registry in platform/postprocess.
+postprocess-schema:
+	$(GO) generate ./platform/postprocess
+
+# CI/local guard: fail when the checked-in artifacts no longer match the
+# registry (hand edit, or a registry change committed without regenerating).
+# -check renders in memory and byte-compares — it never writes, so it cannot
+# flag a legitimate uncommitted regen as drift nor restore-discard it.
+postprocess-schema-check:
+	$(GO) run ./platform/postprocess/gen -check
 
 test-smoke:
 	./scripts/test_all.sh

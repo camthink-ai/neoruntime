@@ -31,8 +31,8 @@ var (
 // ============ event-log list ============
 
 var eventLogListCmd = &cobra.Command{
-	Use:   "list",
-	Short: "List event logs",
+	Use:     "list",
+	Short:   "List event logs",
 	Aliases: []string{"ls"},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		url := fmt.Sprintf("%s/api/v1/event-logs?limit=%d", eventLogAPIBase, eventLogLimit)
@@ -115,13 +115,13 @@ var eventLogStatsCmd = &cobra.Command{
 		}
 
 		var stats struct {
-			TodayErrors     int `json:"today_errors"`
-			TodayWarnings   int `json:"today_warnings"`
-			Operations      int `json:"operations"`
-			SecurityEvents  int `json:"security_events"`
-			AlarmEvents     int `json:"alarm_events"`
-			SystemEvents    int `json:"system_events"`
-			TotalEntries    int `json:"total_entries"`
+			TodayErrors    int `json:"today_errors"`
+			TodayWarnings  int `json:"today_warnings"`
+			Operations     int `json:"operations"`
+			SecurityEvents int `json:"security_events"`
+			AlarmEvents    int `json:"alarm_events"`
+			SystemEvents   int `json:"system_events"`
+			TotalEntries   int `json:"total_entries"`
 		}
 
 		if err := json.Unmarshal(resp.Data, &stats); err != nil {

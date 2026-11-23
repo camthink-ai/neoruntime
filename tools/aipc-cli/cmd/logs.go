@@ -21,9 +21,9 @@ var logsCmd = &cobra.Command{
 }
 
 var (
-	logsAPIBase  string
-	logsLines    int
-	logsLevel    string
+	logsAPIBase string
+	logsLines   int
+	logsLevel   string
 )
 
 // ============ logs services ============
@@ -80,11 +80,11 @@ var logsFilesCmd = &cobra.Command{
 		}
 
 		var files []struct {
-			Path        string `json:"path"`
-			Name        string `json:"name"`
-			Size        int64  `json:"size"`
+			Path         string `json:"path"`
+			Name         string `json:"name"`
+			Size         int64  `json:"size"`
 			ModifiedTime string `json:"modified_time"`
-			Service     string `json:"service"`
+			Service      string `json:"service"`
 		}
 
 		if err := json.Unmarshal(resp.Data, &files); err != nil {

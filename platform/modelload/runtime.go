@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -45,6 +46,17 @@ const (
 	defaultDetectionThreshold = 0.25
 	defaultNmsThreshold       = 0.45
 	defaultMaxDetections      = 64
+)
+
+// Pose-blob composition constants. The network size range mirrors HAL's
+// create-time acceptance window (16..4096); score values below 0.01 are never
+// sent because HAL treats score_threshold < 1e-6 as unset and silently falls
+// back to 0.6 — a value the user never chose.
+const (
+	poseScoreThresholdFloor = 0.01
+	poseNetworkDimMin       = 16
+	poseNetworkDimMax       = 4096
+	defaultPoseThreshold    = 0.25
 )
 
 // defaultPostprocessLabels mirrors the plugin's compiled-in label table
@@ -95,23 +107,34 @@ func supportedProfileBasenames() string {
 // init_post_process, so the stored file loads as-is and Infer returns bare
 // tensors (the consumer decodes). Platform-mode detection models get
 // materialized under a plugin-recognized basename with a composed variant;
-// everything else passes through unchanged.
+// keypoint models keep their stored path (no basename contract — the facial
+// decoder is the empty-variant default and the pose decoder is built into
+// HAL, selected by the composed blob); everything else passes through
+// unchanged.
 func RuntimeRegistration(m *model.AIModel) (path string, variant string, grpcModelType string, err error) {
 	if mode, ok := model.ResolveOutputMode(m.OutputMode); ok && mode == model.OutputModeRaw {
 		return m.FilePath, "", "", nil
 	}
-	if model.ResolveModelType(m.ModelType) != "detection" {
+	switch model.ResolveModelType(m.ModelType) {
+	case "detection":
+		path, err = detectionRuntimePath(m)
+		if err != nil {
+			return "", "", "", err
+		}
+		variant, err = DetectionVariantJSON(m)
+		if err != nil {
+			return "", "", "", err
+		}
+		return path, variant, m.ModelType, nil
+	case "keypoint":
+		variant, err = KeypointVariantJSON(m)
+		if err != nil {
+			return "", "", "", err
+		}
+		return m.FilePath, variant, m.ModelType, nil
+	default:
 		return m.FilePath, m.Variant, m.ModelType, nil
 	}
-	path, err = detectionRuntimePath(m)
-	if err != nil {
-		return "", "", "", err
-	}
-	variant, err = DetectionVariantJSON(m)
-	if err != nil {
-		return "", "", "", err
-	}
-	return path, variant, m.ModelType, nil
 }
 
 // detectionRuntimePath materializes a detection model under a HEF basename the
@@ -328,6 +351,173 @@ func detectionLabels(m *model.AIModel) []string {
 		}
 	}
 	return defaultPostprocessLabels
+}
+
+// KeypointPostprocessProfile returns the stored postprocess_profile for a
+// keypoint model, falling back to the facial default when Config is missing,
+// unparseable, or has no postprocess_profile key (legacy rows — their
+// behavior is byte-identical to facial: empty variant blob). A present but
+// unknown value is an error, mirroring DetectionPostprocessProfile: a typo
+// would otherwise silently select the facial decoder for a pose model.
+func KeypointPostprocessProfile(m *model.AIModel) (string, error) {
+	if m.Config != "" {
+		var cfg map[string]interface{}
+		if err := json.Unmarshal([]byte(m.Config), &cfg); err == nil {
+			if v, ok := cfg["postprocess_profile"]; ok {
+				name, isStr := v.(string)
+				if !isStr {
+					return "", fmt.Errorf("postprocess_profile must be a string, got %T (supported: %s)", v, supportedKeypointProfiles())
+				}
+				if _, valid := model.LookupKeypointProfile(name); !valid {
+					return "", fmt.Errorf("postprocess_profile %q is not supported for keypoint models (supported: %s)", name, supportedKeypointProfiles())
+				}
+				return name, nil
+			}
+		}
+	}
+	return model.DefaultKeypointProfile, nil
+}
+
+func supportedKeypointProfiles() string {
+	names := make([]string, 0, len(model.KeypointPostprocessProfiles))
+	for _, p := range model.KeypointPostprocessProfiles {
+		names = append(names, p.Value)
+	}
+	return strings.Join(names, ", ")
+}
+
+// KeypointVariantJSON builds the model_variant sent to ai-runtime for
+// keypoint models. Decision order:
+//
+//  1. non-keypoint rows pass through unchanged;
+//  2. a variant that trims to a `{` passes through verbatim — the advanced
+//     escape hatch takes PRECEDENCE over the profile, so hand-written pose
+//     blobs (legacy rows have no profile key) keep their exact behavior,
+//     leading whitespace included;
+//  3. empty variant follows the profile: facial → "" (identical to every
+//     pre-profile row), pose → a composed blob carrying only the keys HAL's
+//     pose decoder consumes: the create-time decoder flag plus thresholds
+//     and, when known, the network dimensions. confidence_threshold is
+//     deliberately not sent (HAL reads score_threshold first — sending both
+//     only invites ambiguity), and num_keypoints never (both decoders
+//     hardcode their topology);
+//  4. a bare-name variant (e.g. "yolov8s_pose" from early manual rows) is
+//     overridden by the profile synthesis — such rows are rejected by the
+//     runtime validator today, so nothing working changes.
+//
+// Side-effect-free like DetectionVariantJSON: UpdateModel's reload
+// compose-compare calls it on the stored row, so it must never touch the
+// filesystem or the runtime.
+func KeypointVariantJSON(m *model.AIModel) (string, error) {
+	if model.ResolveModelType(m.ModelType) != "keypoint" {
+		return m.Variant, nil
+	}
+	if strings.HasPrefix(strings.TrimSpace(m.Variant), "{") {
+		return m.Variant, nil
+	}
+	profile, err := KeypointPostprocessProfile(m)
+	if err != nil {
+		return "", err
+	}
+	if profile == model.DefaultKeypointProfile {
+		return "", nil
+	}
+	cfg := map[string]interface{}{
+		"native_yolov8_pose": true,
+	}
+	if v, ok := keypointThreshold(m); ok {
+		cfg["keypoint_threshold"] = v
+	}
+	if v, ok := poseScoreThreshold(m); ok {
+		cfg["score_threshold"] = v
+	}
+	if w, ok := poseNetworkDim(m, "yolov8_pose_network_width", m.InputWidth); ok {
+		cfg["yolov8_pose_network_width"] = w
+	}
+	if h, ok := poseNetworkDim(m, "yolov8_pose_network_height", m.InputHeight); ok {
+		cfg["yolov8_pose_network_height"] = h
+	}
+	blob, err := json.Marshal(cfg)
+	if err != nil {
+		// Unreachable for these value types; keep the stored variant if so.
+		return m.Variant, nil
+	}
+	return string(blob), nil
+}
+
+// poseScoreThreshold resolves the detection-side threshold for the pose blob:
+// an explicit config threshold wins over the row column, the default last.
+// The resolved value is sent only inside HAL's readable window — anything
+// below 0.01 reads as "unset" and silently becomes 0.6, so it is omitted
+// instead (HAL then keeps its own struct default).
+func poseScoreThreshold(m *model.AIModel) (float64, bool) {
+	v := float64(m.Threshold)
+	fromConfig := false
+	if m.Config != "" {
+		var cfg map[string]interface{}
+		if err := json.Unmarshal([]byte(m.Config), &cfg); err == nil {
+			if t, ok := cfg["threshold"].(float64); ok {
+				v = t
+				fromConfig = true
+			}
+		}
+	}
+	// Legacy rows without an explicit threshold: the zero column means
+	// "never set", not "zero" (same rule as detectionThreshold).
+	if !fromConfig && m.Threshold <= 0 {
+		v = defaultPoseThreshold
+	}
+	if v < poseScoreThresholdFloor || v > 1 {
+		return 0, false
+	}
+	return v, true
+}
+
+// keypointThreshold reads keypoint_threshold from the schema-driven Config,
+// falling back to the schema default. Presence of the key decides, not the
+// value's sign — an explicit 0 ("report even the weakest keypoints") is a
+// legal schema value and is preserved, unlike the score threshold above
+// (0.25 mirrors the wizard default; the key has no row column).
+// keypointThreshold resolves the per-keypoint score cut for the pose blob.
+// An explicit config value is honored only inside HAL's readable [0,1]
+// window: the REST surface does not schema-validate config (only the wizard
+// form does), so an out-of-range value is omitted rather than forwarded —
+// HAL then keeps its own default, mirroring poseScoreThreshold's treatment
+// of the <0.01 floor. Absent config keeps the composed default so
+// form-created rows keep their blob shape.
+func keypointThreshold(m *model.AIModel) (float64, bool) {
+	if m.Config != "" {
+		var cfg map[string]interface{}
+		if err := json.Unmarshal([]byte(m.Config), &cfg); err == nil {
+			if v, ok := cfg["keypoint_threshold"].(float64); ok {
+				if math.IsNaN(v) || v < 0 || v > 1 {
+					return 0, false
+				}
+				return v, true
+			}
+		}
+	}
+	return defaultPoseThreshold, true
+}
+
+// poseNetworkDim resolves one network dimension for the pose blob: an
+// explicit config key (the wizard does not render one, but the REST surface
+// accepts it) wins when inside HAL's 16..4096 window, then the row's parsed
+// HEF dimension, otherwise the key is omitted entirely and HAL applies its
+// own 640 default.
+func poseNetworkDim(m *model.AIModel, configKey string, rowDim int) (int, bool) {
+	if m.Config != "" {
+		var cfg map[string]interface{}
+		if err := json.Unmarshal([]byte(m.Config), &cfg); err == nil {
+			if v, ok := cfg[configKey].(float64); ok && v >= poseNetworkDimMin && v <= poseNetworkDimMax {
+				return int(v), true
+			}
+		}
+	}
+	if rowDim >= poseNetworkDimMin && rowDim <= poseNetworkDimMax {
+		return rowDim, true
+	}
+	return 0, false
 }
 
 // RemoveRuntimeCopy deletes the materialized runtime copy of a model, if any.

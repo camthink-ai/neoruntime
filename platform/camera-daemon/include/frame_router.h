@@ -120,6 +120,23 @@ public:
      */
     void force_reclaim(uint64_t frame_id);
 
+    /**
+     * @brief Declare a hardware-in-use reference on a dispatched frame
+     *        (FD_PUB_MSG_FRAME_IN_USE).
+     *
+     * Forwarded to the watchdog: the frame is exempt from the normal frame
+     * timeout and only reclaimed after the longer in-use hard cap, so the
+     * buffer is not recycled (and overwritten) while an async device job
+     * still DMAs from it. Returns true iff the declaration landed
+     * atomically on a still-tracked frame — false means no protection was
+     * granted (frame already released or queued for reclaim).
+     */
+    bool mark_frame_in_use(uint64_t frame_id);
+
+    /** Drop one in-use reference (RELEASE/disconnect path of the declaring
+     * client). Reverts the frame to the normal deadline at count zero. */
+    void clear_frame_in_use(uint64_t frame_id);
+
     RouterStreamStats get_stats(const std::string& stream_name) const;
 
     /** Wait for fresh frame arrivals without retaining image buffers. */

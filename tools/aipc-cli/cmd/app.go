@@ -6,9 +6,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
-	"os/signal"
 	"syscall"
 	"time"
 
@@ -134,16 +134,16 @@ Examples:
 		if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
 			return fmt.Errorf("manifest file not found: %s", manifestPath)
 		}
-			// Only check file existence for local image paths
-			isLocalImage := strings.HasPrefix(imagePath, "/") || strings.HasPrefix(imagePath, "./") ||
+		// Only check file existence for local image paths
+		isLocalImage := strings.HasPrefix(imagePath, "/") || strings.HasPrefix(imagePath, "./") ||
 			strings.HasSuffix(imagePath, ".tar") || strings.HasSuffix(imagePath, ".tar.gz") || strings.HasSuffix(imagePath, ".tgz")
-			if isLocalImage {
+		if isLocalImage {
 			if _, err := os.Stat(imagePath); os.IsNotExist(err) {
 				return fmt.Errorf("image file not found: %s", imagePath)
 			}
 			abspath, _ := filepath.Abs(imagePath)
 			imagePath = abspath
-			}
+		}
 
 		// Convert to absolute paths for gRPC server
 		absManifest, _ := filepath.Abs(manifestPath)
@@ -312,133 +312,135 @@ var appRemoveCmd = &cobra.Command{
 		return nil
 	},
 }
-	// ============ app update ============
 
-	var appUpdateCmd = &cobra.Command{
-		Use:   "update <app-id> <manifest> <image>",
-		Short: "Update an installed application",
-		Long: `Update an installed application with a new manifest and container image.
+// ============ app update ============
+
+var appUpdateCmd = &cobra.Command{
+	Use:   "update <app-id> <manifest> <image>",
+	Short: "Update an installed application",
+	Long: `Update an installed application with a new manifest and container image.
 Preserves volume data, web URL, and restart count. If the app was running,
 it will be automatically restarted after the update.
 
 Examples:
   aipc-cli app update my-app app.yaml new-image.tar
 `,
-		Args: cobra.ExactArgs(3),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			appID := args[0]
-			manifestPath := args[1]
-			imagePath := args[2]
+	Args: cobra.ExactArgs(3),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		appID := args[0]
+		manifestPath := args[1]
+		imagePath := args[2]
 
-			if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
-				return fmt.Errorf("manifest file not found: %s", manifestPath)
+		if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
+			return fmt.Errorf("manifest file not found: %s", manifestPath)
+		}
+		// Only check file existence for local image paths
+		isLocalImage := strings.HasPrefix(imagePath, "/") || strings.HasPrefix(imagePath, "./") ||
+			strings.HasSuffix(imagePath, ".tar") || strings.HasSuffix(imagePath, ".tar.gz") || strings.HasSuffix(imagePath, ".tgz")
+		if isLocalImage {
+			if _, err := os.Stat(imagePath); os.IsNotExist(err) {
+				return fmt.Errorf("image file not found: %s", imagePath)
 			}
-			// Only check file existence for local image paths
-			isLocalImage := strings.HasPrefix(imagePath, "/") || strings.HasPrefix(imagePath, "./") ||
-				strings.HasSuffix(imagePath, ".tar") || strings.HasSuffix(imagePath, ".tar.gz") || strings.HasSuffix(imagePath, ".tgz")
-			if isLocalImage {
-				if _, err := os.Stat(imagePath); os.IsNotExist(err) {
-					return fmt.Errorf("image file not found: %s", imagePath)
-				}
-				abspath, _ := filepath.Abs(imagePath)
-				imagePath = abspath
-			}
+			abspath, _ := filepath.Abs(imagePath)
+			imagePath = abspath
+		}
 
-			absManifest, _ := filepath.Abs(manifestPath)
-			// absImage handled above
+		absManifest, _ := filepath.Abs(manifestPath)
+		// absImage handled above
 
-			if err := connectAppManager(); err != nil {
-				return err
-			}
+		if err := connectAppManager(); err != nil {
+			return err
+		}
 
-			printer.Info("Updating application %s...", appID)
+		printer.Info("Updating application %s...", appID)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
 
-			result, err := grpcCli.AppManager.InstallApp(ctx, &apppb.InstallRequest{
-				ManifestPath: absManifest,
-				ImagePath:    imagePath,
-				Force:        true,
-			})
-			if err != nil {
-				return fmt.Errorf("update failed: %w", err)
-			}
+		result, err := grpcCli.AppManager.InstallApp(ctx, &apppb.InstallRequest{
+			ManifestPath: absManifest,
+			ImagePath:    imagePath,
+			Force:        true,
+		})
+		if err != nil {
+			return fmt.Errorf("update failed: %w", err)
+		}
 
-			if !result.Status.Success {
-				printer.Error("Update failed: %s", result.Status.Message)
-				return fmt.Errorf("update failed")
-			}
+		if !result.Status.Success {
+			printer.Error("Update failed: %s", result.Status.Message)
+			return fmt.Errorf("update failed")
+		}
 
-			if result.Updated {
-				printer.Success("Application updated: %s", result.AppId)
-			} else {
-				printer.Success("Application installed: %s", result.AppId)
-			}
-			return nil
-		},
-	}
+		if result.Updated {
+			printer.Success("Application updated: %s", result.AppId)
+		} else {
+			printer.Success("Application installed: %s", result.AppId)
+		}
+		return nil
+	},
+}
 
-	// ============ app dev ============
+// ============ app dev ============
 
-	var appDevCmd = &cobra.Command{
-		Use:   "dev <app-id>",
-		Short: "Run app in dev mode with hot reload",
-		Long: `Start an app in development mode. Source directories from the
+var appDevCmd = &cobra.Command{
+	Use:   "dev <app-id>",
+	Short: "Run app in dev mode with hot reload",
+	Long: `Start an app in development mode. Source directories from the
 host are bind-mounted, readonly rootfs is disabled, and
 file changes trigger automatic reload.
 
 Examples:
   aipc-cli app dev my-app
 `,
-		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			appID := args[0]
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		appID := args[0]
 
-			if err := connectAppManager(); err != nil {
-				return err
-			}
+		if err := connectAppManager(); err != nil {
+			return err
+		}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 
-			printer.Info("Starting app %s in dev mode...", appID)
+		printer.Info("Starting app %s in dev mode...", appID)
 
-			result, err := grpcCli.AppManager.StartApp(ctx, &apppb.StartRequest{
-				AppId: appID,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to start: %w", err)
-			}
+		result, err := grpcCli.AppManager.StartApp(ctx, &apppb.StartRequest{
+			AppId: appID,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to start: %w", err)
+		}
 
-			if !result.Success {
-				printer.Error("Start failed: %s", result.Message)
-				return fmt.Errorf("start failed")
-			}
+		if !result.Success {
+			printer.Error("Start failed: %s", result.Message)
+			return fmt.Errorf("start failed")
+		}
 
-			printer.Success("App %s running in dev mode", appID)
-			printer.Info("Editing source files will trigger reload")
-			printer.Info("Press Ctrl+C to stop")
+		printer.Success("App %s running in dev mode", appID)
+		printer.Info("Editing source files will trigger reload")
+		printer.Info("Press Ctrl+C to stop")
 
-			sigCh := make(chan os.Signal, 1)
-			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-			<-sigCh
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
 
-			printer.Info("Stopping dev mode...")
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer stopCancel()
+		printer.Info("Stopping dev mode...")
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
 
-			if _, err := grpcCli.AppManager.StopApp(stopCtx, &apppb.StopRequest{
-				AppId:          appID,
-				TimeoutSeconds: 10,
-			}); err != nil {
-				printer.Warning("Stop error: %v", err)
-			} else {
-				printer.Success("App stopped")
-			}
-			return nil
-		},
-	}
+		if _, err := grpcCli.AppManager.StopApp(stopCtx, &apppb.StopRequest{
+			AppId:          appID,
+			TimeoutSeconds: 10,
+		}); err != nil {
+			printer.Warning("Stop error: %v", err)
+		} else {
+			printer.Success("App stopped")
+		}
+		return nil
+	},
+}
+
 // ============ app stats ============
 
 var appStatsCmd = &cobra.Command{

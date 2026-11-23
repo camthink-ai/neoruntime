@@ -147,6 +147,284 @@ static std::string json_extract_string_best_effort(const std::string &json, cons
     return json.substr(p, q - p);
 }
 
+// Root-member-only string extraction for LOADER CONTROL KEYS
+// (backend_lib_path / backend_function / backend_config_path).
+// json_extract_string_best_effort substring-searches the raw text, so the
+// key spelling anywhere — including nested inside an ordinary object or
+// array value of a user-supplied variant blob — matches, and what it names
+// gets dlopen'd (review 2026-09-21 P0). Loader keys only ever ride at the
+// TOP LEVEL of platform-composed configs, so this walker honors exactly
+// that surface: iterate the root object's members, compare keys verbatim
+// (escaped spellings never match), and skip non-matching values
+// structurally. A key spelled inside a STRING value stays escaped in the
+// raw text and cannot collide. Returns "" when the key is absent at the
+// root (callers already treat "" as absent).
+static std::string json_extract_root_string(const std::string &json, const char *key)
+{
+    if (!key || json.empty())
+        return {};
+    const size_t n = json.size();
+    size_t i = 0;
+    auto skip_ws = [&]() {
+        while (i < n && std::isspace((unsigned char)json[i]))
+            i++;
+    };
+    skip_ws();
+    if (i >= n || json[i] != '{')
+        return {};
+    ++i;
+    skip_ws();
+    if (i < n && json[i] == '}')
+        return {};
+    for (;;)
+    {
+        skip_ws();
+        if (i >= n || json[i] != '"')
+            return {};
+        ++i;
+        std::string mkey;
+        bool escaped_key = false;
+        while (i < n && json[i] != '"')
+        {
+            char c = json[i];
+            if (c == '\\' && i + 1 < n)
+            {
+                ++i;
+                escaped_key = true;
+                c = json[i];
+            }
+            mkey.push_back(c);
+            ++i;
+        }
+        if (i >= n)
+            return {};
+        ++i; // key's closing quote
+        skip_ws();
+        if (i >= n || json[i] != ':')
+            return {};
+        ++i;
+        skip_ws();
+        if (i >= n)
+            return {};
+        const bool key_match = !escaped_key && mkey == key;
+        if (json[i] == '"')
+        {
+            ++i;
+            std::string val;
+            while (i < n && json[i] != '"')
+            {
+                char c = json[i];
+                if (c == '\\' && i + 1 < n)
+                {
+                    ++i;
+                    c = json[i];
+                    switch (c)
+                    {
+                    case 'n': c = '\n'; break;
+                    case 't': c = '\t'; break;
+                    case 'r': c = '\r'; break;
+                    default: break; // \" \\ \/ \b \f pass through literally
+                    }
+                }
+                val.push_back(c);
+                ++i;
+            }
+            if (i >= n)
+                return {};
+            ++i;
+            if (key_match)
+                return val;
+        }
+        else if (json[i] == '{' || json[i] == '[')
+        {
+            // Skip a container counting only same-type brackets; JSON's
+            // grammar keeps them balanced, and string contents are opaque.
+            const char open = json[i];
+            const char close = (open == '{') ? '}' : ']';
+            int depth = 0;
+            bool in_str = false;
+            for (; i < n; ++i)
+            {
+                const char c = json[i];
+                if (in_str)
+                {
+                    if (c == '\\')
+                        ++i;
+                    else if (c == '"')
+                        in_str = false;
+                    continue;
+                }
+                if (c == '"')
+                {
+                    in_str = true;
+                    continue;
+                }
+                if (c == open)
+                    ++depth;
+                else if (c == close)
+                {
+                    --depth;
+                    if (depth == 0)
+                    {
+                        ++i;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0)
+                return {};
+        }
+        else
+        {
+            // number / true / false / null token
+            while (i < n && json[i] != ',' && json[i] != '}' &&
+                   !std::isspace((unsigned char)json[i]))
+                ++i;
+        }
+        skip_ws();
+        if (i < n && json[i] == ',')
+        {
+            ++i;
+            continue;
+        }
+        return {}; // '}' (end) or malformed
+    }
+}
+
+// Root-member variant of json_extract_string_value_best_effort for loader
+// control keys — same signature/semantics, root-only scanning.
+static inline std::string json_extract_root_string_value(const std::string &json, const char *key,
+                                                          const std::string &default_value)
+{
+    const std::string v = json_extract_root_string(json, key);
+    return v.empty() ? default_value : v;
+}
+
+// Root-member PRESENCE check for the create-time loader-key guard (review
+// 2026-09-24 P0). Presence must not be inferred from
+// json_extract_root_string(...).empty() — that misses a root key whose value
+// is a non-string (number/bool/object/array), and the guard must refuse the
+// key whatever its value type. Mirrors the json_extract_root_string walk
+// (escaped key spellings never match; a key spelled inside a STRING value
+// stays escaped in the raw text and is not a structural root member).
+static bool json_root_has_key(const std::string &json, const char *key)
+{
+    if (!key || json.empty())
+        return false;
+    const size_t n = json.size();
+    size_t i = 0;
+    auto skip_ws = [&]() {
+        while (i < n && std::isspace((unsigned char)json[i]))
+            i++;
+    };
+    skip_ws();
+    if (i >= n || json[i] != '{')
+        return false;
+    ++i;
+    skip_ws();
+    if (i < n && json[i] == '}')
+        return false;
+    for (;;)
+    {
+        skip_ws();
+        if (i >= n || json[i] != '"')
+            return false;
+        ++i;
+        std::string mkey;
+        bool escaped_key = false;
+        while (i < n && json[i] != '"')
+        {
+            char c = json[i];
+            if (c == '\\' && i + 1 < n)
+            {
+                ++i;
+                escaped_key = true;
+                c = json[i];
+            }
+            mkey.push_back(c);
+            ++i;
+        }
+        if (i >= n)
+            return false;
+        ++i; // key's closing quote
+        skip_ws();
+        if (i >= n || json[i] != ':')
+            return false;
+        ++i;
+        skip_ws();
+        if (i >= n)
+            return false;
+        if (!escaped_key && mkey == key)
+            return true; // present at the root, whatever the value type
+        // Skip this member's value to reach the next one — same shape-aware
+        // skipping as json_extract_root_string.
+        if (json[i] == '"')
+        {
+            ++i;
+            while (i < n && json[i] != '"')
+            {
+                if (json[i] == '\\' && i + 1 < n)
+                    ++i;
+                ++i;
+            }
+            if (i >= n)
+                return false;
+            ++i;
+        }
+        else if (json[i] == '{' || json[i] == '[')
+        {
+            const char open = json[i];
+            const char close = (open == '{') ? '}' : ']';
+            int depth = 0;
+            bool in_str = false;
+            for (; i < n; ++i)
+            {
+                const char c = json[i];
+                if (in_str)
+                {
+                    if (c == '\\')
+                        ++i;
+                    else if (c == '"')
+                        in_str = false;
+                    continue;
+                }
+                if (c == '"')
+                {
+                    in_str = true;
+                    continue;
+                }
+                if (c == open)
+                    ++depth;
+                else if (c == close)
+                {
+                    --depth;
+                    if (depth == 0)
+                    {
+                        ++i;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0)
+                return false;
+        }
+        else
+        {
+            // number / true / false / null token
+            while (i < n && json[i] != ',' && json[i] != '}' &&
+                   !std::isspace((unsigned char)json[i]))
+                ++i;
+        }
+        skip_ws();
+        if (i < n && json[i] == ',')
+        {
+            ++i;
+            continue;
+        }
+        return false; // '}' (end) or malformed
+    }
+}
+
 static bool str_has_json_object_prefix(const char *s)
 {
     if (!s)
@@ -443,12 +721,16 @@ static void merge_vendor_patch_json_best_effort(Hailo15PostPriv *p, const char *
         }
     }
 
-    // Common string keys used by vendor plugins.
-    for (const char *key : {"backend_lib_path", "backend_function", "backend_config_path", "output_activation",
-                            "scdepth_output_name", "output_tensor_name"})
+    // Loader control keys merge ROOT-MEMBER-ONLY: json_extract_string_best_effort
+    // matches the key spelling at any nesting depth, and what these keys name
+    // gets dlopen'd — a "backend_lib_path" nested inside an ordinary value of
+    // a user-supplied variant blob must never select a library (review
+    // 2026-09-21 P0). merged_vendor_json is HAL-composed (top-level keys
+    // only), so root-only reads lose nothing there.
+    for (const char *key : {"backend_lib_path", "backend_function", "backend_config_path"})
     {
-        const std::string before = json_extract_string_best_effort(p->merged_vendor_json, key);
-        const std::string v = json_extract_string_best_effort(patch, key);
+        const std::string before = json_extract_root_string(p->merged_vendor_json, key);
+        const std::string v = json_extract_root_string(patch, key);
         if (!v.empty() && replace_or_insert_json_string(p->merged_vendor_json, key, v))
         {
             changed = true;
@@ -463,6 +745,19 @@ static void merge_vendor_patch_json_best_effort(Hailo15PostPriv *p, const char *
             else if (std::strcmp(key, "backend_config_path") == 0)
                 p->plugin_config_path = v;
 #endif
+        }
+    }
+
+    // Common string content keys used by vendor plugins.
+    for (const char *key : {"output_activation", "scdepth_output_name", "output_tensor_name"})
+    {
+        const std::string before = json_extract_string_best_effort(p->merged_vendor_json, key);
+        const std::string v = json_extract_string_best_effort(patch, key);
+        if (!v.empty() && replace_or_insert_json_string(p->merged_vendor_json, key, v))
+        {
+            changed = true;
+            if (before != v)
+                HAL_LOG_INFO("hailo15_postprocess: merged %s override \"%s\" -> \"%s\"", key, before.c_str(), v.c_str());
         }
     }
 
@@ -1054,6 +1349,48 @@ static std::string json_strip_hailo_postprocess_loader_keys(std::string j)
 // session whose vendor plugin could not be resolved is never returned.
 static void hailo15_post_destroy(HalPostprocessSession *session);
 
+// Per-type accessors for the config_file / config_json channels of
+// HalPostprocessConfig (the union repeats one member per post type). The
+// 9-way dispatch used to be inlined three times inside create; the
+// create-time loader-key guard is a fourth reader.
+static const char *postprocess_config_file_of(const HalPostprocessConfig *config)
+{
+    if (!config)
+        return nullptr;
+    switch (config->type)
+    {
+    case HAL_POST_TYPE_DETECTION: return config->config.detection.config_file;
+    case HAL_POST_TYPE_CLASSIFICATION: return config->config.classification.config_file;
+    case HAL_POST_TYPE_CLIP: return config->config.clip.config_file;
+    case HAL_POST_TYPE_SEGMENTATION: return config->config.segmentation.config_file;
+    case HAL_POST_TYPE_KEYPOINT: return config->config.keypoint.config_file;
+    case HAL_POST_TYPE_EMBEDDING: return config->config.embedding.config_file;
+    case HAL_POST_TYPE_OCR_DETECTION: return config->config.ocr_detection.config_file;
+    case HAL_POST_TYPE_OCR_RECOGNITION: return config->config.ocr_recognition.config_file;
+    case HAL_POST_TYPE_DEPTH: return config->config.depth.config_file;
+    default: return nullptr;
+    }
+}
+
+static const char *postprocess_config_json_of(const HalPostprocessConfig *config)
+{
+    if (!config)
+        return nullptr;
+    switch (config->type)
+    {
+    case HAL_POST_TYPE_DETECTION: return config->config.detection.config_json;
+    case HAL_POST_TYPE_CLASSIFICATION: return config->config.classification.config_json;
+    case HAL_POST_TYPE_CLIP: return config->config.clip.config_json;
+    case HAL_POST_TYPE_SEGMENTATION: return config->config.segmentation.config_json;
+    case HAL_POST_TYPE_KEYPOINT: return config->config.keypoint.config_json;
+    case HAL_POST_TYPE_EMBEDDING: return config->config.embedding.config_json;
+    case HAL_POST_TYPE_OCR_DETECTION: return config->config.ocr_detection.config_json;
+    case HAL_POST_TYPE_OCR_RECOGNITION: return config->config.ocr_recognition.config_json;
+    case HAL_POST_TYPE_DEPTH: return config->config.depth.config_json;
+    default: return nullptr;
+    }
+}
+
 static HalPostprocessSession *hailo15_post_create(const HalPostprocessConfig *config)
 {
     if (!config)
@@ -1063,78 +1400,48 @@ static HalPostprocessSession *hailo15_post_create(const HalPostprocessConfig *co
         return nullptr;
     p->cfg = *config;
 
+    // Fail-loud on loader control keys in the INLINE config_json — the
+    // user-reachable channel (review 2026-09-24 P0: REST and the gRPC
+    // validator refuse these keys for every model type; this is the
+    // last-line guard so a future routing change upstairs cannot reopen the
+    // arbitrary-dlopen vector). Loader selection is platform-controlled:
+    // choose_defaults() resolves plugin paths in code, and the trusted
+    // local config_file channel (device example JSONs, camera-daemon DPM
+    // specs) is untouched. backend_function stays legal — detection's
+    // closed schema whitelists it. Nested mentions inside ordinary values
+    // were already neutered by the root-only extraction (2026-09-21); this
+    // refuses the root keys themselves, whatever their value type.
     {
-        const char *cf = nullptr;
-        if (config->type == HAL_POST_TYPE_DETECTION)
-            cf = config->config.detection.config_file;
-        else if (config->type == HAL_POST_TYPE_CLASSIFICATION)
-            cf = config->config.classification.config_file;
-        else if (config->type == HAL_POST_TYPE_CLIP)
-            cf = config->config.clip.config_file;
-        else if (config->type == HAL_POST_TYPE_SEGMENTATION)
-            cf = config->config.segmentation.config_file;
-        else if (config->type == HAL_POST_TYPE_KEYPOINT)
-            cf = config->config.keypoint.config_file;
-        else if (config->type == HAL_POST_TYPE_EMBEDDING)
-            cf = config->config.embedding.config_file;
-        else if (config->type == HAL_POST_TYPE_OCR_DETECTION)
-            cf = config->config.ocr_detection.config_file;
-        else if (config->type == HAL_POST_TYPE_OCR_RECOGNITION)
-            cf = config->config.ocr_recognition.config_file;
-        else if (config->type == HAL_POST_TYPE_DEPTH)
-            cf = config->config.depth.config_file;
+        const char *cj = postprocess_config_json_of(config);
+        if (str_has_json_object_prefix(cj) &&
+            (json_root_has_key(cj, "backend_lib_path") ||
+             json_root_has_key(cj, "backend_config_path")))
+        {
+            HAL_LOG_ERROR("hailo15_postprocess: refusing create (type=%d) — "
+                          "config_json carries a loader control key "
+                          "(backend_lib_path/backend_config_path); loader "
+                          "selection is platform-controlled",
+                          (int)config->type);
+            delete p;
+            return nullptr;
+        }
+    }
+
+    {
+        const char *cf = postprocess_config_file_of(config);
 
         std::string json_cfg;
         if (cf && cf[0] != '\0')
             json_cfg = read_file_to_string(cf);
         if (json_cfg.empty())
         {
-            const char *cj = nullptr;
-            if (config->type == HAL_POST_TYPE_DETECTION)
-                cj = config->config.detection.config_json;
-            else if (config->type == HAL_POST_TYPE_CLASSIFICATION)
-                cj = config->config.classification.config_json;
-            else if (config->type == HAL_POST_TYPE_CLIP)
-                cj = config->config.clip.config_json;
-            else if (config->type == HAL_POST_TYPE_SEGMENTATION)
-                cj = config->config.segmentation.config_json;
-            else if (config->type == HAL_POST_TYPE_KEYPOINT)
-                cj = config->config.keypoint.config_json;
-            else if (config->type == HAL_POST_TYPE_EMBEDDING)
-                cj = config->config.embedding.config_json;
-            else if (config->type == HAL_POST_TYPE_OCR_DETECTION)
-                cj = config->config.ocr_detection.config_json;
-            else if (config->type == HAL_POST_TYPE_OCR_RECOGNITION)
-                cj = config->config.ocr_recognition.config_json;
-            else if (config->type == HAL_POST_TYPE_DEPTH)
-                cj = config->config.depth.config_json;
+            const char *cj = postprocess_config_json_of(config);
             if (str_has_json_object_prefix(cj))
                 json_cfg = cj;
         }
         p->merged_vendor_json = std::move(json_cfg);
         // If both config_file and config_json are provided, treat config_json as a patch on top of the file.
-        {
-            const char *cj = nullptr;
-            if (config->type == HAL_POST_TYPE_DETECTION)
-                cj = config->config.detection.config_json;
-            else if (config->type == HAL_POST_TYPE_CLASSIFICATION)
-                cj = config->config.classification.config_json;
-            else if (config->type == HAL_POST_TYPE_CLIP)
-                cj = config->config.clip.config_json;
-            else if (config->type == HAL_POST_TYPE_SEGMENTATION)
-                cj = config->config.segmentation.config_json;
-            else if (config->type == HAL_POST_TYPE_KEYPOINT)
-                cj = config->config.keypoint.config_json;
-            else if (config->type == HAL_POST_TYPE_EMBEDDING)
-                cj = config->config.embedding.config_json;
-            else if (config->type == HAL_POST_TYPE_OCR_DETECTION)
-                cj = config->config.ocr_detection.config_json;
-            else if (config->type == HAL_POST_TYPE_OCR_RECOGNITION)
-                cj = config->config.ocr_recognition.config_json;
-            else if (config->type == HAL_POST_TYPE_DEPTH)
-                cj = config->config.depth.config_json;
-            merge_vendor_patch_json_best_effort(p, cj);
-        }
+        merge_vendor_patch_json_best_effort(p, postprocess_config_json_of(config));
         if (config->type == HAL_POST_TYPE_CLIP)
             merge_hal_clip_struct_into_json(p->merged_vendor_json, &config->config.clip);
         if (config->type == HAL_POST_TYPE_OCR_DETECTION &&
@@ -1167,8 +1474,8 @@ static HalPostprocessSession *hailo15_post_create(const HalPostprocessConfig *co
     if (config->type == HAL_POST_TYPE_OCR_DETECTION || config->type == HAL_POST_TYPE_OCR_RECOGNITION)
     {
         p->ocr_builtin = true;
-        const std::string bl = json_extract_string_best_effort(p->merged_vendor_json, "backend_lib_path");
-        const std::string bf = json_extract_string_best_effort(p->merged_vendor_json, "backend_function");
+        const std::string bl = json_extract_root_string(p->merged_vendor_json, "backend_lib_path");
+        const std::string bf = json_extract_root_string(p->merged_vendor_json, "backend_function");
         if (!bl.empty() && !bf.empty())
             p->ocr_builtin = false;
         if (config->type == HAL_POST_TYPE_OCR_RECOGNITION && p->ocr_builtin)
@@ -1260,9 +1567,12 @@ static HalPostprocessSession *hailo15_post_create(const HalPostprocessConfig *co
 
     if (!json_cfg.empty())
     {
-        p->plugin_lib_path = json_extract_string_value_best_effort(json_cfg, "backend_lib_path", "");
-        p->plugin_function = json_extract_string_value_best_effort(json_cfg, "backend_function", "");
-        p->plugin_config_path = json_extract_string_value_best_effort(json_cfg, "backend_config_path", "");
+        // Root-member-only: a loader key nested inside a user-supplied
+        // variant blob's ordinary values must not reach dlopen (review
+        // 2026-09-21 P0).
+        p->plugin_lib_path = json_extract_root_string_value(json_cfg, "backend_lib_path", "");
+        p->plugin_function = json_extract_root_string_value(json_cfg, "backend_function", "");
+        p->plugin_config_path = json_extract_root_string_value(json_cfg, "backend_config_path", "");
     }
     if ((p->plugin_lib_path.empty() || p->plugin_function.empty()) && !p->yolov8_pose_builtin &&
         p->cfg.type != HAL_POST_TYPE_DEPTH)
@@ -1271,9 +1581,9 @@ static HalPostprocessSession *hailo15_post_create(const HalPostprocessConfig *co
     // Ensure merged JSON patch wins over defaults (especially when only backend_function is provided).
     if (!json_cfg.empty())
     {
-        const std::string bl = json_extract_string_value_best_effort(json_cfg, "backend_lib_path", "");
-        const std::string bf = json_extract_string_value_best_effort(json_cfg, "backend_function", "");
-        const std::string bc = json_extract_string_value_best_effort(json_cfg, "backend_config_path", "");
+        const std::string bl = json_extract_root_string_value(json_cfg, "backend_lib_path", "");
+        const std::string bf = json_extract_root_string_value(json_cfg, "backend_function", "");
+        const std::string bc = json_extract_root_string_value(json_cfg, "backend_config_path", "");
         if (!bl.empty())
             p->plugin_lib_path = bl;
         if (!bf.empty())
@@ -2183,6 +2493,12 @@ static const char *hailo15_post_get_version(void)
     return "Hailo15 HAL-POSTPROCESS (vendor plugin)";
 }
 
+// Hot-update: merges numeric/bool/string content keys and prompts into the
+// live session's merged_vendor_json. It NEVER touches backend_lib_path /
+// backend_config_path (or backend_function) — those loader keys are read
+// only at create time and the plugin paths stay as resolved by create — so
+// this channel cannot re-open the loader-key vector the create-time guard
+// refuses (review 2026-09-24 P0 audit).
 static int hailo15_post_apply_config_json(HalPostprocessSession *session, const char *patch_json)
 {
     if (!session || !patch_json || !str_has_json_object_prefix(patch_json))

@@ -82,9 +82,9 @@ var monitorSummaryCmd = &cobra.Command{
 			} `json:"cpu"`
 			Memory struct {
 				Virtual struct {
-					Total         uint64  `json:"total"`
-					Used          uint64  `json:"used"`
-					UsagePercent  float64 `json:"usage_percent"`
+					Total        uint64  `json:"total"`
+					Used         uint64  `json:"used"`
+					UsagePercent float64 `json:"usage_percent"`
 				} `json:"virtual"`
 			} `json:"memory"`
 			Disk struct {
@@ -186,8 +186,8 @@ var monitorCPUCmd = &cobra.Command{
 // ============ monitor memory ============
 
 var monitorMemoryCmd = &cobra.Command{
-	Use:   "memory",
-	Short: "Show memory and swap usage",
+	Use:     "memory",
+	Short:   "Show memory and swap usage",
 	Aliases: []string{"mem"},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		resp, err := doAPIGet(monitorAPIBase + "/api/v1/monitor/memory")
@@ -292,8 +292,8 @@ var monitorDiskCmd = &cobra.Command{
 // ============ monitor network ============
 
 var monitorNetworkCmd = &cobra.Command{
-	Use:   "network",
-	Short: "Show network interface statistics",
+	Use:     "network",
+	Short:   "Show network interface statistics",
 	Aliases: []string{"net"},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		resp, err := doAPIGet(monitorAPIBase + "/api/v1/monitor/network")
@@ -307,11 +307,11 @@ var monitorNetworkCmd = &cobra.Command{
 
 		var net struct {
 			Interfaces []struct {
-				Name         string `json:"name"`
-				BytesSent    uint64 `json:"bytes_sent"`
-				BytesRecv    uint64 `json:"bytes_recv"`
-				PacketsSent  uint64 `json:"packets_sent"`
-				PacketsRecv  uint64 `json:"packets_recv"`
+				Name        string `json:"name"`
+				BytesSent   uint64 `json:"bytes_sent"`
+				BytesRecv   uint64 `json:"bytes_recv"`
+				PacketsSent uint64 `json:"packets_sent"`
+				PacketsRecv uint64 `json:"packets_recv"`
 			} `json:"interfaces"`
 		}
 

@@ -1,0 +1,624 @@
+{
+  "generated_from": "platform/postprocess/registry.go",
+  "runtime_types": [
+    "detection",
+    "yolo",
+    "landmarks",
+    "keypoint",
+    "segmentation",
+    "classification",
+    "clip",
+    "embedding",
+    "depth",
+    "monocular_depth",
+    "scdepth",
+    "ocr_detection",
+    "ocr_recognition"
+  ],
+  "detection_variant_keys": [
+    "backend_function",
+    "iou_threshold",
+    "detection_threshold",
+    "output_activation",
+    "label_offset",
+    "max_boxes",
+    "labels"
+  ],
+  "keypoint_variant_keys": [
+    "native_yolov8_pose",
+    "score_threshold",
+    "confidence_threshold",
+    "keypoint_threshold",
+    "iou_threshold",
+    "num_keypoints",
+    "yolov8_pose_network_width",
+    "yolov8_pose_network_height"
+  ],
+  "forbidden_variant_keys": [
+    "backend_lib_path",
+    "backend_config_path"
+  ],
+  "aliases": [
+    {
+      "canonical": "confidence_threshold",
+      "aliases": [
+        "detection_threshold"
+      ]
+    },
+    {
+      "canonical": "max_boxes",
+      "aliases": [
+        "max_detections"
+      ]
+    }
+  ],
+  "decoders": [
+    {
+      "model_type": "detection",
+      "decoder": "hailo_yolov8n",
+      "label": "YOLOv8n 384x640 (default)",
+      "select_value": "hailo_yolov8n_384_640",
+      "basename": "hailo_yolov8n_384_640",
+      "selection": "backend_function",
+      "params": [
+        {
+          "key": "backend_function",
+          "type": "string",
+          "default": "hailo_yolov8n",
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "labels",
+          "type": "string_list",
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "detection_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.25,
+          "mutability": "hot_update",
+          "effect": "consumed"
+        },
+        {
+          "key": "max_boxes",
+          "type": "integer",
+          "min": 1,
+          "max": 999,
+          "default": 64,
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "iou_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.45,
+          "mutability": "hot_update",
+          "effect": "advisory"
+        },
+        {
+          "key": "output_activation",
+          "type": "string",
+          "default": "none",
+          "mutability": "create_only",
+          "effect": "advisory"
+        },
+        {
+          "key": "label_offset",
+          "type": "integer",
+          "default": 1,
+          "mutability": "create_only",
+          "effect": "advisory"
+        }
+      ],
+      "hardcoded": [
+        {
+          "key": "output_tensor",
+          "value": "hailo_yolov8n_384_640/yolov8_nms_postprocess"
+        },
+        {
+          "key": "labels",
+          "value": "COCO 80",
+          "note": "compiled-in table; the labels key only relabels for consumers"
+        },
+        {
+          "key": "filter_by_score",
+          "value": "true"
+        }
+      ]
+    },
+    {
+      "model_type": "detection",
+      "decoder": "hailo_yolov8s",
+      "label": "YOLOv8s 384x640",
+      "select_value": "hailo_yolov8s_384_640",
+      "basename": "hailo_yolov8s_384_640",
+      "selection": "backend_function",
+      "params": [
+        {
+          "key": "backend_function",
+          "type": "string",
+          "default": "hailo_yolov8s",
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "labels",
+          "type": "string_list",
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "detection_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.25,
+          "mutability": "hot_update",
+          "effect": "consumed"
+        },
+        {
+          "key": "max_boxes",
+          "type": "integer",
+          "min": 1,
+          "max": 999,
+          "default": 64,
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "iou_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.45,
+          "mutability": "hot_update",
+          "effect": "advisory"
+        },
+        {
+          "key": "output_activation",
+          "type": "string",
+          "default": "none",
+          "mutability": "create_only",
+          "effect": "advisory"
+        },
+        {
+          "key": "label_offset",
+          "type": "integer",
+          "default": 1,
+          "mutability": "create_only",
+          "effect": "advisory"
+        }
+      ],
+      "hardcoded": [
+        {
+          "key": "output_tensor",
+          "value": "hailo_yolov8s_384_640/yolov8_nms_postprocess"
+        },
+        {
+          "key": "labels",
+          "value": "COCO 80",
+          "note": "compiled-in table; the labels key only relabels for consumers"
+        },
+        {
+          "key": "filter_by_score",
+          "value": "true"
+        }
+      ]
+    },
+    {
+      "model_type": "detection",
+      "decoder": "hailo_yolov8m",
+      "label": "YOLOv8m 384x640",
+      "select_value": "hailo_yolov8m_384_640",
+      "basename": "hailo_yolov8m_384_640",
+      "selection": "backend_function",
+      "params": [
+        {
+          "key": "backend_function",
+          "type": "string",
+          "default": "hailo_yolov8m",
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "labels",
+          "type": "string_list",
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "detection_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.25,
+          "mutability": "hot_update",
+          "effect": "consumed"
+        },
+        {
+          "key": "max_boxes",
+          "type": "integer",
+          "min": 1,
+          "max": 999,
+          "default": 64,
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "iou_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.45,
+          "mutability": "hot_update",
+          "effect": "advisory"
+        },
+        {
+          "key": "output_activation",
+          "type": "string",
+          "default": "none",
+          "mutability": "create_only",
+          "effect": "advisory"
+        },
+        {
+          "key": "label_offset",
+          "type": "integer",
+          "default": 1,
+          "mutability": "create_only",
+          "effect": "advisory"
+        }
+      ],
+      "hardcoded": [
+        {
+          "key": "output_tensor",
+          "value": "hailo_yolov8m_384_640/yolov8_nms_postprocess"
+        },
+        {
+          "key": "labels",
+          "value": "COCO 80",
+          "note": "compiled-in table; the labels key only relabels for consumers"
+        },
+        {
+          "key": "filter_by_score",
+          "value": "true"
+        }
+      ]
+    },
+    {
+      "model_type": "detection",
+      "decoder": "yolov5m_vehicles",
+      "label": "YOLOv5m Vehicles 1920x1080",
+      "select_value": "yolov5m_vehicles",
+      "basename": "yolov5m_vehicles",
+      "selection": "backend_function",
+      "custom": true,
+      "params": [
+        {
+          "key": "backend_function",
+          "type": "string",
+          "default": "yolov5m_vehicles",
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "labels",
+          "type": "string_list",
+          "mutability": "create_only",
+          "effect": "advisory"
+        },
+        {
+          "key": "detection_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.25,
+          "mutability": "hot_update",
+          "effect": "advisory"
+        },
+        {
+          "key": "max_boxes",
+          "type": "integer",
+          "min": 1,
+          "max": 999,
+          "default": 64,
+          "mutability": "create_only",
+          "effect": "advisory"
+        },
+        {
+          "key": "iou_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.45,
+          "mutability": "hot_update",
+          "effect": "advisory"
+        },
+        {
+          "key": "output_activation",
+          "type": "string",
+          "default": "none",
+          "mutability": "create_only",
+          "effect": "advisory"
+        },
+        {
+          "key": "label_offset",
+          "type": "integer",
+          "default": 1,
+          "mutability": "create_only",
+          "effect": "advisory"
+        }
+      ],
+      "hardcoded": [
+        {
+          "key": "output_tensor",
+          "value": "yolov5m_vehicles/yolov5_nms_postprocess"
+        },
+        {
+          "key": "labels",
+          "value": "\"car\" (single class, baked)"
+        }
+      ]
+    },
+    {
+      "model_type": "keypoint",
+      "decoder": "facial_landmarks_nv12",
+      "label": "Face Landmarks (default)",
+      "select_value": "facial_landmarks",
+      "hardcoded": [
+        {
+          "key": "num_keypoints",
+          "value": "468"
+        },
+        {
+          "key": "presence_threshold",
+          "value": "0.5"
+        },
+        {
+          "key": "input_normalization",
+          "value": "192x192"
+        },
+        {
+          "key": "output_tensors",
+          "value": "face_landmarks_lite/conv22, face_landmarks_lite/conv25"
+        }
+      ]
+    },
+    {
+      "model_type": "keypoint",
+      "decoder": "native_yolov8_pose",
+      "label": "YOLOv8 Pose (COCO-17)",
+      "select_value": "yolov8_pose",
+      "selection": "flag:native_yolov8_pose",
+      "params": [
+        {
+          "key": "native_yolov8_pose",
+          "type": "boolean",
+          "default": true,
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "score_threshold",
+          "type": "number",
+          "min": 0.01,
+          "max": 1,
+          "default": 0.25,
+          "mutability": "hot_update",
+          "effect": "consumed",
+          "note": "takes precedence over confidence_threshold; \u003c1e-6 silently falls back to 0.6 in the decoder"
+        },
+        {
+          "key": "keypoint_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.25,
+          "mutability": "hot_update",
+          "effect": "consumed"
+        },
+        {
+          "key": "confidence_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.25,
+          "mutability": "hot_update",
+          "effect": "consumed",
+          "note": "only used when score_threshold is absent"
+        },
+        {
+          "key": "iou_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.7,
+          "mutability": "hot_update",
+          "effect": "consumed",
+          "note": "adopted only when 0 \u003c v \u003c 1"
+        },
+        {
+          "key": "yolov8_pose_network_width",
+          "type": "integer",
+          "min": 16,
+          "max": 4096,
+          "default": 640,
+          "mutability": "create_only",
+          "effect": "consumed",
+          "note": "read once at create; absent from both hot-update key tables"
+        },
+        {
+          "key": "yolov8_pose_network_height",
+          "type": "integer",
+          "min": 16,
+          "max": 4096,
+          "default": 640,
+          "mutability": "create_only",
+          "effect": "consumed",
+          "note": "read once at create; absent from both hot-update key tables"
+        },
+        {
+          "key": "num_keypoints",
+          "type": "number",
+          "mutability": "hot_update",
+          "effect": "advisory",
+          "note": "decoder hardcodes COCO-17; this key changes nothing"
+        }
+      ],
+      "hardcoded": [
+        {
+          "key": "num_keypoints",
+          "value": "17 (COCO-17 topology)"
+        }
+      ]
+    },
+    {
+      "model_type": "segmentation",
+      "decoder": "linknet",
+      "label": "LinkNet Segmentation",
+      "params": [
+        {
+          "key": "threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.25,
+          "mutability": "hot_update",
+          "effect": "advisory"
+        }
+      ],
+      "hardcoded": [
+        {
+          "key": "mask_threshold",
+          "value": "0.5"
+        },
+        {
+          "key": "output_layout",
+          "value": "single channel, one class per output tensor"
+        }
+      ]
+    },
+    {
+      "model_type": "clip",
+      "decoder": "clip_zeroshot",
+      "label": "CLIP Zero-Shot Classification",
+      "params": [
+        {
+          "key": "score_threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "mutability": "hot_update",
+          "effect": "advisory"
+        },
+        {
+          "key": "top_k",
+          "type": "number",
+          "min": 1,
+          "max": 100,
+          "default": 5,
+          "mutability": "hot_update",
+          "effect": "advisory"
+        }
+      ],
+      "hardcoded": [
+        {
+          "key": "logit_scale",
+          "value": "100"
+        },
+        {
+          "key": "prompt_prefix",
+          "value": "\"A photo of \""
+        },
+        {
+          "key": "top_k",
+          "value": "not implemented (returns all scores)"
+        },
+        {
+          "key": "prompts_channel",
+          "value": "ZeroMQ runtime messages, not the config file"
+        }
+      ]
+    },
+    {
+      "model_type": "embedding",
+      "decoder": "clipgen",
+      "label": "CLIP Image Embedding",
+      "hardcoded": [
+        {
+          "key": "embedding_dims",
+          "value": "640 / 512 / 768 (per model)"
+        },
+        {
+          "key": "output_layout",
+          "value": "single tensor, 1-D assumed"
+        }
+      ]
+    },
+    {
+      "model_type": "ocr_detection",
+      "decoder": "paddle_det",
+      "label": "PaddleOCR Text Detection",
+      "params": [
+        {
+          "key": "threshold",
+          "type": "number",
+          "min": 0,
+          "max": 1,
+          "default": 0.25,
+          "mutability": "hot_update",
+          "effect": "advisory"
+        },
+        {
+          "key": "max_detections",
+          "type": "number",
+          "min": 1,
+          "max": 999,
+          "default": 64,
+          "mutability": "create_only",
+          "effect": "advisory"
+        }
+      ]
+    },
+    {
+      "model_type": "ocr_recognition",
+      "decoder": "paddle_rec",
+      "label": "PaddleOCR Text Recognition",
+      "hardcoded": [
+        {
+          "key": "charset",
+          "value": "compiled-in table"
+        }
+      ]
+    },
+    {
+      "model_type": "depth",
+      "decoder": "monocular_depth",
+      "label": "Monocular Depth"
+    },
+    {
+      "model_type": "scdepth",
+      "decoder": "scdepth",
+      "label": "SCDepth",
+      "params": [
+        {
+          "key": "scdepth_output_name",
+          "type": "string",
+          "mutability": "create_only",
+          "effect": "consumed"
+        },
+        {
+          "key": "depth_float32",
+          "type": "boolean",
+          "mutability": "create_only",
+          "effect": "consumed"
+        }
+      ]
+    }
+  ]
+}

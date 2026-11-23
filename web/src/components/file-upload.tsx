@@ -82,10 +82,15 @@ export default function FileUpload({
         const error = rejectedFiles[0].errors[0];
         if (error.code === 'file-too-large') {
           toast.error(
-            `文件过大，最大允许 ${maxSize ? `${(maxSize / 1024 / 1024).toFixed(1)}MB` : '未限制'}`
+            t('sys.file_upload.file_too_large', {
+              limit: maxSize
+                ? `${(maxSize / 1024 / 1024).toFixed(1)}MB`
+                : t('sys.file_upload.no_limit', '未限制'),
+              defaultValue: '文件过大，最大允许 {{limit}}',
+            })
           );
         } else if (error.code === 'file-invalid-type') {
-          toast.error('文件类型不支持');
+          toast.error(t('sys.file_upload.file_type_unsupported', '文件类型不支持'));
         } else {
           toast.error(error.message);
         }
@@ -111,7 +116,7 @@ export default function FileUpload({
         }
       }
     },
-    [single, onChange, onUpload, maxSize]
+    [single, onChange, onUpload, maxSize, t]
   );
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -272,10 +277,11 @@ interface FileUploadButtonProps extends Omit<FileUploadProps, 'children'> {
 }
 
 export function FileUploadButton({
-  buttonText = '选择文件',
+  buttonText,
   buttonClassName,
   ...props
 }: FileUploadButtonProps) {
+  const { t } = useTranslation();
   return (
     <FileUpload {...props}>
       <button
@@ -285,7 +291,7 @@ export function FileUploadButton({
           buttonClassName
         )}
       >
-        {buttonText}
+        {buttonText || t('sys.file_upload.select_file', '选择文件')}
       </button>
     </FileUpload>
   );
@@ -299,6 +305,7 @@ interface ImageUploadProps extends FileUploadProps {
 }
 
 export function ImageUpload({ previewUrl, ...props }: ImageUploadProps) {
+  const { t } = useTranslation();
   const [preview, setPreview] = useState<string | null>(previewUrl || null);
 
   const handleChange = (files: File[]) => {
@@ -331,9 +338,11 @@ export function ImageUpload({ previewUrl, ...props }: ImageUploadProps) {
         ) : (
           <>
             <UploadCloud className="w-12 h-12 mb-3 text-muted-foreground" />
-            <p className="text-muted-foreground mb-1">点击或拖拽上传图片</p>
+            <p className="text-muted-foreground mb-1">
+              {t('sys.file_upload.upload_image_hint', '点击或拖拽上传图片')}
+            </p>
             <p className="text-sm text-muted-foreground">
-              支持 PNG, JPG, GIF, WebP
+              {t('sys.file_upload.image_formats_hint', '支持 PNG, JPG, GIF, WebP')}
             </p>
           </>
         )}

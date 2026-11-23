@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { AlertTriangle, Package, Plus, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
@@ -14,6 +14,8 @@ import {
 } from '@/components/ui/select';
 import type { WizardConfig, WizardModelMapping } from '@/services/types';
 import { isValidModelAlias } from '@/pages/apps/lib/importFlow';
+import type { InstallIssue } from '@/pages/apps/lib/importFlow';
+import InlineValidation from './InlineValidation';
 
 /** Select value that switches a row into custom (free-id) mode. */
 const CUSTOM_MODEL_VALUE = '__custom__';
@@ -22,6 +24,7 @@ export interface ModelsSectionProps {
   config: WizardConfig;
   onChange: (next: WizardConfig) => void;
   availableModels: Array<{ model_id: string; name?: string }>;
+  issues: InstallIssue[];
 }
 
 /**
@@ -43,6 +46,7 @@ export default function ModelsSection({
   config,
   onChange,
   availableModels,
+  issues,
 }: ModelsSectionProps) {
   const { t } = useTranslation();
   const models = config.models ?? {};
@@ -53,6 +57,30 @@ export default function ModelsSection({
    * unknown ids enter custom mode without needing an entry here.
    */
   const [customDrafts, setCustomDrafts] = useState<string[]>([]);
+  // A model alias is the map key persisted to app.yaml, so editing it changes
+  // on every keystroke. It must not also be the React key: doing so remounts
+  // the whole row after the first character and drops the input focus. Keep a
+  // UI-only row identity and move it together with every alias rename.
+  const rowKeysRef = useRef(new Map<string, string>());
+  const nextRowKeyRef = useRef(0);
+
+  const fallbackRowKey = (alias: string) => `model-row-existing:${alias}`;
+
+  const getRowKey = (alias: string) => rowKeysRef.current.get(alias) ?? fallbackRowKey(alias);
+
+  const ensureNewRowKey = (alias: string) => {
+    if (!rowKeysRef.current.has(alias)) {
+      nextRowKeyRef.current += 1;
+      rowKeysRef.current.set(alias, `model-row-new:${nextRowKeyRef.current}`);
+    }
+  };
+
+  const moveRowKey = (from: string, to: string) => {
+    if (from === to) return;
+    const key = rowKeysRef.current.get(from) ?? fallbackRowKey(from);
+    rowKeysRef.current.delete(from);
+    rowKeysRef.current.set(to, key);
+  };
 
   const rebuild = (
     alias: string,
@@ -63,6 +91,7 @@ export default function ModelsSection({
     for (const [a, mapping] of entries) {
       next[a === alias ? aliasTo : a] = a === alias ? fn(mapping) : mapping;
     }
+    moveRowKey(alias, aliasTo);
     onChange({ ...config, models: next });
   };
 
@@ -71,6 +100,7 @@ export default function ModelsSection({
    * config state instead of component-local state. */
   const addDependency = () => {
     if ('' in models) return;
+    ensureNewRowKey('');
     onChange({
       ...config,
       models: { ...models, '': { id: '' } },
@@ -107,6 +137,7 @@ export default function ModelsSection({
 
   const removeDependency = (alias: string) => {
     setCustomDrafts(drafts => drafts.filter(a => a !== alias));
+    rowKeysRef.current.delete(alias);
     const next = Object.fromEntries(entries.filter(([a]) => a !== alias));
     onChange({
       ...config,
@@ -159,7 +190,7 @@ export default function ModelsSection({
             const missingOptional = isCustom && !hasPath && !mapping.required;
             return (
               <div
-                key={alias || '__draft__'}
+                key={getRowKey(alias)}
                 className="rounded-md border border-border/60 p-2.5 space-y-2"
               >
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -309,6 +340,7 @@ export default function ModelsSection({
             </p>
           )}
         </div>
+        <InlineValidation issues={issues} field="models" />
       </div>
 
       {/* Max QPS */}
@@ -394,6 +426,7 @@ export default function ModelsSection({
             'Allow app to discover and register models at runtime'
           )}
         </p>
+        <InlineValidation issues={issues} field="permissions.inference" />
       </div>
     </div>
   );

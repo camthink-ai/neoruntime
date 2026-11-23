@@ -351,7 +351,9 @@ message SetIrCutResponse {
 
 // LED control
 message SetLedDutyRequest {
-  uint32 led_id = 1;      // 0=white light, 1=IR LED
+  // MCU LED map (bsp_led_t): 0=IR near, 1=IR far, 2=white2 (dedicated
+  // TIM3_CH2), 3=white1 / 4=ir1 (shared TIM3_CH1).
+  uint32 led_id = 1;
   uint32 duty_percent = 2; // 0-100
 }
 

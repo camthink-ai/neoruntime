@@ -63,8 +63,33 @@ typedef enum {
      * SCM_RIGHTS. The caller MUST release with DSP_LOOKUP_RELEASE when done
      * reading (typically right after repacking into its own input buffer). */
     FD_PUB_MSG_DSP_LOOKUP       = 12,   /* client → server */
-    FD_PUB_MSG_DSP_LOOKUP_RESP  = 13,   /* server → client, fds attached */
-    FD_PUB_MSG_DSP_LOOKUP_RELEASE = 14, /* client → server */
+    FD_PUB_MSG_DSP_LOOKUP_RESP   = 13,   /* server → client, fds attached */
+    FD_PUB_MSG_DSP_LOOKUP_RELEASE = 14,  /* client → server */
+    /* Hardware-in-use declaration for a held frame. A client that bound a
+     * frame's dma-buf fds to an async device job (NPU inference via
+     * bind_dma_frame, or any direct-DMA consumer) MUST send this and wait
+     * for the OK reply BEFORE submitting the job, and keep the frame
+     * un-RELEASEd until the job completes: the router watchdog exempts
+     * in-use frames from the normal frame timeout (the underlying buffer
+     * must not be returned to the pool and overwritten while the device
+     * still DMAs from it — reclaiming mid-flight is undefined behavior per
+     * the HailoRT bindings contract) and instead enforces a longer in-use
+     * hard cap against buggy clients.
+     * IMPORTANT: this message carries a synchronous OK/ERROR reply, so it
+     * MUST be sent on a dedicated control connection — never on a frame
+     * subscription connection, whose recv loop only accepts FRAME
+     * messages (a reply there desyncs the byte stream and disconnects it).
+     * The frame may be held by ANY connection of the declaring client
+     * process (e.g. its stream subscription connection) — the daemon
+     * resolves the frame across its clients. Declarations are reference
+     * counted per frame: each accepted FRAME_IN_USE must be matched by the
+     * declaring side eventually RELEASE-ing that frame (or disconnecting),
+     * which drops the reference. ERROR (-1) = unknown/untracked frame
+     * (already released or force-reclaimed), ERROR (-2) = declarer's
+     * in-use cap exceeded; in both cases NO protection was granted and the
+     * caller must not submit DMA on that frame. */
+    FD_PUB_MSG_FRAME_IN_USE      = 15,   /* client → server (control conn),
+                                            server → client OK/ERROR reply */
 } FdPubMsgType;
 
 /* ========== Message header (all messages start with this) ========== */
@@ -215,6 +240,16 @@ typedef struct {
     FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_DSP_LOOKUP_RELEASE */
     uint64_t buffer_id;     /* id from the FdPubDspLookupMsg */
 } FdPubDspLookupReleaseMsg;
+
+/* ========== Client → Server: hardware-in-use declaration ====================
+ * Semantics: see FD_PUB_MSG_FRAME_IN_USE above. frame_id must identify a
+ * frame still held (un-RELEASEd) by any of the declaring process's
+ * connections. Synchronous FdPubResponseMsg reply: code 0 = protection
+ * granted, -1 = unknown/untracked frame, -2 = declarer cap exceeded. */
+typedef struct {
+    FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_FRAME_IN_USE */
+    uint64_t frame_id;      /* Frame ID from FdPubFrameMsg */
+} FdPubFrameInUseMsg;
 
 /* ========== Helper: Send message with optional FDs via SCM_RIGHTS ==========
  * General form: the ancillary buffer is sized for `fd_capacity` fds (must

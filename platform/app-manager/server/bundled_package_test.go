@@ -336,3 +336,80 @@ func TestBundledPackageHEFHash(t *testing.T) {
 		t.Fatal("bundledPackageHEFHash() expected error for corrupted package")
 	}
 }
+
+// Keypoint packages join detection in the load-time composition chain: the
+// pose profile synthesizes the create-time decoder-flag blob (network dims
+// flow from PackageMeta.Network into the create-only size keys), and the
+// facial default keeps the exact legacy empty-variant registration.
+func TestUnpackBundledPackageKeypointPose(t *testing.T) {
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "model.bin")
+	meta := &storage.PackageMeta{
+		ModelID:    "pose_pkg",
+		ModelType:  "keypoint",
+		OutputMode: "platform",
+		Config:     json.RawMessage(`{"postprocess_profile":"yolov8_pose","threshold":0.4,"keypoint_threshold":0.55}`),
+		HEF:        storage.PackageHEF{Filename: "yolov8s_pose.hef"},
+		Network:    storage.PackageNetwork{InputWidth: 640, InputHeight: 640},
+	}
+	writeTestPackage(t, binPath, meta, testHEFBytes())
+
+	reg, err := unpackBundledPackage(binPath, dir, "pose_pkg")
+	if err != nil {
+		t.Fatalf("unpackBundledPackage() error: %v", err)
+	}
+	if reg.ModelType != "keypoint" {
+		t.Fatalf("ModelType = %q, want keypoint", reg.ModelType)
+	}
+	// No basename contract for keypoint: the package's own filename survives.
+	if reg.HEF != "yolov8s_pose.hef" {
+		t.Errorf("HEF = %q, want package filename (keypoint stages no profile basename)", reg.HEF)
+	}
+
+	var variant map[string]interface{}
+	if err := json.Unmarshal([]byte(reg.ModelVariant), &variant); err != nil {
+		t.Fatalf("ModelVariant is not JSON: %v (%q)", err, reg.ModelVariant)
+	}
+	if variant["native_yolov8_pose"] != true {
+		t.Errorf("native_yolov8_pose = %v, want true (create-time flag must reach the runtime)", variant["native_yolov8_pose"])
+	}
+	if v, _ := variant["score_threshold"].(float64); v != 0.4 {
+		t.Errorf("score_threshold = %v, want 0.4 (config threshold lifted)", variant["score_threshold"])
+	}
+	if v, _ := variant["keypoint_threshold"].(float64); v != 0.55 {
+		t.Errorf("keypoint_threshold = %v, want 0.55", variant["keypoint_threshold"])
+	}
+	if v, _ := variant["yolov8_pose_network_width"].(float64); v != 640 {
+		t.Errorf("yolov8_pose_network_width = %v, want 640 (from PackageMeta.Network)", variant["yolov8_pose_network_width"])
+	}
+	if _, ok := variant["num_keypoints"]; ok {
+		t.Errorf("num_keypoints leaked into composed blob: %v", variant["num_keypoints"])
+	}
+}
+
+func TestUnpackBundledPackageKeypointFacialDefault(t *testing.T) {
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "model.bin")
+	meta := &storage.PackageMeta{
+		ModelID:    "face_pkg",
+		ModelType:  "landmarks", // alias spelling must resolve to the keypoint branch
+		OutputMode: "platform",
+		HEF:        storage.PackageHEF{Filename: "face_landmarks_lite.hef"},
+	}
+	writeTestPackage(t, binPath, meta, testHEFBytes())
+
+	reg, err := unpackBundledPackage(binPath, dir, "face_pkg")
+	if err != nil {
+		t.Fatalf("unpackBundledPackage() error: %v", err)
+	}
+	// unpack canonicalizes the alias spelling before composing (unlike
+	// platform rows, which keep their stored spelling).
+	if reg.ModelType != "keypoint" {
+		t.Fatalf("ModelType = %q, want canonicalized keypoint", reg.ModelType)
+	}
+	// Missing profile == facial default == empty variant: byte-identical to
+	// every keypoint registration before profiles existed.
+	if reg.ModelVariant != "" {
+		t.Errorf("ModelVariant = %q, want empty (facial default)", reg.ModelVariant)
+	}
+}

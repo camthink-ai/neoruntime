@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	"gopkg.in/yaml.v3"
 
+	"aipc/platform/app-manager/manifest"
 	apppb "aipc/platform/app-manager/proto"
 	"aipc/platform/common/constants"
 )
@@ -51,6 +52,10 @@ func validManifestYAML(t *testing.T, id string) []byte {
 }
 
 func postMultipart(t *testing.T, url, filename string, content []byte, h func(*gin.Context)) *httptest.ResponseRecorder {
+	return postMultipartFields(t, url, filename, content, nil, h)
+}
+
+func postMultipartFields(t *testing.T, url, filename string, content []byte, fields map[string]string, h func(*gin.Context)) *httptest.ResponseRecorder {
 	t.Helper()
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
@@ -60,6 +65,11 @@ func postMultipart(t *testing.T, url, filename string, content []byte, h func(*g
 	}
 	if _, err := fw.Write(content); err != nil {
 		t.Fatalf("write form file: %v", err)
+	}
+	for key, value := range fields {
+		if err := mw.WriteField(key, value); err != nil {
+			t.Fatalf("write form field %s: %v", key, err)
+		}
 	}
 	if err := mw.Close(); err != nil {
 		t.Fatalf("close multipart writer: %v", err)
@@ -223,5 +233,103 @@ func TestUploadTokenUnique(t *testing.T) {
 			t.Fatalf("uploadToken repeated %q — concurrent uploads would truncate each other", tok)
 		}
 		seen[tok] = true
+	}
+}
+
+func TestValidateManifestEditIdentity(t *testing.T) {
+	guardTestRoot(t)
+	dir, err := newAppStagingDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	basePath := filepath.Join(dir, "app.yaml")
+	baseData := validManifestYAML(t, "package-app")
+	if err := os.WriteFile(basePath, baseData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	base, err := manifest.ParseManifest(baseData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateManifestEditIdentity(basePath, base); err != nil {
+		t.Fatalf("unchanged manifest rejected: %v", err)
+	}
+
+	renamed := *base
+	renamed.Metadata.ID = "renamed-app"
+	if err := validateManifestEditIdentity(basePath, &renamed); err == nil || !strings.Contains(err.Error(), "metadata.id is immutable") {
+		t.Fatalf("renamed id error = %v, want immutable rejection", err)
+	}
+
+	changedImage := *base
+	changedImage.Spec.Image = "docker.io/library/busybox:latest"
+	if err := validateManifestEditIdentity(basePath, &changedImage); err == nil || !strings.Contains(err.Error(), "spec.image is immutable") {
+		t.Fatalf("changed image error = %v, want immutable rejection", err)
+	}
+}
+
+func TestUploadManifestProtectsNeoappIdentity(t *testing.T) {
+	guardTestRoot(t)
+	dir, err := newAppStagingDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	basePath := filepath.Join(dir, "app.yaml")
+	baseData := validManifestYAML(t, "package-app")
+	if err := os.WriteFile(basePath, baseData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	base, err := manifest.ParseManifest(baseData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name       string
+		edit       func(*manifest.AppManifest)
+		wantCode   int
+		wantDetail string
+	}{
+		{
+			name:       "id changed",
+			edit:       func(m *manifest.AppManifest) { m.Metadata.ID = "other-app" },
+			wantCode:   CodeInvalidRequest,
+			wantDetail: "metadata.id is immutable",
+		},
+		{
+			name:       "image changed",
+			edit:       func(m *manifest.AppManifest) { m.Spec.Image = "docker.io/library/busybox:latest" },
+			wantCode:   CodeInvalidRequest,
+			wantDetail: "spec.image is immutable",
+		},
+		{
+			name:     "editable metadata changed",
+			edit:     func(m *manifest.AppManifest) { m.Metadata.Name = "Edited Name" },
+			wantCode: CodeSuccess,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			edited := *base
+			tt.edit(&edited)
+			data, err := yaml.Marshal(&edited)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := postMultipartFields(
+				t,
+				"/api/v1/apps/upload-manifest",
+				"app.yaml",
+				data,
+				map[string]string{"base_manifest_path": basePath},
+				func(c *gin.Context) { (&APIHandlers{}).UploadManifest(c) },
+			)
+			code, detail, _ := decodeUploadResponse(t, w)
+			if code != tt.wantCode || !strings.Contains(detail, tt.wantDetail) {
+				t.Fatalf("code=%d detail=%q, want code=%d detail containing %q", code, detail, tt.wantCode, tt.wantDetail)
+			}
+		})
 	}
 }

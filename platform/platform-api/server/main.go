@@ -576,6 +576,13 @@ func (s *PlatformAPIServer) setupRoutes() {
 	api.POST("/system/os-upgrade/cancel", osUpgradeHandler.Cancel)
 	api.DELETE("/system/os-upgrade/package", osUpgradeHandler.DeletePackage)
 
+	// Installed-app compatibility verdict for the global web banner. Public
+	// for the same reason as the status endpoints above: the incompatibility
+	// it reports is exactly the state in which the operator must reach the
+	// login page and the rescue channel without a live session, and platform-
+	// api restarts during upgrades wipe in-memory tokens.
+	s.engine.GET("/api/v1/system/app-compat", apiHandlers.AppCompatStatus)
+
 	s.engine.GET("/api/v1/system/health", apiHandlers.HealthCheck) // Health check doesn't need auth
 
 	// Time routes

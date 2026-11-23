@@ -58,7 +58,7 @@ If no usable vendor classification postprocess is available (common on small roo
 
 - Use `--preprocess-color nv12_to_bgr` if the model was trained for BGR order.
 - For NV12 two-plane inputs (Y + UV), the example feeds NV12 directly; `--preprocess-color` does not apply on that path.
-- Optional `--post-file` / `--post-json` can still point at a vendor `backend_lib_path` / `backend_function` when you have a matching `.so` on the device (see `data/classification_wrapper.example.json` as a template).
+- Optional `--post-file` can still point at a vendor `backend_lib_path` / `backend_function` when you have a matching `.so` on the device (see `data/classification_wrapper.example.json` as a template). The inline `--post-json` no longer accepts these loader keys — HAL refuses a create whose inline JSON carries `backend_lib_path` / `backend_config_path` (loader selection is platform-controlled); use `--post-file` for custom plugin routing.
 
 ### Deploy note (OSD text on the encoded stream)
 

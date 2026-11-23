@@ -5,7 +5,12 @@ import PCMenu from './pc/menu';
 import MobileMenuDrawer from './mobile/menu-drawer';
 import MobileHeader from './mobile/mobile-header';
 
-import { enableAuth, hasValidAuthToken, isLoginPath, useAuthStore } from '@/store/auth';
+import {
+  enableAuth,
+  hasValidAuthToken,
+  isLoginPath,
+  useAuthStore,
+} from '@/store/auth';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { cn } from '@/lib/utils';
 import Loading from '@/components/loading';
@@ -27,7 +32,7 @@ export default function Layout() {
   useEffect(() => {
     if (navigation.state === 'idle') setBootstrapped(true);
   }, [navigation.state]);
-  const showInitialLoading =    !bootstrapped && navigation.state === 'loading';
+  const showInitialLoading = !bootstrapped && navigation.state === 'loading';
 
   if (enableAuth && !isLoginPage && !hasValidAuthToken()) {
     return <Navigate to="/login" replace />;

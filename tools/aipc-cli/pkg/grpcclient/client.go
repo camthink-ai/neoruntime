@@ -11,8 +11,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	apppb "aipc/platform/app-manager/proto"
 	inferencepb "aipc/platform/ai-runtime/proto"
+	apppb "aipc/platform/app-manager/proto"
 	devicepb "aipc/platform/device-control/proto"
 	eventpb "aipc/platform/event-bus/proto"
 )

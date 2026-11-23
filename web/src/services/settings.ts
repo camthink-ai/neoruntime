@@ -87,6 +87,7 @@ export interface ISPConfig {
   exposure_time_us: number;
   gain: number;
   wdr_value: number;
+  noise_reduction: number;
   powerline_freq: 0 | 1 | 2;
   awb_index: number;
 }

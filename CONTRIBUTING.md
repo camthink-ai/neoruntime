@@ -82,7 +82,9 @@ Allowed types:
 
 Rules:
 
-- Keep the subject lowercase, imperative, and under 72 characters.
+- Start the subject with a lowercase imperative word and keep it under 72
+  characters. Embedded acronyms (ISP, LED, MCU, ...) are allowed; only
+  fully-capitalized subjects are rejected.
 - Include a body for functional changes. Explain what changed, why it changed,
   and any compatibility, deployment, migration, or verification notes.
 - Keep commits reviewable. A commit should represent one coherent change.

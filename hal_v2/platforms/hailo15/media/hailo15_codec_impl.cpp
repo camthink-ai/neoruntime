@@ -363,33 +363,15 @@ static int hw_codec_init(const HalCodecConfig *config, void **codec_ctx_return)
         return hailo15_ml_err(enc_exp.error());
     }
     MediaLibraryEncoderPtr enc = enc_exp.value();
+    /* Attaches the profile (incl. OSD/privacy_mask sections merged into `json` by
+     * resolve_hw_encoder_json) to every encoded buffer — this is how the declarative
+     * OSD/privacy-mask blenders of medialib 1.13 find their config. Must be set before
+     * set_config(). */
     enc->add_config_attacher(true);
     media_library_return ret = enc->set_config(json);
     if (ret != MEDIA_LIBRARY_SUCCESS)
     {
         return hailo15_ml_err(ret);
-    }
-    if (ext && (ext->osd_config_json || ext->osd_config_path))
-    {
-        std::string osd_json = "{}";
-        if (ext->osd_config_json && ext->osd_config_json[0])
-        {
-            osd_json = ext->osd_config_json;
-        }
-        else if (ext->osd_config_path)
-        {
-            auto opt = files_utils::read_string_from_file(ext->osd_config_path);
-            if (!opt.has_value())
-            {
-                return HAL_ERR_RESULT;
-            }
-            osd_json = opt.value();
-        }
-        auto osd_blender = enc->get_osd_blender();
-        if (osd_blender)
-        {
-            (void)osd_blender->configure(osd_json);
-        }
     }
     auto *cc = static_cast<HalCodecContext *>(std::calloc(1, sizeof(HalCodecContext)));
     if (!cc)

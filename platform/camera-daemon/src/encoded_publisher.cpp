@@ -181,6 +181,19 @@ void EncodedPublisher::remove_stream(const std::string& name) {
     HAL_LOG_INFO("EncodedPublisher: Removed stream '%s'", name.c_str());
 }
 
+bool EncodedPublisher::has_stream(const std::string& name) const {
+    return streams_.find(name) != streams_.end();
+}
+
+std::vector<std::string> EncodedPublisher::stream_names() const {
+    std::vector<std::string> names;
+    names.reserve(streams_.size());
+    for (const auto& entry : streams_) {
+        names.push_back(entry.first);
+    }
+    return names;
+}
+
 void EncodedPublisher::add_local_listener(LocalCallback cb) {
     std::lock_guard<std::mutex> lock(listeners_mu_);
     local_listeners_.push_back(std::move(cb));
@@ -370,6 +383,7 @@ void EncodedPublisher::on_packet(const std::string& stream_name, const HalPacket
         queue_.push_back(std::move(qp));
         it->second->last_packet_seq.store(seq, std::memory_order_relaxed);
         it->second->packets_published.fetch_add(1, std::memory_order_relaxed);
+        it->second->bytes_published.fetch_add(packet->size, std::memory_order_relaxed);
     }
     queue_cv_.notify_one();
 }
@@ -404,11 +418,32 @@ void EncodedPublisher::dispatch_loop() {
         pkt_count++;
 
         // --- Keyframe detection (NAL parsing, safe to do here) ---
+        // Video codecs only: audio flows through this publisher too and can
+        // never contain an IDR — parsing it as H.264 would count random
+        // start-code+type-5 byte pairs as keyframes and (worse) trip the
+        // encoder-health alarm below on a perfectly healthy audio stream.
+        static const std::string kH264 = "h264";
+        static const std::string kH265 = "h265";
         auto it = streams_.find(pkt->stream_name);
-        if (it != streams_.end()) {
+        if (it != streams_.end() &&
+            (it->second->config.codec == kH264 || it->second->config.codec == kH265)) {
             pkt->is_keyframe = detect_h264_keyframe(
                 pkt->raw_data.data(), pkt->raw_data.size(),
                 it->second->config.codec);
+            if (pkt->is_keyframe) {
+                auto& st = *it->second;
+                st.keyframes_published.fetch_add(1, std::memory_order_relaxed);
+                st.last_keyframe_ms.store(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count(),
+                    std::memory_order_relaxed);
+                if (st.encoder_health_alarm_latched.exchange(false,
+                        std::memory_order_relaxed)) {
+                    HAL_LOG_INFO("EncodedPublisher [stream=%s]: encoder health "
+                                 "RECOVERED — keyframe coding resumed",
+                                 pkt->stream_name.c_str());
+                }
+            }
         }
 
         if (pkt->is_keyframe) keyframe_count++;
@@ -421,6 +456,9 @@ void EncodedPublisher::dispatch_loop() {
                         (unsigned long)max_broadcast_us);
             slow_broadcast_count = 0;
             max_broadcast_us = 0;
+            if (it != streams_.end()) {
+                check_encoder_health(pkt->stream_name, *it->second);
+            }
         }
 
         // --- Timing: start of dispatch work ---
@@ -629,12 +667,72 @@ void EncodedPublisher::maybe_request_keyframe(StreamState& ss) {
     }
 }
 
+void EncodedPublisher::check_encoder_health(const std::string& stream_name,
+                                            StreamState& ss) {
+    // Video streams only — audio can never code an IDR (see dispatch_loop).
+    if (ss.config.codec != "h264" && ss.config.codec != "h265") return;
+
+    const uint64_t pkts = ss.packets_published.load(std::memory_order_relaxed);
+    const uint64_t bytes = ss.bytes_published.load(std::memory_order_relaxed);
+    const uint64_t kfs  = ss.keyframes_published.load(std::memory_order_relaxed);
+    const int64_t  last_kf = ss.last_keyframe_ms.load(std::memory_order_relaxed);
+
+    bool degraded = false;
+    int64_t idr_gap_ms = -1;  // -1 = never had a keyframe
+    if (kfs == 0 && pkts >= kHealthMinPktsNoIdr) {
+        // Dual-signal: no keyframe ever AND tiny average packets. The size
+        // guard keeps a detect_h264_keyframe false negative (healthy frames
+        // misparsed) from firing a false alarm — real coded video averages
+        // KBs per packet, SEI/SPS/PPS metadata ~165B.
+        if (bytes / pkts < kHealthMinAvgBytes) degraded = true;
+    } else if (kfs > 0 && last_kf > 0) {
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        idr_gap_ms = now_ms - last_kf;
+        if (idr_gap_ms > kHealthMaxIdrGapMs) degraded = true;  // IDR went away
+    }
+    if (!degraded) return;
+
+    if (!ss.encoder_health_alarm_latched.exchange(true, std::memory_order_relaxed)) {
+        if (idr_gap_ms < 0) {
+            HAL_LOG_ERROR(
+                "EncodedPublisher [stream=%s]: ENCODER HEALTH ALARM — %lu packets "
+                "published but no keyframe ever coded. The encoder is emitting "
+                "metadata-only packets and coding no video. Suspected DMA/CMA "
+                "buffer starvation: check 'dmesg | grep cma_alloc' for ret: -12. "
+                "A daemon restart usually does NOT fix this; a device reboot is "
+                "the known remedy.",
+                stream_name.c_str(), (unsigned long)pkts);
+        } else {
+            HAL_LOG_ERROR(
+                "EncodedPublisher [stream=%s]: ENCODER HEALTH ALARM — %lu packets "
+                "published but only %lu keyframes (last IDR %ld ms ago). The "
+                "encoder is emitting metadata-only packets and coding no video. "
+                "Suspected DMA/CMA buffer starvation: check 'dmesg | grep "
+                "cma_alloc' for ret: -12. A daemon restart usually does NOT fix "
+                "this; a device reboot is the known remedy.",
+                stream_name.c_str(), (unsigned long)pkts, (unsigned long)kfs,
+                (long)idr_gap_ms);
+        }
+    }
+    // Nudge the encoder — harmless if it cannot comply, and it is the only
+    // in-process self-heal available (restart would not clear kernel state).
+    maybe_request_keyframe(ss);
+}
+
 void EncodedPublisher::broadcast(StreamState& ss, const uint8_t* buf, size_t len,
                                  bool is_keyframe) {
     std::lock_guard<std::mutex> lock(ss.clients_mu);
 
+    // Non-video streams (audio) have no reference chains — a dropped packet
+    // doesn't desync the next one, and is_keyframe is only ever set for
+    // h264/h265. Clear the gate so a needs_keyframe flag left by an earlier
+    // drop can't starve a non-video client forever.
+    const bool video = ss.config.codec == "h264" || ss.config.codec == "h265";
+
     for (auto& c : ss.clients) {
         if (!c->alive) continue;
+        if (!video) c->needs_keyframe = false;
 
         // Check for reverse control messages (keyframe request etc.)
         check_client_control(ss, *c);
@@ -678,6 +776,9 @@ bool EncodedPublisher::get_stream_stats(const std::string& name, StreamDropStats
     if (it == streams_.end()) return false;
     auto& ss = *it->second;
     out->packets_published = ss.packets_published.load(std::memory_order_relaxed);
+    out->bytes_published = ss.bytes_published.load(std::memory_order_relaxed);
+    out->keyframes_published = ss.keyframes_published.load(std::memory_order_relaxed);
+    out->last_keyframe_ms = ss.last_keyframe_ms.load(std::memory_order_relaxed);
     out->queue_overflow_drops = ss.queue_overflow_drops.load(std::memory_order_relaxed);
     out->client_send_drops = ss.client_send_drops.load(std::memory_order_relaxed);
     out->client_send_failures = ss.client_send_failures.load(std::memory_order_relaxed);

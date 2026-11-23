@@ -19,7 +19,11 @@ import {
 } from '@/components/ui/alert-dialog';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { useModelInfo, useExportModel, useUpdateModel } from '@/hooks/useModels';
+import {
+  useModelInfo,
+  useExportModel,
+  useUpdateModel,
+} from '@/hooks/useModels';
 import { useToast } from '@/hooks/use-toast';
 import {
   HardDrive,
@@ -53,6 +57,7 @@ import ModelConfigEditor, {
   useModelTypeOptions,
   type ModelConfigEditorHandle,
 } from './import/ModelConfigEditor';
+import EffectiveConfigPanel from './import/EffectiveConfigPanel';
 import TensorTable from './TensorTable';
 
 interface ModelData {
@@ -62,6 +67,9 @@ interface ModelData {
   version?: string;
   load_timestamp?: number;
   status?: string;
+  // Desired state recorded at registration/update ('loaded' | 'unloaded') —
+  // when it disagrees with status, the last load attempt failed.
+  desired_state?: string;
   estimated_memory?: number;
   estimated_tops?: number;
   inputs?: unknown;
@@ -304,10 +312,7 @@ export default function ModelDetailDialog({
     if (!editTypeOpt) return;
     // Spread into a plain snapshot: prefillUpdateForm reads promoted
     // top-level columns through its index signature.
-    const prefilled = prefillUpdateForm(
-      { ...mergedModel },
-      editTypeOpt.fields
-    );
+    const prefilled = prefillUpdateForm({ ...mergedModel }, editTypeOpt.fields);
     const rawProfile = prefilled.config.postprocess_profile;
     editInitialProfileRef.current =      typeof rawProfile === 'string' ? rawProfile : null;
     initialEditFormRef.current = prefilled;
@@ -332,10 +337,7 @@ export default function ModelDetailDialog({
       {
         onSuccess: () => {
           toast({
-            title: t(
-              'sys.ai_models.message.update_success',
-              '模型更新成功'
-            ),
+            title: t('sys.ai_models.message.update_success', '模型更新成功'),
           });
           exitEdit();
         },
@@ -454,253 +456,312 @@ export default function ModelDetailDialog({
               outputFormat={classifyOutputFormat(
                 mergedModel.vstream_info ?? ''
               )}
+              // Edit mode never re-parses the HEF — the row's stored network
+              // dimensions are the keypoint template's only dim source.
+              inputDims={{
+                width: mergedModel.input_width,
+                height: mergedModel.input_height,
+              }}
+              // Snapshot of the loaded row — the editor's diff view and
+              // reload banner compare against it.
+              initialForm={initialEditFormRef.current}
               disabled={updateMutation.isPending}
             />
           </div>
         ) : (
-        <div className="space-y-5 py-4 flex-1 min-h-0 overflow-y-auto">
-          {/* Badges + type description */}
-          <div className="space-y-2">
-            <div className="flex items-center gap-2 flex-wrap">
-              <Badge variant="secondary" className="rounded-full">
-                {typeInfo.type}
-              </Badge>
-              {mergedModel.variant && (
-                <Badge
-                  variant="outline"
-                  className="max-w-full rounded-full text-xs break-words whitespace-normal"
-                >
-                  {mergedModel.variant}
+          <div className="space-y-5 py-4 flex-1 min-h-0 overflow-y-auto">
+            {/* Badges + type description */}
+            <div className="space-y-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                <Badge variant="secondary" className="rounded-full">
+                  {typeInfo.type}
                 </Badge>
-              )}
-              {mergedModel.output_mode && (
-                <Badge
-                  variant={isRawMode ? 'outline' : 'secondary'}
-                  className="rounded-full text-xs"
-                >
-                  {isRawMode
-                    ? t('sys.ai_models.detail.output_mode_raw', '裸张量')
-                    : t(
-                        'sys.ai_models.detail.output_mode_platform',
-                        '平台解码'
-                      )}
-                </Badge>
-              )}
-            </div>
-            <p className="text-sm text-muted-foreground break-words">
-              {typeInfo.description}
-            </p>
-          </div>
-
-          {/* 基本信息 */}
-          {section(
-            t('sys.ai_models.detail.section_basic', '基本信息'),
-            <>
-              {item(
-                Tag,
-                t('sys.ai_models.detail.model_id', '模型 ID'),
-                <span className="font-mono break-all">
-                  {mergedModel.model_id}
-                </span>,
-                true
-              )}
-              {hasNonEmptyString(mergedModel.model_type)
-                && item(
-                  Tag,
-                  t('sys.ai_models.detail.model_type', '模型类型'),
-                  mergedModel.model_type
+                {mergedModel.variant && (
+                  <Badge
+                    variant="outline"
+                    className="max-w-full rounded-full text-xs break-words whitespace-normal"
+                  >
+                    {mergedModel.variant}
+                  </Badge>
                 )}
-              {hasNonEmptyString(mergedModel.variant)
-                && item(
-                  Tag,
-                  t('sys.ai_models.detail.variant', '变体'),
-                  mergedModel.variant
-                )}
-              {hasNonEmptyString(mergedModel.version)
-                && item(
-                  Tag,
-                  t('sys.ai_models.detail.version', '版本'),
-                  mergedModel.version
-                )}
-              {inputSize
-                && item(
-                  ExternalLink,
-                  t('sys.ai_models.detail.input_size', '输入尺寸'),
-                  inputSize
-                )}
-              {hasNonEmptyString(mergedModel.network_name)
-                && item(
-                  Tag,
-                  t('sys.ai_models.detail.network_name', '网络名称'),
-                  mergedModel.network_name
-                )}
-            </>
-          )}
-
-          {/* 模型接口：输入/输出张量（无张量数据时整节隐藏） */}
-          <TensorTable
-            inputs={mergedModel.inputs}
-            outputs={mergedModel.outputs}
-          />
-
-          {/* 运行状态 */}
-          {section(
-            t('sys.ai_models.detail.section_runtime', '运行状态'),
-            <>
-              {item(
-                Clock,
-                t('sys.ai_models.detail.status', '状态'),
-                <Badge
-                  variant={isLoaded ? 'default' : 'secondary'}
-                  className={`text-xs ${
-                    isLoaded ? 'bg-emerald-600 hover:bg-emerald-700' : ''
-                  }`}
-                >
-                  {isLoaded
-                    ? t('sys.ai_models.status.loaded', '已加载')
-                    : t('sys.ai_models.status.uploaded', '未加载')}
-                </Badge>
-              )}
-              {hasNumber(mergedModel.load_timestamp)
-                && item(
-                  Clock,
-                  t('sys.ai_models.detail.load_time', '加载时间'),
-                  formatTimestamp(mergedModel.load_timestamp)
-                )}
-              {hasNumber(mergedModel.estimated_tops)
-                && item(
-                  HardDrive,
-                  t('sys.ai_models.detail.estimated_tops', '预估算力'),
-                  `${mergedModel.estimated_tops}`
-                )}
-              {hasNumber(mergedModel.estimated_memory)
-                && item(
-                  HardDrive,
-                  t('sys.ai_models.detail.estimated_memory', '预估内存'),
-                  `${mergedModel.estimated_memory}`
-                )}
-            </>
-          )}
-
-          {/* 后处理参数 */}
-          {hasPostprocessSection
-            && section(
-              t('sys.ai_models.detail.section_postprocess', '后处理参数'),
-              <>
-                {hasNonEmptyString(mergedModel.output_mode)
-                  && item(
-                    Settings2,
-                    t('sys.ai_models.form.output_mode', '输出模式'),
-                    isRawMode
+                {mergedModel.output_mode && (
+                  <Badge
+                    variant={isRawMode ? 'outline' : 'secondary'}
+                    className="rounded-full text-xs"
+                  >
+                    {isRawMode
                       ? t('sys.ai_models.detail.output_mode_raw', '裸张量')
                       : t(
                           'sys.ai_models.detail.output_mode_platform',
                           '平台解码'
-                        )
-                  )}
-                {hasNumber(mergedModel.threshold)
-                  && item(
-                    Settings2,
-                    t('sys.ai_models.detail.threshold', '置信阈值'),
-                    `${(mergedModel.threshold * 100).toFixed(0)}%`
-                  )}
-                {hasNumber(mergedModel.max_detections)
-                  && item(
-                    Settings2,
-                    t('sys.ai_models.detail.max_detections', '最大检测数'),
-                    `${mergedModel.max_detections}`
-                  )}
-                {hasNmsThreshold
-                  && item(
-                    Settings2,
-                    t('sys.ai_models.detail.nms_threshold', 'NMS 阈值'),
-                    `${nmsThreshold}`
-                  )}
-                {labels.length > 0
+                        )}
+                  </Badge>
+                )}
+              </div>
+              <p className="text-sm text-muted-foreground break-words">
+                {typeInfo.description}
+              </p>
+            </div>
+
+            {/* 基本信息 */}
+            {section(
+              t('sys.ai_models.detail.section_basic', '基本信息'),
+              <>
+                {item(
+                  Tag,
+                  t('sys.ai_models.detail.model_id', '模型 ID'),
+                  <span className="font-mono break-all">
+                    {mergedModel.model_id}
+                  </span>,
+                  true
+                )}
+                {hasNonEmptyString(mergedModel.model_type)
                   && item(
                     Tag,
-                    t('sys.ai_models.detail.labels', '类别标签'),
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      {visibleLabels.map(label => (
-                        <Badge
-                          key={label}
-                          variant="secondary"
-                          className="text-xs font-mono"
-                        >
-                          {label}
-                        </Badge>
-                      ))}
-                      {(hiddenLabelsCount > 0 || labelsExpanded) && (
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          className="h-6 px-2 text-xs text-muted-foreground"
-                          onClick={() => setLabelsExpanded(prev => !prev)}
-                        >
-                          {labelsExpanded
-                            ? t('sys.ai_models.detail.labels_collapse', '收起')
-                            : t(
-                                'sys.ai_models.detail.labels_more',
-                                '还有 {{count}} 个',
-                                { count: hiddenLabelsCount }
-                              )}
-                        </Button>
-                      )}
-                    </div>,
-                    true
+                    t('sys.ai_models.detail.model_type', '模型类型'),
+                    mergedModel.model_type
+                  )}
+                {hasNonEmptyString(mergedModel.variant)
+                  && item(
+                    Tag,
+                    t('sys.ai_models.detail.variant', '变体'),
+                    mergedModel.variant
+                  )}
+                {hasNonEmptyString(mergedModel.version)
+                  && item(
+                    Tag,
+                    t('sys.ai_models.detail.version', '版本'),
+                    mergedModel.version
+                  )}
+                {inputSize
+                  && item(
+                    ExternalLink,
+                    t('sys.ai_models.detail.input_size', '输入尺寸'),
+                    inputSize
+                  )}
+                {hasNonEmptyString(mergedModel.network_name)
+                  && item(
+                    Tag,
+                    t('sys.ai_models.detail.network_name', '网络名称'),
+                    mergedModel.network_name
                   )}
               </>
             )}
 
-          {/* 关联与文件 */}
-          {section(
-            t('sys.ai_models.detail.section_files', '关联与文件'),
-            <>
-              {appsCount > 0
-                && item(
-                  AppWindow,
-                  `${t('sys.ai_models.detail.used_by_apps', '关联应用')} (${appsCount})`,
-                  <div className="flex flex-wrap gap-1.5">
-                    {mergedModel.used_by_apps?.map((appId: string) => (
+            {/* 模型接口：输入/输出张量（无张量数据时整节隐藏） */}
+            <TensorTable
+              inputs={mergedModel.inputs}
+              outputs={mergedModel.outputs}
+            />
+
+            {/* 运行状态 */}
+            {section(
+              t('sys.ai_models.detail.section_runtime', '运行状态'),
+              <>
+                {item(
+                  Clock,
+                  t('sys.ai_models.detail.status', '状态'),
+                  <Badge
+                    variant={isLoaded ? 'default' : 'secondary'}
+                    className={`text-xs ${
+                      isLoaded ? 'bg-emerald-600 hover:bg-emerald-700' : ''
+                    }`}
+                  >
+                    {isLoaded
+                      ? t('sys.ai_models.status.loaded', '已加载')
+                      : t('sys.ai_models.status.uploaded', '未加载')}
+                  </Badge>
+                )}
+                {hasNonEmptyString(mergedModel.desired_state)
+                  && item(
+                    Clock,
+                    t('sys.ai_models.detail.desired_state', '期望状态'),
+                    <div className="space-y-1">
                       <Badge
-                        key={appId}
-                        variant="secondary"
-                        className="text-xs"
+                        variant="outline"
+                        className={
+                          mergedModel.desired_state === 'loaded' && !isLoaded
+                            ? 'border-amber-500/60 text-xs text-amber-600 dark:text-amber-400'
+                            : 'text-xs text-muted-foreground'
+                        }
                       >
-                        {appId}
+                        {mergedModel.desired_state === 'loaded'
+                          ? t('sys.ai_models.detail.desired_loaded', '已加载')
+                          : t(
+                              'sys.ai_models.detail.desired_unloaded',
+                              '已卸载'
+                            )}
                       </Badge>
-                    ))}
-                  </div>,
-                  true
-                )}
-              {hasNumber(mergedModel.file_size)
-                && item(
-                  HardDrive,
-                  t('sys.ai_models.detail.file_size', '文件大小'),
-                  formatFileSize(mergedModel.file_size)
-                )}
-              {hasNonEmptyString(mergedModel.model_path)
-                && item(
-                  FolderOpen,
-                  t('sys.ai_models.detail.model_path', '模型路径'),
-                  <code className="block w-full rounded-lg bg-muted/50 px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap">
-                    {mergedModel.model_path}
-                  </code>,
-                  true
-                )}
-              {hasNonEmptyString(mergedModel.file_hash)
-                && item(
-                  Hash,
-                  t('sys.ai_models.detail.file_hash', '文件哈希'),
-                  <code className="block w-full rounded-lg bg-muted/50 px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap">
-                    {mergedModel.file_hash}
-                  </code>,
-                  true
-                )}
-            </>
-          )}
-        </div>
+                      {mergedModel.desired_state === 'loaded' && !isLoaded && (
+                        <p className="text-xs text-amber-600 dark:text-amber-400">
+                          {t(
+                            'sys.ai_models.detail.desired_state_mismatch',
+                            '期望已加载但当前未加载——上次加载未成功，原因见运行日志。'
+                          )}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                {hasNumber(mergedModel.load_timestamp)
+                  && item(
+                    Clock,
+                    t('sys.ai_models.detail.load_time', '加载时间'),
+                    formatTimestamp(mergedModel.load_timestamp)
+                  )}
+                {hasNumber(mergedModel.estimated_tops)
+                  && item(
+                    HardDrive,
+                    t('sys.ai_models.detail.estimated_tops', '预估算力'),
+                    `${mergedModel.estimated_tops}`
+                  )}
+                {hasNumber(mergedModel.estimated_memory)
+                  && item(
+                    HardDrive,
+                    t('sys.ai_models.detail.estimated_memory', '预估内存'),
+                    `${mergedModel.estimated_memory}`
+                  )}
+              </>
+            )}
+
+            {/* 后处理参数 */}
+            {hasPostprocessSection
+              && section(
+                t('sys.ai_models.detail.section_postprocess', '后处理参数'),
+                <>
+                  {hasNonEmptyString(mergedModel.output_mode)
+                    && item(
+                      Settings2,
+                      t('sys.ai_models.form.output_mode', '输出模式'),
+                      isRawMode
+                        ? t('sys.ai_models.detail.output_mode_raw', '裸张量')
+                        : t(
+                            'sys.ai_models.detail.output_mode_platform',
+                            '平台解码'
+                          )
+                    )}
+                  {hasNumber(mergedModel.threshold)
+                    && item(
+                      Settings2,
+                      t('sys.ai_models.detail.threshold', '置信阈值'),
+                      `${(mergedModel.threshold * 100).toFixed(0)}%`
+                    )}
+                  {hasNumber(mergedModel.max_detections)
+                    && item(
+                      Settings2,
+                      t('sys.ai_models.detail.max_detections', '最大检测数'),
+                      `${mergedModel.max_detections}`
+                    )}
+                  {hasNmsThreshold
+                    && item(
+                      Settings2,
+                      t('sys.ai_models.detail.nms_threshold', 'NMS 阈值'),
+                      `${nmsThreshold}`
+                    )}
+                  {labels.length > 0
+                    && item(
+                      Tag,
+                      t('sys.ai_models.detail.labels', '类别标签'),
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {visibleLabels.map(label => (
+                          <Badge
+                            key={label}
+                            variant="secondary"
+                            className="text-xs font-mono"
+                          >
+                            {label}
+                          </Badge>
+                        ))}
+                        {(hiddenLabelsCount > 0 || labelsExpanded) && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 px-2 text-xs text-muted-foreground"
+                            onClick={() => setLabelsExpanded(prev => !prev)}
+                          >
+                            {labelsExpanded
+                              ? t(
+                                  'sys.ai_models.detail.labels_collapse',
+                                  '收起'
+                                )
+                              : t(
+                                  'sys.ai_models.detail.labels_more',
+                                  '还有 {{count}} 个',
+                                  { count: hiddenLabelsCount }
+                                )}
+                          </Button>
+                        )}
+                      </div>,
+                      true
+                    )}
+                </>
+              )}
+
+            {/* 生效配置：运行时实际收到的后处理参数投影（含逃生舱覆盖
+              提示）。仅在 schema 已知该类型且行上有输出模式时展示。 */}
+            {editTypeOpt
+              && hasNonEmptyString(mergedModel.output_mode)
+              && hasPostprocessSection && (
+                <EffectiveConfigPanel
+                  modelType={mergedModel.model_type ?? ''}
+                  outputMode={mergedModel.output_mode ?? ''}
+                  variant={mergedModel.variant ?? ''}
+                  config={config ?? {}}
+                  inputWidth={mergedModel.input_width}
+                  inputHeight={mergedModel.input_height}
+                  fields={editTypeOpt.fields}
+                  profileParamEffects={editTypeOpt.profileParamEffects}
+                />
+              )}
+
+            {/* 关联与文件 */}
+            {section(
+              t('sys.ai_models.detail.section_files', '关联与文件'),
+              <>
+                {appsCount > 0
+                  && item(
+                    AppWindow,
+                    `${t('sys.ai_models.detail.used_by_apps', '关联应用')} (${appsCount})`,
+                    <div className="flex flex-wrap gap-1.5">
+                      {mergedModel.used_by_apps?.map((appId: string) => (
+                        <Badge
+                          key={appId}
+                          variant="secondary"
+                          className="text-xs"
+                        >
+                          {appId}
+                        </Badge>
+                      ))}
+                    </div>,
+                    true
+                  )}
+                {hasNumber(mergedModel.file_size)
+                  && item(
+                    HardDrive,
+                    t('sys.ai_models.detail.file_size', '文件大小'),
+                    formatFileSize(mergedModel.file_size)
+                  )}
+                {hasNonEmptyString(mergedModel.model_path)
+                  && item(
+                    FolderOpen,
+                    t('sys.ai_models.detail.model_path', '模型路径'),
+                    <code className="block w-full rounded-lg bg-muted/50 px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap">
+                      {mergedModel.model_path}
+                    </code>,
+                    true
+                  )}
+                {hasNonEmptyString(mergedModel.file_hash)
+                  && item(
+                    Hash,
+                    t('sys.ai_models.detail.file_hash', '文件哈希'),
+                    <code className="block w-full rounded-lg bg-muted/50 px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap">
+                      {mergedModel.file_hash}
+                    </code>,
+                    true
+                  )}
+              </>
+            )}
+          </div>
         )}
 
         <div className="flex items-center justify-end gap-2 shrink-0">

@@ -680,11 +680,43 @@ bool repack_nv12_planes(uint32_t width, uint32_t height, uint32_t format,
         why = "frame format is not NV12 (repack supports NV12 only)";
         return false;
     }
+    const uint32_t w = width, h = height;
+    if (num_planes == 1) {
+        // Compact single-dmabuf NV12 (the layout bind_stream_nv12_input
+        // accepts): Y at offset 0, UV at offset w*h, both tightly packed —
+        // the same strides[0] == width contract the direct-bind path
+        // enforces for this layout. Without this arm, a declaration
+        // failure (old daemon, control-channel hiccup, quota refusal)
+        // would turn an otherwise valid stream into per-frame errors
+        // instead of the promised private-copy fallback.
+        if (fds.size() < 1) {
+            why = "NV12 frame carries no plane fds";
+            return false;
+        }
+        if (strides[0] != w) {
+            why = "single-fd NV12 repack requires a compact stride";
+            return false;
+        }
+        if (sizes[0] < (uint64_t)w * h * 3 / 2) {
+            why = "single-fd NV12 buffer smaller than width*height*3/2";
+            return false;
+        }
+        out.assign((size_t)w * h * 3 / 2, '\0');
+        void* map = mmap(nullptr, sizes[0], PROT_READ, MAP_SHARED, fds[0], 0);
+        if (map == MAP_FAILED) {
+            why = "mmap of NV12 buffer failed";
+            return false;
+        }
+        memcpy(out.data(), static_cast<const char*>(map),
+               (size_t)w * h * 3 / 2);
+        munmap(map, sizes[0]);
+        return true;
+    }
     if (num_planes != 2) {
-        why = "NV12 frame must have 2 planes, got " + std::to_string(num_planes);
+        why = "NV12 frame must have 1 or 2 planes, got "
+              + std::to_string(num_planes);
         return false;
     }
-    const uint32_t w = width, h = height;
     if (w == 0 || h == 0 || (h & 1) != 0) {
         why = "invalid NV12 geometry";
         return false;
@@ -2729,6 +2761,46 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                 inputs[0] = direct_lease->tensor();
                 num_inputs = 1;
                 input_owner = direct_lease;
+                // The frame's dma-buf fds back the async NPU read until
+                // on_complete; the hw-in-use exemption must be CONFIRMED by
+                // the daemon before we submit — without it the watchdog
+                // force-reclaims (and the pool overwrites) the buffer
+                // mid-flight, which is UB per the HailoRT bindings
+                // contract. Unconfirmed → fall back to a private copy.
+                if (!fd_receiver_->declare_frame_hw_in_use(frame.frame_id)) {
+                    direct_lease.reset();
+                    input_owner.reset();
+                    const uint64_t t0 = now_us();
+                    auto nv12 = std::make_shared<std::string>();
+                    std::string why;
+                    static const std::vector<int> kNoFds;
+                    if (!repack_nv12_planes(
+                            frame.width, frame.height, frame.format,
+                            frame.num_planes, frame.strides, frame.sizes,
+                            frame.fd_group ? frame.fd_group->fds : kNoFds,
+                            *nv12, why)) {
+                        frame.delivery.acknowledge();
+                        resp.set_frame_sequence(frame.sequence);
+                        resp.set_timestamp_ns(frame.timestamp_ns);
+                        resp.mutable_status()->set_success(false);
+                        resp.mutable_status()->set_message(
+                            "DMA input unprotected and repack failed: " + why);
+                        resp.mutable_perf()->set_repack_us(repack_us);
+                        if (!writer->Write(resp)) break;
+                        continue;
+                    }
+                    inputs[0] = HalTensor{};
+                    inputs[0].data      = const_cast<char*>(nv12->data());
+                    inputs[0].byte_size =
+                        static_cast<uint32_t>(frame.width) * frame.height * 3 / 2;
+                    inputs[0].dma_fd    = -1;
+                    inputs[0].dtype     = HAL_DTYPE_UINT8;
+                    inputs[0].ndim      = 2;
+                    inputs[0].shape[0]  = static_cast<int32_t>(frame.height * 3 / 2);
+                    inputs[0].shape[1]  = static_cast<int32_t>(frame.width);
+                    input_owner = nv12;
+                    repack_us += now_us() - t0;
+                }
             } else if (num_inputs == 0) {
                 // Packed-RGB-input model: convert through the session-aware
                 // preprocess. build_nv12_tensors can never match an RGB model's
@@ -2778,6 +2850,54 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                     // Preserve the pre-existing non-NV12/unknown-model fallback.
                     num_inputs = build_nv12_tensors(frame, inputs);
                     input_owner = frame.fd_group;
+                    // Same contract as the direct-DMA arm above: whatever
+                    // this fallback bound (fds or a mapped view), the frame
+                    // memory backs the async inference read until on_complete
+                    // — the exemption must be confirmed, else copy privately.
+                    if (num_inputs > 0 &&
+                        !fd_receiver_->declare_frame_hw_in_use(frame.frame_id)) {
+                        input_owner.reset();
+                        const uint64_t t0 = now_us();
+                        auto nv12 = std::make_shared<std::string>();
+                        std::string why;
+                        static const std::vector<int> kNoFds;
+                        if (repack_nv12_planes(
+                                frame.width, frame.height, frame.format,
+                                frame.num_planes, frame.strides, frame.sizes,
+                                frame.fd_group ? frame.fd_group->fds : kNoFds,
+                                *nv12, why)) {
+                            inputs[0] = HalTensor{};
+                            inputs[0].data =
+                                const_cast<char*>(nv12->data());
+                            inputs[0].byte_size =
+                                static_cast<uint32_t>(frame.width) *
+                                frame.height * 3 / 2;
+                            inputs[0].dma_fd    = -1;
+                            inputs[0].dtype     = HAL_DTYPE_UINT8;
+                            inputs[0].ndim      = 2;
+                            inputs[0].shape[0] =
+                                static_cast<int32_t>(frame.height * 3 / 2);
+                            inputs[0].shape[1] =
+                                static_cast<int32_t>(frame.width);
+                            input_owner = nv12;
+                            // build_nv12_tensors filled inputs[1] with the
+                            // second source plane; the packed buffer
+                            // replaces BOTH planes — submit one input and
+                            // drop the stale DMA reference.
+                            num_inputs = 1;
+                            repack_us += now_us() - t0;
+                        } else {
+                            frame.delivery.acknowledge();
+                            resp.set_frame_sequence(frame.sequence);
+                            resp.set_timestamp_ns(frame.timestamp_ns);
+                            resp.mutable_status()->set_success(false);
+                            resp.mutable_status()->set_message(
+                                "DMA input unprotected and repack failed: " + why);
+                            resp.mutable_perf()->set_repack_us(repack_us);
+                            if (!writer->Write(resp)) break;
+                            continue;
+                        }
+                    }
                 }
             }
 

@@ -84,6 +84,10 @@ FdReceiver::FdReceiver(const std::string& socket_path)
 
 FdReceiver::~FdReceiver() {
     stop_all();
+    if (in_use_.fd >= 0) {
+        ::close(in_use_.fd);
+        in_use_.fd = -1;
+    }
 }
 
 int FdReceiver::connect_to_server() {
@@ -550,6 +554,76 @@ bool FdReceiver::stream_connected(const std::string& stream_name) const {
     auto it = streams_.find(stream_name);
     return it != streams_.end() &&
            it->second->running.load(std::memory_order_acquire);
+}
+
+bool FdReceiver::declare_frame_hw_in_use(uint64_t frame_id) {
+    using namespace std::chrono;
+    constexpr int kReplyTimeoutMs = 200;
+    constexpr auto kUnsupportedRetryDelay = seconds(30);
+
+    // Bounded acquisition: a concurrent declarer must not stall the
+    // inference loop; failing the declare only costs the zero-copy fast
+    // path (caller falls back to a private copy).
+    std::unique_lock<std::timed_mutex> lock(in_use_.mu, std::defer_lock);
+    if (!lock.try_lock_for(milliseconds(100))) return false;
+
+    auto mark_unsupported = [&]() {
+        if (in_use_.fd >= 0) {
+            ::close(in_use_.fd);
+            in_use_.fd = -1;
+        }
+        in_use_.unsupported = true;
+        in_use_.next_retry = steady_clock::now() + kUnsupportedRetryDelay;
+    };
+
+    if (in_use_.unsupported) {
+        if (steady_clock::now() < in_use_.next_retry) return false;
+        in_use_.unsupported = false;  // cool-down elapsed: re-probe once
+    }
+    if (in_use_.fd < 0) {
+        in_use_.fd = connect_to_server();
+        if (in_use_.fd < 0) {
+            mark_unsupported();
+            return false;
+        }
+    }
+
+    FdPubFrameInUseMsg msg{};
+    msg.hdr.type = FD_PUB_MSG_FRAME_IN_USE;
+    msg.hdr.size = sizeof(msg);
+    msg.frame_id = frame_id;
+    if (::send(in_use_.fd, &msg, sizeof(msg), MSG_NOSIGNAL) !=
+        static_cast<ssize_t>(sizeof(msg))) {
+        mark_unsupported();
+        return false;
+    }
+
+    struct pollfd pfd{in_use_.fd, POLLIN, 0};
+    if (::poll(&pfd, 1, kReplyTimeoutMs) <= 0) {
+        // Old daemon: type 15 drained silently, no reply ever comes.
+        LOG_WARN("FdReceiver: FRAME_IN_USE confirm timed out (frame %lu); "
+                 "direct-DMA inputs fall back to repack until next probe",
+                 (unsigned long)frame_id);
+        mark_unsupported();
+        return false;
+    }
+
+    FdPubResponseMsg resp{};
+    if (::recv(in_use_.fd, &resp, sizeof(resp), MSG_WAITALL) !=
+            static_cast<ssize_t>(sizeof(resp)) ||
+        resp.hdr.size != sizeof(resp) ||
+        (resp.hdr.type != FD_PUB_MSG_OK && resp.hdr.type != FD_PUB_MSG_ERROR)) {
+        mark_unsupported();
+        return false;
+    }
+
+    if (resp.hdr.type == FD_PUB_MSG_OK && resp.code == 0) return true;
+
+    // Proper ERROR (-1 unknown/reclaimed, -2 declarer cap): the daemon
+    // understood us — no protection was granted, but the channel is fine.
+    LOG_DEBUG("FdReceiver: FRAME_IN_USE frame %lu refused (code=%d)",
+              (unsigned long)frame_id, resp.code);
+    return false;
 }
 
 void FdReceiver::stop_all() {

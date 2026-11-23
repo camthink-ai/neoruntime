@@ -2,6 +2,8 @@ import { useTranslation } from 'react-i18next';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import type { WizardConfig } from '@/services/types';
+import type { InstallIssue } from '../../lib/importFlow';
+import InlineValidation from './InlineValidation';
 
 export interface BasicInfoSectionProps {
   config: WizardConfig;
@@ -9,6 +11,7 @@ export interface BasicInfoSectionProps {
   /** app.yaml uploaded: the id binds the manifest directory and is immutable. */
   isIdReadOnly: boolean;
   existingAppIds: Set<string>;
+  issues: InstallIssue[];
 }
 
 /**
@@ -21,6 +24,7 @@ export default function BasicInfoSection({
   onChange,
   isIdReadOnly,
   existingAppIds,
+  issues,
 }: BasicInfoSectionProps) {
   const { t } = useTranslation();
 
@@ -36,6 +40,11 @@ export default function BasicInfoSection({
               metadata: { ...config.metadata, id: e.target.value },
             })}
           disabled={isIdReadOnly}
+          aria-invalid={
+            issues.some(
+              issue => issue.field === 'metadata.id' && issue.severity === 'error'
+            ) || undefined
+          }
           className={`mt-2 ${existingAppIds.has(config.metadata.id.trim()) ? 'border-red-500 focus-visible:ring-red-500' : ''}`}
         />
         {isIdReadOnly && (
@@ -43,6 +52,7 @@ export default function BasicInfoSection({
             {t('sys.apps.import.readonly_id_hint')}
           </p>
         )}
+        <InlineValidation issues={issues} field="metadata.id" />
         {existingAppIds.has(config.metadata.id.trim()) && (
           <p className="mt-1 text-sm text-red-500">
             {t(
@@ -58,12 +68,18 @@ export default function BasicInfoSection({
         <Input
           placeholder="My Application"
           value={config.metadata.name}
+          aria-invalid={
+            issues.some(
+              issue => issue.field === 'metadata.name' && issue.severity === 'error'
+            ) || undefined
+          }
           onChange={e => onChange({
               ...config,
               metadata: { ...config.metadata, name: e.target.value },
             })}
           className="mt-2"
         />
+        <InlineValidation issues={issues} field="metadata.name" />
       </div>
 
       <div>
@@ -71,12 +87,18 @@ export default function BasicInfoSection({
         <Input
           placeholder="1.0.0"
           value={config.metadata.version}
+          aria-invalid={
+            issues.some(
+              issue => issue.field === 'metadata.version' && issue.severity === 'error'
+            ) || undefined
+          }
           onChange={e => onChange({
               ...config,
               metadata: { ...config.metadata, version: e.target.value },
             })}
           className="mt-2"
         />
+        <InlineValidation issues={issues} field="metadata.version" />
       </div>
 
       <div>

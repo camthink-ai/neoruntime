@@ -104,7 +104,9 @@ Requires Hailo Yocto Poky SDK for ARM cross-compilation.
 ### Prerequisites
 
 - Hailo SDK 4.0.23 installed at `/opt/poky/4.0.23/`
-- Available from Hailo developer portal
+- Direct download (zip containing the self-extracting installer):
+  <https://resources.camthink.ai/tools/poky-glibc-x86_64-core-image-hailo-dev-armv8a-hailo15-ne503-toolchain-4.0.23.zip> —
+  unzip it and run the installer with `-y -d /opt/poky/4.0.23`
 
 ### Build Steps
 

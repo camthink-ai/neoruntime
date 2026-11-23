@@ -289,6 +289,19 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(daynight-policy-test PRIVATE pthread)
     add_test(NAME daynight-policy-test COMMAND daynight-policy-test)
 
+    add_executable(frame-watchdog-in-use-test
+        tests/frame_watchdog_in_use_test.cpp
+        src/frame_watchdog.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(frame-watchdog-in-use-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+    )
+    target_link_libraries(frame-watchdog-in-use-test PRIVATE pthread)
+    add_test(NAME frame-watchdog-in-use-test COMMAND frame-watchdog-in-use-test)
+
     add_executable(ai-overlay-face-blur-test
         tests/ai_overlay_face_blur_test.cpp
         src/ai_overlay_subscriber.cpp

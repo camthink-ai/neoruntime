@@ -189,8 +189,8 @@ inline int apply_frontend_stream_override(const MediaLibraryPtr &ml, const std::
         }
         /* Preserve OSD + static privacy mask across the resolution change by rescaling (relative
          * overlay positions and image dims auto-adapt; absolute font/line/outline and privacy-mask
-         * vertices are rescaled). set_override_parameters() does NOT reconfigure the blenders, so
-         * they are pushed again below via configure_osd()/configure_privacy_mask(). */
+         * vertices are rescaled). Since medialib 1.13 the blenders read OSD/masking per frame from
+         * the profile, so applying the rescaled profile below is sufficient. */
         hailo15::osd_ml::rescale_stream_osd_and_masking(p, stream_id, old_enc_w, old_enc_h, new_w, new_h);
         if (priv_for_osd)
         {
@@ -233,32 +233,10 @@ inline int apply_frontend_stream_override(const MediaLibraryPtr &ml, const std::
         return hailo15_ml_err(r);
     }
 
-    /* set_override_parameters() does NOT reconfigure the blenders (the encoder instance
-     * persists). For the static privacy mask this is fixable: the privacy-mask blender is public
-     * and takes the struct directly, so re-push the rescaled config (vertices are absolute px).
-     *
-     * OSD, however, cannot be cleanly re-applied from the HAL in this medialib version:
-     * configure_osd() is private, osd::Blender::configure() needs an internally-serialized
-     * string, and add_overlay() expects osd::ImageOverlay (a different type than the profile's
-     * global ImageOverlay). So the OSD blender keeps its existing overlays across the change.
-     * The overlay x/y and image width/height are relative (0..1), so they track the new frame on
-     * their own; only font_size/line_thickness/outline_size (rescaled in the profile above) are
-     * not pushed to the persisted blender. (A full MediaLibrary reinit would re-create the
-     * encoder and pick up the rescaled OSD config.) */
-    if (new_w > 0U && new_h > 0U)
-    {
-        auto enc_it = ml->m_encoders.find(stream_id);
-        auto eos_it = p.encoded_output_streams.find(stream_id);
-        if (enc_it != ml->m_encoders.end() && enc_it->second &&
-            eos_it != p.encoded_output_streams.end())
-        {
-            auto pm_blender = enc_it->second->get_privacy_mask_blender();
-            if (pm_blender)
-            {
-                (void)pm_blender->configure(std::make_unique<privacy_mask_config_t>(eos_it->second.masking));
-            }
-        }
-    }
+    /* Since medialib 1.13 the OSD/privacy-mask blenders read their config from the
+     * profile attached to each encoded buffer, so set_override_parameters() above
+     * is all that is needed for the rescaled OSD + masking to take effect — no
+     * blender re-push (the pre-1.13 workaround) is required any more. */
 
     return HAL_OK;
 }

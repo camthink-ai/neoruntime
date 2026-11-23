@@ -29,10 +29,10 @@ var (
 // ============ files list ============
 
 var filesListCmd = &cobra.Command{
-	Use:   "list [path]",
-	Short: "List directory contents",
+	Use:     "list [path]",
+	Short:   "List directory contents",
 	Aliases: []string{"ls"},
-	Args:  cobra.MaximumNArgs(1),
+	Args:    cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := "/"
 		if len(args) > 0 {
@@ -52,12 +52,12 @@ var filesListCmd = &cobra.Command{
 		var result struct {
 			Path  string `json:"path"`
 			Files []struct {
-				Name   string `json:"name"`
-				Path   string `json:"path"`
-				IsDir  bool   `json:"is_dir"`
-				Size   int64  `json:"size"`
+				Name    string `json:"name"`
+				Path    string `json:"path"`
+				IsDir   bool   `json:"is_dir"`
+				Size    int64  `json:"size"`
 				ModTime string `json:"mod_time"`
-				Mode   string `json:"mode"`
+				Mode    string `json:"mode"`
 			} `json:"files"`
 		}
 
@@ -267,10 +267,10 @@ var filesDownloadCmd = &cobra.Command{
 // ============ files delete ============
 
 var filesDeleteCmd = &cobra.Command{
-	Use:   "delete <path>",
-	Short: "Delete a file or directory",
+	Use:     "delete <path>",
+	Short:   "Delete a file or directory",
 	Aliases: []string{"rm"},
-	Args:  cobra.ExactArgs(1),
+	Args:    cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := args[0]
 
@@ -340,10 +340,10 @@ var filesMkdirCmd = &cobra.Command{
 // ============ files rename ============
 
 var filesRenameCmd = &cobra.Command{
-	Use:   "rename <old-path> <new-path>",
-	Short: "Rename or move a file",
+	Use:     "rename <old-path> <new-path>",
+	Short:   "Rename or move a file",
 	Aliases: []string{"mv"},
-	Args:  cobra.ExactArgs(2),
+	Args:    cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		body := map[string]string{"old_path": args[0], "new_path": args[1]}
 		payload, _ := json.Marshal(body)

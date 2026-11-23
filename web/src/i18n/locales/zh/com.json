@@ -126,7 +126,14 @@
     "yes": "是",
     "no": "否",
     "export": "导出",
-    "import": "导入"
+    "import": "导入",
+    "processing": "处理中...",
+    "pause": "暂停",
+    "resume": "恢复",
+    "reconnect": "重新连接",
+    "copy_failed": "复制失败",
+    "save_failed": "保存失败",
+    "prev": "上一页"
   },
   "events": {
     "title": "事件中心",
@@ -234,7 +241,9 @@
     "max_auth_tries": "最大认证尝试次数",
     "restart_service": "保存后重启 SSH 服务",
     "update_success": "SSH 配置已更新",
-    "update_error": "SSH 配置更新失败："
+    "update_error": "SSH 配置更新失败：",
+    "port_invalid": "端口范围应为 1-65535",
+    "max_auth_tries_invalid": "最大认证尝试次数范围应为 1-10"
   },
   "maintenance": {
     "processes": {

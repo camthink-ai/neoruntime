@@ -160,6 +160,17 @@ func (h *APIHandlers) SetIrCut(c *gin.Context) {
 		return
 	}
 
+	// Surface backend rejections (e.g. AUTO is unsupported on ir-cut) instead
+	// of the 200/OK envelope, which drops success:false via omitempty.
+	if !resp.GetSuccess() {
+		message := resp.GetMessage()
+		if message == "" {
+			message = "Set IR-Cut failed"
+		}
+		Resp(c).FailMsg(CodeDeviceError, message)
+		return
+	}
+
 	if h.eventLogger != nil {
 		h.eventLogger.LogWithCodeAsync("device.control", events.MessageParams{"device": "ircut", "action": "set_mode", "mode": req.Mode}, getUsernameFromContext(c))
 	}

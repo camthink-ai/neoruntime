@@ -53,7 +53,7 @@ func (h *APIHandlers) WizardInstall(c *gin.Context) {
 	// Generate YAML content
 	yamlData, err := h.generateAppYAML(&req)
 	if err != nil {
-		Resp(c).FailMsg(CodeServiceError, "Failed to generate manifest: "+err.Error())
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid app configuration: "+err.Error())
 		return
 	}
 
@@ -282,5 +282,9 @@ func wizardRequestToManifest(req *WizardRequest) *manifest.AppManifest {
 // owns all quoting and escaping, so values containing ':', '#' or quotes
 // produce valid YAML (the hand-built string version did not).
 func (h *APIHandlers) generateAppYAML(req *WizardRequest) ([]byte, error) {
-	return yaml.Marshal(wizardRequestToManifest(req))
+	m := wizardRequestToManifest(req)
+	if err := m.Validate(); err != nil {
+		return nil, err
+	}
+	return yaml.Marshal(m)
 }

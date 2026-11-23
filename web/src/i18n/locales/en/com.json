@@ -126,7 +126,14 @@
     "yes": "Yes",
     "no": "No",
     "export": "Export",
-    "import": "Import"
+    "import": "Import",
+    "processing": "Processing...",
+    "pause": "Pause",
+    "resume": "Resume",
+    "reconnect": "Reconnect",
+    "copy_failed": "Copy failed",
+    "save_failed": "Save Failed",
+    "prev": "Previous"
   },
   "events": {
     "title": "Event Center",
@@ -234,7 +241,9 @@
     "max_auth_tries": "Max Authentication Attempts",
     "restart_service": "Restart SSH service after saving",
     "update_success": "SSH configuration updated",
-    "update_error": "SSH configuration update failed: "
+    "update_error": "SSH configuration update failed: ",
+    "port_invalid": "Port must be between 1 and 65535",
+    "max_auth_tries_invalid": "Max authentication tries must be between 1 and 10"
   },
   "maintenance": {
     "processes": {

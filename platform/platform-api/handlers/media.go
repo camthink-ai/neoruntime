@@ -2220,57 +2220,132 @@ func extractEncodersFromFile(path string) []encoderParams {
 // writeAppliedStreamsToConfig writes all applied encoder params back to the YAML config file
 // in a single read-modify-write cycle to avoid concurrent goroutine races.
 func (h *MediaHandlers) writeAppliedStreamsToConfig(streams []*camerapb.PipelineStreamConfig) {
+	// Hold configMu across the whole read-modify-write. Every sibling YAML
+	// writer (addStreamToConfig, setStreamEnabledInConfig, ...) holds it and
+	// projectMediaConfig's doc requires callers to hold it; without the lock,
+	// an AddStream appending between our ReadFile and the whole-list replace
+	// below would be silently erased (reverse zombie: live at HAL, missing at
+	// next boot).
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+
 	data, err := os.ReadFile(h.configPath)
 	if err != nil {
+		logger.Warn("media: applied-streams persist skipped: read config: %v", err)
 		return
 	}
 
 	var config map[string]interface{}
 	if err := yaml.Unmarshal(data, &config); err != nil {
+		logger.Warn("media: applied-streams persist skipped: parse config: %v", err)
 		return
 	}
 
+	// Materialize the list when the YAML has encoders: null/absent so a
+	// reconfigure that ADDS streams to such a degraded config still persists
+	// them (same materialization addStreamToConfig performs).
 	encoders, ok := config["encoders"].([]interface{})
 	if !ok {
+		encoders = []interface{}{}
+	}
+	config["encoders"] = encoders
+
+	// AppliedStreams is the authoritative post-reconfigure layout, so rebuild
+	// the encoder list from it: update existing entries, ADD entries the YAML
+	// lacks (update-only left a reconfigure-added stream forever missing from
+	// the YAML), and DROP entries the pipeline no longer has (a removed stream
+	// otherwise resurrects at next boot as a zombie encoder). The HTTP layer
+	// requires 1-4 streams and nil AppliedStreams routes to the YAML-reload
+	// fallback at the caller, so an empty slice is never a legitimate
+	// "drop all" — guard rather than persist an empty list.
+	if len(streams) == 0 {
 		return
 	}
-
-	for _, s := range streams {
-		for _, item := range encoders {
-			m, ok := item.(map[string]interface{})
-			if !ok {
-				continue
+	oldEntries := make(map[string]map[string]interface{}, len(encoders))
+	for _, item := range encoders {
+		if m, ok := item.(map[string]interface{}); ok {
+			if n := getFieldString(m, "stream_name"); n != "" {
+				oldEntries[n] = m
 			}
-			if getFieldString(m, "stream_name") != s.StreamId {
-				continue
-			}
-			if s.EncoderWidth > 0 {
-				m["width"] = s.EncoderWidth
-			}
-			if s.EncoderHeight > 0 {
-				m["height"] = s.EncoderHeight
-			}
-			if s.Codec != "" {
-				m["codec"] = s.Codec
-			}
-			if s.EncoderBitrate > 0 {
-				m["bitrate"] = s.EncoderBitrate
-			}
-			if s.EncoderFramerate > 0 {
-				m["fps"] = s.EncoderFramerate
-			}
-			if s.EncoderGop > 0 {
-				m["gop"] = s.EncoderGop
-			}
-			break
 		}
 	}
+	seen := make(map[string]bool, len(streams))
+	nextEncoders := make([]interface{}, 0, len(streams))
+	for _, s := range streams {
+		if s.GetStreamId() == "" || seen[s.GetStreamId()] {
+			continue
+		}
+		seen[s.GetStreamId()] = true
+		var m map[string]interface{}
+		if old, ok := oldEntries[s.GetStreamId()]; ok {
+			m = old
+		} else {
+			m = map[string]interface{}{"enabled": true}
+		}
+		// Applied dims come from live codec contexts, which report the rotated
+		// geometry while a portrait transform is active; persist the canonical
+		// landscape pair (same guard as writeStreamToConfig: only canonicalize
+		// a complete pair — swapping a partial (0,H) echo would write width=H
+		// and leave a stale height behind).
+		w, ht := s.GetEncoderWidth(), s.GetEncoderHeight()
+		if w > 0 && ht > 0 {
+			w, ht = canonicalEncoderDims(w, ht)
+		}
+		if w > 0 {
+			m["width"] = int(w)
+		}
+		if ht > 0 {
+			m["height"] = int(ht)
+		}
+		if s.GetCodec() != "" {
+			m["codec"] = s.GetCodec()
+		}
+		if s.GetEncoderBitrate() > 0 {
+			m["bitrate"] = int(s.GetEncoderBitrate())
+		}
+		if s.GetEncoderFramerate() > 0 {
+			m["fps"] = int(s.GetEncoderFramerate())
+		}
+		if s.GetEncoderGop() > 0 {
+			m["gop"] = int(s.GetEncoderGop())
+		}
+		m["stream_name"] = s.GetStreamId()
+		nextEncoders = append(nextEncoders, m)
+	}
+	// Retain deliberately-disabled stubs: DisableStream keeps an enabled:false
+	// entry (params preserved) precisely so EnableStream can re-create the
+	// encoder later, and such streams never appear in AppliedStreams (no live
+	// codec context echoes them). Dropping them on absence would break the
+	// disable→reconfigure→enable round-trip. Only an EXPLICIT enabled:false is
+	// a stub, though: the YAML convention treats an absent key as enabled
+	// (boot discovery creates those encoders), so entries without the key are
+	// droppable zombies like any other enabled entry missing from the applied
+	// layout — otherwise a legacy no-key entry could never be removed.
+	for _, item := range encoders {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		n := getFieldString(m, "stream_name")
+		if n == "" || seen[n] {
+			continue
+		}
+		if enabledRaw, present := m["enabled"]; present {
+			if enabled, _ := enabledRaw.(bool); !enabled {
+				nextEncoders = append(nextEncoders, m)
+			}
+		}
+	}
+	config["encoders"] = nextEncoders
 
 	outData, err := marshalMediaConfig(config)
 	if err != nil {
+		logger.Warn("media: applied-streams persist failed: marshal: %v", err)
 		return
 	}
-	_ = h.projectMediaConfig(context.Background(), "", string(outData))
+	if err := h.projectMediaConfig(context.Background(), "", string(outData)); err != nil {
+		logger.Warn("media: applied-streams persist failed: %v", err)
+	}
 }
 
 // canonicalEncoderDims returns the landscape (sensor-native) width/height for an
@@ -2822,14 +2897,17 @@ func (h *MediaHandlers) DisableStream(c *gin.Context) {
 			break
 		}
 	}
-	if !found {
-		Resp(c).FailMsg(CodeNotFound, "Stream not found in config: "+streamName)
-		return
-	}
+	// A stream missing from YAML is NOT proof it is absent at runtime: a
+	// reconfigure-persist can drop the YAML entry while HAL still streams the
+	// stream (a later profile switch rebuilt the pipeline from the on-disk
+	// profile file that still authors it).  The daemon probes HAL directly and
+	// force-removes such a zombie, so forward the RemoveStream and let it
+	// decide; its "Stream not found" reply maps back to 404 below, keeping the
+	// old contract for genuinely absent streams.
 
 	// Check if the stream is actually running via gRPC.
 	running := h.getRunningStreamParams(streamName)
-	if running == nil {
+	if found && running == nil {
 		Resp(c).OK(gin.H{"message": "Stream is already disabled", "stream": streamName})
 		return
 	}
@@ -2847,15 +2925,23 @@ func (h *MediaHandlers) DisableStream(c *gin.Context) {
 		return
 	}
 	if !resp.Success {
+		// Preserve the 404 contract for genuinely absent streams now that the
+		// YAML-missing case is forwarded instead of rejected locally.
+		if strings.HasPrefix(resp.Message, "Stream not found") {
+			Resp(c).FailMsg(CodeNotFound, resp.Message)
+			return
+		}
 		Resp(c).FailMsg(CodeCameraError, resp.Message)
 		return
 	}
 
 	// Persist disabled state (keep all params!) and reload in-memory stream list
-	h.setStreamEnabledInConfig(streamName, false)
-	if h.streamReloader != nil {
-		h.streamReloader.RestartH264Stream(streamName)
-		h.streamReloader.ReloadStreams(h.configPath)
+	if found {
+		h.setStreamEnabledInConfig(streamName, false)
+		if h.streamReloader != nil {
+			h.streamReloader.RestartH264Stream(streamName)
+			h.streamReloader.ReloadStreams(h.configPath)
+		}
 	}
 
 	if h.eventLogger != nil {

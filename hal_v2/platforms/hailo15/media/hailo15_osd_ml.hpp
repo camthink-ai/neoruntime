@@ -2,6 +2,15 @@
  * @file hailo15_osd_ml.hpp
  * @brief Inline conversion helpers between HAL OSD types and Hailo MediaLibrary OSD types.
  *
+ * Medialib 1.13 (SDK 4.0.23) removed the imperative osd::Blender API: overlays now live
+ * declaratively in the per-stream config_stream_osd_t of the medialib profile, and the
+ * internal blender picks them up from the profile attached to each encoded buffer.
+ * Conversions therefore target the GLOBAL overlay structs from media_library_types.hpp
+ * (ImageOverlay / TextOverlay / DateTimeOverlay), held via shared_ptr in
+ * config_stream_osd_t. osd_types.hpp is still included for DEFAULT_FONT_PATH /
+ * DEFAULT_DATETIME_STRING / osd::calculate_text_size (the global calculate_text_size
+ * is not exported by libmedialib).
+ *
  * Also provides font-size rescaling and layout-change recalculation utilities
  * that mirror the webserver OsdResource::update_osds() behaviour.
  */
@@ -13,11 +22,11 @@
 #include "hailo15_common.hpp"
 
 #include "hailo/osd_types.hpp"
-#include "hailo/osd.hpp"
 #include <hailo/media_library/media_library_types.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <optional>
 #include <type_traits>
 #include <cstring>
@@ -32,14 +41,12 @@ namespace hailo15::osd_ml
 /* ====================================================================
  * Resolution-change rescale (preserve OSD + static privacy mask, don't clear)
  *
- * On a resolution change the OSD/privacy-mask blenders are NOT reconfigured by
- * set_override_parameters() (configure_frontend_encoder only sets the encoding). To keep OSD
- * overlays and the static privacy mask correct at the new geometry without dropping them:
- *  - OSD overlay x/y and ImageOverlay width/height are RELATIVE (0..1) -> auto-adapt, keep.
- *  - OSD font_size / line_thickness / outline_size are ABSOLUTE (px) -> scale by width ratio.
- *  - Static privacy mask polygon vertices are ABSOLUTE int px -> scale by w/h ratio + clamp.
- * After applying the profile, the caller must also push the rescaled config into the persisted
- * blenders via MediaLibrary::configure_osd() / configure_privacy_mask().
+ * Overlay x/y and ImageOverlay width/height are RELATIVE (0..1) -> auto-adapt, keep.
+ * font_size / line_thickness / outline_size are ABSOLUTE (px) -> scale by width ratio.
+ * Static privacy mask polygon vertices are ABSOLUTE int px -> scale by w/h ratio + clamp.
+ * Since medialib 1.13 the blenders read OSD/masking from the profile attached to each
+ * frame, so applying the rescaled profile via set_override_parameters() is sufficient —
+ * no blender re-push is needed.
  * ==================================================================== */
 inline void rescale_stream_osd_and_masking(config_profile_t &p, const std::string &stream_id,
                                            uint32_t old_w, uint32_t old_h,
@@ -104,165 +111,167 @@ inline void rescale_stream_osd_and_masking(config_profile_t &p, const std::strin
 }
 
 /* ====================================================================
- * HAL -> ML conversions
+ * HAL -> ML conversions (global overlay structs from media_library_types.hpp)
  * ==================================================================== */
 
-inline osd::rotation_alignment_policy_t hal_to_ml_rotation_policy(HalOsdRotationPolicy p)
+inline rotation_alignment_policy_t hal_to_ml_rotation_policy(HalOsdRotationPolicy p)
 {
     switch (p)
     {
         case HAL_OSD_ROTATION_POLICY_TOP_LEFT:
-            return osd::rotation_alignment_policy_t::TOP_LEFT;
+            return rotation_alignment_policy_t::TOP_LEFT;
         case HAL_OSD_ROTATION_POLICY_CENTER:
         default:
-            return osd::rotation_alignment_policy_t::CENTER;
+            return rotation_alignment_policy_t::CENTER;
     }
 }
 
-inline osd::HorizontalAlignment hal_to_ml_halign(HalOsdHorizontalAlignment a)
+inline HorizontalAlignment hal_to_ml_halign(HalOsdHorizontalAlignment a)
 {
     switch (a)
     {
         case HAL_OSD_HALIGN_CENTER:
-            return osd::HorizontalAlignment::CENTER;
+            return HorizontalAlignment::CENTER;
         case HAL_OSD_HALIGN_RIGHT:
-            return osd::HorizontalAlignment::RIGHT;
+            return HorizontalAlignment::RIGHT;
         case HAL_OSD_HALIGN_LEFT:
         default:
-            return osd::HorizontalAlignment::LEFT;
+            return HorizontalAlignment::LEFT;
     }
 }
 
-inline osd::VerticalAlignment hal_to_ml_valign(HalOsdVerticalAlignment a)
+inline VerticalAlignment hal_to_ml_valign(HalOsdVerticalAlignment a)
 {
     switch (a)
     {
         case HAL_OSD_VALIGN_CENTER:
-            return osd::VerticalAlignment::CENTER;
+            return VerticalAlignment::CENTER;
         case HAL_OSD_VALIGN_BOTTOM:
-            return osd::VerticalAlignment::BOTTOM;
+            return VerticalAlignment::BOTTOM;
         case HAL_OSD_VALIGN_TOP:
         default:
-            return osd::VerticalAlignment::TOP;
+            return VerticalAlignment::TOP;
     }
 }
 
-inline osd::font_weight_t hal_to_ml_font_weight(HalOsdFontWeight w)
+inline font_weight_t hal_to_ml_font_weight(HalOsdFontWeight w)
 {
     switch (w)
     {
         case HAL_OSD_FONT_WEIGHT_BOLD:
-            return osd::font_weight_t::BOLD;
+            return font_weight_t::BOLD;
         case HAL_OSD_FONT_WEIGHT_NORMAL:
         default:
-            return osd::font_weight_t::NORMAL;
+            return font_weight_t::NORMAL;
     }
 }
 
-inline osd::rgba_color_t hal_to_ml_color(const HalOsdColor &c)
+inline rgba_color_t hal_to_ml_color(const HalOsdColor &c)
 {
-    return osd::rgba_color_t{c.r, c.g, c.b, c.a};
+    return rgba_color_t{c.r, c.g, c.b, c.a};
 }
 
-/* -- Full overlay conversions HAL -> ML -- */
-
-inline osd::ImageOverlay hal_to_ml_image(const HalOsdImageOverlay &h)
+/** r < 0 disables a colour in the HAL model; map that to an unset std::optional. */
+inline std::optional<rgba_color_t> hal_to_ml_opt_color(const HalOsdColor &c)
 {
-    return osd::ImageOverlay(
-        std::string(h.base.id),
-        h.base.x,
-        h.base.y,
-        h.width,
-        h.height,
-        std::string(h.image_path),
-        h.base.z_index,
-        h.base.angle,
-        hal_to_ml_rotation_policy(h.base.rotation_policy),
-        hal_to_ml_halign(h.base.h_align),
-        hal_to_ml_valign(h.base.v_align));
+    if (c.r < 0 || c.g < 0 || c.b < 0 || c.a < 0)
+    {
+        return std::nullopt;
+    }
+    return std::optional<rgba_color_t>(hal_to_ml_color(c));
 }
 
-inline osd::TextOverlay hal_to_ml_text(const HalOsdTextOverlay &h)
+/** Fill the shared Overlay base fields from a HAL base. */
+inline void hal_base_to_ml_overlay(const HalOsdOverlayBase &h, Overlay *ml)
+{
+    ml->id = std::string(h.id);
+    ml->x = h.x;
+    ml->y = h.y;
+    ml->z_index = h.z_index;
+    ml->angle = h.angle;
+    ml->rotation_alignment_policy = hal_to_ml_rotation_policy(h.rotation_policy);
+    ml->horizontal_alignment = std::optional<HorizontalAlignment>(hal_to_ml_halign(h.h_align));
+    ml->vertical_alignment = std::optional<VerticalAlignment>(hal_to_ml_valign(h.v_align));
+}
+
+/** Fill BaseTextOverlay fields (used by both TextOverlay and DateTimeOverlay). */
+template <typename HalTextT>
+inline void hal_text_to_ml_base_text(const HalTextT &h, BaseTextOverlay *ml)
 {
     const char *font_path = (h.font_path[0] != '\0') ? h.font_path : DEFAULT_FONT_PATH;
-    return osd::TextOverlay(
-        std::string(h.base.id),
-        h.base.x,
-        h.base.y,
-        std::string(h.label),
-        hal_to_ml_color(h.text_color),
-        hal_to_ml_color(h.background_color),
-        h.font_size,
-        h.line_thickness,
-        h.base.z_index,
-        std::string(font_path),
-        h.base.angle,
-        hal_to_ml_rotation_policy(h.base.rotation_policy),
-        hal_to_ml_color(h.shadow_color),
-        h.shadow_offset_x,
-        h.shadow_offset_y,
-        hal_to_ml_font_weight(h.font_weight),
-        h.outline_size,
-        hal_to_ml_color(h.outline_color),
-        hal_to_ml_halign(h.base.h_align),
-        hal_to_ml_valign(h.base.v_align));
+    ml->label = std::string(h.label);
+    ml->text_color = hal_to_ml_color(h.text_color);
+    ml->background_color = hal_to_ml_color(h.background_color);
+    ml->font_path = std::string(font_path);
+    ml->font_size = static_cast<int>(std::lround(h.font_size));
+    ml->line_thickness = (h.line_thickness > 0) ? std::optional<int>(h.line_thickness) : std::nullopt;
+    const std::optional<rgba_color_t> shadow = hal_to_ml_opt_color(h.shadow_color);
+    ml->shadow_color = shadow;
+    ml->shadow_offset_x = shadow ? std::optional<float>(h.shadow_offset_x) : std::nullopt;
+    ml->shadow_offset_y = shadow ? std::optional<float>(h.shadow_offset_y) : std::nullopt;
+    ml->font_weight = std::optional<font_weight_t>(hal_to_ml_font_weight(h.font_weight));
+    ml->outline_size = (h.outline_size > 0) ? std::optional<int>(h.outline_size) : std::nullopt;
+    ml->outline_color = (h.outline_size > 0) ? hal_to_ml_opt_color(h.outline_color) : std::nullopt;
+    /* m_width / m_height are informational text metrics; fill via the exported
+     * osd::calculate_text_size (the global one is not exported by libmedialib). */
+    try
+    {
+        mat_dims d = osd::calculate_text_size(ml->label, ml->font_path, ml->font_size,
+                                              ml->line_thickness.value_or(0));
+        ml->m_width = static_cast<size_t>(d.width);
+        ml->m_height = static_cast<size_t>(d.height);
+    }
+    catch (...)
+    {
+        ml->m_width = 0;
+        ml->m_height = 0;
+    }
 }
 
-inline osd::DateTimeOverlay hal_to_ml_datetime(const HalOsdDateTimeOverlay &h)
+/* -- Full overlay conversions HAL -> ML (shared_ptr for config_stream_osd_t) -- */
+
+inline std::shared_ptr<ImageOverlay> hal_to_ml_image(const HalOsdImageOverlay &h)
 {
-    const char *font_path = (h.text.font_path[0] != '\0') ? h.text.font_path : DEFAULT_FONT_PATH;
+    auto ml = std::make_shared<ImageOverlay>();
+    hal_base_to_ml_overlay(h.base, ml.get());
+    ml->width = h.width;
+    ml->height = h.height;
+    ml->image_path = std::string(h.image_path);
+    return ml;
+}
+
+inline std::shared_ptr<TextOverlay> hal_to_ml_text(const HalOsdTextOverlay &h)
+{
+    auto ml = std::make_shared<TextOverlay>();
+    hal_base_to_ml_overlay(h.base, ml.get());
+    hal_text_to_ml_base_text(h, ml.get());
+    return ml;
+}
+
+inline std::shared_ptr<DateTimeOverlay> hal_to_ml_datetime(const HalOsdDateTimeOverlay &h)
+{
+    auto ml = std::make_shared<DateTimeOverlay>();
+    hal_base_to_ml_overlay(h.text.base, ml.get());
+    hal_text_to_ml_base_text(h.text, ml.get());
     const char *fmt = (h.datetime_format[0] != '\0') ? h.datetime_format : DEFAULT_DATETIME_STRING;
-    return osd::DateTimeOverlay(
-        std::string(h.text.base.id),
-        h.text.base.x,
-        h.text.base.y,
-        std::string(fmt),
-        hal_to_ml_color(h.text.text_color),
-        hal_to_ml_color(h.text.background_color),
-        std::string(font_path),
-        h.text.font_size,
-        h.text.line_thickness,
-        h.text.base.z_index,
-        h.text.base.angle,
-        hal_to_ml_rotation_policy(h.text.base.rotation_policy),
-        hal_to_ml_color(h.text.shadow_color),
-        h.text.shadow_offset_x,
-        h.text.shadow_offset_y,
-        hal_to_ml_font_weight(h.text.font_weight),
-        h.text.outline_size,
-        hal_to_ml_color(h.text.outline_color),
-        hal_to_ml_halign(h.text.base.h_align),
-        hal_to_ml_valign(h.text.base.v_align));
+    ml->datetime_format = std::optional<std::string>(std::string(fmt));
+    return ml;
 }
 
-inline osd::CustomOverlay hal_to_ml_custom(const HalOsdCustomOverlay &h)
-{
-    osd::custom_overlay_format fmt = (h.format == HAL_OSD_CUSTOM_FMT_ARGB) ? osd::ARGB : osd::A420;
-    return osd::CustomOverlay(
-        std::string(h.base.id),
-        h.base.x,
-        h.base.y,
-        h.width,
-        h.height,
-        h.base.z_index,
-        fmt,
-        h.base.angle,
-        hal_to_ml_rotation_policy(h.base.rotation_policy),
-        hal_to_ml_halign(h.base.h_align),
-        hal_to_ml_valign(h.base.v_align));
-}
+/* Custom overlays (raw ARGB/A420 buffers) have no public path in medialib 1.13
+ * (CustomOverlay became internal); no HAL->ML conversion exists. */
 
 /* ====================================================================
- * ML -> HAL conversions
+ * ML -> HAL conversions (operate on the global overlay structs)
  * ==================================================================== */
 
-inline HalOsdRotationPolicy ml_to_hal_rotation_policy(osd::rotation_alignment_policy_t p)
+inline HalOsdRotationPolicy ml_to_hal_rotation_policy(rotation_alignment_policy_t p)
 {
     switch (p)
     {
-        case osd::rotation_alignment_policy_t::TOP_LEFT:
+        case rotation_alignment_policy_t::TOP_LEFT:
             return HAL_OSD_ROTATION_POLICY_TOP_LEFT;
-        case osd::rotation_alignment_policy_t::CENTER:
+        case rotation_alignment_policy_t::CENTER:
         default:
             return HAL_OSD_ROTATION_POLICY_CENTER;
     }
@@ -327,26 +336,26 @@ template <typename RotT>
 static inline HalOsdRotationPolicy rotation_policy_to_hal_any(const RotT &p)
 {
     const int v = enum_int_value(p);
-    return (v == (int)osd::rotation_alignment_policy_t::TOP_LEFT) ? HAL_OSD_ROTATION_POLICY_TOP_LEFT
-                                                                  : HAL_OSD_ROTATION_POLICY_CENTER;
+    return (v == (int)rotation_alignment_policy_t::TOP_LEFT) ? HAL_OSD_ROTATION_POLICY_TOP_LEFT
+                                                             : HAL_OSD_ROTATION_POLICY_CENTER;
 }
 
 template <typename FontWeightT>
 static inline HalOsdFontWeight font_weight_to_hal_any(const FontWeightT &w)
 {
     const int v = enum_int_value(w);
-    return (v == (int)osd::font_weight_t::BOLD) ? HAL_OSD_FONT_WEIGHT_BOLD : HAL_OSD_FONT_WEIGHT_NORMAL;
+    return (v == (int)font_weight_t::BOLD) ? HAL_OSD_FONT_WEIGHT_BOLD : HAL_OSD_FONT_WEIGHT_NORMAL;
 }
 
 template <typename AlignT>
 static inline HalOsdHorizontalAlignment halign_to_hal_any(const AlignT &a)
 {
     const float f = align_float_value(a);
-    if (std::fabs(f - osd::HorizontalAlignment::CENTER.as_float()) < 1e-6f)
+    if (std::fabs(f - HorizontalAlignment::CENTER.as_float()) < 1e-6f)
     {
         return HAL_OSD_HALIGN_CENTER;
     }
-    if (std::fabs(f - osd::HorizontalAlignment::RIGHT.as_float()) < 1e-6f)
+    if (std::fabs(f - HorizontalAlignment::RIGHT.as_float()) < 1e-6f)
     {
         return HAL_OSD_HALIGN_RIGHT;
     }
@@ -357,18 +366,18 @@ template <typename AlignT>
 static inline HalOsdVerticalAlignment valign_to_hal_any(const AlignT &a)
 {
     const float f = align_float_value(a);
-    if (std::fabs(f - osd::VerticalAlignment::CENTER.as_float()) < 1e-6f)
+    if (std::fabs(f - VerticalAlignment::CENTER.as_float()) < 1e-6f)
     {
         return HAL_OSD_VALIGN_CENTER;
     }
-    if (std::fabs(f - osd::VerticalAlignment::BOTTOM.as_float()) < 1e-6f)
+    if (std::fabs(f - VerticalAlignment::BOTTOM.as_float()) < 1e-6f)
     {
         return HAL_OSD_VALIGN_BOTTOM;
     }
     return HAL_OSD_VALIGN_TOP;
 }
 
-inline HalOsdHorizontalAlignment ml_to_hal_halign(const osd::HorizontalAlignment &a)
+inline HalOsdHorizontalAlignment ml_to_hal_halign(const HorizontalAlignment &a)
 {
     float v = a.as_float();
     if (v <= 0.01f)
@@ -378,7 +387,7 @@ inline HalOsdHorizontalAlignment ml_to_hal_halign(const osd::HorizontalAlignment
     return HAL_OSD_HALIGN_CENTER;
 }
 
-inline HalOsdVerticalAlignment ml_to_hal_valign(const osd::VerticalAlignment &a)
+inline HalOsdVerticalAlignment ml_to_hal_valign(const VerticalAlignment &a)
 {
     float v = a.as_float();
     if (v <= 0.01f)
@@ -388,19 +397,19 @@ inline HalOsdVerticalAlignment ml_to_hal_valign(const osd::VerticalAlignment &a)
     return HAL_OSD_VALIGN_CENTER;
 }
 
-inline HalOsdFontWeight ml_to_hal_font_weight(osd::font_weight_t w)
+inline HalOsdFontWeight ml_to_hal_font_weight(font_weight_t w)
 {
     switch (w)
     {
-        case osd::font_weight_t::BOLD:
+        case font_weight_t::BOLD:
             return HAL_OSD_FONT_WEIGHT_BOLD;
-        case osd::font_weight_t::NORMAL:
+        case font_weight_t::NORMAL:
         default:
             return HAL_OSD_FONT_WEIGHT_NORMAL;
     }
 }
 
-inline HalOsdColor ml_to_hal_color(const osd::rgba_color_t &c)
+inline HalOsdColor ml_to_hal_color(const rgba_color_t &c)
 {
     return HalOsdColor{c.red, c.green, c.blue, c.alpha};
 }
@@ -408,13 +417,14 @@ inline HalOsdColor ml_to_hal_color(const osd::rgba_color_t &c)
 /* -- Extract base fields from an ML overlay into HalOsdOverlayBase -- */
 
 template <typename OverlayT>
-inline void ml_overlay_to_hal_base(const OverlayT &src, HalOsdOverlayBase *dst, HalOsdOverlayType type)
+inline void ml_overlay_to_hal_base(const OverlayT &src, HalOsdOverlayBase *dst, HalOsdOverlayType type,
+                                   bool enabled = true)
 {
     std::memset(dst, 0, sizeof(*dst));
     std::strncpy(dst->id, src.id.c_str(), sizeof(dst->id) - 1);
     dst->id[sizeof(dst->id) - 1] = '\0';
     dst->type = type;
-    dst->enabled = true;
+    dst->enabled = enabled;
     dst->x = src.x;
     dst->y = src.y;
     dst->z_index = src.z_index;
@@ -476,10 +486,10 @@ static inline void ml_base_text_to_hal(const BaseTextT &src, HalOsdTextOverlay *
 /* -- Full overlay conversions ML -> HAL -- */
 
 template <typename ImageT>
-inline void ml_to_hal_image(const ImageT &src, HalOsdImageOverlay *dst)
+inline void ml_to_hal_image(const ImageT &src, HalOsdImageOverlay *dst, bool enabled = true)
 {
     std::memset(dst, 0, sizeof(*dst));
-    ml_overlay_to_hal_base(src, &dst->base, HAL_OSD_OVERLAY_IMAGE);
+    ml_overlay_to_hal_base(src, &dst->base, HAL_OSD_OVERLAY_IMAGE, enabled);
     dst->width = src.width;
     dst->height = src.height;
     std::strncpy(dst->image_path, src.image_path.c_str(), sizeof(dst->image_path) - 1);
@@ -487,18 +497,18 @@ inline void ml_to_hal_image(const ImageT &src, HalOsdImageOverlay *dst)
 }
 
 template <typename TextT>
-inline void ml_to_hal_text(const TextT &src, HalOsdTextOverlay *dst)
+inline void ml_to_hal_text(const TextT &src, HalOsdTextOverlay *dst, bool enabled = true)
 {
     std::memset(dst, 0, sizeof(*dst));
-    ml_overlay_to_hal_base(src, &dst->base, HAL_OSD_OVERLAY_TEXT);
+    ml_overlay_to_hal_base(src, &dst->base, HAL_OSD_OVERLAY_TEXT, enabled);
     ml_base_text_to_hal(src, dst);
 }
 
 template <typename DateTimeT>
-inline void ml_to_hal_datetime(const DateTimeT &src, HalOsdDateTimeOverlay *dst)
+inline void ml_to_hal_datetime(const DateTimeT &src, HalOsdDateTimeOverlay *dst, bool enabled = true)
 {
     std::memset(dst, 0, sizeof(*dst));
-    ml_overlay_to_hal_base(src, &dst->text.base, HAL_OSD_OVERLAY_DATETIME);
+    ml_overlay_to_hal_base(src, &dst->text.base, HAL_OSD_OVERLAY_DATETIME, enabled);
     ml_base_text_to_hal(src, &dst->text);
     const char *fmt = nullptr;
     if constexpr (is_std_optional_v<decltype(src.datetime_format)>)
@@ -511,17 +521,6 @@ inline void ml_to_hal_datetime(const DateTimeT &src, HalOsdDateTimeOverlay *dst)
     }
     std::strncpy(dst->datetime_format, fmt ? fmt : "", sizeof(dst->datetime_format) - 1);
     dst->datetime_format[sizeof(dst->datetime_format) - 1] = '\0';
-}
-
-inline void ml_to_hal_custom(const osd::CustomOverlay &src, HalOsdCustomOverlay *dst)
-{
-    std::memset(dst, 0, sizeof(*dst));
-    ml_overlay_to_hal_base(src, &dst->base, HAL_OSD_OVERLAY_CUSTOM);
-    dst->width = src.width;
-    dst->height = src.height;
-    dst->format = (src.get_format() == osd::ARGB) ? HAL_OSD_CUSTOM_FMT_ARGB : HAL_OSD_CUSTOM_FMT_A420;
-    dst->data = nullptr;
-    dst->data_size = 0;
 }
 
 /* ====================================================================
@@ -562,7 +561,7 @@ inline bool is_portrait_rotation(HalRotationAngle angle)
  * image height" => DSP blend fails => the whole encoded stream wedges (black
  * screen, pipeline stall on every restart while the bad OSD persists). We
  * cannot fix the medialib conversion, so we clamp the offending normalized
- * coordinate here, before handing the overlay to blender->add_overlay().
+ * coordinate here, before putting the overlay into the stream's OSD config.
  *
  * Verified correct for HAL_ROTATION_ANGLE_90 on device 192.168.93.213.
  *
@@ -642,29 +641,39 @@ inline void clear_encoder_osd(config_profile_t &p, const std::string *stream_id)
 }
 
 /* ====================================================================
- * recalculate_osd_on_layout_change
+ * recalculate_osd_in_profile
  *
- * When encoder resolution or rotation changes, rescale OSD font sizes
- * proportionally to the new width.  This matches the webserver
- * OsdResource::update_osds() behaviour.
+ * When encoder resolution or rotation changes, prepare the stream's OSD in
+ * the caller's profile copy.  This mirrors the webserver
+ * OsdResource::update_osds() behaviour (delete all overlay ids on layout
+ * change — overlays may not fit the new geometry).
  * ==================================================================== */
 
 /**
- * Recalculate OSD overlays for a specific encoder stream when resolution
- * or rotation changes.
+ * Recalculate OSD overlays for a specific encoder stream, in a caller-owned
+ * profile copy, when resolution or rotation changes.
  *
- * @param priv          Hailo15MediaPriv (for media_lib access and osd_layout_by_encoder).
+ * Pure in-memory: never calls MediaLibrary. The caller owns the profile
+ * lifecycle and must run the WHOLE cycle — get_current_profile() fetch,
+ * field mutations, this function per stream, then exactly ONE
+ * set_override_parameters(p) — under priv->osd_state_mu, the same discipline
+ * as the OSD ops in hailo15_osd_impl.cpp (fetch -> mutate -> apply is atomic
+ * against concurrent OSD ops). Callers must NOT hold priv->mutex.
+ *
+ * @param priv          Hailo15MediaPriv (osd_layout_by_encoder, shadow state).
+ * @param p             Caller-fetched profile copy; mutated in place.
  * @param stream_id     Encoder stream id (e.g. "sink0").
  * @param new_w         New encoder input width after change.
  * @param new_h         New encoder input height after change.
  * @param new_rotation  New rotation angle after change.
  */
-inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
-                                              const std::string &stream_id,
-                                              uint32_t new_w, uint32_t new_h,
-                                              HalRotationAngle new_rotation)
+inline void recalculate_osd_in_profile(Hailo15MediaPriv *priv,
+                                       config_profile_t &p,
+                                       const std::string &stream_id,
+                                       uint32_t new_w, uint32_t new_h,
+                                       HalRotationAngle new_rotation)
 {
-    if (!priv || !priv->media_lib)
+    if (!priv)
         return;
 
     /* 1. Look up old state. If not found, just save current and return. */
@@ -679,9 +688,18 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
     uint32_t old_w = old_state.width;
     uint32_t old_h = old_state.height;
 
-    /* 3. Caller already provides new_w/new_h with portrait swap applied. */
+    /* Shadow-disabled overlays are snapshots of the OLD geometry — drop them on
+     * every layout-change call, BEFORE the no-change skip below: a full rotation
+     * reinit pre-refreshes osd_layout_by_encoder (refresh_osd_layout_from_profile
+     * runs in build_contexts paths), which makes the skip branch fire while stale
+     * snapshots would otherwise survive and later re-enable at wrong geometry —
+     * exactly the DSP-bounds hazard this exists to prevent. erase-by-key is a
+     * no-op when absent; HAL-local state, needs no profile apply. */
+    priv->osd_disabled_by_stream.erase(stream_id);
 
-    /* 4. Skip if nothing changed (same dimensions and same portrait/landscape). */
+    /* 2. Caller already provides new_w/new_h with portrait swap applied. */
+
+    /* 3. Skip if nothing changed (same dimensions and same portrait/landscape). */
     bool old_portrait = is_portrait_rotation(static_cast<HalRotationAngle>(old_state.rotation));
     bool new_portrait = is_portrait_rotation(new_rotation);
     if (old_w == new_w && old_h == new_h && old_portrait == new_portrait)
@@ -690,80 +708,33 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
         return;
     }
 
-    /* 5-6. Get the current profile and find the stream's OSD config. */
-    auto prof_exp = priv->media_lib->get_current_profile();
-    if (!prof_exp)
-    {
-        old_state = OsdLayoutState{new_w, new_h, static_cast<int>(new_rotation)};
-        return;
-    }
-    config_profile_t prof = prof_exp.value();
-
-    auto stream_it = prof.encoded_output_streams.find(stream_id);
-    if (stream_it == prof.encoded_output_streams.end())
+    /* 4. Find the stream's OSD config in the caller's profile copy. */
+    auto stream_it = p.encoded_output_streams.find(stream_id);
+    if (stream_it == p.encoded_output_streams.end())
     {
         old_state = OsdLayoutState{new_w, new_h, static_cast<int>(new_rotation)};
         return;
     }
 
-    /* Webserver behaviour:
-     * - On resolution/rotation changes, it re-emits OSD config and deletes existing overlay IDs
-     *   because previous overlays may not fit the new stream geometry.
-     * - It also rescales font sizes proportionally to width.
-     *
-     * In HAL we mirror the safety aspect: clear existing overlays for this stream in the profile
-     * so that the next OSD configure/add recreates them cleanly (avoids DSP verify failures). */
-    bool modified = false;
+    /* Webserver behaviour on layout change: it re-emits OSD config and deletes
+     * existing overlay ids because previous overlays may not fit the new stream
+     * geometry. In the declarative model clearing the profile config is the
+     * whole story — there is no separate blender state to purge. */
     config_stream_osd_t &osd = stream_it->second.osd;
 
-    /* Clear overlays for this stream: safest alignment with webserver's "delete all ids" on layout changes. */
     if (!osd.image_overlays.empty() || !osd.text_overlays.empty() || !osd.datetime_overlays.empty())
     {
-        /* Also remove runtime overlays from the blender, otherwise the DSP may still try to blend
-         * stale overlays created earlier via add_overlay(). */
-        try
-        {
-            auto enc_it = priv->media_lib->m_encoders.find(stream_id);
-            if (enc_it != priv->media_lib->m_encoders.end() && enc_it->second)
-            {
-                auto blender = enc_it->second->get_osd_blender();
-                if (blender)
-                {
-                    for (const auto &ptr : osd.image_overlays)
-                    {
-                        if (ptr)
-                        {
-                            (void)blender->remove_overlay(ptr->id);
-                        }
-                    }
-                    for (const auto &ptr : osd.text_overlays)
-                    {
-                        if (ptr)
-                        {
-                            (void)blender->remove_overlay(ptr->id);
-                        }
-                    }
-                    for (const auto &ptr : osd.datetime_overlays)
-                    {
-                        if (ptr)
-                        {
-                            (void)blender->remove_overlay(ptr->id);
-                        }
-                    }
-                }
-            }
-        }
-        catch (...)
-        {
-            /* Best-effort cleanup: even if blender removal fails, still clear profile OSD to avoid further growth. */
-        }
-
         osd.image_overlays.clear();
         osd.text_overlays.clear();
         osd.datetime_overlays.clear();
-        modified = true;
     }
 
+    /* Shadow-disabled overlays were already dropped above (before the no-change
+     * skip), covering both the light path and the pre-refreshed rotation reinit. */
+
+    /* Font rescale per webserver parity: proportional to new encoder width.
+     * Currently unreachable (the clear above empties the vectors) — kept so a
+     * future rescale-without-clear policy only has to touch this site. */
     if (old_w > 0 && new_w > 0 && old_w != new_w)
     {
         for (auto &text_ptr : osd.text_overlays)
@@ -772,7 +743,6 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
             {
                 float old_font = text_ptr->font_size;
                 text_ptr->font_size = (old_font / static_cast<float>(old_w)) * static_cast<float>(new_w);
-                modified = true;
             }
         }
         for (auto &dt_ptr : osd.datetime_overlays)
@@ -781,18 +751,11 @@ inline void recalculate_osd_on_layout_change(Hailo15MediaPriv *priv,
             {
                 float old_font = dt_ptr->font_size;
                 dt_ptr->font_size = (old_font / static_cast<float>(old_w)) * static_cast<float>(new_w);
-                modified = true;
             }
         }
     }
 
-    /* 8. Apply the modified profile via set_override_parameters. */
-    if (modified)
-    {
-        priv->media_lib->set_override_parameters(prof);
-    }
-
-    /* 9. Update the layout state. */
+    /* 5. Update the layout state. */
     old_state = OsdLayoutState{new_w, new_h, static_cast<int>(new_rotation)};
 }
 

@@ -231,3 +231,28 @@ func TestGenerateAppYAMLHandlerWrapper(t *testing.T) {
 		t.Fatal("generateAppYAML() returned empty bytes")
 	}
 }
+
+func TestGenerateAppYAMLValidatesAndCanonicalizesRuntimeFields(t *testing.T) {
+	var h APIHandlers
+	invalid := &WizardRequest{
+		Metadata: WizardMetadata{ID: "bad-env", Name: "Bad Env", Version: "release-1"},
+		Image:    "docker.io/library/alpine:latest",
+		Env:      []WizardEnvVar{{Name: "BAD-NAME", Value: "x"}},
+	}
+	if _, err := h.generateAppYAML(invalid); err == nil || !strings.Contains(err.Error(), "environment validation failed") {
+		t.Fatalf("generateAppYAML() error = %v, want environment validation failure", err)
+	}
+
+	compatible := &WizardRequest{
+		Metadata:      WizardMetadata{ID: "legacy-policy", Name: "Legacy Policy", Version: "release-1"},
+		Image:         "docker.io/library/alpine:latest",
+		RestartPolicy: "on_failure",
+	}
+	data, err := h.generateAppYAML(compatible)
+	if err != nil {
+		t.Fatalf("generateAppYAML() error: %v", err)
+	}
+	if !strings.Contains(string(data), "restart_policy: on-failure") {
+		t.Fatalf("generated YAML did not canonicalize restart policy:\n%s", data)
+	}
+}

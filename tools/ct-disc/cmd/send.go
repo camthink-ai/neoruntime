@@ -15,8 +15,8 @@ var (
 	sendBroker   string
 	sendPayload  string
 	sendWait     int
-	sendUsername  string
-	sendPassword  string
+	sendUsername string
+	sendPassword string
 )
 
 var sendCmd = &cobra.Command{
@@ -66,8 +66,8 @@ func runSend(cmd *cobra.Command, args []string) error {
 
 	output.Success(fmt.Sprintf("Response from %s:", sn))
 	return printer.Print(map[string]string{
-		"sn":      sn,
-		"command": command,
+		"sn":       sn,
+		"command":  command,
 		"response": resp.Payload,
 	})
 }

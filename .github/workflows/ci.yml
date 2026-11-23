@@ -2,17 +2,152 @@ name: CI
 
 on:
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, 'release/**']
   push:
-    branches: [main, develop]
+    branches: [main, develop, 'release/**']
+    # Required PR checks must be created even for docs-only changes, so path
+    # filtering is limited to push events. Swagger remains an explicit
+    # exception because it is validated against the registered API routes.
+    paths:
+      - '**'
+      - '!docs/**'
+      - 'docs/api/swagger.yaml'
+      - '!**.md'
+      - '!LICENSE'
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
+  changes:
+    name: Detect CI scope
+    runs-on: ubuntu-22.04
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+      ct_disc: ${{ steps.filter.outputs.ct_disc }}
+      web: ${{ steps.filter.outputs.web }}
+      swagger: ${{ steps.filter.outputs.swagger }}
+    steps:
+      - name: Classify changed files
+        id: filter
+        uses: actions/github-script@v9
+        with:
+          script: |
+            let paths = [];
+            let runAll = false;
+
+            if (context.eventName === 'pull_request') {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                per_page: 100,
+              });
+              // The API exposes at most 3,000 PR files. At the limit, prefer
+              // a full run over making a potentially incomplete decision.
+              runAll = files.length >= 3000;
+              paths = files.flatMap((file) =>
+                file.previous_filename
+                  ? [file.filename, file.previous_filename]
+                  : [file.filename],
+              );
+            } else {
+              const before = context.payload.before || '';
+              if (!before || /^0+$/.test(before)) {
+                // A newly created branch has no reliable previous tree.
+                runAll = true;
+              } else {
+                const comparison = await github.request(
+                  'GET /repos/{owner}/{repo}/compare/{basehead}',
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    basehead: `${before}...${context.sha}`,
+                  },
+                );
+                const files = comparison.data.files;
+                if (!Array.isArray(files)) {
+                  runAll = true;
+                } else {
+                  // Compare responses cap the file list at 300 entries.
+                  runAll = files.length >= 300;
+                  paths = files.flatMap((file) =>
+                    file.previous_filename
+                      ? [file.filename, file.previous_filename]
+                      : [file.filename],
+                  );
+                }
+              }
+            }
+
+            let coreNeeded = runAll;
+            let ctDiscNeeded = runAll;
+            let webNeeded = runAll;
+            let swaggerNeeded = runAll;
+
+            if (!runAll) {
+              for (const path of paths) {
+                if (
+                  path === '.github/workflows/ci.yml' ||
+                  path.startsWith('.github/actions/')
+                ) {
+                  coreNeeded = true;
+                  ctDiscNeeded = true;
+                  webNeeded = true;
+                  swaggerNeeded = true;
+                } else if (path.startsWith('web/')) {
+                  webNeeded = true;
+                } else if (path.startsWith('tools/ct-disc/')) {
+                  ctDiscNeeded = true;
+                } else if (path === 'docs/api/swagger.yaml') {
+                  swaggerNeeded = true;
+                } else if (
+                  path.startsWith('docs/') ||
+                  path.endsWith('.md') ||
+                  path === 'LICENSE' ||
+                  path === 'package.json' ||
+                  path === 'package-lock.json' ||
+                  path === 'commitlint.config.mjs'
+                ) {
+                  // Documentation and commit-message tooling do not require
+                  // the product build matrix.
+                } else {
+                  coreNeeded = true;
+                }
+
+                if (
+                  path === 'platform/platform-api/server/main.go' ||
+                  path === 'docs/api/swagger.yaml' ||
+                  path === 'scripts/check_swagger_sync.py'
+                ) {
+                  swaggerNeeded = true;
+                }
+              }
+            }
+
+            core.setOutput('core', coreNeeded);
+            core.setOutput('ct_disc', ctDiscNeeded);
+            core.setOutput('web', webNeeded);
+            core.setOutput('swagger', swaggerNeeded);
+            await core.summary
+              .addHeading('Selected CI scope', 3)
+              .addList([
+                `Core: ${coreNeeded}`,
+                `CT discovery: ${ctDiscNeeded}`,
+                `Web: ${webNeeded}`,
+                `Swagger: ${swaggerNeeded}`,
+              ])
+              .write();
+
   core:
     name: Core build and tests
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.core == 'true') }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +183,8 @@ jobs:
 
   ct-disc:
     name: CT discovery tool
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.ct_disc == 'true') }}
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -63,6 +200,8 @@ jobs:
 
   web:
     name: Web console
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -83,6 +222,8 @@ jobs:
 
   swagger-sync:
     name: Swagger sync
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.swagger == 'true') }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4

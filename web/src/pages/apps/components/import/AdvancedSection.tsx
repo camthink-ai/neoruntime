@@ -13,6 +13,8 @@ import {
 import { Plus, X } from 'lucide-react';
 import type { WizardConfig } from '@/services/types';
 import { restartPoliciesFor } from '../../lib/formFieldOptions';
+import type { InstallIssue } from '../../lib/importFlow';
+import InlineValidation from './InlineValidation';
 
 /** i18n labels for the preset restart policies; out-of-preset values from
  * the manifest render with their raw value (what the file says). */
@@ -28,6 +30,7 @@ const RESTART_LABELS: Record<string, { key: string; fallback: string }> = {
 export interface AdvancedSectionProps {
   config: WizardConfig;
   onChange: (next: WizardConfig) => void;
+  issues: InstallIssue[];
 }
 
 /**
@@ -38,6 +41,7 @@ export interface AdvancedSectionProps {
 export default function AdvancedSection({
   config,
   onChange,
+  issues,
 }: AdvancedSectionProps) {
   const { t } = useTranslation();
 
@@ -112,6 +116,7 @@ export default function AdvancedSection({
             </p>
           )}
         </div>
+        <InlineValidation issues={issues} field="env" />
       </div>
 
       {/* Volumes */}
@@ -200,6 +205,7 @@ export default function AdvancedSection({
             </p>
           )}
         </div>
+        <InlineValidation issues={issues} field="volumes" />
       </div>
 
       {/* Runtime Options (moved from the resources page — they are
@@ -239,7 +245,9 @@ export default function AdvancedSection({
               })}
             </SelectContent>
           </Select>
+          <InlineValidation issues={issues} field="restart_policy" />
         </div>
+        <InlineValidation issues={issues} field="security" />
       </div>
     </div>
   );

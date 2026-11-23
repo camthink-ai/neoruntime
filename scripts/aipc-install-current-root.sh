@@ -21,6 +21,10 @@ TAG="aipc-current-root"
 # harness exercise activation safely inside a temporary rootfs.
 TEST_ACTIVATE_WITH_ROOTFS_PREFIX="${AIPC_TEST_ACTIVATE_WITH_ROOTFS_PREFIX:-0}"
 
+# Test-only override that lets the unit harness exercise the active-root
+# compatibility gate inside a temporary rootfs.
+TEST_COMPAT_GATE_WITH_ROOTFS_PREFIX="${AIPC_TEST_COMPAT_GATE_WITH_ROOTFS_PREFIX:-0}"
+
 root_path() { printf '%s%s' "$ROOTFS_PREFIX" "$1"; }
 NGINX_ROOT="$(root_path "${AIPC_NGINX_ROOT:-/data/nginx}")"
 log() { echo "[$TAG] $*"; }
@@ -169,10 +173,19 @@ grep -Eq '^OS_VERSION=[1-9]+\.[0-9]+\.[0-9]+$' "$OS_RELEASE_FILE" || \
    -n "$(json_number "$MANIFEST" target_data_schema)" ]] || \
     fail "persistent app manifest has incomplete compatibility metadata"
 
-if [[ -z "$ROOTFS_PREFIX" ]]; then
-    AIPC_OS_COMPATIBILITY_FILE="$OS_RELEASE_FILE" \
-    AIPC_APP_MANIFEST="$MANIFEST" \
-    "$COMPAT_CHECK"
+# The compatibility verdict gates services, never the bring-up chain: every
+# business unit keeps its hard aipc-compat-check ExecStartPre, platform-api
+# runs the check --warn-only as the rescue channel, and aipc-restore must
+# still run so an OS upgrade cannot strand the device on the image-default
+# network config.  Aborting here would leave the new rootfs without promoted
+# units, without the rescue channel and without the restored static IP
+# (docs/deployment/os-upgrade.md).
+if [[ -z "$ROOTFS_PREFIX" || "$TEST_COMPAT_GATE_WITH_ROOTFS_PREFIX" == "1" ]]; then
+    if ! AIPC_OS_COMPATIBILITY_FILE="$OS_RELEASE_FILE" \
+         AIPC_APP_MANIFEST="$MANIFEST" \
+         "$COMPAT_CHECK" --warn-only; then
+        warn "compatibility checker exited non-zero under --warn-only; continuing"
+    fi
 fi
 
 # Recreate rootfs-local executable links. The real files live on /data and

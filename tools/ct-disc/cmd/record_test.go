@@ -130,11 +130,11 @@ func TestCSVRecordWriterNeutralizesHostileDeviceFields(t *testing.T) {
 	var buf bytes.Buffer
 	w := &csvRecordWriter{writer: csv.NewWriter(&buf)}
 	rec := resourceRecord{
-		Timestamp:   "2026-08-19T00:00:00Z",
-		UnixMillis:  1,
-		SN:          `=HYPERLINK("http://evil")`,
-		IP:          "192.168.1.10",
-		MetricsOK:   true,
+		Timestamp:      "2026-08-19T00:00:00Z",
+		UnixMillis:     1,
+		SN:             `=HYPERLINK("http://evil")`,
+		IP:             "192.168.1.10",
+		MetricsOK:      true,
 		DiskMountpoint: "/data",
 	}
 	if err := w.Write(rec); err != nil {

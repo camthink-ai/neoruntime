@@ -47,6 +47,36 @@ func requireSafeAppID(id string) error {
 	return nil
 }
 
+// validateManifestEditIdentity binds edited YAML to the original staged
+// .neoapp manifest. The package image was extracted from that baseline, so
+// changing its app id or single-container image would split package identity.
+func validateManifestEditIdentity(baseManifestPath string, edited *manifest.AppManifest) error {
+	if baseManifestPath == "" {
+		return nil
+	}
+	basePath, err := safeStagingManifest(baseManifestPath)
+	if err != nil {
+		return fmt.Errorf("base_manifest_path is invalid: %w", err)
+	}
+	baseData, err := os.ReadFile(basePath)
+	if err != nil {
+		return fmt.Errorf("failed to read base manifest: %w", err)
+	}
+	base, err := manifest.ParseManifest(baseData)
+	if err != nil {
+		return fmt.Errorf("base manifest is invalid: %w", err)
+	}
+	if edited.Metadata.ID != base.Metadata.ID {
+		return fmt.Errorf("metadata.id is immutable for an uploaded .neoapp package (expected %q)", base.Metadata.ID)
+	}
+	if !base.IsMultiContainer() {
+		if edited.IsMultiContainer() || edited.Spec.Image != base.Spec.Image {
+			return fmt.Errorf("spec.image is immutable for an uploaded .neoapp package (expected %q)", base.Spec.Image)
+		}
+	}
+	return nil
+}
+
 // uploadToken makes upload artifact names unique across concurrent requests.
 // A second-granularity timestamp alone collides (same second, same generated
 // name), and the later os.Create then truncates the other upload's
@@ -882,6 +912,10 @@ func (h *APIHandlers) UploadManifest(c *gin.Context) {
 	// Before the ID becomes a directory name — the install-time guard in
 	// app-manager runs too late to prevent the out-of-root write here.
 	if err := requireSafeAppID(appManifest.Metadata.ID); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, err.Error())
+		return
+	}
+	if err := validateManifestEditIdentity(c.PostForm("base_manifest_path"), appManifest); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, err.Error())
 		return
 	}

@@ -87,10 +87,10 @@ var mediaConfigCmd = &cobra.Command{
 					Gop        int    `json:"gop"`
 				} `json:"streams"`
 				ISP struct {
-					Brightness  int `json:"brightness"`
-					Contrast    int `json:"contrast"`
-					Saturation  int `json:"saturation"`
-					Sharpness   int `json:"sharpness"`
+					Brightness int `json:"brightness"`
+					Contrast   int `json:"contrast"`
+					Saturation int `json:"saturation"`
+					Sharpness  int `json:"sharpness"`
 				} `json:"isp"`
 				RTSP struct {
 					Enabled bool `json:"enabled"`
@@ -153,10 +153,10 @@ var mediaConfigCmd = &cobra.Command{
 // ============ media image ============
 
 var (
-	mediaBrightness  int
-	mediaContrast    int
-	mediaSaturation  int
-	mediaSharpness   int
+	mediaBrightness int
+	mediaContrast   int
+	mediaSaturation int
+	mediaSharpness  int
 )
 
 var mediaImageCmd = &cobra.Command{
@@ -207,10 +207,10 @@ Examples:
 // ============ media encoder ============
 
 var (
-	mediaStream   string
-	mediaBitrate  int
-	mediaFPS      int
-	mediaGop      int
+	mediaStream  string
+	mediaBitrate int
+	mediaFPS     int
+	mediaGop     int
 )
 
 var mediaEncoderCmd = &cobra.Command{
@@ -285,10 +285,10 @@ Examples:
 // ============ media ai-overlay ============
 
 var (
-	mediaAIOverlayEnable        bool
-	mediaAIOverlayShowLabel     bool
-	mediaAIOverlayShowConf      bool
-	mediaAIOverlayThickness     int
+	mediaAIOverlayEnable    bool
+	mediaAIOverlayShowLabel bool
+	mediaAIOverlayShowConf  bool
+	mediaAIOverlayThickness int
 )
 
 var mediaAIOverlayCmd = &cobra.Command{

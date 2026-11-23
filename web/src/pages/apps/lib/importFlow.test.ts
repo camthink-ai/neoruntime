@@ -2,10 +2,18 @@ import { describe, expect, it } from 'vitest';
 import type { WizardConfig } from '@/services/types';
 import {
   collectInstallErrors,
+  collectInstallIssues,
   isValidContainerImageRef,
   isValidModelAlias,
   resolveLocalMode,
 } from './importFlow';
+
+const errorIssue = (section: string, field: string, reason: string) => ({
+  section,
+  field,
+  reason,
+  severity: 'error',
+});
 
 const completeConfig: WizardConfig = {
   metadata: {
@@ -131,8 +139,8 @@ describe('collectInstallErrors', () => {
 
     // Assert
     expect(issues).toEqual([
-      { section: 'basic_info', reason: 'app_id_required' },
-      { section: 'basic_info', reason: 'app_name_required' },
+      errorIssue('basic_info', 'metadata.id', 'app_id_required'),
+      errorIssue('basic_info', 'metadata.name', 'app_name_required'),
     ]);
   });
 
@@ -148,7 +156,7 @@ describe('collectInstallErrors', () => {
 
     // Assert
     expect(issues).toEqual([
-      { section: 'basic_info', reason: 'invalid_image_ref' },
+      errorIssue('basic_info', 'image', 'invalid_image_ref'),
     ]);
   });
 
@@ -163,10 +171,9 @@ describe('collectInstallErrors', () => {
     });
 
     // Assert
-    expect(issues).toContainEqual({
-      section: 'basic_info',
-      reason: 'local_source_required',
-    });
+    expect(issues).toContainEqual(
+      errorIssue('basic_info', 'image', 'local_source_required')
+    );
   });
 
   it('returns no source issue for local image-only once a tar is uploaded', () => {
@@ -218,7 +225,7 @@ describe('collectInstallErrors', () => {
 
     // Assert
     expect(issues).toEqual([
-      { section: 'models', reason: 'invalid_model_alias' },
+      errorIssue('models', 'models', 'invalid_model_alias'),
     ]);
   });
 
@@ -237,7 +244,7 @@ describe('collectInstallErrors', () => {
 
     // Assert
     expect(issues).toEqual([
-      { section: 'models', reason: 'model_id_required' },
+      errorIssue('models', 'models', 'model_id_required'),
     ]);
   });
 
@@ -259,8 +266,8 @@ describe('collectInstallErrors', () => {
 
     // Assert
     expect(issues).toEqual([
-      { section: 'models', reason: 'invalid_model_alias' },
-      { section: 'models', reason: 'model_id_required' },
+      errorIssue('models', 'models', 'invalid_model_alias'),
+      errorIssue('models', 'models', 'model_id_required'),
     ]);
   });
 
@@ -285,7 +292,7 @@ describe('collectInstallErrors', () => {
 
     // Assert
     expect(issues).toEqual([
-      { section: 'models', reason: 'model_unavailable_required' },
+      errorIssue('models', 'models', 'model_unavailable_required'),
     ]);
   });
 
@@ -336,7 +343,7 @@ describe('collectInstallErrors', () => {
 
     // Assert
     expect(issues).toEqual([
-      { section: 'models', reason: 'model_path_invalid' },
+      errorIssue('models', 'models', 'model_path_invalid'),
     ]);
   });
 
@@ -377,5 +384,146 @@ describe('collectInstallErrors', () => {
 
     // Assert
     expect(issues).toEqual([]);
+  });
+
+  it('validates version, safe app id, and positive resource limits', () => {
+    const config: WizardConfig = {
+      ...completeConfig,
+      metadata: { ...completeConfig.metadata, id: '../bad', version: ' ' },
+      resources: { cpu: '0%', memory: '-1Mi' },
+    };
+
+    const issues = collectInstallErrors(config, {
+      sourceType: 'local',
+      sourceReady: true,
+    });
+
+    expect(issues).toEqual([
+      errorIssue('basic_info', 'metadata.id', 'app_id_invalid'),
+      errorIssue('basic_info', 'metadata.version', 'app_version_required'),
+      errorIssue('resources', 'resources.cpu', 'cpu_limit_invalid'),
+      errorIssue('resources', 'resources.memory', 'memory_limit_invalid'),
+    ]);
+  });
+
+  it('accepts a non-empty non-SemVer version for compatibility', () => {
+    const config: WizardConfig = {
+      ...completeConfig,
+      metadata: { ...completeConfig.metadata, version: '2026.09-release' },
+    };
+
+    expect(
+      collectInstallErrors(config, {
+        sourceType: 'local',
+        sourceReady: true,
+      })
+    ).toEqual([]);
+  });
+
+  it('validates permission ports, quotas, event topics, and network mode', () => {
+    const config: WizardConfig = {
+      ...completeConfig,
+      permissions: {
+        ...completeConfig.permissions,
+        inference: {
+          ...completeConfig.permissions?.inference,
+          max_qps: -1,
+          max_concurrent: 0,
+        },
+        events: { publish: ['app/event', 'app/event'], subscribe: [''] },
+        network: { mode: 'isolated', inbound: [8080, 8080, 70000] },
+      },
+    };
+
+    const reasons = collectInstallErrors(config, {
+      sourceType: 'local',
+      sourceReady: true,
+    }).map(issue => issue.reason);
+
+    expect(reasons).toEqual([
+      'inference_quota_invalid',
+      'event_topic_invalid',
+      'event_topic_duplicate',
+      'network_inbound_invalid',
+      'network_inbound_duplicate',
+      'network_inbound_requires_host',
+    ]);
+  });
+
+  it('validates environment names, volume paths, and restart policy', () => {
+    const config: WizardConfig = {
+      ...completeConfig,
+      env: [
+        { name: 'BAD-NAME', value: 'x' },
+        { name: 'BAD-NAME', value: 'y' },
+      ],
+      volumes: [
+        { host: 'relative', container: '/app/data' },
+        { host: '/data/other', container: '/app/data' },
+      ],
+      restart_policy: 'sometimes',
+    };
+
+    const reasons = collectInstallErrors(config, {
+      sourceType: 'local',
+      sourceReady: true,
+    }).map(issue => issue.reason);
+
+    expect(reasons).toEqual([
+      'env_name_invalid',
+      'env_name_duplicate',
+      'volume_path_invalid',
+      'volume_destination_duplicate',
+      'restart_policy_invalid',
+    ]);
+  });
+
+  it('keeps zero quotas and legacy restart aliases compatible', () => {
+    const config: WizardConfig = {
+      ...completeConfig,
+      permissions: {
+        ...completeConfig.permissions,
+        inference: { max_qps: 0, max_concurrent: 0 },
+      },
+      restart_policy: 'on_failure',
+    };
+
+    expect(
+      collectInstallErrors(config, {
+        sourceType: 'local',
+        sourceReady: true,
+      })
+    ).toEqual([]);
+  });
+
+  it('returns risk checks as warnings without treating them as errors', () => {
+    const config: WizardConfig = {
+      ...completeConfig,
+      resources: { cpu: '150%', memory: '8Gi' },
+      permissions: {
+        ...completeConfig.permissions,
+        video: ['missing-stream'],
+        inference: { allow_register_model: true },
+        network: { mode: 'host' },
+      },
+      security: { readonly_rootfs: false },
+    };
+    const opts = {
+      sourceType: 'local' as const,
+      sourceReady: true,
+      availableStreamIds: [] as string[],
+    };
+
+    expect(collectInstallErrors(config, opts)).toEqual([]);
+    expect(
+      collectInstallIssues(config, opts).map(issue => issue.reason)
+    ).toEqual([
+      'cpu_limit_high',
+      'memory_limit_high',
+      'dynamic_model_registration_warning',
+      'host_network_warning',
+      'video_stream_unavailable',
+      'writable_rootfs_warning',
+    ]);
   });
 });

@@ -13,9 +13,9 @@ import (
 )
 
 var processCmd = &cobra.Command{
-	Use:   "process",
-	Short: "Process management",
-	Long:  `Manage system processes: list, info, kill.`,
+	Use:     "process",
+	Short:   "Process management",
+	Long:    `Manage system processes: list, info, kill.`,
 	Aliases: []string{"ps"},
 }
 
@@ -30,8 +30,8 @@ var (
 // ============ process list ============
 
 var processListCmd = &cobra.Command{
-	Use:   "list",
-	Short: "List running processes",
+	Use:     "list",
+	Short:   "List running processes",
 	Aliases: []string{"ls"},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		url := fmt.Sprintf("%s/api/v1/processes?sort=%s&limit=%d", processAPIBase, processSort, processLimit)
@@ -109,18 +109,18 @@ var processInfoCmd = &cobra.Command{
 		}
 
 		var p struct {
-			PID        int32   `json:"pid"`
-			PPID       int32   `json:"ppid"`
-			Name       string  `json:"name"`
+			PID        int32    `json:"pid"`
+			PPID       int32    `json:"ppid"`
+			Name       string   `json:"name"`
 			Status     []string `json:"status"`
-			CPUPercent float64 `json:"cpu_percent"`
-			MemPercent float64 `json:"mem_percent"`
-			Username   string  `json:"username"`
-			Cmdline    string  `json:"cmdline"`
-			Cwd        string  `json:"cwd"`
-			Exe        string  `json:"exe"`
-			NumThreads int     `json:"num_threads"`
-			CreateTime int64   `json:"create_time"`
+			CPUPercent float64  `json:"cpu_percent"`
+			MemPercent float64  `json:"mem_percent"`
+			Username   string   `json:"username"`
+			Cmdline    string   `json:"cmdline"`
+			Cwd        string   `json:"cwd"`
+			Exe        string   `json:"exe"`
+			NumThreads int      `json:"num_threads"`
+			CreateTime int64    `json:"create_time"`
 		}
 
 		if err := json.Unmarshal(resp.Data, &p); err != nil {

@@ -770,3 +770,121 @@ func TestValidateModelsDuplicateIDPathContract(t *testing.T) {
 		t.Fatalf("ModelEnvVars = %v, want both aliases", got)
 	}
 }
+
+func validRuntimeManifest() *AppManifest {
+	return &AppManifest{
+		APIVersion: "v1",
+		Kind:       "Application",
+		Metadata: Metadata{
+			ID: "runtime-validation", Name: "Runtime Validation", Version: "1",
+		},
+		Spec: Spec{
+			Image:         "docker.io/example/app:1",
+			Resources:     Resources{CPU: "50%", Memory: "256Mi"},
+			RestartPolicy: "on-failure",
+		},
+	}
+}
+
+func TestValidateWizardEditableRuntimeFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*AppManifest)
+		wantErr string
+	}{
+		{
+			name: "invalid env name",
+			mutate: func(m *AppManifest) {
+				m.Spec.Env = []EnvVar{{Name: "BAD-NAME", Value: "x"}}
+			},
+			wantErr: "environment validation failed",
+		},
+		{
+			name: "duplicate env name",
+			mutate: func(m *AppManifest) {
+				m.Spec.Env = []EnvVar{{Name: "MODE"}, {Name: "MODE"}}
+			},
+			wantErr: "duplicate name",
+		},
+		{
+			name: "relative volume path",
+			mutate: func(m *AppManifest) {
+				m.Spec.Volumes = []Volume{{Host: "data", Container: "/app/data"}}
+			},
+			wantErr: "absolute clean path",
+		},
+		{
+			name: "duplicate volume destination",
+			mutate: func(m *AppManifest) {
+				m.Spec.Volumes = []Volume{
+					{Host: "/data/a", Container: "/app/data"},
+					{Host: "/data/b", Container: "/app/data"},
+				}
+			},
+			wantErr: "duplicate container destination",
+		},
+		{
+			name: "negative inference quota",
+			mutate: func(m *AppManifest) {
+				m.Spec.Permissions.Inference.MaxQPS = -1
+			},
+			wantErr: "max_qps must be zero or greater",
+		},
+		{
+			name: "invalid inbound port",
+			mutate: func(m *AppManifest) {
+				m.Spec.Permissions.Network = NetworkPerms{Mode: "host", Inbound: []int{70000}}
+			},
+			wantErr: "between 1 and 65535",
+		},
+		{
+			name: "inbound requires host mode",
+			mutate: func(m *AppManifest) {
+				m.Spec.Permissions.Network = NetworkPerms{Mode: "isolated", Inbound: []int{8080}}
+			},
+			wantErr: "requires network.mode=host",
+		},
+		{
+			name: "duplicate event topic",
+			mutate: func(m *AppManifest) {
+				m.Spec.Permissions.Events.Publish = []string{"app/event", "app/event"}
+			},
+			wantErr: "duplicate value",
+		},
+		{
+			name:    "invalid restart policy",
+			mutate:  func(m *AppManifest) { m.Spec.RestartPolicy = "sometimes" },
+			wantErr: "restart_policy must be",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := validRuntimeManifest()
+			tt.mutate(m)
+			if err := m.Validate(); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateCanonicalizesCompatibleRestartAliases(t *testing.T) {
+	for input, want := range map[string]string{
+		"on_failure": "on-failure",
+		"never":      "no",
+		"always":     "always",
+		"":           "",
+	} {
+		t.Run(input, func(t *testing.T) {
+			m := validRuntimeManifest()
+			m.Spec.RestartPolicy = input
+			if err := m.Validate(); err != nil {
+				t.Fatalf("Validate() error: %v", err)
+			}
+			if m.Spec.RestartPolicy != want {
+				t.Fatalf("restart policy = %q, want %q", m.Spec.RestartPolicy, want)
+			}
+		})
+	}
+}

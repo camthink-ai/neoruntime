@@ -14,6 +14,16 @@ on:
         required: false
         type: boolean
         default: true
+      min_os_version:
+        description: Minimum supported OS version.
+        required: false
+        type: string
+        default: '1.13.0'
+      max_os_version:
+        description: Maximum supported OS version.
+        required: false
+        type: string
+        default: '1.13.0'
 
 permissions:
   contents: write
@@ -29,6 +39,10 @@ jobs:
     runs-on: [self-hosted, linux, x64, docker]
     env:
       DOCKER_RELEASE_IMAGE: zerobot/ne503-dev-env-full:4.0.23
+      # Poky 4.0.23 SDK with medialib 1.13.0, extracted on this runner from
+      # the vendor toolchain installer; mounted over the image's baked-in
+      # (medialib 1.12) SDK by docker-pack-release.
+      DOCKER_RELEASE_SDK_HOST_DIR: /mnt/HDD1/poky/4.0.23-1.13.0
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,9 +52,23 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BUILD_MCU_FW_INPUT: ${{ inputs.build_mcu_fw }}
+          AIPC_MIN_OS_VERSION_INPUT: ${{ inputs.min_os_version }}
+          AIPC_MAX_OS_VERSION_INPUT: ${{ inputs.max_os_version }}
         run: |
           VERSION_INPUT="${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}"
           VERSION="${VERSION_INPUT:-${GITHUB_REF_NAME}}"
+          AIPC_MIN_OS_VERSION="${AIPC_MIN_OS_VERSION_INPUT:-1.13.0}"
+          AIPC_MAX_OS_VERSION="${AIPC_MAX_OS_VERSION_INPUT:-1.13.0}"
+          # Firmware is linked against medialib 1.13 and cannot load on an
+          # older OS; dispatch inputs may raise the floor (e.g. for a future
+          # sdk bump) but must not lower it below the mounted sdk requirement.
+          # app-manifest.json carries the range verbatim and the device-side
+          # compat check trusts it, so a lowered floor ships a broken install.
+          MIN_SDK_OS_VERSION=1.13.0
+          if [ "$(printf '%s\n' "$AIPC_MIN_OS_VERSION" "$MIN_SDK_OS_VERSION" | sort -V | head -1)" != "$MIN_SDK_OS_VERSION" ]; then
+            echo "ERROR: min_os_version ($AIPC_MIN_OS_VERSION) is below the SDK requirement ($MIN_SDK_OS_VERSION, medialib 1.13)."
+            exit 1
+          fi
           BUILD_MCU_FW=1
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$BUILD_MCU_FW_INPUT" != "true" ]; then
             BUILD_MCU_FW=0
@@ -48,14 +76,29 @@ jobs:
 
           make docker-pack-release \
             DOCKER_RELEASE_IMAGE="$DOCKER_RELEASE_IMAGE" \
+            DOCKER_RELEASE_SDK_HOST_DIR="$DOCKER_RELEASE_SDK_HOST_DIR" \
             VERSION="$VERSION" \
-            BUILD_MCU_FW="$BUILD_MCU_FW"
+            BUILD_MCU_FW="$BUILD_MCU_FW" \
+            AIPC_MIN_OS_VERSION="$AIPC_MIN_OS_VERSION" \
+            AIPC_MAX_OS_VERSION="$AIPC_MAX_OS_VERSION"
+
+      - name: Resolve artifact version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          RAW="${VERSION_INPUT:-${GITHUB_REF_NAME}}"
+          RAW="${RAW##*/}"   # release/v1.1.0 -> v1.1.0 (artifact names must not contain '/')
+          RAW="${RAW#v}"     # normalize to exactly one leading 'v'
+          echo "FIRMWARE_VERSION=v${RAW}" >> "$GITHUB_ENV"
 
       - name: Upload firmware package
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
-          name: hailo-firmware
+          name: neoruntime-hailo-firmware-${{ env.FIRMWARE_VERSION }}
           path: build/release/neoruntime-hailo15-*.tar.gz
+          retention-days: 7
 
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
@@ -116,10 +159,12 @@ jobs:
           cat ct-disc-sha256sums.txt
 
       - name: Upload ct-disc tools artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
           name: ct-disc-tools
           if-no-files-found: error
+          retention-days: 7
           path: |
             tools/ct-disc/dist/ct-disc-*
             tools/ct-disc/ct-disc-gui-windows-amd64-v*.zip

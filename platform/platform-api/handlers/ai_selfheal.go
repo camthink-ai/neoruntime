@@ -93,7 +93,7 @@ func loadModelRuntime(ctx context.Context, client inferencepb.InferenceServiceCl
 		}
 	}
 
-	if model.ResolveModelType(dbModel.ModelType) == "detection" {
+	if model.LoadProbeWorthy(dbModel.ModelType) {
 		if smokeErr := modelload.RunLoadSmokeTest(ctx, client, dbModel.ModelID, modelInfo, grpcModelType != ""); smokeErr != nil {
 			rollbackRegistration(client, dbModel.ModelID)
 			return fmt.Errorf("postprocess smoke test failed: %w", smokeErr)

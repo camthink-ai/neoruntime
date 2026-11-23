@@ -21,10 +21,10 @@ type CommandResponse struct {
 }
 
 type Client struct {
-	client   pahomqtt.Client
-	config   Config
-	respMu   sync.Mutex
-	pending  map[string]chan CommandResponse
+	client  pahomqtt.Client
+	config  Config
+	respMu  sync.Mutex
+	pending map[string]chan CommandResponse
 }
 
 func NewClient(cfg Config) (*Client, error) {

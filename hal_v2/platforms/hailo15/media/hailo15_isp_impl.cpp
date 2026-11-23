@@ -220,10 +220,12 @@ static void ml_apply_isp_auto_algorithm_blocks(Hailo15MediaPriv *priv, bool enab
     {
         return;
     }
-    if (s_ml_ae_cproc_aw_drv_enabled == enable_ae_cproc_aw_drv)
-    {
-        return;
-    }
+    /* Always push the state — never early-return on a cached flag. A profile
+     * switch (or any pipeline rebuild that reloads iq_settings) re-enables the
+     * firmware auto algorithms (ACproc/AE/AWdrv), so a cached "already
+     * disabled" goes stale and manual ISP writes are fought per-frame again.
+     * Cost is one set_override_parameters (~30ms) per ISP update, matching the
+     * webserver IspBlender::set_auto_configs flow this mirrors. */
     /* V1 video_impl: brief delay before disabling auto blocks when entering manual (AE converge). */
     if (s_ml_ae_cproc_aw_drv_enabled && !enable_ae_cproc_aw_drv)
     {
@@ -641,6 +643,119 @@ bool safe_ext_ctrl_set_optional(v4l2::v4l2ControlManager &m, CtrlEnum ctrl, cons
         HAL_LOG_DEBUG("Hailo15 ISP: ext_ctrl_set optional (%d) skipped", static_cast<int>(ctrl));
         return false;
     }
+}
+
+/**
+ * Direct cproc write fallback + the cproc enable gate.
+ *
+ * Verified on the deployed NE503 kernel (C probe + cold-boot strace, 2026-10-08):
+ * - /dev/video0 DOES implement QUERY_EXT_CTRL / S_CTRL / S_EXT_CTRLS for the cproc
+ *   family, so the manager path (name walk -> S_EXT_CTRLS) works inside the daemon;
+ *   the direct S_CTRL fallback below is kept as a second chance, not as the only path.
+ * - The kernel registers cproc at fixed UAPI CIDs on /dev/video0:
+ *     0x00983200 isp_cproc_enable, 0x00983204 brightness, 0x00983205 saturation,
+ *     0x00983207 contrast (meta-hailo-os source places them at +0x2900; deployed
+ *     kernel uses +0x3200).
+ * - Cold boot leaves isp_cproc_enable=0 (firmware default) and nothing in the
+ *   manager's map writes it. With the gate at 0 the cproc block is bypassed: manual
+ *   B/C/S values land in the kernel (G_CTRL readback tracks them) but the picture
+ *   does not change — the "ISP settings dead after reboot until manual mode is
+ *   toggled off/on" bug. The firmware ACproc algorithm sets enable=1 while it runs
+ *   (kernel-sticky), which is why the off->on toggle used to revive manual mode.
+ *   Measured proof: B=10 with enable=0 -> frame luma unchanged (58.4); writing only
+ *   enable=1 -> luma collapses to ~15 with the same kernel brightness (-85).
+ * - EE/sharpness blocks were not identifiable on the deployed kernel, so they stay
+ *   manager-only (best-effort).
+ *
+ * Auto mode deliberately does not touch the gate: leaving manual re-enables ACproc,
+ * which manages cproc (and the gate) itself — same state as a fresh boot.
+ */
+struct DirectCtrlCid
+{
+    v4l2::Video0Ctrl ctrl;
+    uint32_t cid;
+};
+static const DirectCtrlCid k_direct_cproc_cids[] = {
+    {v4l2::Video0Ctrl::BRIGHTNESS, 0x00983204u},
+    {v4l2::Video0Ctrl::SATURATION, 0x00983205u},
+    {v4l2::Video0Ctrl::CONTRAST, 0x00983207u},
+};
+static const uint32_t k_cproc_enable_cid = 0x00983200u;
+static std::optional<uint32_t> v4l2_find_ctrl_id_by_name(int fd, const char *ctrl_name);
+
+/**
+ * Resolve the cproc-enable CID by control NAME, not by number: the numeric ID
+ * differs between kernel BSPs (meta-hailo-os registers the family at
+ * V4L2_CID_USER_BASE + 0x2900, the deployed NE503 kernel at +0x3200), and a
+ * direct S_CTRL to an unregistered ID returns EINVAL. A hard-coded number
+ * would make apply_manual() fail wholesale on the other BSP before ever
+ * writing brightness/contrast/saturation. Falls back to the deployed-kernel
+ * ID when the query walk fails (older kernels, permission quirks). Cached:
+ * one walk per process.
+ */
+static uint32_t cproc_enable_cid()
+{
+    static const uint32_t cid = [] {
+        const int fd = open("/dev/video0", O_RDWR | O_CLOEXEC);
+        if (fd >= 0)
+        {
+            const auto found = v4l2_find_ctrl_id_by_name(fd, "isp_cproc_enable");
+            close(fd);
+            if (found.has_value())
+            {
+                return *found;
+            }
+        }
+        return k_cproc_enable_cid;
+    }();
+    return cid;
+}
+
+static bool direct_cproc_s_ctrl(v4l2::Video0Ctrl ctrl, int32_t value)
+{
+    for (const auto &entry : k_direct_cproc_cids)
+    {
+        if (entry.ctrl != ctrl)
+        {
+            continue;
+        }
+        const int fd = open("/dev/video0", O_RDWR | O_CLOEXEC);
+        if (fd < 0)
+        {
+            return false;
+        }
+        struct v4l2_control v4l2_ctrl;
+        memset(&v4l2_ctrl, 0, sizeof(v4l2_ctrl));
+        v4l2_ctrl.id = entry.cid;
+        v4l2_ctrl.value = value;
+        const bool ok = (ioctl(fd, VIDIOC_S_CTRL, &v4l2_ctrl) == 0);
+        close(fd);
+        return ok;
+    }
+    return false;
+}
+
+/**
+ * Open the cproc gate (isp_cproc_enable). Not in the medialib manager map, so this
+ * is a direct S_CTRL with the name-resolved CID (BSP-dependent number; see
+ * cproc_enable_cid). Returns false when the write is rejected —
+ * callers treat it as fatal for the manual apply (a closed gate means the picture
+ * silently ignores every B/C/S value).
+ */
+static bool direct_cproc_enable(int32_t value)
+{
+    const int fd = open("/dev/video0", O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return false;
+    }
+    struct v4l2_control v4l2_ctrl;
+    memset(&v4l2_ctrl, 0, sizeof(v4l2_ctrl));
+    v4l2_ctrl.id = cproc_enable_cid();
+    v4l2_ctrl.value = value;
+    const bool ok = (ioctl(fd, VIDIOC_S_CTRL, &v4l2_ctrl) == 0);
+    close(fd);
+    return ok;
 }
 
 /**
@@ -1712,19 +1827,42 @@ bool apply_manual(v4l2::v4l2ControlManager &m, const HalIspManualConfig *config)
     const uint16_t sh_down = calc_from_percent_u(sharpness_p, 0, 65535, s_ref_sharpness_down);
     const uint16_t sh_up = calc_from_percent_u(sharpness_p, 0, 30000, s_ref_sharpness_up);
 
-    /* Match webserver: set BRIGHTNESS as int32_t (int8 domain) — see isp.cpp stream_params POST. */
+    /* Match webserver: set BRIGHTNESS as int32_t (int8 domain) — see isp.cpp stream_params POST.
+     * cproc controls go through the manager first (works on kernels that implement
+     * QUERY_EXT_CTRL) and fall back to direct S_CTRL with the fixed kernel CIDs. */
+    auto cproc_set = [&m](v4l2::Video0Ctrl ctrl, int32_t value) {
+        if (safe_ext_ctrl_set(m, ctrl, value) || direct_cproc_s_ctrl(ctrl, value))
+        {
+            return true;
+        }
+        HAL_LOG_WARNING("Hailo15 ISP: cproc set rejected on both paths (ctrl=%d, value=%d)",
+                        static_cast<int>(ctrl), value);
+        return false;
+    };
     bool ok = true;
     {
+        /* Gate first: with isp_cproc_enable=0 (cold-boot firmware default) the cproc
+         * block is bypassed and every B/C/S write below is accepted but invisible. */
+        if (!direct_cproc_enable(1))
+        {
+            HAL_LOG_ERROR("Hailo15 ISP: cproc enable write rejected (cid=0x%08x) — "
+                          "manual picture would be visually inert",
+                          k_cproc_enable_cid);
+            ok = false;
+        }
         const int32_t b_clamped = std::clamp(b_hw, -128, 127);
-        ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::BRIGHTNESS, b_clamped);
+        ok = ok && cproc_set(v4l2::Video0Ctrl::BRIGHTNESS, b_clamped);
     }
-    ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::CONTRAST, c_hw);
-    ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::SATURATION, s_hw);
+    ok = ok && cproc_set(v4l2::Video0Ctrl::CONTRAST, c_hw);
+    ok = ok && cproc_set(v4l2::Video0Ctrl::SATURATION, s_hw);
 
-    ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::EE_ENABLE, static_cast<int32_t>(0));
-    ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::SHARPNESS_DOWN, static_cast<int32_t>(sh_down));
-    ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::SHARPNESS_UP, static_cast<int32_t>(sh_up));
-    ok = ok && safe_ext_ctrl_set(m, v4l2::Video0Ctrl::EE_ENABLE, static_cast<int32_t>(1));
+    /* EE/sharpness controls are absent from the deployed kernel's control set
+     * (and unresolvable through the manager); keep them best-effort so a
+     * missing block cannot fail the whole manual picture apply. */
+    (void)safe_ext_ctrl_set_optional(m, v4l2::Video0Ctrl::EE_ENABLE, static_cast<int32_t>(0));
+    (void)safe_ext_ctrl_set_optional(m, v4l2::Video0Ctrl::SHARPNESS_DOWN, static_cast<int32_t>(sh_down));
+    (void)safe_ext_ctrl_set_optional(m, v4l2::Video0Ctrl::SHARPNESS_UP, static_cast<int32_t>(sh_up));
+    (void)safe_ext_ctrl_set_optional(m, v4l2::Video0Ctrl::EE_ENABLE, static_cast<int32_t>(1));
     // Note: snap_refs_after_write removed — recalibrating baseline to just-written
     // HW values causes subsequent GETs to always return 50%. Keep original baselines.
     return ok;
@@ -1790,7 +1928,11 @@ static int hailo15_isp_set_image_config(void *video_ctx, const HalIspImageConfig
         {
             invalidate_picture_baselines_hw_only();
         }
-        (void)apply_manual(m, &config->manual_config);
+        if (!apply_manual(m, &config->manual_config))
+        {
+            HAL_LOG_ERROR("hailo15_isp_set_image_config: apply_manual failed (one or more V4L2 writes rejected)");
+            return HAL_ERROR;
+        }
         /* Exposure is already applied by the separate set_exposure_config() call
            in camera_daemon.cpp. Discarding the return here prevents a V4L2 control
            failure in apply_exposure from blocking unrelated WDR/AWB/noise-reduction
@@ -1963,7 +2105,11 @@ static int hailo15_isp_set_manual_config(void *video_ctx, const HalIspManualConf
             s_manual_picture_mode_track = true;
         }
         invalidate_picture_baselines_hw_only();
-        (void)apply_manual(m, config);
+        if (!apply_manual(m, config))
+        {
+            HAL_LOG_ERROR("hailo15_isp_set_manual_config: apply_manual failed (one or more V4L2 writes rejected)");
+            return HAL_ERROR;
+        }
         return HAL_OK;
     }
     catch (const std::exception &e)

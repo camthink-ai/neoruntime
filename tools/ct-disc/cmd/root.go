@@ -13,7 +13,7 @@ import (
 var (
 	buildVersion = "dev"
 	cfgFile      string
-	outputFmt   string
+	outputFmt    string
 	ifaceName    string
 	verbose      bool
 )

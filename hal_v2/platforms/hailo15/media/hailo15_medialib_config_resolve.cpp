@@ -35,6 +35,82 @@ static bool read_file_all(const char *path, std::string *out)
     return !out->empty();
 }
 
+/*
+ * Merge the caller's OSD config (ext->osd_config_json / osd_config_path) into an
+ * encoder config JSON. Medialib 1.13 removed MediaLibraryEncoder::get_osd_blender(),
+ * so standalone-encoder OSD is applied declaratively: the encoder config
+ * (CONFIG_SCHEMA_ENCODER_AND_BLENDING, "version": "5.0.0") accepts top-level "osd"
+ * and "privacy_mask" sections alongside "encoding"; set_config() plus the config
+ * attacher (enabled by hw_codec_init) pick them up per encoded buffer. Accepts both
+ * the "privacy_mask" key (encoder_osd_sinkN.json layout) and the profile-style
+ * "masking" key; a bare {"osd": ...} document also works.
+ */
+static void merge_osd_into_encoder_json(const Hailo15HalCodecPrivExt *ext, std::string *raw)
+{
+    if (!ext || !raw || raw->empty())
+    {
+        return;
+    }
+    std::string osd_json;
+    if (ext->osd_config_json && ext->osd_config_json[0])
+    {
+        osd_json = ext->osd_config_json;
+    }
+    else if (ext->osd_config_path && ext->osd_config_path[0])
+    {
+        if (!read_file_all(ext->osd_config_path, &osd_json))
+        {
+            /* Old behaviour failed the whole codec init here; surfacing the
+             * misconfiguration loudly (but not fatally) beats a silently
+             * OSD-less stream. */
+            HAL_LOG_WARNING("hailo15 cfg: osd_config_path '%s' is not readable; "
+                            "encoder will start without OSD",
+                            ext->osd_config_path);
+            return;
+        }
+    }
+    else
+    {
+        return;
+    }
+    auto osd_j = nlohmann::json::parse(osd_json, nullptr, false);
+    if (osd_j.is_discarded() || !osd_j.is_object())
+    {
+        HAL_LOG_WARNING("hailo15 cfg: osd config is not a valid JSON object; ignored");
+        return;
+    }
+    auto j = nlohmann::json::parse(*raw, nullptr, false);
+    if (j.is_discarded() || !j.is_object())
+    {
+        return;
+    }
+    bool merged = false;
+    if (osd_j.contains("osd") && osd_j["osd"].is_object())
+    {
+        j["osd"] = osd_j["osd"];
+        merged = true;
+    }
+    if (osd_j.contains("privacy_mask") && osd_j["privacy_mask"].is_object())
+    {
+        j["privacy_mask"] = osd_j["privacy_mask"];
+        merged = true;
+    }
+    else if (osd_j.contains("masking") && osd_j["masking"].is_object())
+    {
+        j["privacy_mask"] = osd_j["masking"];
+        merged = true;
+    }
+    if (merged)
+    {
+        *raw = j.dump();
+    }
+    else
+    {
+        HAL_LOG_WARNING("hailo15 cfg: osd config has none of the recognized keys "
+                        "(osd / privacy_mask / masking); nothing merged");
+    }
+}
+
 static const char *hal_pix_to_medialib_format(HalPixelFormat f)
 {
     switch (f)
@@ -247,9 +323,10 @@ static void patch_encoder_json_from_hal(const HalCodecConfig *cc, nlohmann::json
     }
 }
 
-/* Embedded default encoder JSON (aligned with hal/codec/hailo15/codec_impl.cpp). */
+/* Embedded default encoder JSON (aligned with hal/codec/hailo15/codec_impl.cpp).
+ * Schema version 5.0.0 = SDK 4.0.23 / medialib 1.13 CONFIG_SCHEMA_ENCODER_AND_BLENDING. */
 static const char kDefaultEncoderJson[] = R"HALCFG({
-  "version": "4.0.0",
+  "version": "5.0.0",
   "metadata": {
     "architecture": "hailo15h",
     "content_hash": "",
@@ -490,7 +567,7 @@ static int resolve_hw_jpeg_encoder_json(const HalCodecConfig *cfg, const Hailo15
     {
         quality = (cfg->jpeg_quality >= 1u && cfg->jpeg_quality <= 100u) ? cfg->jpeg_quality : 85u;
         nlohmann::json j;
-        j["version"] = "4.0.0";
+        j["version"] = "5.0.0";
         j["metadata"] = {{"architecture", "hailo15h"},
                          {"content_hash", ""},
                          {"description", "HAL v2 standalone JPEG encoder"},
@@ -506,6 +583,7 @@ static int resolve_hw_jpeg_encoder_json(const HalCodecConfig *cfg, const Hailo15
 
     if (!raw.empty())
     {
+        merge_osd_into_encoder_json(ext, &raw);
         auto j = nlohmann::json::parse(raw, nullptr, false);
         if (!j.is_discarded())
         {
@@ -575,6 +653,7 @@ int resolve_hw_encoder_json(const HalCodecConfig *cfg, const Hailo15HalCodecPriv
 
     if (!raw.empty())
     {
+        merge_osd_into_encoder_json(ext, &raw);
         auto j = nlohmann::json::parse(raw, nullptr, false);
         if (!j.is_discarded())
         {

@@ -11,6 +11,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 #include <cerrno>
 #include <cctype>
 #include <cmath>
@@ -503,6 +504,46 @@ static void apply_lens_infrared_profile(DaemonConfig& config) {
                  config.infrared.infrared_profile.c_str());
 }
 
+/* Per-lens day profile: same contract as the IR substitution above. The
+ * daylight IQ tuning differs between the AF lens and the FG2009 motorized
+ * zoom (each lens was tuned separately), so when the yaml still carries the
+ * generic name, the FG2009 unit resolves to its own entry. An explicit
+ * non-default daylight_profile is respected for bench tuning, and the
+ * substitution only fires when the media config that will actually be loaded
+ * can resolve the new name: an empty config_path means the compiled-in
+ * default bundle (whose profile list is build-gated to carry both entries);
+ * otherwise the configured container itself must list it. Unlike the IR
+ * substitution, the pack product container does NOT count as a provider —
+ * the IR path is paired with select_product_media_config_for_infrared, which
+ * switches config_path to whichever container serves the resolved entry, so
+ * checking both containers there is safe; the day path has no such selector,
+ * and renaming into an entry the loaded (custom) container cannot serve
+ * would make every boot/UI/IR-exit switch target an unknown profile. A
+ * custom container without the entry keeps the shared Daylight_Basic name —
+ * day mode degrades to the previous behavior rather than failing
+ * HAL_ERR_PROFILE_INVALID. */
+static void apply_lens_daylight_profile(DaemonConfig& config) {
+    if (config.lens_model != "fg2009" ||
+        config.media_daylight_profile != "Daylight_Basic") {
+        return;
+    }
+    static const std::string kFg2009DayProfile = "Daylight_Basic_FG2009";
+    if (!config.media_config_path.empty() &&
+        !media_config_contains_profile(config.media_config_path,
+                                       kFg2009DayProfile)) {
+        HAL_LOG_WARNING("FG2009 lens but the configured media file '%s' does not "
+                        "provide '%s'; keeping '%s' (the loaded container must "
+                        "serve the per-lens day entry)",
+                        config.media_config_path.c_str(),
+                        kFg2009DayProfile.c_str(),
+                        config.media_daylight_profile.c_str());
+        return;
+    }
+    config.media_daylight_profile = kFg2009DayProfile;
+    HAL_LOG_INFO("FG2009 lens; day profile -> %s",
+                 config.media_daylight_profile.c_str());
+}
+
 static DaemonConfig load_config(const std::string& path) {
     DaemonConfig cfg;
 
@@ -529,6 +570,7 @@ static DaemonConfig load_config(const std::string& path) {
     cfg.watchdog_scan_ms = 100;
     cfg.watchdog_timeout_ms = 5000;
     cfg.watchdog_warn_ms = 3000;
+    cfg.watchdog_in_use_timeout_ms = 30000;
     cfg.log_level = "info";
 
     // FG2009 open-loop geometry: bench-calibrated bootstrap offsets
@@ -613,6 +655,8 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.media_config_json = val;
             else if (trimmed.find("backup_path:") != std::string::npos)
                 cfg.backup_folder_path = val;
+            else if (trimmed.find("daylight_profile:") != std::string::npos)
+                cfg.media_daylight_profile = val;
         } else if (section == "video") {
             if (trimmed.find("device_path:") != std::string::npos)
                 cfg.device_path = val;
@@ -630,6 +674,8 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.watchdog_timeout_ms = parse_u32_config(val, "watchdog.frame_timeout_ms");
             else if (trimmed.find("warn_threshold_ms:") != std::string::npos)
                 cfg.watchdog_warn_ms = parse_u32_config(val, "watchdog.warn_threshold_ms");
+            else if (trimmed.find("in_use_timeout_ms:") != std::string::npos)
+                cfg.watchdog_in_use_timeout_ms = parse_u32_config(val, "watchdog.in_use_timeout_ms");
         } else if (section == "dsp") {
             // P2: DspServiceConfig knobs (defaults live in dsp_service.h).
             // Quota and retained-resource caps are per process incarnation.
@@ -1041,6 +1087,29 @@ static DaemonConfig load_config(const std::string& path) {
         }
     }
 
+    // Canonicalize encoder order: main, sub, third first (stable for the rest).
+    // Boot discovery pairs pipeline sinks with config entries positionally, and
+    // HAL assigns sinks in canonical order (main→sink0, sub→sink1, third→sink2
+    // via the override map built in init_media). YAML entry order is NOT
+    // canonical: platform-api's reconfigure rebuild appends a re-added stream
+    // at the end, so "remove sub + re-add" legitimately yields [main, third,
+    // sub] — a cold boot on that order bound 'third' to sink1 and 'sub' to
+    // sink2, making sub.sock serve 640x384 while third.sock served 1280x720
+    // (wire cross observed on the reboot acceptance case). Sorting in memory
+    // makes every positional walk sink-ordered; the YAML file is untouched.
+    {
+        auto rank = [](const std::string& n) -> int {
+            if (n == "main") return 0;
+            if (n == "sub") return 1;
+            if (n == "third") return 2;
+            return 3;
+        };
+        std::stable_sort(cfg.encoders.begin(), cfg.encoders.end(),
+                         [&rank](const EncoderCfg& a, const EncoderCfg& b) {
+                             return rank(a.stream_name) < rank(b.stream_name);
+                         });
+    }
+
     // Derive raw stream configs from encoder configs.
     // YAML encoders: is the single source of truth for stream resolution.
     // If no explicit streams: section was provided, auto-generate from encoders.
@@ -1138,6 +1207,7 @@ int main(int argc, char** argv) {
     apply_lens_model_identity(config);
     apply_lens_infrared_profile(config);
     select_product_media_config_for_infrared(config);
+    apply_lens_daylight_profile(config);
 
     HAL_LOG_INFO("===================================");
     HAL_LOG_INFO("AIPC Camera Daemon v2.0.0");

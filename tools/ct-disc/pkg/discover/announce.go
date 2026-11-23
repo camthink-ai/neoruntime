@@ -9,12 +9,12 @@ import (
 )
 
 const (
-	MulticastAddr = "239.255.255.250"
-	MulticastPort = 19850
-	AnnounceType  = "ct-announce"
-	ProbeType     = "ct-probe"
+	MulticastAddr  = "239.255.255.250"
+	MulticastPort  = 19850
+	AnnounceType   = "ct-announce"
+	ProbeType      = "ct-probe"
 	SetNetworkType = "ct-set-network"
-	MaxPacketSize = 1024
+	MaxPacketSize  = 1024
 )
 
 var ErrInvalidAnnounce = errors.New("invalid announce packet")

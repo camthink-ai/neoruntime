@@ -106,6 +106,22 @@ public:
     /// Number of active subscribers for a stream.
     int subscriber_count(const std::string& stream_name) const;
 
+    /// Declare a still-held frame as bound to an async hardware job
+    /// (FD_PUB_MSG_FRAME_IN_USE) and WAIT for the daemon's confirmation.
+    /// Returns true only when the daemon confirmed the exemption was
+    /// granted (or was already in place): the caller may then submit DMA
+    /// work on the frame's buffers. Returns false when the confirmation
+    /// did not arrive (old daemon without support, connection trouble,
+    /// unknown/reclaimed frame, per-client cap) — the caller MUST then
+    /// NOT submit DMA on the shared buffer and fall back to a private
+    /// copy (or drop the frame).
+    ///
+    /// The declaration travels on a dedicated control connection (its
+    /// synchronous OK/ERROR reply would desync a stream connection's
+    /// frame-only recv loop) and resolves frames held by any of this
+    /// process's stream connections. Thread-safe (serialized).
+    bool declare_frame_hw_in_use(uint64_t frame_id);
+
     /// Whether the stream's physical publisher connection is still receiving.
     bool stream_connected(const std::string& stream_name) const;
 
@@ -158,6 +174,20 @@ private:
         std::chrono::steady_clock::time_point deadline);
     void teardown_stream_connection(const std::shared_ptr<StreamConn>& conn);
     static void recv_loop(std::shared_ptr<StreamConn> conn) noexcept;
+
+    /* Dedicated control channel for FRAME_IN_USE declarations: the OK/ERROR
+     * reply must never ride a stream connection (frame-only recv loop).
+     * Lazily connected, mutex-serialized, and marked unsupported for a
+     * cool-down window when the daemon cannot confirm (old version or
+     * broken channel) so the per-frame hot path does not stall on
+     * timeouts — callers then take the private-copy fallback. */
+    struct InUseChannel {
+        std::timed_mutex mu;
+        int fd = -1;
+        bool unsupported = false;
+        std::chrono::steady_clock::time_point next_retry{};
+    };
+    InUseChannel in_use_;
 
     std::string socket_path_;
     mutable std::timed_mutex mu_;

@@ -37,6 +37,7 @@ import {
   initialModelImportForm,
   prefillUpdateForm,
   sanitizeModelId,
+  suggestKeypointProfile,
   suggestPostprocessProfile,
   suggestModelId,
   type ModelImportFormState,
@@ -61,6 +62,10 @@ interface UpdateTargetModel {
   output_mode?: string;
   variant?: string;
   vstream_info?: string;
+  /** Row's stored network dimensions — the keypoint template's dim source
+   *  in update mode, where no re-parse happens. */
+  input_width?: number;
+  input_height?: number;
   config?: Record<string, unknown>;
   [key: string]: unknown;
 }
@@ -362,6 +367,20 @@ export default function ImportModelDialog({
             && pkg?.config?.postprocess_profile === undefined
           ) {
             seededConfig.postprocess_profile = suggestedProfile;
+          }
+          // Keypoint HEFs pick their decoder by network identity (a
+          // pose-shaped name → yolov8_pose; face/landmark or unknown →
+          // facial default). The dedicated suggester beats the tensor-name
+          // prefix match above (it also catches yolov8s_pose-style names
+          // the exact-prefix check misses); packages still win outright.
+          if (
+            suggestedType === 'keypoint'
+            && pkg?.config?.postprocess_profile === undefined
+          ) {
+            seededConfig.postprocess_profile =              suggestKeypointProfile(
+                result.vstream_info,
+                result.network_name
+              ) ?? 'facial_landmarks';
           }
 
           setForm(prev => ({
@@ -702,7 +721,21 @@ export default function ImportModelDialog({
             modelTypeOptions={modelTypeOptions}
             initialProfile={initialProfileRef.current}
             outputFormat={outputFormat}
+            vstreamInfo={parseResult?.vstream_info ?? model?.vstream_info}
             suggestedType={parseResult?.suggested_type}
+            // Parsed dims win; the model row's stored dims are the fallback
+            // for update mode (no re-parse happens there, but the keypoint
+            // template still wants the create-time network dimensions).
+            inputDims={{
+              width: parseResult?.input_width ?? model?.input_width,
+              height: parseResult?.input_height ?? model?.input_height,
+            }}
+            // Update mode: snapshot of the loaded row — drives the editor's
+            // changed-keys diff view and reload banner.
+            initialForm={initialFormRef.current}
+            // Replacement-HEF facts feed the edit diff (added rows against
+            // the persisted payload — a file swap reloads the model).
+            replacementFile={parseResult}
             existingModelIds={modelsReady ? existingModelIdSet : null}
             disabled={isLoading}
             navHeader={navHeader}

@@ -140,6 +140,10 @@ struct DaemonConfig {
     std::string media_config_path;
     std::string media_config_json;
     std::string backup_folder_path;  // Profile backup/restore directory
+    // Generic day-profile alias resolved per lens at config load (main.cpp
+    // apply_lens_daylight_profile): stays "Daylight_Basic" on AF-lens units,
+    // becomes "Daylight_Basic_FG2009" on FG2009 motorized-zoom units.
+    std::string media_daylight_profile = "Daylight_Basic";
 
     // Video device
     std::string device_path;
@@ -168,6 +172,8 @@ struct DaemonConfig {
     uint32_t    watchdog_scan_ms;
     uint32_t    watchdog_timeout_ms;
     uint32_t    watchdog_warn_ms;
+    // Hard cap for hw-in-use frames (FRAME_IN_USE); 0 disables the exemption
+    uint32_t    watchdog_in_use_timeout_ms;
 
     // DSP offload service (P2: `dsp:` YAML section; defaults in dsp_service.h)
     DspServiceConfig dsp;
@@ -480,6 +486,20 @@ public:
     // Reapply the cached web OSD after MediaLibrary recreates encoder/blender
     // objects. Also clears vendor profile defaults on active encoders first.
     bool reapply_osd_config_after_pipeline_rebuild(const char* reason);
+    // Reapply the persisted web-tuned ISP state after a pipeline rebuild that
+    // reloaded the active profile's IQ defaults (profile switch, MediaLibrary
+    // reinit, stream layout change, pipeline reconfigure; in-place changes
+    // like transform rotation re-push harmlessly). cached_isp_state_ and the
+    // isp_config.json mirror still hold the web values and get_isp_config()
+    // serves that cache, so without a re-push the web UI shows values the
+    // hardware no longer has, and the next daemon start replays them onto
+    // whatever profile is active. No-op when the mirror is absent (the user
+    // never tuned ISP; the fresh profile defaults must be kept). Skips with
+    // a WARNING when video_source_'s video context no longer belongs to the
+    // rebuilt pipeline (some paths recreate MediaLibrary without rebinding
+    // the source; update_isp_settings would write through the dangling ctx).
+    // Best-effort: a failure logs and never fails the rebuild caller.
+    bool reapply_isp_config_after_pipeline_rebuild(const char* reason);
 
     // Privacy-mask/DPM config persistence — best-effort disk mirror of the last
     // config applied via set_privacy_mask_config so web-configured static regions
@@ -576,10 +596,20 @@ public:
     // Profile management (FROM_MEDIA mode)
     std::string get_current_profile() const;
     std::vector<std::string> list_profiles() const;
+    // Effective day profile for this unit's lens ("Daylight_Basic" on AF-lens
+    // units, the FG2009 entry on motorized-zoom units) — what the generic
+    // UI/API name resolves to at boot, on IR exit, and on UI switches.
+    const std::string& daylight_profile() const { return config_.media_daylight_profile; }
     // Switch the active medialib profile. On failure the daemon rolls back to the
     // previous profile and (when non-null) writes a human-readable cause into *message
     // (e.g. thermal restriction / unknown profile). Returns true only on a clean switch.
-    bool switch_profile(const std::string& profile_name, std::string* message = nullptr);
+    // verify_budget_ms bounds the post-switch (and rollback) first-frame wait. The
+    // 5s default fits warm interactive switches; callers replaying a persisted
+    // profile at boot must pass a larger budget — an AI-ISP profile's cold first
+    // start (model load + DSP init) can exceed 5s and would otherwise be rolled
+    // back to the default profile on every boot.
+    bool switch_profile(const std::string& profile_name, std::string* message = nullptr,
+                        uint64_t verify_budget_ms = 5000);
 
     // Active-profile persistence — best-effort disk mirror of the last
     // successfully-switched profile name so a web profile change survives
@@ -698,6 +728,22 @@ private:
     // Remains held while op_mu_ is temporarily released around blocking HAL calls.
     // This prevents two ReconfigurePipeline RPCs from entering MediaLibrary concurrently.
     std::mutex pipeline_reconfig_mu_;
+    // Serializes the full body of add_stream()/remove_stream()/
+    // reconfigure_pipeline()/reconfigure_encoder()/update_encoder_config().
+    // op_mu_ is intentionally released around blocking HAL calls in these
+    // paths, so without this guard a concurrent remove_stream +
+    // reconfigure_pipeline can interleave: reconfigure rebuilds
+    // config_.encoders from a codec list that still contains the stream being
+    // removed, resurrecting it as enabled=true right before remove finishes
+    // tearing down its HAL encoder -- every later AddStream for that stream
+    // is then rejected by the "already exists" guard until daemon restart.
+    // Held for the whole function; RAII covers every return path. Lock order:
+    // stream_op_mu_ -> pipeline_reconfig_mu_ -> op_mu_. NOT covered (known
+    // follow-ups): switch_profile() (has its own profile_switch_mu_ + throttle),
+    // set_transform_config()'s rotation_full_reinit path, and the AF worker's
+    // refresh_autofocus_video_context() (takes pipeline_reconfig_mu_ + op_mu_
+    // only, so it can still interleave with a stream add/remove HAL rebuild).
+    std::mutex stream_op_mu_;
     // Serializes the full body of switch_profile() (HAL switch + post-switch frame
     // verify + rollback). op_mu_ is intentionally released through the HAL-call and
     // verify/rollback windows, so without this guard a second concurrent profile
@@ -840,7 +886,7 @@ private:
 #endif
 
     bool switch_profile_internal(const std::string& profile_name, bool restart_af,
-                                 std::string* message);
+                                 std::string* message, uint64_t verify_budget_ms = 5000);
     bool set_led_duty_raw(uint32_t led_id, uint32_t duty_percent);
     double current_zoom_ratio() const;
 

@@ -176,6 +176,265 @@ func TestDetectionVariantJSON(t *testing.T) {
 	}
 }
 
+func TestKeypointPostprocessProfile(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     string
+		want    string
+		wantErr bool
+	}{
+		{"empty config", "", model.DefaultKeypointProfile, false},
+		{"facial explicit", `{"postprocess_profile":"facial_landmarks"}`, "facial_landmarks", false},
+		{"pose profile", `{"postprocess_profile":"yolov8_pose"}`, "yolov8_pose", false},
+		{"unknown profile", `{"postprocess_profile":"openpose"}`, "", true},
+		{"detection basename rejected", `{"postprocess_profile":"hailo_yolov8n_384_640"}`, "", true},
+		{"invalid json", "{not json", model.DefaultKeypointProfile, false},
+		{"wrong value type", `{"postprocess_profile":42}`, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &model.AIModel{Config: tt.cfg}
+			got, err := KeypointPostprocessProfile(m)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("KeypointPostprocessProfile() = %q, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("KeypointPostprocessProfile() unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("KeypointPostprocessProfile() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestKeypointVariantJSON(t *testing.T) {
+	verbatim := "  {\"native_yolov8_pose\":true,\"score_threshold\":0.7}"
+	tests := []struct {
+		name      string
+		m         *model.AIModel
+		want      map[string]interface{} // used unless passthru/wantEmpty
+		passthru  bool                   // expect exact passthrough of m.Variant
+		wantEmpty bool                   // expect "" (facial default)
+		wantErr   bool
+	}{
+		{
+			// Legacy row shape: no profile key, empty variant. Must keep the
+			// exact pre-profile behavior — empty blob, mediapipe default.
+			name:      "legacy row without profile stays empty",
+			m:         &model.AIModel{ModelType: "keypoint"},
+			wantEmpty: true,
+		},
+		{
+			name:      "explicit facial profile stays empty",
+			m:         &model.AIModel{ModelType: "keypoint", Config: `{"postprocess_profile":"facial_landmarks"}`},
+			wantEmpty: true,
+		},
+		{
+			name: "pose profile with 640 input composes full blob",
+			m: &model.AIModel{
+				ModelType: "keypoint", InputWidth: 640, InputHeight: 640,
+				Config: `{"postprocess_profile":"yolov8_pose"}`,
+			},
+			want: map[string]interface{}{
+				"native_yolov8_pose":         true,
+				"score_threshold":            0.25,
+				"keypoint_threshold":         0.25,
+				"yolov8_pose_network_width":  float64(640),
+				"yolov8_pose_network_height": float64(640),
+			},
+		},
+		{
+			name: "pose profile without input dims omits network keys",
+			m: &model.AIModel{
+				ModelType: "keypoint", InputWidth: 0, InputHeight: 0,
+				Config: `{"postprocess_profile":"yolov8_pose"}`,
+			},
+			want: map[string]interface{}{
+				"native_yolov8_pose": true,
+				"score_threshold":    0.25,
+				"keypoint_threshold": 0.25,
+			},
+		},
+		{
+			name: "config thresholds and explicit network size override row",
+			m: &model.AIModel{
+				ModelType: "keypoint", Threshold: 0.9, InputWidth: 640, InputHeight: 384,
+				Config: `{"postprocess_profile":"yolov8_pose","threshold":0.5,"keypoint_threshold":0.6,"yolov8_pose_network_width":1280}`,
+			},
+			want: map[string]interface{}{
+				"native_yolov8_pose":         true,
+				"score_threshold":            0.5,
+				"keypoint_threshold":         0.6,
+				"yolov8_pose_network_width":  float64(1280),
+				"yolov8_pose_network_height": float64(384),
+			},
+		},
+		{
+			// score_threshold < 1e-6 makes HAL silently fall back to 0.6 —
+			// never send a value the decoder misreads; omit instead.
+			name: "zero threshold is omitted not sent",
+			m: &model.AIModel{
+				ModelType: "keypoint",
+				Config:    `{"postprocess_profile":"yolov8_pose","threshold":0}`,
+			},
+			want: map[string]interface{}{
+				"native_yolov8_pose": true,
+				"keypoint_threshold": 0.25,
+			},
+		},
+		{
+			// REST does not schema-validate config (review 2026-09-21), so
+			// an out-of-window keypoint_threshold must be omitted — never
+			// forwarded into the blob — exactly like the score window above.
+			name: "out-of-range keypoint_threshold is omitted not sent",
+			m: &model.AIModel{
+				ModelType: "keypoint",
+				Config:    `{"postprocess_profile":"yolov8_pose","keypoint_threshold":2}`,
+			},
+			want: map[string]interface{}{
+				"native_yolov8_pose": true,
+				"score_threshold":    0.25,
+			},
+		},
+		{
+			name:     "json variant with leading whitespace passes through verbatim",
+			m:        &model.AIModel{ModelType: "keypoint", Variant: verbatim},
+			passthru: true,
+		},
+		{
+			// Today such rows die at the gRPC validator (keypoint bare names
+			// are rejected there); synthesizing over them is strictly a fix.
+			name: "bare name variant is overridden by profile synthesis",
+			m: &model.AIModel{
+				ModelType: "keypoint", Variant: "yolov8s_pose",
+				Config: `{"postprocess_profile":"yolov8_pose"}`,
+			},
+			want: map[string]interface{}{
+				"native_yolov8_pose": true,
+				"score_threshold":    0.25,
+				"keypoint_threshold": 0.25,
+			},
+		},
+		{
+			name: "unknown profile errors",
+			m: &model.AIModel{
+				ModelType: "keypoint",
+				Config:    `{"postprocess_profile":"openpose"}`,
+			},
+			wantErr: true,
+		},
+		{
+			name:     "non-keypoint variant unchanged",
+			m:        &model.AIModel{ModelType: "classification", Variant: "resnet18"},
+			passthru: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := KeypointVariantJSON(tt.m)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("KeypointVariantJSON() = %q, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("KeypointVariantJSON() unexpected error: %v", err)
+			}
+			if tt.passthru {
+				if got != tt.m.Variant {
+					t.Fatalf("KeypointVariantJSON() = %q, want passthrough %q", got, tt.m.Variant)
+				}
+				return
+			}
+			if tt.wantEmpty {
+				if got != "" {
+					t.Fatalf("KeypointVariantJSON() = %q, want empty string", got)
+				}
+				return
+			}
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+				t.Fatalf("composed variant is not valid JSON: %v (%q)", err, got)
+			}
+			if !reflect.DeepEqual(parsed, tt.want) {
+				t.Fatalf("KeypointVariantJSON() = %v, want %v", parsed, tt.want)
+			}
+		})
+	}
+}
+
+func TestRuntimeRegistrationKeypoint(t *testing.T) {
+	root, restore := newPostprocessTestEnv(t)
+	defer restore()
+
+	blob := filepath.Join(root, "models", "blobs", "cafebabe.hef")
+	writeHEF(t, blob, "pose-bytes")
+
+	t.Run("facial row registers empty variant, path passthrough", func(t *testing.T) {
+		m := &model.AIModel{ModelID: "face1", ModelType: "keypoint", FilePath: blob}
+		path, variant, grpcType, err := RuntimeRegistration(m)
+		if err != nil {
+			t.Fatalf("RuntimeRegistration: %v", err)
+		}
+		if path != blob || variant != "" || grpcType != "keypoint" {
+			t.Fatalf("got (%q, %q, %q), want (%q, \"\", \"keypoint\")", path, variant, grpcType, blob)
+		}
+	})
+
+	t.Run("pose row gets composed blob, no materialization", func(t *testing.T) {
+		m := &model.AIModel{
+			ModelID: "pose1", ModelType: "keypoint", FilePath: blob,
+			InputWidth: 640, InputHeight: 640,
+			Config: `{"postprocess_profile":"yolov8_pose"}`,
+		}
+		path, variant, grpcType, err := RuntimeRegistration(m)
+		if err != nil {
+			t.Fatalf("RuntimeRegistration: %v", err)
+		}
+		if path != blob {
+			t.Fatalf("path = %q, want passthrough %q (keypoint needs no basename)", path, blob)
+		}
+		if grpcType != "keypoint" {
+			t.Fatalf("grpcType = %q, want keypoint", grpcType)
+		}
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(variant), &parsed); err != nil {
+			t.Fatalf("variant not JSON: %v (%q)", err, variant)
+		}
+		if parsed["native_yolov8_pose"] != true {
+			t.Fatalf("native_yolov8_pose = %v, want true", parsed["native_yolov8_pose"])
+		}
+	})
+
+	t.Run("landmarks alias resolves to keypoint branch", func(t *testing.T) {
+		m := &model.AIModel{ModelID: "lm1", ModelType: "landmarks", FilePath: blob,
+			Config: `{"postprocess_profile":"yolov8_pose"}`}
+		_, variant, grpcType, err := RuntimeRegistration(m)
+		if err != nil {
+			t.Fatalf("RuntimeRegistration: %v", err)
+		}
+		if grpcType != "landmarks" {
+			t.Fatalf("grpcType = %q, want stored spelling landmarks", grpcType)
+		}
+		if !strings.Contains(variant, `"native_yolov8_pose":true`) {
+			t.Fatalf("variant = %q, want composed pose blob", variant)
+		}
+	})
+
+	t.Run("unknown keypoint profile errors the load", func(t *testing.T) {
+		m := &model.AIModel{ModelID: "bad1", ModelType: "keypoint", FilePath: blob,
+			Config: `{"postprocess_profile":"openpose"}`}
+		if _, _, _, err := RuntimeRegistration(m); err == nil {
+			t.Fatal("RuntimeRegistration() = nil error, want unknown profile error")
+		}
+	})
+}
+
 func TestRuntimeRegistration(t *testing.T) {
 	root, restore := newPostprocessTestEnv(t)
 	defer restore()

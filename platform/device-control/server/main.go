@@ -735,7 +735,11 @@ func (s *DeviceControlServer) SetWhiteLight(ctx context.Context, req *pb.LightLe
 
 	if s.cameraDaemonClient != nil {
 		resp, err := s.cameraDaemonClient.SetLedDuty(ctx, &camerapb.SetLedDutyRequest{
-			LedId:       0, // white light
+			// MCU LED map (bsp_led_t): 0=IR near, 1=IR far, 2=white2 (dedicated
+			// TIM3_CH2), 3/4=white1/ir1 (shared TIM3_CH1). The old LedId:0 drove
+			// the NEAR IR fill light while every caller (aipc-cli "device light",
+			// the REST route name, the emitted event) said "white light".
+			LedId:       2, // white2: dedicated white channel
 			DutyPercent: uint32(req.Level),
 		})
 		if err != nil {
@@ -766,7 +770,7 @@ func (s *DeviceControlServer) SetIrLed(ctx context.Context, req *pb.LightLevelRe
 
 	if s.cameraDaemonClient != nil {
 		resp, err := s.cameraDaemonClient.SetLedDuty(ctx, &camerapb.SetLedDutyRequest{
-			LedId:       1, // IR LED
+			LedId:       1, // far IR fill light (MCU LED map: 0=IR near, 1=IR far, 2=white2, 3/4=shared)
 			DutyPercent: req.Level,
 		})
 		if err != nil {
@@ -798,8 +802,16 @@ func (s *DeviceControlServer) SetIrCut(ctx context.Context, req *pb.IrCutRequest
 		mode = 1
 	case pb.IrCutMode_IRCUT_DAY:
 		mode = 0
-	default: // AUTO → default to day
-		mode = 0
+	default:
+		// IRCUT_AUTO (also the proto3 default for an unset field): day/night
+		// auto-switching is a light-sensor policy that lives behind the
+		// imaging-mode endpoint. Silently mapping AUTO to day used to report
+		// success while forcing day mode (aipc-cli "device ircut auto" hit
+		// this); fail loudly and point at the real endpoint instead.
+		return &pb.Status{
+			Success: false,
+			Message: "AUTO is not supported on ir-cut; use imaging-mode with mode=auto",
+		}, nil
 	}
 
 	resp, err := s.cameraDaemonClient.SetIrCut(ctx, &camerapb.SetIrCutRequest{Mode: mode})

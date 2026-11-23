@@ -1,5 +1,13 @@
 {
   "sys": {
+    "compatibility": {
+      "banner_title": "The installed app is incompatible with the device OS; services are held down",
+      "banner_desc": "App {{app}} supports OS {{min}}–{{max}}; this device is running OS {{os}}. Install a compatible app package to restore full functionality.",
+      "app_version_label": "App version",
+      "supported_os_label": "Supported OS range",
+      "current_os_label": "Current device OS",
+      "firmware_upgrade_action": "Firmware Upgrade"
+    },
     "common": {
       "unknown": "Unknown",
       "actions": "Actions",
@@ -22,7 +30,10 @@
       "save": "Save",
       "saving": "Saving...",
       "ssh_settings": "SSH Settings",
-      "view_all": "View All"
+      "view_all": "View All",
+      "enabled": "Enabled",
+      "saved": "Saved",
+      "save_failed_retry": "Save failed, device configuration restored"
     },
     "login": {
       "login_title": "Login CamThink",
@@ -58,7 +69,8 @@
       "latency": "Latency",
       "bandwidth": "Bandwidth",
       "preview_disconnected": "Preview Disconnected",
-      "volume": "Volume"
+      "volume": "Volume",
+      "disconnected": "Disconnected"
     },
     "gyro": {
       "title": "Gyroscope Calibration",
@@ -327,14 +339,16 @@
       "write_inactive_copy": "Write Inactive Copy",
       "reboot_now": "Reboot Now",
       "remove_package": "Remove Package",
-      "reupload_package": "Re-upload"
+      "reupload_package": "Re-upload",
+      "ota_complete_login_prompt": "Firmware update complete. Please log in again."
     },
     "password_settings": {
       "title": "Password Disable",
       "status": "Password Status",
       "disable": "Disable Password",
       "enable": "Enable Password",
-      "warning": "Disabling the password poses a security risk as anyone can access the device."
+      "warning": "Disabling the password poses a security risk as anyone can access the device.",
+      "enable_warning": "Enable the device password? A password will be required to access the device."
     },
     "firmware_settings": {
       "title": "Firmware Upgrade",
@@ -377,6 +391,7 @@
       "eject_warning": "Make sure no read/write operations are in progress before ejecting.",
       "eject_confirm": "Are you sure you want to unmount?",
       "formatting": "Formatting...",
+      "formatting_hint": "Do not leave or refresh this page while formatting is in progress; it unlocks automatically when done (large SD cards may take several minutes).",
       "ejecting": "Ejecting...",
       "format_success": "Formatted successfully",
       "format_failed": "Format failed",
@@ -661,7 +676,17 @@
       "privacy_mask_draw_hint_progress": "Click to place vertices (need 3 min). Double-click to close the polygon.",
       "privacy_mask_draw_hint_close": "Double-click to close the polygon.",
       "privacy_mask_draw_hint_idle": "Click \"Add Region\" then click on the live video to place vertices. Drag a vertex to fine-tune.",
-      "privacy_mask_no_regions": "No mask regions yet"
+      "privacy_mask_no_regions": "No mask regions yet",
+      "daynight_mode": "Day / Night Mode",
+      "daynight_auto_hint": "Auto: switches day/night with the light sensor",
+      "infrared_on_hint": "Infrared profile and IR illumination are active",
+      "infrared_off_hint": "Use the daylight profile with IR illumination off",
+      "daynight_auto": "Auto",
+      "daynight_day": "Day",
+      "daynight_night": "Night",
+      "light_thresholds": "Light thresholds (auto)",
+      "night_enter": "Enter night ≤",
+      "day_enter": "Enter day ≥"
     },
     "media_player": {
       "bitrate": "Bitrate",
@@ -1105,34 +1130,6 @@
       "reconnecting": "Reconnecting...",
       "max_retries_reached": "Max retries reached. Click to reconnect."
     },
-    "ssh": {
-      "permit_root_login": "Root Login",
-      "port_invalid": "Port must be between 1 and 65535",
-      "permit_root": {
-        "yes": "Allow",
-        "prohibit_password": "Key Only",
-        "no": "Deny"
-      },
-      "password_authentication": "Password Authentication",
-      "pubkey_authentication": "Public Key Authentication",
-      "auth": {
-        "enabled": "Enabled",
-        "disabled": "Disabled"
-      },
-      "max_auth_tries": "Max Authentication Tries",
-      "max_auth_tries_invalid": "Max authentication tries must be between 1 and 10",
-      "restart_service": "Restart SSH service after saving",
-      "logs": "SSH Logs",
-      "no_logs": "No logs available",
-      "status": {
-        "active": "Running",
-        "inactive": "Stopped",
-        "unknown": "Unknown"
-      },
-      "update_success": "SSH configuration updated successfully",
-      "update_error": "Failed to update SSH configuration: ",
-      "logs_refreshed": "Logs refreshed"
-    },
     "file_management": {
       "title": "File Management",
       "search_placeholder": "Search files...",
@@ -1209,12 +1206,25 @@
       "confirm_save_description": "Are you sure you want to save changes? This will overwrite the original file.",
       "forward": "Forward",
       "select_all": "Select All",
-      "up": "Up"
+      "up": "Up",
+      "preparing_zip": "Packaging {{count}} files...",
+      "download_complete": "Successfully downloaded {{count}} files",
+      "batch_download_failed": "Batch download failed",
+      "deleting": "Deleting...",
+      "confirm_delete": "Confirm Delete",
+      "batch_delete_confirm": "Batch Delete Confirmation",
+      "batch_delete_warning": "Are you sure you want to delete {{count}} selected files/folders? This cannot be undone."
     },
     "file_upload": {
       "uploading": "Uploading...",
       "add_more_files": "Click or drag to add more files",
-      "placeholder": "Drag files here, or click to select"
+      "placeholder": "Drag files here, or click to select",
+      "file_too_large": "File too large; maximum allowed {{limit}}",
+      "no_limit": "Unlimited",
+      "file_type_unsupported": "Unsupported file type",
+      "select_file": "Select File",
+      "upload_image_hint": "Click or drag to upload an image",
+      "image_formats_hint": "Supports PNG, JPG, GIF, WebP"
     },
     "apps": {
       "title": "Applications",
@@ -1293,7 +1303,10 @@
         "resource_load": "Resource Load",
         "since_last_hour": "since last hour",
         "stability_index": "Overall stability index",
-        "optimal_allocation": "Optimal allocation active"
+        "optimal_allocation": "Optimal allocation active",
+        "cpu": "CPU",
+        "memory": "Memory",
+        "uptime": "Uptime"
       },
       "permissions": {
         "events": "Events"
@@ -1305,7 +1318,9 @@
         "device": "Device Control",
         "network": "Network",
         "light": "Light",
-        "lens": "Lens"
+        "lens": "Lens",
+        "video": "Video Streams",
+        "models": "AI Models"
       },
       "import": {
         "wizard_title": "Application Setup Wizard",
@@ -1363,8 +1378,6 @@
         "yaml_copied": "Copied to clipboard",
         "yaml_copy_failed": "Copy failed",
         "yaml_preview_hint": "Read-only preview · generated from the form — copy and use as app.yaml",
-        "yaml_edited_review": "app.yaml: modified in the YAML editor (installed as edited)",
-        "yaml_review_unchanged": "app.yaml: unmodified",
         "yaml_loading": "Loading editor…",
         "image_address": "Image Address",
         "app_id": "Application ID *",
@@ -1524,7 +1537,31 @@
         "model_required_row": "Required (install fails if missing)",
         "model_custom_hint": "Declare a model bundled in the image and not registered with the system: when the id is not in the system list, the in-image AMPK model package (.bin) path is required to pass install validation.",
         "model_unavailable_required": "A required model dependency is unregistered and declares no path — install would be blocked. Provide the model path or pick a system model.",
-        "image_uploading": "Image upload is still in progress, please wait"
+        "image_uploading": "Image upload is still in progress, please wait",
+        "app_version_required": "App version is required",
+        "cpu_limit_invalid": "CPU limit must be greater than zero and use cores or a percentage (for example 0.5 or 50%)",
+        "cpu_limit_high": "CPU limit exceeds one core (100%); confirm the device has enough capacity",
+        "memory_limit_invalid": "Memory limit must be a positive integer with a supported unit (for example 256Mi or 1Gi)",
+        "memory_limit_high": "Memory limit exceeds 4Gi; confirm the device has enough capacity",
+        "reserved_model_alias": "The model alias conflicts with a platform-injected environment variable",
+        "model_path_conflict": "The same model ID cannot declare different package paths",
+        "inference_quota_invalid": "Inference QPS and concurrency must be zero or greater; zero keeps the default or unlimited behavior",
+        "event_topic_invalid": "Event topics must not be empty",
+        "event_topic_duplicate": "Publish and subscribe topic lists must not contain duplicates",
+        "video_stream_unavailable": "The manifest references a video stream that is not available on this device",
+        "network_mode_invalid": "Network mode must be isolated or host",
+        "network_inbound_invalid": "Inbound ports must be integers from 1 through 65535",
+        "network_inbound_duplicate": "Inbound ports must not be duplicated",
+        "network_inbound_requires_host": "Inbound ports require host network mode",
+        "host_network_warning": "Host network mode shares the device network namespace; confirm that the app requires it",
+        "dynamic_model_registration_warning": "The app may dynamically register models; continue only if you trust it",
+        "env_name_invalid": "Environment variable names must start with a letter or underscore and contain only letters, digits, and underscores",
+        "env_name_duplicate": "Environment variable names must not be duplicated",
+        "volume_path_invalid": "Volume host and container paths must be absolute and contain no ., .., or repeated separators",
+        "volume_destination_duplicate": "Multiple volumes cannot use the same container destination",
+        "restart_policy_invalid": "Restart policy must be no, on-failure, or always (legacy never and on_failure are also accepted)",
+        "writable_rootfs_warning": "The app requests a writable root filesystem, which reduces isolation",
+        "warning_confirm": "The following risks were detected. Continue with installation?"
       },
       "logs": {
         "title": "Logs",
@@ -1555,7 +1592,15 @@
         "website": "Official Website",
         "docs": "Documentation",
         "version_history": "Version History",
-        "release_date": "Release Date"
+        "release_date": "Release Date",
+        "permissions": "Permissions & Resources",
+        "info": "App Info",
+        "id": "ID",
+        "version": "Version",
+        "installed_at": "Installed At",
+        "started_at": "Started At",
+        "fetch_failed": "Failed to load app details",
+        "missing_manifest": "App is missing manifest_path information"
       },
       "terminal": {
         "title": "Container Terminal"
@@ -1617,6 +1662,13 @@
         "postprocess_profile_hailo_yolov8s_384_640": "yolov8s 384x640",
         "postprocess_profile_hailo_yolov8m_384_640": "yolov8m 384x640",
         "postprocess_profile_yolov5m_vehicles": "yolov5m vehicles 1920x1080 (single class)",
+        "postprocess_profile_facial_landmarks": "Facial landmarks (default)",
+        "postprocess_profile_yolov8_pose": "YOLOv8 pose (COCO-17)",
+        "postprocess_profile_facial_landmarks_note": "MediaPipe facial landmark decoder: 468 points, presence threshold 0.5, 192×192 input — all fixed at compile time, no tunable parameters.",
+        "postprocess_profile_yolov8_pose_note": "Built-in COCO-17 pose decoder: confidence and keypoint thresholds stay tunable; the network size is fixed at registration and changing it reloads the model.",
+        "keypoint_threshold": "Keypoint threshold",
+        "field_effect_advisory": "no effect",
+        "field_effect_metadata": "metadata only",
         "labels": "Class Labels",
         "labels_hint": "Comma-separated, in training order; detection class_id starts at 1 and maps to labels[N-1], with no background class. Stored as metadata only — runtime labels are baked into the model.",
         "labels_placeholder": "smoke,fire",
@@ -1624,9 +1676,14 @@
         "variant_hint": "Overrides the postprocess config composed from the fields above. A {…} object must carry the full plugin schema; leave empty to use the profile selection above.",
         "variant_placeholder": "Empty for defaults, or paste a full custom JSON blob",
         "variant_template": "Insert template from current values",
+        "variant_template_none_facial": "The facial-landmarks decoder is fully compile-time fixed — there is no blob to compose for this profile.",
         "variant_invalid_json": "Variant is not valid JSON",
         "variant_missing_keys": "Variant JSON is missing required key(s): {{keys}}",
-        "variant_function_unsupported": "backend_function must be one of: {{fns}}"
+        "variant_function_unsupported": "backend_function must be one of: {{fns}}",
+        "variant_bare_name": "Keypoint variants must be a full JSON object (bare names are rejected by the runtime)",
+        "variant_forbidden_keys": "Variant contains forbidden loader control key(s): {{keys}}",
+        "variant_pose_hint": "Overrides the pose blob composed at load time. A {…} blob is passed to the decoder verbatim (loader control keys are rejected); leave empty to use the profile selection above.",
+        "variant_pose_placeholder": "Empty for the composed pose blob, or paste a custom JSON object"
       },
       "empty": {
         "templates": "No AI models available",
@@ -1723,7 +1780,21 @@
         "labels": "Class labels",
         "labels_more": "{{count}} more",
         "labels_expand": "Show all",
-        "labels_collapse": "Collapse"
+        "labels_collapse": "Collapse",
+        "desired_state": "Desired state",
+        "desired_loaded": "Loaded",
+        "desired_unloaded": "Unloaded",
+        "desired_state_mismatch": "Desired loaded but currently not loaded — the last load attempt failed; see the runtime journal.",
+        "effective_title": "Effective config (runtime)",
+        "effective_hint": "The postprocess parameters the runtime actually received at load time — projected through the same resolution order the loader uses (a custom blob wins over the composed profile).",
+        "effective_raw_note": "Raw mode: outputs are bare tensors; postprocess config takes no part at runtime.",
+        "effective_escape": "A custom variant blob is overriding the composed profile — the form values under Postprocess Parameters above have no effect.",
+        "effective_escape_broken": "The stored variant is not a valid JSON object — loading will be rejected; fix or clear it.",
+        "effective_passthrough": "Bare-name variant: ",
+        "effective_passthrough_detection": " routes as the backend function; the remaining keys are composed from the config.",
+        "effective_passthrough_keypoint": " is overridden by the composed profile (bare names do not steer pose decoding).",
+        "effective_none": "This profile has no runtime postprocess parameters — all decoder behavior is fixed at compile time.",
+        "effective_payload": "Runtime payload JSON (verbatim)"
       },
       "model_type": {
         "detection": "Object Detection",
@@ -1773,6 +1844,13 @@
         "variant_how_title": "How to fill it in",
         "variant_how_plain": "Type a built-in variant name (e.g. hailo_yolov8n)",
         "variant_how_json": "Full override: press the button below to generate a JSON template from the current values, then edit it",
+        "variant_pose_intro": "The model variant (model_variant) overrides the pose blob the platform composes at load time. A hand-written {…} blob is passed through to the decoder verbatim.",
+        "variant_pose_when_1": "Pinning thresholds in the blob instead of the form (a blob overrides the composed config entirely)",
+        "variant_pose_when_2": "Recording network dimensions that differ from the parsed HEF values (create-time keys; changing them later requires a reload)",
+        "variant_pose_when_3": "Passing extra decoder keys the form does not expose — unknown keys are forwarded as-is",
+        "variant_pose_how_1": "Leave it empty — the profile selection above composes the blob at load time",
+        "variant_pose_how_2": "Full override: press the button below to generate the pose blob from the current values, then edit it (bare names are rejected)",
+        "variant_pose_skip_hint": "Facial-landmark models (468 points, fully compile-time fixed) and default pose setups: leave it empty.",
         "step_upload": "Upload",
         "step_parse": "Parse",
         "step_configure": "Configure",
@@ -1798,7 +1876,26 @@
         "package_prefill": "AMPK package detected — configuration pre-filled from the package; review before registering",
         "type_mismatch": "This HEF carries the yolov8_nms_postprocess output layer but the type is not detection — it is likely miscategorized",
         "type_mismatch_switch": "Switch to detection",
-        "profile_change_hint": "Changing the postprocess profile reloads the model if it is currently loaded"
+        "profile_change_hint": "Changing the postprocess profile reloads the model if it is currently loaded",
+        "raw_tensor_preview": "Output tensor preview",
+        "raw_tensor_preview_stream": "Output stream name",
+        "raw_tensor_preview_note": "Outputs are returned as raw bytes; NMS streams are float32 semantics. Your app decodes them.",
+        "summary_title": "Recognition result",
+        "summary_type": "Type",
+        "summary_profile": "Decoder profile",
+        "summary_dims": "Network size",
+        "summary_output": "Output format",
+        "summary_format_nms": "NMS (platform-decodable)",
+        "summary_format_feature_map": "Feature map",
+        "summary_format_unknown": "Unrecognized",
+        "summary_overridden": "The parse-suggested type has been overridden manually — change it back unless intentional, to keep the matching postprocess.",
+        "diff_title": "This submit will change",
+        "diff_hint": "Key-level differences against the currently saved config; config keys are expanded one by one.",
+        "diff_empty": "Identical to the saved config — no changes.",
+        "reload_banner": "These changes will reload the model (unload then load again); inference pauses briefly.",
+        "recordkeeping_group": "Record-only parameters",
+        "recordkeeping_hint": "The runtime does not read these keys — they are kept as record/compatibility metadata only.",
+        "variant_primer_toggle": "When and how to use it"
       },
       "type": {
         "landmark": "Keypoint Detection",
@@ -1924,7 +2021,14 @@
         "ir_led_on": "ON",
         "ir_led_off": "OFF",
         "set_success": "Setting updated",
-        "set_failed": "Failed to update setting"
+        "set_failed": "Failed to update setting",
+        "preset_name_prompt": "Preset name",
+        "preset_saved": "Preset saved",
+        "preset_loaded": "Preset loaded",
+        "presets": "Presets",
+        "save_preset": "Save current",
+        "no_presets": "No presets saved",
+        "load": "Load"
       },
       "lens": {
         "title": "Lens Control",

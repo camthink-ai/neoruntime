@@ -140,6 +140,14 @@ export interface ModelFieldDef {
   max?: number;
   step?: number;
   options?: { value: string; label: string; custom?: boolean }[];
+  /** Whether a value reaches the decoder (consumed, default), only
+   *  documents intent (advisory), or is consumer-side metadata (metadata) —
+   *  mirrored from the backend registry's Effect. */
+  effect?: 'consumed' | 'advisory' | 'metadata';
+  /** Profiles the field renders under; empty/absent = always visible.
+   *  Used by the keypoint form: threshold controls exist only for
+   *  yolov8_pose, never for the compiled-in facial decoder. */
+  profiles?: string[];
 }
 
 export interface ModelTypeDef {
@@ -147,6 +155,16 @@ export interface ModelTypeDef {
   label: string;
   fields: ModelFieldDef[];
   aliases?: string[];
+  /** Per-profile effect overrides keyed by the postprocess profile's select
+   *  value → field key → effect. Multi-decoder types (detection's four
+   *  plugin entries, keypoint's facial/pose pair) diverge per decoder: the
+   *  field-level annotation is the DEFAULT profile's truth and this table
+   *  carries the rest (e.g. yolov5m_vehicles reads none of the knobs, so
+   *  threshold is advisory under it while consumed elsewhere). */
+  profile_param_effects?: Record<
+    string,
+    Record<string, ModelFieldDef['effect']>
+  >;
 }
 
 export interface FileFormat {

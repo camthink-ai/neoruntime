@@ -5144,6 +5144,31 @@ paths:
                     data:
                       $ref: '#/components/schemas/OSUpgradeJob'
 
+  /system/app-compat:
+    get:
+      tags: [System]
+      summary: On-demand compatibility verdict of the installed app
+      description: Intentionally public (no session auth), like the other
+        upgrade-status routes — the UI needs the verdict pre-auth and after
+        the session loss that follows an upgrade reboot. Computed from the
+        os-release file and the installed app manifest on every call; the
+        os-upgrade job verdict goes stale once an app package is installed.
+      operationId: getAppCompatStatus
+      security: []
+      responses:
+        '200':
+          description: Installed-app compatibility verdict; missing or
+            unreadable metadata degrades to a structured invalid verdict
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/AppCompatibility'
+
   /system/os-upgrade/status:
     get:
       tags: [System]
@@ -8179,6 +8204,10 @@ components:
       properties:
         valid:
           type: boolean
+        app_version:
+          type: string
+          description: Version of the installed app (or of the parsed package
+            in the ota parse verdict)
         error_code:
           type: string
           description: e.g. APP_OS_METADATA_UNAVAILABLE, APP_MANIFEST_MISSING,

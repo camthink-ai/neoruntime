@@ -1134,6 +1134,31 @@ migrate_persistent_data() {
     mkdir -p "$AIPC_DATA_ROOT/containerd"
 }
 
+# Immutable release trees are hardlinked instead of copied during staging and
+# backup. Both phases would otherwise rewrite the full release (~300MB each,
+# over 1GB total with the package copy) onto the /data eMMC, which stretched
+# deploys past the frontend's polling patience on slow boards. Hardlinks are
+# safe because these trees are immutable: a deploy replaces them wholesale and
+# nothing writes them in place, so a snapshot costs directory entries, not
+# data blocks. `etc` and `nginx` hold runtime-mutable content, and unknown
+# top-level entries default to real copies, so a future mutable addition can
+# never silently share an inode with a snapshot. Hardlinks also require the
+# source to sit on the same filesystem as the destination; a package run from
+# e.g. tmpfs or USB falls back to real copies.
+IMMUTABLE_RELEASE_DIRS="|bin|lib|libexec|scripts|recovery|web|swagger-ui|firmware|docs|share|systemd|"
+
+release_tree_copy() { # release_tree_copy <src-entry> <dest-dir>
+    local entry="$1" dest="$2" name
+    name="$(basename -- "$entry")"
+    if [[ -d "$entry" && ! -L "$entry" ]] &&
+       [[ "$IMMUTABLE_RELEASE_DIRS" == *"|$name|"* ]] &&
+       [[ "$(stat -c %d "$entry" 2>/dev/null || echo s1)" == "$(stat -c %d "$dest" 2>/dev/null || echo s2)" ]]; then
+        cp -al "$entry" "$dest"/
+    else
+        cp -a "$entry" "$dest"/
+    fi
+}
+
 # Build a complete candidate root on the same filesystem as /data/aipc. The
 # complete root (including configs and metadata) is validated before rename,
 # so a power loss can expose either the old release or the new release, never
@@ -1150,7 +1175,7 @@ prepare_staging() {
         for entry in "$INSTALL_PREFIX"/*; do
             name="$(basename -- "$entry")"
             case "$name" in data|models|apps|logs|backups|images) continue ;; esac
-            cp -a "$entry" "$STAGING_DIR"/
+            release_tree_copy "$entry" "$STAGING_DIR"
         done
         shopt -u dotglob nullglob
     fi
@@ -1160,12 +1185,24 @@ prepare_staging() {
     # Documentation=) are staged by the Makefile under opt/aipc/ and must be
     # carried into the new root here, or /data/aipc/firmware/mcu and
     # /data/aipc/docs would be absent after the atomic swap.
+    local pkg_hardlink=0
+    if [[ "$(stat -c %d "$package_root" 2>/dev/null || echo s1)" == "$(stat -c %d "$STAGING_DIR" 2>/dev/null || echo s2)" ]]; then
+        pkg_hardlink=1
+    fi
     for dir in bin lib/hal libexec scripts recovery web swagger-ui firmware docs share nginx; do
         [[ -d "$package_root/$dir" ]] || continue
         rm -rf "$STAGING_DIR/$dir"
         mkdir -p "$STAGING_DIR/$dir"
-        cp -a "$package_root/$dir"/. "$STAGING_DIR/$dir"/
+        # nginx carries generated runtime state (route-sync output); real copy.
+        if [[ "$pkg_hardlink" == 1 && "$dir" != "nginx" ]]; then
+            cp -al "$package_root/$dir"/. "$STAGING_DIR/$dir"/
+        else
+            cp -a "$package_root/$dir"/. "$STAGING_DIR/$dir"/
+        fi
     done
+    if [[ "$pkg_hardlink" == 1 ]]; then
+        log "  Package trees hardlinked onto /data (same filesystem, no data copy)"
+    fi
 
     # Canonical units are immutable release content too. Stage the exact set
     # before the directory exchange so a power loss cannot leave new binaries
@@ -1410,6 +1447,12 @@ create_backup() {
     # Snapshot every immutable release component, including scripts, libexec,
     # canonical units and future top-level additions. Mutable state is kept in
     # /data/aipc-data and represented by links so backups remain bounded.
+    # Immutable trees are hardlinked (see release_tree_copy): the snapshot
+    # shares inodes with the live release and costs no data blocks. The
+    # separate bin/lib-hal/recovery sections below stay hardlinked for the
+    # same reason; etc/, /usr libexec and /etc units stay real copies because
+    # they are mutable or are restore targets (a restore onto a hardlink
+    # destination would be a same-inode cp and refuse to write).
     if [[ -d "$INSTALL_PREFIX" ]]; then
         mkdir -p "$backup_dir/release" "$backup_dir/release/logs"
         local entry name
@@ -1417,7 +1460,7 @@ create_backup() {
         for entry in "$INSTALL_PREFIX"/*; do
             name="$(basename -- "$entry")"
             case "$name" in data|models|apps|logs|backups|images) continue ;; esac
-            cp -a "$entry" "$backup_dir/release/"
+            release_tree_copy "$entry" "$backup_dir/release/"
         done
         shopt -u dotglob nullglob
         ln -s "$AIPC_DATA_ROOT/database" "$backup_dir/release/data"
@@ -1426,15 +1469,15 @@ create_backup() {
     fi
 
     for svc in "${SERVICES_ORDERED[@]}"; do
-        [[ -f "$INSTALL_BIN/$svc" ]]   && cp -a "$INSTALL_BIN/$svc"   "$backup_dir/bin/" 2>/dev/null || true
+        [[ -f "$INSTALL_BIN/$svc" ]]   && cp -al "$INSTALL_BIN/$svc"   "$backup_dir/bin/" 2>/dev/null || true
     done
     for tool in shm-reader nv12-to-jpeg aipc-cli; do
-        [[ -f "$INSTALL_BIN/$tool" ]]  && cp -a "$INSTALL_BIN/$tool"  "$backup_dir/bin/" 2>/dev/null || true
+        [[ -f "$INSTALL_BIN/$tool" ]]  && cp -al "$INSTALL_BIN/$tool"  "$backup_dir/bin/" 2>/dev/null || true
     done
 
-    cp -a "$INSTALL_LIB"/libaipc_hal*.so* "$INSTALL_LIB"/libhal-*.so* "$backup_dir/lib/hal/" 2>/dev/null || true
+    cp -al "$INSTALL_LIB"/libaipc_hal*.so* "$INSTALL_LIB"/libhal-*.so* "$backup_dir/lib/hal/" 2>/dev/null || true
     cp -a "$INSTALL_ETC"/*.yaml       "$backup_dir/etc/"     2>/dev/null || true
-    cp -a "$INSTALL_RECOVERY"/*       "$backup_dir/recovery/" 2>/dev/null || true
+    cp -al "$INSTALL_RECOVERY"/*      "$backup_dir/recovery/" 2>/dev/null || true
     for helper in /usr/libexec/aipc-*; do
         [[ -f "$helper" ]] || continue
         if os_owns_boot_control && is_os_boot_helper "$(basename "$helper")"; then
@@ -1587,14 +1630,17 @@ if [[ "$MODE" == "rollback" ]]; then
 
     warn "Legacy partial backup detected; using compatibility rollback path"
     log "Restoring binaries..."
-    cp -a "$BACKUP_DIR/bin"/* "$INSTALL_BIN/" 2>/dev/null || true
+    # --remove-destination: new backups hardlink the immutable trees, so a
+    # backup entry can be the same inode as the live file; a plain cp would
+    # refuse with "same file" and restore nothing.
+    cp -a --remove-destination "$BACKUP_DIR/bin"/* "$INSTALL_BIN/" 2>/dev/null || true
 
     log "Restoring libraries..."
-    cp -aP "$BACKUP_DIR/lib/hal"/* "$INSTALL_LIB/" 2>/dev/null || true
+    cp -aP --remove-destination "$BACKUP_DIR/lib/hal"/* "$INSTALL_LIB/" 2>/dev/null || true
 
     log "Restoring configs..."
-    cp -a "$BACKUP_DIR/etc"/* "$INSTALL_ETC/" 2>/dev/null || true
-    cp -a "$BACKUP_DIR/recovery"/* "$INSTALL_RECOVERY/" 2>/dev/null || true
+    cp -a --remove-destination "$BACKUP_DIR/etc"/* "$INSTALL_ETC/" 2>/dev/null || true
+    cp -a --remove-destination "$BACKUP_DIR/recovery"/* "$INSTALL_RECOVERY/" 2>/dev/null || true
 
     log "Restoring systemd units..."
     for file in "$BACKUP_DIR/systemd"/*.service "$BACKUP_DIR/systemd"/*.timer "$BACKUP_DIR/systemd"/*.target; do

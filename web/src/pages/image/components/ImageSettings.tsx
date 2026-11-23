@@ -779,6 +779,26 @@ export default function ImageSettings() {
                 </>
               )}
 
+              {/* Noise Reduction — always visible */}
+              <div className="space-y-1.5">
+                <Label className="text-xs">
+                  {t('sys.media_settings.noise_reduction')}
+                </Label>
+                <div className="flex items-center space-x-3">
+                  <Slider
+                    value={[isp?.noise_reduction ?? 50]}
+                    onValueChange={v => handleISPChange('noise_reduction', v[0])}
+                    min={0}
+                    max={100}
+                    step={1}
+                    className="flex-1"
+                  />
+                  <span className="text-xs text-muted-foreground w-10 text-right tabular-nums">
+                    {isp?.noise_reduction ?? 50}
+                  </span>
+                </div>
+              </div>
+
               {/* Powerline Frequency — always visible */}
               <div className="space-y-1.5">
                 <Label className="text-xs">

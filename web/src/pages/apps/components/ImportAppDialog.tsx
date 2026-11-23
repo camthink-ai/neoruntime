@@ -7,6 +7,7 @@ import {
   useState,
   useEffect,
 } from 'react';
+import axios from 'axios';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -50,7 +51,8 @@ import { resolveYamlViewMode, wizardConfigToYaml } from '../lib/wizardYaml';
 import {
   resolveLocalMode,
   isValidContainerImageRef,
-  collectInstallErrors,
+  collectInstallIssues,
+  type InstallIssue,
   type ImportSectionId,
 } from '../lib/importFlow';
 import BasicInfoSection from './import/BasicInfoSection';
@@ -163,6 +165,10 @@ export default function ImportAppDialog({
   const [yamlMounted, setYamlMounted] = useState(false);
 
   const cancelRequestedRef = useRef(false);
+  // In-flight upload request, if any. Aborted on wizard cancel/close so a
+  // zombie request cannot keep driving the progress bar (or fight a newer
+  // upload) after the dialog is closed and reopened.
+  const uploadAbortRef = useRef<AbortController | null>(null);
   // snapshot of the config hydrated from the uploaded manifest; dirty
   // checks and the PATCH body diff against it.
   const hydratedConfigRef = useRef<WizardConfig | null>(null);
@@ -277,6 +283,11 @@ export default function ImportAppDialog({
   }, [manifestPath, imageTarPath]);
 
   const resetWizardState = () => {
+    // Kill any in-flight upload first: its progress callbacks and finally
+    // reset must never leak past a cancel/close into a reopened dialog.
+    uploadAbortRef.current?.abort();
+    uploadAbortRef.current = null;
+
     setPage('source');
     setSourceType('local');
     setConfig({ ...defaultConfig });
@@ -399,6 +410,11 @@ export default function ImportAppDialog({
       return;
     }
 
+    // Close without the wizard cancel path (e.g. parent-driven): abort any
+    // in-flight upload the same way resetWizardState does.
+    uploadAbortRef.current?.abort();
+    uploadAbortRef.current = null;
+
     setPage('source');
     setSourceType('local');
     setConfig({ ...defaultConfig });
@@ -439,10 +455,19 @@ export default function ImportAppDialog({
   // slots) vs bare image tar (the form below generates the manifest) ----
 
   const handlePackageUpload = async (file: File) => {
+    const controller = new AbortController();
+    uploadAbortRef.current = controller;
     setIsUploadingLocal(true);
     setLocalProgress(0);
     try {
-      const res = await appsApi.uploadPackage(file, p => setLocalProgress(p));
+      const res = await appsApi.uploadPackage(
+        file,
+        p => {
+          // A stale run's events must not fight a newer upload's bar.
+          if (!controller.signal.aborted) setLocalProgress(p);
+        },
+        controller.signal
+      );
       const data = res?.data;
       if (data?.path && data?.image_path) {
         if (cancelRequestedRef.current) {
@@ -460,7 +485,8 @@ export default function ImportAppDialog({
         yaml.attachUpload(
           new File([data.manifest_yaml ?? ''], 'app.yaml', {
             type: 'application/x-yaml',
-          })
+          }),
+          { identityBasePath: data.path }
         );
         setImageTarPath(data.image_path);
         setImageTarName(data.image || file.name);
@@ -471,21 +497,38 @@ export default function ImportAppDialog({
         });
       }
     } catch (err: unknown) {
+      // Wizard cancel aborted the request — the cancel path already reset
+      // the UI; don't surface it as an upload failure.
+      if (axios.isCancel(err)) return;
       toast.error(
         resolveInstallApiError(err, t)
           || t('sys.apps.import.package_upload_failed', 'Package upload failed')
       );
     } finally {
-      setIsUploadingLocal(false);
-      setLocalProgress(0);
+      // Only the latest run owns the upload slot: an older run settling
+      // after a new upload began must not zero the new progress bar.
+      if (uploadAbortRef.current === controller) {
+        uploadAbortRef.current = null;
+        setIsUploadingLocal(false);
+        setLocalProgress(0);
+      }
     }
   };
 
   const handleImageUpload = async (file: File) => {
+    const controller = new AbortController();
+    uploadAbortRef.current = controller;
     setIsUploadingLocal(true);
     setLocalProgress(0);
     try {
-      const res = await appsApi.uploadImage(file, p => setLocalProgress(p));
+      const res = await appsApi.uploadImage(
+        file,
+        p => {
+          // A stale run's events must not fight a newer upload's bar.
+          if (!controller.signal.aborted) setLocalProgress(p);
+        },
+        controller.signal
+      );
       const data = res?.data;
       if (!data?.path) {
         throw new Error(
@@ -506,13 +549,21 @@ export default function ImportAppDialog({
         size: data.size ?? file.size,
       });
     } catch (err: unknown) {
+      // Wizard cancel aborted the request — the cancel path already reset
+      // the UI; don't surface it as an upload failure.
+      if (axios.isCancel(err)) return;
       toast.error(
         resolveInstallApiError(err, t)
           || t('sys.apps.import.image_upload_failed', '镜像上传失败')
       );
     } finally {
-      setIsUploadingLocal(false);
-      setLocalProgress(0);
+      // Only the latest run owns the upload slot: an older run settling
+      // after a new upload began must not zero the new progress bar.
+      if (uploadAbortRef.current === controller) {
+        uploadAbortRef.current = null;
+        setIsUploadingLocal(false);
+        setLocalProgress(0);
+      }
     }
   };
 
@@ -693,19 +744,38 @@ export default function ImportAppDialog({
 
     // One-page form: run the full validation at once and jump to the
     // first offending section (the old wizard gated step by step).
-    const issues = collectInstallErrors(effectiveConfig, {
+    const issues = collectInstallIssues(effectiveConfig, {
       sourceType,
-      sourceReady: isSourceReady,
+      sourceReady:
+        sourceType === 'registry'
+          ? isValidContainerImageRef(effectiveConfig.image)
+          : !!(effectiveManifestPath || imageTarPath),
       // undefined while loading → availability check skipped (backend still
       // fast-fails); once loaded, an empty list is a real empty device.
       availableModelIds: modelsLoaded
         ? availableModels.map(m => m.model_id)
         : undefined,
+      availableStreamIds: availableStreams.map(stream => stream.stream_id),
     });
-    if (issues.length > 0) {
-      toast.error(t(`sys.apps.import.${issues[0].reason}`));
-      scrollToSection(issues[0].section);
+    const errors = issues.filter(issue => issue.severity === 'error');
+    if (errors.length > 0) {
+      toast.error(t(`sys.apps.import.${errors[0].reason}`));
+      scrollToSection(errors[0].section);
       return;
+    }
+    const warnings = issues.filter(issue => issue.severity === 'warning');
+    if (warnings.length > 0) {
+      const warningList = warnings
+        .map(issue => `• ${t(`sys.apps.import.${issue.reason}`)}`)
+        .join('\n');
+      if (
+        !window.confirm(
+          `${t('sys.apps.import.warning_confirm')}\n\n${warningList}`
+        )
+      ) {
+        scrollToSection(warnings[0].section);
+        return;
+      }
     }
 
     const duplicate = existingAppIds.has(effectiveConfig.metadata.id);
@@ -818,6 +888,15 @@ export default function ImportAppDialog({
   }, [progress?.phase]);
 
   // ---- Derived render data ----
+
+  const formIssues: InstallIssue[] = collectInstallIssues(config, {
+    sourceType,
+    sourceReady: isSourceReady,
+    availableModelIds: modelsLoaded
+      ? availableModels.map(model => model.model_id)
+      : undefined,
+    availableStreamIds: availableStreams.map(stream => stream.stream_id),
+  });
 
   const sections: { id: ImportSectionId; label: string }[] = [
     { id: 'basic_info', label: t('sys.apps.import.basic_info') },
@@ -1055,6 +1134,7 @@ export default function ImportAppDialog({
                   onChange={setConfig}
                   isIdReadOnly={isIdReadOnly}
                   existingAppIds={existingAppIds}
+                  issues={formIssues}
                 />
               </>
             )}
@@ -1062,7 +1142,11 @@ export default function ImportAppDialog({
             {activeSection === 'resources' && (
               <>
                 {sectionHeading(t('sys.apps.import.resources'))}
-                <ResourcesSection config={config} onChange={setConfig} />
+                <ResourcesSection
+                  config={config}
+                  onChange={setConfig}
+                  issues={formIssues}
+                />
               </>
             )}
 
@@ -1075,6 +1159,7 @@ export default function ImportAppDialog({
                   config={config}
                   onChange={setConfig}
                   availableModels={availableModels}
+                  issues={formIssues}
                 />
               </>
             )}
@@ -1086,6 +1171,7 @@ export default function ImportAppDialog({
                   config={config}
                   onChange={setConfig}
                   availableStreams={availableStreams}
+                  issues={formIssues}
                 />
               </>
             )}
@@ -1095,7 +1181,11 @@ export default function ImportAppDialog({
                 {sectionHeading(
                   t('sys.apps.import.advanced', 'Advanced Config')
                 )}
-                <AdvancedSection config={config} onChange={setConfig} />
+                <AdvancedSection
+                  config={config}
+                  onChange={setConfig}
+                  issues={formIssues}
+                />
               </>
             )}
           </div>

@@ -6,6 +6,7 @@
 #include "common/hal_log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <arpa/inet.h>
 #include <cstdio>
 #include <chrono>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <unordered_map>
 #include <netdb.h>
 #include <thread>
 
@@ -45,6 +47,105 @@ uint64_t steady_now_ns()
 {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+}
+
+/* --------------------------------------------------------------------
+ * Cross-instance RTP timestamp continuity (per SSRC + destination port).
+ *
+ * A rotation/flip change takes the HAL through a full medialib reinit which
+ * destroys the encoder pipeline and the UDP pusher with it; the caller then
+ * re-arms a NEW HalUdpStream, typically on the same port/SSRC. The new
+ * pipeline's media clock restarts from a lower base, so raw timestamps
+ * regress; RTP clients (ffmpeg/ffplay/VLC) keep the per-SSRC max timestamp
+ * and drop every "older" packet forever ("dropping old packet received too
+ * late") until the client is manually restarted.
+ *
+ * Emitted timestamps are therefore kept monotonic per logical stream, with
+ * state that PERSISTS across pusher (re)creations:
+ *   - equal raw timestamps pass through unchanged — multi_resize branches
+ *     share the source pts, so concurrent streams legitimately carry equal
+ *     ticks (bumping on equality would ratchet N interleaved pushers to
+ *     N× the real frame rate);
+ *   - on a true regression the emission is rebased onto this stream's emitted
+ *     history while preserving its own raw cadence:
+ *     emitted = last_emitted + (raw - last_raw) when raw advanced, else +1
+ *     tick — correct at any frame rate, unlike a fixed per-frame tick.
+ *
+ * Keyed by (SSRC, destination port), NOT SSRC alone: concurrent pushers share
+ * the DEFAULT ssrc 0x12345678 (e.g. video_test_sub_v2's two lanes) while
+ * their pts bases differ by pipeline latency — a shared key would have the
+ * lanes clamp each other on every AU and inflate both cadences. The port
+ * identifies the logical stream: re-arming the same port resumes the state
+ * (restart continuity), different ports never interact.
+ * -------------------------------------------------------------------- */
+struct RtpStreamContState
+{
+    uint32_t last_emitted_ts{0};
+    uint32_t last_raw_ts{0};
+    uint16_t last_seq{0};
+    bool ts_seen{false};
+    bool seq_seen{false};
+};
+std::mutex g_rtp_ts_mu;
+std::unordered_map<uint64_t, RtpStreamContState> g_rtp_ts_by_stream;
+
+uint32_t clamp_rtp_ts_monotonic(uint32_t ssrc, uint16_t port, uint32_t raw)
+{
+    const std::lock_guard<std::mutex> lock(g_rtp_ts_mu);
+    const uint64_t key = (static_cast<uint64_t>(ssrc) << 16) | port;
+    RtpStreamContState &st = g_rtp_ts_by_stream[key];
+    uint32_t emitted = raw;
+    if (st.ts_seen && static_cast<int32_t>(raw - st.last_emitted_ts) < 0)
+    {
+        const int32_t d_raw = static_cast<int32_t>(raw - st.last_raw_ts);
+        emitted = (d_raw > 0) ? static_cast<uint32_t>(static_cast<int64_t>(st.last_emitted_ts) + d_raw)
+                              : st.last_emitted_ts + 1U;
+        static std::atomic<uint32_t> rebase_logs{0};
+        if (rebase_logs.fetch_add(1, std::memory_order_relaxed) < 16)
+        {
+            HAL_LOG_WARNING("hal_udp_stream: rtp ts rebase ssrc=0x%08x port=%u raw=%u last_raw=%u "
+                            "last_emitted=%u -> emitted=%u",
+                            ssrc, port, raw, st.last_raw_ts, st.last_emitted_ts, emitted);
+        }
+    }
+    st.ts_seen = true;
+    st.last_emitted_ts = emitted;
+    st.last_raw_ts = raw;
+    return emitted;
+}
+
+/** Randomized base counter for FIRST-EVER streams only (RFC 3550 advises a
+ *  non-zero start); continuation uses the stream's own emitted history. */
+std::atomic<uint32_t> g_rtp_seq_alloc{0x6D2BU};
+
+/** First sequence number of a (re)created pusher: resume from the stream's
+ *  actually-emitted tail + a small forward gap (reads as bounded packet loss).
+ *  A fixed-size allocation block drifts below the old tail once a pusher
+ *  emitted more packets than the block size — high-bitrate streams pass 4096
+ *  packets within seconds, which would turn every restart into a large
+ *  backward jump (stale/reordered classification at the receiver). */
+uint16_t rtp_seq_start(uint32_t ssrc, uint16_t port)
+{
+    const std::lock_guard<std::mutex> lock(g_rtp_ts_mu);
+    const uint64_t key = (static_cast<uint64_t>(ssrc) << 16) | port;
+    auto it = g_rtp_ts_by_stream.find(key);
+    if (it != g_rtp_ts_by_stream.end() && it->second.seq_seen)
+    {
+        return static_cast<uint16_t>(it->second.last_seq + 16U);
+    }
+    return static_cast<uint16_t>(g_rtp_seq_alloc.fetch_add(0x1000U, std::memory_order_relaxed) & 0xFFFFU);
+}
+
+/** Record the last emitted sequence number of the logical stream (called once
+ *  per access unit; restarts only ever happen between AUs, after the queue
+ *  drains, so AU granularity is sufficient). */
+void note_emitted_seq(uint32_t ssrc, uint16_t port, uint16_t seq)
+{
+    const std::lock_guard<std::mutex> lock(g_rtp_ts_mu);
+    const uint64_t key = (static_cast<uint64_t>(ssrc) << 16) | port;
+    RtpStreamContState &st = g_rtp_ts_by_stream[key];
+    st.last_seq = seq;
+    st.seq_seen = true;
 }
 
 void build_rtp_header(uint8_t *out, uint16_t seq, uint32_t ts, uint32_t ssrc, uint8_t payload_type, bool marker)
@@ -268,6 +369,7 @@ struct HalUdpStream::Impl
     {
         RtpState rtp{};
         rtp.ssrc = cfg.rtp_ssrc;
+        rtp.seq = static_cast<uint16_t>((rtp_seq_start(rtp.ssrc, cfg.port) - 1U) & 0xFFFFU); /* first ++seq = start */
         sockaddr *addr = reinterpret_cast<sockaddr *>(&peer);
 
         while (running.load(std::memory_order_acquire) || !queue.empty())
@@ -301,7 +403,7 @@ struct HalUdpStream::Impl
             {
                 ts_ns = steady_now_ns();
             }
-            const uint32_t rtp_ts = ns_to_rtp_ts90k(ts_ns);
+            const uint32_t rtp_ts = clamp_rtp_ts_monotonic(rtp.ssrc, cfg.port, ns_to_rtp_ts90k(ts_ns));
             const bool h265 = (cfg.mode == HalUdpStreamMode::RtpH265AnnexB);
             for (size_t k = 0; k < nals.size(); k++)
             {
@@ -322,6 +424,7 @@ struct HalUdpStream::Impl
                     HAL_LOG_ERROR("hal_udp_stream: sendto failed (rtp)");
                 }
             }
+            note_emitted_seq(rtp.ssrc, cfg.port, rtp.seq);
         }
     }
 };

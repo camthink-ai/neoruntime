@@ -14,13 +14,13 @@ import (
 )
 
 var (
-	annProduct string
-	annSN      string
-	annIP      string
-	annPort    int
-	annFW      string
-	annCaps    string
-	annHW      string
+	annProduct  string
+	annSN       string
+	annIP       string
+	annPort     int
+	annFW       string
+	annCaps     string
+	annHW       string
 	annInterval int
 )
 

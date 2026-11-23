@@ -332,7 +332,14 @@ func (h *MonitorHandler) GetDisk(c *gin.Context) {
 // scanUnmountedPartitions uses lsblk to find removable partitions with a filesystem
 // that are not currently mounted (e.g., freshly inserted SD cards).
 func scanUnmountedPartitions(seenDevices map[string]bool) []gin.H {
-	cmd := exec.Command("lsblk", "-b", "-J", "-o", "NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE")
+	// FSTYPE makes lsblk read each partition's superblock. While a card is
+	// being reformatted (mkfs write stream saturating the device) or is
+	// failing, that read can stall for the whole operation — minutes on a
+	// large SD card. Bound the probe so /monitor/disk stays responsive and
+	// degrades to reporting mounted partitions only.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "lsblk", "-b", "-J", "-o", "NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil
