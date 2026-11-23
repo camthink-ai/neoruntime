@@ -110,9 +110,11 @@ export default function Image() {
         <div
           className="relative aspect-video w-full max-w-full overflow-hidden rounded-xl bg-black md:max-w-none md:rounded-2xl"
           onPointerDown={() => {
-            // 点击播放区空白处（非 OSD overlay 框/手柄、非隐私遮挡多边形/顶点）
-            // 取消选中：上述元素的 pointerdown 均 stopPropagation，不会触发此处，
-            // 故此处仅捕获空白点击 → player 内文字框/遮挡区域回到完成态。
+            // Clicking empty space in the player area (i.e. not an OSD overlay
+            // box/handle or a privacy-mask polygon/vertex) deselects: those
+            // elements stopPropagation on pointerdown and never reach here,
+            // so this only captures blank clicks → text boxes/mask regions in
+            // the player return to their committed state.
             osd.setSelectedId(null);
             privacy.setActiveRegion(null);
           }}
@@ -156,7 +158,7 @@ export default function Image() {
         </div>
       </div>
 
-      {/* 配置侧栏 — 移动端底部全宽 + 上边框，桌面端右侧固定宽 */}
+      {/* Config sidebar — full-width at the bottom with a top border on mobile, fixed width on the right on desktop */}
       <div className="relative z-10 flex min-h-0 flex-1 flex-col overflow-hidden border-t border-border bg-card md:h-full md:w-96 md:shrink-0 md:flex-none md:border-l md:border-t-0">
         <div className="flex px-6 pt-6 pb-2 items-center gap-2 border-b border-border text-lg font-semibold tracking-tight text-foreground">
           <span className="flex items-center gap-2">

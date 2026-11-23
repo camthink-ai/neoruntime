@@ -364,7 +364,7 @@ export default function Player({
   }, [enableAudio]);
 
   // Default the browser listen state to ON when the audio-owning player
-  // mounts ("喇叭默认开启"). The store is a module singleton that survives
+  // mounts ("speaker on by default"). The store is a module singleton that survives
   // route changes; without resetting, the speaker could re-enter in an
   // inconsistent state. With autoplay-on-mount, this intent immediately
   // starts the AudioPlayer (the reactive effect above) — no click needed for
@@ -411,8 +411,8 @@ export default function Player({
 
   // External callers (e.g. encoder reconfigure) request a full player reconnect
   // by dispatching 'player-reload'. This tears down WS + MSE and reconnects,
-  // fetching fresh SPS/PPS and waiting for a clean IDR — avoiding 花屏/黑屏
-  // after a resolution/codec/fps change.
+  // fetching fresh SPS/PPS and waiting for a clean IDR — avoiding corrupted
+  // or black frames after a resolution/codec/fps change.
   useEffect(() => {
     const onPlayerReload = () => {
       handleReloadRef.current?.();
@@ -423,7 +423,7 @@ export default function Player({
 
   // AI ISP profile switches restart the daemon's GStreamer pipeline for
   // ~interrupt_ms (reported by the switch RPC). Reconnecting immediately would
-  // hit a half-rebuilt pipeline and 花屏/黑屏. Wait out the interrupt window,
+  // hit a half-rebuilt pipeline and corrupted or black frames. Wait out the interrupt window,
   // then reuse the canonical reload path. The switching ref suppresses the
   // transient "Disconnected" state the WS close produces during the wait.
   useEffect(() => {

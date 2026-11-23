@@ -58,7 +58,8 @@ export default function StreamPreview() {
   useEffect(() => {
     if (isLoading) return;
 
-    // /api/v1/streams 目前可能不可用（404），但播放可以走 h264 默认地址
+    // /api/v1/streams may be unavailable (404) for now, but playback can
+    // use the default h264 endpoint
     if (!error) {
       setVideoUrl(getStreamUrl(effectiveStreamId));
       setStatus('loading');
