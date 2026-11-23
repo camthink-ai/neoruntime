@@ -3,26 +3,22 @@ import { createBuiltinAdapter } from '@/lib/ct-player/adapters/registry';
 import type { SourceAdapter } from '@/lib/ct-player/shared/types';
 import type { StreamPlayerOptions, StreamPlayerStats } from './types';
 
-// Device protocol: V2 has an 18-byte header, V1 has 10 bytes, and older
-// devices send raw video. PTS is a big-endian 90 kHz value at byte 6.
+// Device protocol (V2): every video message carries a fixed 18-byte private
+// header that must be stripped before decoding; PTS is a big-endian 90 kHz
+// value at byte offset 6.
 export function deviceAdapter(): SourceAdapter {
-  let adapter: SourceAdapter | null = null;
+  // 'avcc' is a registry builtin, so creation never yields null here.
+  const adapter = createBuiltinAdapter({
+    name: 'avcc',
+    options: { headerBytes: 18, ptsOffset: 6 },
+  })!;
   return {
     name: 'neoruntime',
     push(message) {
       if (message.length === 0) return [];
-      if (!adapter) {
-        const hasHeader = message.length >= 10
-          && new DataView(message.buffer, message.byteOffset, 4).getUint32(0, false) === 0xffd8ff00;
-        const headerBytes = hasHeader ? ((message[5] & 1) !== 0 ? 18 : 10) : 0;
-        adapter = createBuiltinAdapter({
-          name: 'avcc',
-          options: headerBytes ? { headerBytes, ptsOffset: 6 } : {},
-        });
-      }
-      return adapter!.push(message);
+      return adapter.push(message);
     },
-    reset() { adapter = null; },
+    reset() { adapter.reset(); },
   };
 }
 
