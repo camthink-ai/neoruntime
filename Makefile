@@ -118,6 +118,9 @@ build-ci: build-go build-web
 	@echo "=== CI build complete: Go services + web ==="
 
 proto: proto-inference proto-device proto-event proto-camera proto-app proto-lens proto-discovery
+ifeq ($(HAL_PLATFORM),hailo15)
+	@if [ -n "$(SDK_PATH)" ]; then ./scripts/generate_proto_arm.sh --sdk-path "$(SDK_PATH)"; fi
+endif
 
 # OPT-IN: populate the repo-root models/ tree with the optional showcase
 # set from the Hailo model zoo. pack-release stages whatever is in models/,
@@ -130,9 +133,6 @@ models:
 		bash scripts/download_models.sh --with-genai --dest models || exit 1; \
 	fi
 	@echo "models tree ready under ./models (see make pack-release)"
-ifeq ($(HAL_PLATFORM),hailo15)
-	@if [ -n "$(SDK_PATH)" ]; then ./scripts/generate_proto_arm.sh --sdk-path "$(SDK_PATH)"; fi
-endif
 
 proto-inference:
 	cd platform/ai-runtime/proto && $(PROTOC_GO) inference.proto
