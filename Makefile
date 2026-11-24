@@ -119,12 +119,11 @@ build-ci: build-go build-web
 
 proto: proto-inference proto-device proto-event proto-camera proto-app proto-lens proto-discovery
 
-# Populate the repo-root models/ tree that pack-release stages into the
-# bundle. The DPM-critical linknet ships in-tree (models/segmentation, the
-# factory preload build — the public zoo build is a different compile that
-# silently breaks the person channel, so it is never fetched); everything
-# else comes from the Hailo model zoo via download_models.sh. GenAI (~3GB)
-# is opt-in: make models WITH_GENAI=1.
+# OPT-IN: populate the repo-root models/ tree with the optional showcase
+# set from the Hailo model zoo. pack-release stages whatever is in models/,
+# so running this before packing adds the optional models to the bundle;
+# without it a bundle carries only the four committed DPM-critical files.
+# GenAI (~3GB) stays behind WITH_GENAI=1.
 models:
 	@WITH_GENAI=0 bash scripts/download_models.sh --dest models
 	@if [ "$(WITH_GENAI)" = "1" ]; then \
@@ -539,11 +538,12 @@ _pack-stage:
 	@cp -f platform/platform-api/swagger-ui/* "$(STAGE_DIR)/opt/aipc/swagger-ui/" 2>/dev/null || true
 	@cp -f docs/api/swagger.yaml "$(STAGE_DIR)/opt/aipc/etc/swagger.yaml" 2>/dev/null || true
 	@# Models: the four DPM-critical files are committed in-tree, so a bare
-	@# `make pack-release` — even offline — stages a DPM-complete bundle. The
-	@# optional set is fetched best-effort into models/ (incremental, SKIPs
-	@# existing files); a fetch failure never blocks the build.
-	@bash scripts/download_models.sh --dest models \
-		|| echo "  - optional model fetch unavailable (offline?); staging committed models only"
+	@# `make pack-release` — even offline — stages a DPM-complete bundle and
+	@# downloads nothing beyond them (--core re-verifies the committed copies
+	@# and skips). The optional showcase set is opt-in: run `make models`
+	@# beforehand and whatever it fetched into models/ is staged as-is.
+	@bash scripts/download_models.sh --core --dest models \
+		|| echo "  - core model check unavailable (offline?); staging committed models only"
 	@staged_models=0; \
 	for cat in detection classification segmentation keypoint clip depth ocr genai; do \
 		mkdir -p "$(STAGE_DIR)/opt/aipc/models/$$cat"; \
