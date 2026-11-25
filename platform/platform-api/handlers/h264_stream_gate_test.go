@@ -87,7 +87,7 @@ func TestMergeParameterSets(t *testing.T) {
 }
 
 func TestClientGatePasses(t *testing.T) {
-	key := []byte{0xff, 0xd8, 0xff, 0x00, 0x00, 0x01} // FrameType=0
+	key := []byte{0xff, 0xd8, 0xff, 0x00, 0x00, 0x01}   // FrameType=0
 	delta := []byte{0xff, 0xd8, 0xff, 0x00, 0x01, 0x02} // FrameType=1
 
 	t.Run("synced client passes everything", func(t *testing.T) {

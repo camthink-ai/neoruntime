@@ -57,13 +57,13 @@ type rs485Hub struct {
 	backoffMax  time.Duration
 	stableReset time.Duration
 
-	mu            sync.Mutex
-	subs          map[*rs485Sub]struct{}
-	started       bool               // Start() called with a lifecycle context
-	running       bool               // pump goroutine exists
-	parent        context.Context    // lifecycle context (shutdown cancels it)
-	cancelStream  context.CancelFunc // cancels the current upstream stream; nil while parked
-	restart       chan struct{}      // buffered 1: wakes a parked pump
+	mu           sync.Mutex
+	subs         map[*rs485Sub]struct{}
+	started      bool               // Start() called with a lifecycle context
+	running      bool               // pump goroutine exists
+	parent       context.Context    // lifecycle context (shutdown cancels it)
+	cancelStream context.CancelFunc // cancels the current upstream stream; nil while parked
+	restart      chan struct{}      // buffered 1: wakes a parked pump
 }
 
 func newRs485Hub(client camerapb.CameraControlClient) *rs485Hub {
