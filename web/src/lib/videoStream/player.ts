@@ -164,6 +164,12 @@ export class VideoStreamPlayer {
         window.dispatchEvent(new CustomEvent('wv_error', {
           detail: codecMismatch ? { type: 'codec_mismatch', codec: player.getStats().codec, message: error.code } : error,
         }));
+        // Machine-terminal failure (tech chain exhausted, startup stall, …)
+        // with no engine recovery left: land the shared Player on its
+        // disconnected state with the Reload control instead of an endless
+        // spinner. A codec_mismatch hook response swaps the stream URL in the
+        // same React batch, superseding this state without a visible flicker.
+        window.dispatchEvent(new CustomEvent('wv_close', { detail: error.detail ?? {} }));
         this.options.onEvent?.({ t: codecMismatch ? 'codecMismatch' : error.code });
       }
     });

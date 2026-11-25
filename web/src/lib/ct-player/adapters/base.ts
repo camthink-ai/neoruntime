@@ -186,7 +186,11 @@ export class NaluFramer {
     const vcl = codec === 'h264' ? isH264Vcl(type) : isHevcVcl(type);
 
     let closedAu = false;
-    if (vcl && this.pendingAu.some((r) => r.vcl)) {
+    // "新 VCL 到来即关闭上一个 AU"的启发式仅适用于无边界字节流（stream
+    // framing）。message framing 每条消息即一个完整 AU（relay 整帧打包），
+    // 多 slice 图像的各 slice 会连续出现——此时必须保持累积等到 endMessage
+    // 一起发出，否则同一 PTS 的半截图像会被当作独立帧提交给解码器。
+    if (this.framing === 'stream' && vcl && this.pendingAu.some((r) => r.vcl)) {
       const frame = this.emitPending(ts);
       if (frame) frames.push(frame);
       closedAu = true;

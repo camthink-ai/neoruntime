@@ -244,6 +244,18 @@ export class FallbackMachine {
   }
 
   private onStall(): FsmOutput {
+    // Startup stall: the socket is open but no frame ever arrived, so no
+    // pipeline exists to restart and the running-state recovery below never
+    // engages — the page would spin forever. Report a terminal failure so
+    // the host can surface its Reload/disconnected control (or reconnect on
+    // its own). HealthMonitor un-latches as soon as the first frame lands.
+    if (this.state === 'idle') {
+      return {
+        actions: [
+          { type: 'terminal', error: ctError('NO_KEYFRAME_TIMEOUT', { detail: { phase: 'startup' } }) },
+        ],
+      };
+    }
     if (this.state !== 'running' && this.state !== 'restarting') {
       return { actions: [] };
     }
