@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next';
+import { toast } from 'sonner';
 import {
   VideoOff,
   AlertTriangle,
@@ -39,10 +40,19 @@ export default function StreamPreview() {
   // Prefer the smallest enabled stream for the low-power dashboard preview
   // instead of hardcoding 'sub'.
   const previewStreamId = selectPreviewStream(streams);
-  const { effectiveStreamId } = useStreamFallback({
+  const { effectiveStreamId, codecNotice } = useStreamFallback({
     streams,
     activeStream: previewStreamId,
   });
+
+  // Surface terminal codec states: switched to H.264 (info) or no playable
+  // stream at all (error). Without this the preview sits in its fallback
+  // loop with no explanation of why HEVC playback is impossible.
+  useEffect(() => {
+    if (!codecNotice) return;
+    if (codecNotice === 'hevc_unsupported_fallback') toast.info(t(`sys.monitoring.${codecNotice}`));
+    else toast.error(t(`sys.monitoring.${codecNotice}`));
+  }, [codecNotice, t]);
 
   const getStreamUrl = useCallback((streamId: string) => {
     let token = getItem<string>('token') || '';

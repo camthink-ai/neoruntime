@@ -517,8 +517,8 @@ export default function Player({
 
   useEffect(() => {
     const handlWvClose = (e: Event) => {
-      const event = e as CustomEvent<{ code?: number; reason?: string }>;
-      if (event.detail.reason === 'Connection replaced') {
+      const event = e as CustomEvent<{ code?: number; reason?: string } | null>;
+      if (event.detail?.reason === 'Connection replaced') {
         toast.error(t('sys.device_tool.preview_disconnected'));
       }
       // During a profile-switch pipeline restart the WS close is expected; keep

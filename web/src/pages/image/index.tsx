@@ -1,6 +1,7 @@
 // @refresh reset
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { toast } from 'sonner';
 import { VideoStreamPlayer } from '@/lib/videoStream/player';
 import Player from '@/components/player/player';
 import {
@@ -51,10 +52,19 @@ export default function Image() {
     width: number;
     height: number;
   } | null>(null);
-  const { effectiveStreamId, effectiveStreamInfo } = useStreamFallback({
+  const { effectiveStreamId, effectiveStreamInfo, codecNotice } = useStreamFallback({
     streams,
     activeStream,
   });
+
+  // Surface terminal codec states: switched to H.264 (info) or no playable
+  // stream at all (error). Without this the player sits disconnected with
+  // no explanation of why HEVC playback is impossible.
+  useEffect(() => {
+    if (!codecNotice) return;
+    if (codecNotice === 'hevc_unsupported_fallback') toast.info(t(`sys.monitoring.${codecNotice}`));
+    else toast.error(t(`sys.monitoring.${codecNotice}`));
+  }, [codecNotice, t]);
   const frameWidth = playbackFrameSize?.width ?? effectiveStreamInfo?.width;
   const frameHeight = playbackFrameSize?.height ?? effectiveStreamInfo?.height;
 

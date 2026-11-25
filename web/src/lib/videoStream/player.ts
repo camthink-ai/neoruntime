@@ -134,9 +134,10 @@ export class VideoStreamPlayer {
       if (this.player !== player) return;
       // Terminal transport failures must surface the disconnected UI: the
       // shared Player ignores plain wv_error events, so translate them into
-      // wv_close instead.
+      // wv_close instead. RETRY_EXHAUSTED carries no detail — default to an
+      // empty payload, the close handler dereferences event.detail.
       if (error.code === 'RETRY_EXHAUSTED' || error.code === 'SUPERSEDED') {
-        window.dispatchEvent(new CustomEvent('wv_close', { detail: error.detail }));
+        window.dispatchEvent(new CustomEvent('wv_close', { detail: error.detail ?? {} }));
         return;
       }
       if (error.code === 'NETWORK_ERROR') {
@@ -169,6 +170,10 @@ export class VideoStreamPlayer {
       window.dispatchEvent(new CustomEvent('wv_error', {
         detail: { type: 'codec_mismatch', codec: request.current.codec, message: request.reason },
       }));
+      // The engine is terminal either way: land on the disconnected state
+      // (Reload control) instead of an endless spinner while the fallback
+      // hook decides whether an H.264 stream can take over.
+      window.dispatchEvent(new CustomEvent('wv_close', { detail: {} }));
       player.respondStreamChange({ accepted: false });
     });
     try {

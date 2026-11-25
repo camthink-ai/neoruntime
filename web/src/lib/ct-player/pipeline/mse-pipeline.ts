@@ -95,19 +95,23 @@ export class MsePipeline implements Pipeline {
     if (this.codec === null) this.codec = frame.codec;
     if (frame.codec !== this.codec) return; // 码流切换由 Player 层重建管道
 
-    // 参数集提取（基于索引，无重复扫描）
+    // 参数集提取（基于索引，无重复扫描）。同时收齐本帧的候选参数集：
+    // SPS 变更触发重建时旧 PPS/VPS 已不匹配，必须整体换用同帧随行的
+    // 新参数集，否则会跳过携带变更的干净 IDR，冻结到参数集重发为止。
     let newSps: Uint8Array | null = null;
+    let newPps: Uint8Array | null = null;
+    let newVps: Uint8Array | null = null;
     for (let i = 0; i < frame.nalus.length; i++) {
       const n = frame.nalus[i];
       const type = n.type;
       const payload = frame.data.subarray(n.offset + 4, n.offset + n.size);
       if (this.codec === 'h264') {
         if (type === 7 && !newSps) newSps = payload;
-        else if (type === 8 && !this.pps) this.pps = payload;
+        else if (type === 8 && !newPps) newPps = payload;
       } else {
-        if (type === 32 && !this.vps) this.vps = payload;
+        if (type === 32 && !newVps) newVps = payload;
         else if (type === 33 && !newSps) newSps = payload;
-        else if (type === 34 && !this.pps) this.pps = payload;
+        else if (type === 34 && !newPps) newPps = payload;
       }
     }
 
@@ -126,6 +130,8 @@ export class MsePipeline implements Pipeline {
       }
       this.sps = newSps;
     }
+    if (newPps) this.pps = newPps;
+    if (newVps) this.vps = newVps;
 
     // 参数集齐备 → 建 init segment
     if (!this.initialized && this.sps && this.pps) {
