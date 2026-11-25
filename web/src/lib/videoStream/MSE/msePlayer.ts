@@ -347,7 +347,7 @@ export default class H264Player {
   }
 
   videoMsgCallback(event: {
-    data: { data: ArrayBuffer; codec: string };
+    data: { data: ArrayBuffer; codec: string; isKeyframe?: boolean };
   }): void {
     this.videoPlayer?.processMp4VideoData(event, 0); // 0 = default snapshotFlag
   }
@@ -780,6 +780,7 @@ export default class H264Player {
           data: {
             data: mediaSegment.buffer as ArrayBuffer,
             codec: '',
+            isKeyframe,
           },
         });
       } catch (e) {
@@ -1062,6 +1063,7 @@ export default class H264Player {
           data: {
             data: mediaSegment.buffer as ArrayBuffer,
             codec: '',
+            isKeyframe,
           },
         });
       } catch (e) {

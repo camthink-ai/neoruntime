@@ -2,6 +2,7 @@
 interface FrameData {
   data: ArrayBuffer;
   codec?: string;
+  isKeyframe?: boolean;
 }
 
 interface CallbackEvent {
@@ -13,6 +14,7 @@ type CallbackFunction = (event: CallbackEvent) => void;
 interface Mp4EventData {
   data: ArrayBuffer;
   codec: string;
+  isKeyframe?: boolean;
 }
 
 type MediaSourceConstructor = {
@@ -598,13 +600,48 @@ class MsMediaSource {
     }
 
     if (this.frameBuffer.length >= this.MAX_FRAME_BUFFER_SIZE) {
-      this.frameBuffer.splice(0, Math.floor(this.MAX_FRAME_BUFFER_SIZE * 0.3));
+      this.dropOldestForKeyframe();
     }
 
     this.frameBuffer.push(objData);
     if (snapshotFlag === 0) {
       this.updateSourceBuffer();
     }
+  }
+
+  /**
+   * Keyframe-aware overflow drop: discard the oldest frames but never past
+   * the last keyframe/init segment in the drop range. Dropping an IDR
+   * leaves all subsequent delta frames with broken references — MSE
+   * decodes them as garbage until the next natural keyframe (the
+   * small-probability corruption after a bitrate-change reconnect, where
+   * the buffer floods during the MSE re-initialization window).
+   */
+  private dropOldestForKeyframe(): void {
+    const dropCount = Math.floor(this.MAX_FRAME_BUFFER_SIZE * 0.3);
+
+    // Find the LAST keyframe or init segment within the drop range — the
+    // anchor that later delta frames in the buffer reference.
+    let lastAnchorIdx = -1;
+    const limit = Math.min(dropCount, this.frameBuffer.length);
+    for (let i = 0; i < limit; i++) {
+      if (this.frameBuffer[i].isKeyframe || this.frameBuffer[i].codec) {
+        lastAnchorIdx = i;
+      }
+    }
+
+    // No keyframe boundary in the drop range: old behavior is safe (all
+    // frames in the range are mid-GOP deltas that reference something
+    // even older that has already been appended to the SourceBuffer).
+    if (lastAnchorIdx === -1) {
+      this.frameBuffer.splice(0, dropCount);
+      return;
+    }
+
+    // Stop the drop at the last keyframe: frames from it onward (including
+    // it) must stay queued — they anchor the decode chain of everything
+    // after them in the buffer.
+    this.frameBuffer.splice(0, lastAnchorIdx);
   }
 
   processMp4AudioData(event: { data: Mp4EventData }): void {
