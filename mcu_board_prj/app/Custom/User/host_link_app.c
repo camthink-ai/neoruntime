@@ -12,12 +12,26 @@
 
 #define HL_EV_TX_DONE  ((EventBits_t)(1u << 0))
 #define HL_EV_ERR      ((EventBits_t)(1u << 1))
+#define HL_EV_RS485_TX_EXIT_ACK  ((EventBits_t)(1u << 2))
+
+/** One queued RS485 RX frame for the forwarder task (see hl_rs485_tx_task_fn). */
+typedef struct {
+    uint16_t len;
+    uint8_t data[HL_RS485_EVT_MAX_LEN];
+} hl_rs485_evt_msg_t;
 
 static host_link_handler_t *g_hl;
 static EventGroupHandle_t s_events;
 static SemaphoreHandle_t s_tx_mutex;
 static TaskHandle_t s_uart_task;
 static TaskHandle_t s_poll_task;
+
+static StaticQueue_t s_rs485_q_mem;
+static uint8_t s_rs485_q_storage[HL_RS485_EVT_QUEUE_LEN * sizeof(hl_rs485_evt_msg_t)];
+static QueueHandle_t s_rs485_q;
+static TaskHandle_t s_rs485_tx_task;
+static volatile uint32_t s_rs485_drop_ctr;
+static volatile uint8_t s_rs485_tx_exit;
 
 static uint8_t s_rx_buf[HOST_LINK_APP_RX_BUF_SIZE];
 static uint16_t s_rx_dma_rd;
@@ -84,17 +98,33 @@ static void hl_lens_host_notify(uint32_t event, int result)
     }
 }
 
+/**
+ * Driver rx callback (runs in the rs485_rx task): enqueue only, never block.
+ * host_link_send_event() can block up to ~1.9 s waiting for the host ACK; the
+ * rs485 driver re-arms its DMA only after this callback returns, so blocking
+ * here would discard every bus byte arriving in the window. The actual send is
+ * done by hl_rs485_tx_task_fn(); xQueueSend copies by value, so borrowing the
+ * driver's DMA buffer for the memcpy is safe.
+ */
 static void hl_rs485_host_notify(const uint8_t *data, uint16_t len, void *user)
 {
-    host_link_handler_t *hl = (host_link_handler_t *)user;
-    int r;
+    hl_rs485_evt_msg_t msg;
 
-    if (hl == NULL || data == NULL || len == 0u) {
+    (void)user; /* sender task resolves g_hl itself */
+
+    if (data == NULL || len == 0u || len > HL_RS485_EVT_MAX_LEN || s_rs485_q == NULL) {
         return;
     }
-    r = host_link_send_event(hl, HOST_LINK_CMD_EV_RS485_RX, data, len);
-    if (r != HOST_LINK_OK) {
-        WIC_LOGW("[host_link] EV_RS485_RX err=%d len=%u", r, (unsigned)len);
+    msg.len = len;
+    memcpy(msg.data, data, len);
+    if (xQueueSend(s_rs485_q, &msg, 0u) != pdTRUE) {
+        /* Full: drop the oldest entry and retry once (single producer, so the
+         * retry cannot fail after a successful pop). */
+        hl_rs485_evt_msg_t stale;
+        if (xQueueReceive(s_rs485_q, &stale, 0u) == pdTRUE) {
+            (void)xQueueSend(s_rs485_q, &msg, 0u);
+        }
+        s_rs485_drop_ctr++;
     }
 }
 
@@ -808,6 +838,41 @@ void host_link_app_on_uart2_error(UART_HandleTypeDef *huart)
     portYIELD_FROM_ISR(hp);
 }
 
+/**
+ * RS485 RX event forwarder task: drains the queue and does the blocking
+ * host_link_send_event() (send 100 ms + ACK 500 ms x 3 retries worst case).
+ * Low priority by design: it may stall when the host is unresponsive, but it
+ * must never delay the rs485_rx task or the host-link poll path.
+ */
+static void hl_rs485_tx_task_fn(void *arg)
+{
+    hl_rs485_evt_msg_t msg;
+
+    (void)arg;
+
+    for (;;) {
+        if (xQueueReceive(s_rs485_q, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
+            if (s_rs485_tx_exit != 0u) {
+                break;
+            }
+            continue;
+        }
+        if (g_hl != NULL) {
+            int r = host_link_send_event(g_hl, HOST_LINK_CMD_EV_RS485_RX,
+                                         msg.data, msg.len);
+            if (r != HOST_LINK_OK) {
+                WIC_LOGW("[host_link] EV_RS485_RX err=%d len=%u", r, (unsigned)msg.len);
+            }
+        }
+        if (s_rs485_tx_exit != 0u && uxQueueMessagesWaiting(s_rs485_q) == 0u) {
+            break;
+        }
+    }
+    s_rs485_tx_task = NULL;
+    (void)xEventGroupSetBits(s_events, HL_EV_RS485_TX_EXIT_ACK);
+    vTaskDelete(NULL);
+}
+
 int host_link_app_init(void)
 {
     if (g_hl != NULL) {
@@ -869,6 +934,39 @@ int host_link_app_init(void)
         return SYS_ERR_NO_MEM;
     }
 
+    s_rs485_q = xQueueCreateStatic(HL_RS485_EVT_QUEUE_LEN, sizeof(hl_rs485_evt_msg_t),
+                                   s_rs485_q_storage, &s_rs485_q_mem);
+    if (s_rs485_q == NULL) {
+        vTaskDelete(s_poll_task);
+        s_poll_task = NULL;
+        vTaskDelete(s_uart_task);
+        s_uart_task = NULL;
+        host_link_deinit(g_hl);
+        g_hl = NULL;
+        vSemaphoreDelete(s_tx_mutex);
+        s_tx_mutex = NULL;
+        vEventGroupDelete(s_events);
+        s_events = NULL;
+        return SYS_ERR_NO_MEM;
+    }
+    s_rs485_tx_exit = 0u;
+    s_rs485_drop_ctr = 0u;
+    if (xTaskCreate(hl_rs485_tx_task_fn, HL_RS485_TX_TASK_NAME, HL_RS485_TX_TASK_STACK, NULL,
+                    HL_RS485_TX_TASK_PRIORITY, &s_rs485_tx_task) != pdPASS) {
+        s_rs485_tx_task = NULL;
+        vTaskDelete(s_poll_task);
+        s_poll_task = NULL;
+        vTaskDelete(s_uart_task);
+        s_uart_task = NULL;
+        host_link_deinit(g_hl);
+        g_hl = NULL;
+        vSemaphoreDelete(s_tx_mutex);
+        s_tx_mutex = NULL;
+        vEventGroupDelete(s_events);
+        s_events = NULL;
+        return SYS_ERR_NO_MEM;
+    }
+
     (void)bsp_ctrl_register_alarm_in(BSP_ALARM_IN0, hl_alarm_in_host_notify);
     (void)bsp_ctrl_register_alarm_in(BSP_ALARM_IN1, hl_alarm_in_host_notify);
 
@@ -881,6 +979,25 @@ void host_link_app_deinit(void)
 {
     (void)bsp_ctrl_register_alarm_in(BSP_ALARM_IN0, NULL);
     (void)bsp_ctrl_register_alarm_in(BSP_ALARM_IN1, NULL);
+
+    /* Stop the RS485 event forwarder before touching anything it depends on.
+     * Detach the driver callback first (stops new enqueues), then ask the
+     * sender task to exit and drain. Cooperative first: the uart/poll tasks
+     * must stay alive so an in-flight host_link_send_event (worst ~1.9 s) can
+     * still receive its ACK; only after the grace window do we hard-delete. */
+    if (rs485_driver_is_inited()) {
+        (void)rs485_driver_set_rx_callback(NULL, NULL);
+    }
+    s_rs485_tx_exit = 1u;
+    if (s_rs485_tx_task != NULL) {
+        (void)xEventGroupWaitBits(s_events, HL_EV_RS485_TX_EXIT_ACK, pdTRUE, pdFALSE,
+                                  pdMS_TO_TICKS(2100));
+        if (s_rs485_tx_task != NULL) {
+            vTaskDelete(s_rs485_tx_task);   /* unreachable in practice */
+            s_rs485_tx_task = NULL;
+        }
+    }
+    s_rs485_tx_exit = 0u;
 
     if (s_poll_task != NULL) {
         vTaskDelete(s_poll_task);
@@ -912,4 +1029,9 @@ void host_link_app_deinit(void)
 host_link_handler_t *host_link_app_handler(void)
 {
     return g_hl;
+}
+
+uint32_t host_link_app_rs485_rx_drops(void)
+{
+    return s_rs485_drop_ctr;
 }

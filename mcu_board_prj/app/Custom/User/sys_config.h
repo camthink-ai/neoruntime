@@ -18,7 +18,7 @@ extern "C" {
 #include "cmsis_os2.h"
 #include "wic_log.h"
 
-#define APP_VERSION             "0.1.8"
+#define APP_VERSION             "0.1.9"
 
 /// @brief Error code
 typedef enum {

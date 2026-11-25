@@ -2,6 +2,7 @@
 
 #include "camera.grpc.pb.h"
 #include "dsp_service.h"
+#include "rs485_event_hub.h"
 #include <grpcpp/grpcpp.h>
 
 #include <memory>
@@ -270,6 +271,14 @@ public:
         const aipc::camera::Rs485TxRequest* request,
         aipc::camera::Status* response) override;
 
+    /* Server-streaming: one Rs485RxEvent per bus frame. Valid before
+     * Rs485Init as well — the stream simply stays silent until the MCU
+     * driver produces frames. Queueing policy lives in device-control. */
+    grpc::Status SubscribeRs485Rx(
+        grpc::ServerContext* context,
+        const aipc::camera::Empty* request,
+        grpc::ServerWriter<aipc::camera::Rs485RxEvent>* writer) override;
+
     grpc::Status GetCapabilities(
         grpc::ServerContext* context,
         const aipc::camera::Empty* request,
@@ -405,6 +414,16 @@ public:
 
 private:
     CameraDaemon* daemon_;
+    /* RS485 RX streaming: HAL callback -> hub fan-out -> per-stream writes.
+     * The HAL subscription is refcounted so exactly one HAL callback exists
+     * while >=1 SubscribeRs485Rx stream is open (the hailo15 HAL appends a
+     * callback per subscribe() and its unsubscribe() removes them all). */
+    static void rs485_rx_trampoline(void* mcu_ctx, const uint8_t* data,
+                                    uint16_t len, void* userdata);
+    static int rs485_hal_subscribe_thunk(void* userdata);
+    static int rs485_hal_unsubscribe_thunk(void* userdata);
+    aipc::Rs485EventHub rs485_hub_;
+    std::unique_ptr<aipc::Rs485HalSubscription> rs485_hal_sub_;
     /* Shared by the sync/async DSP submit handlers: maps the proto request
      * onto DspJobDesc (explicit op switch, range-checked enums). Returns
      * false with `response` already filled on rejection. */

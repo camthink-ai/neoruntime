@@ -1157,6 +1157,8 @@ int cmd_rs485(uint8_t argc, char **argv)
 
     if (strcmp(argv[1], "st") == 0) {
         shell_printf("rs485: %s\r\n", rs485_driver_is_inited() ? "inited" : "not inited");
+        shell_printf("rs485: host_evt_drops=%lu\r\n",
+                     (unsigned long)host_link_app_rs485_rx_drops());
         return 0;
     }
 

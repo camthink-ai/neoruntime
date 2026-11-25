@@ -365,6 +365,20 @@ message Rs485TxRequest {
   bytes data = 1;
 }
 
+// Per-subscriber policy for the RS-485 RX stream (semantics match the
+// event-bus SubscribeRequest): bounded backlog so a slow consumer cannot
+// stall the bus, with an explicit drop policy on overflow.
+message Rs485SubscribeRequest {
+  uint32 queue_size = 1; // backlog depth; 0 = default (16), clamped to 128
+  bool drop_old = 2;     // true: drop oldest frame when full; false: drop newest
+}
+
+// One RS-485 frame received on the bus (idle-delimited, <= 512 bytes).
+message Rs485RxEvent {
+  bytes  data = 1;         // raw frame bytes
+  uint64 timestamp_ns = 2; // receive time on the device (host clock)
+}
+
 // ============ Event subscription (status change notifications) ============
 
 message DeviceEvent {
@@ -467,6 +481,10 @@ service DeviceControl {
   rpc Rs485Init(Rs485InitRequest) returns (Status);
   rpc Rs485Deinit(Empty) returns (Status);
   rpc Rs485Tx(Rs485TxRequest) returns (Status);
+  // Push-stream of RS-485 RX frames, fanned out from one camera-daemon
+  // stream. Valid before Rs485Init as well: the stream stays silent until
+  // the MCU driver produces frames.
+  rpc SubscribeRs485Rx(Rs485SubscribeRequest) returns (stream Rs485RxEvent);
 
   // Capabilities (auto-detected from HAL)
   rpc GetCapabilities(Empty) returns (CapabilitiesResponse);
