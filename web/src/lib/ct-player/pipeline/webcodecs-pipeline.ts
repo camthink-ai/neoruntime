@@ -148,7 +148,9 @@ export class WebCodecsPipeline implements Pipeline {
         if (nal.type === 7 && !bytesEqual(this.sps, payload)) sps = payload;
         else if (nal.type === 8 && !bytesEqual(this.pps, payload)) pps = payload;
       }
-      if (sps || pps) this.reconfigureDecoder(sps ?? this.sps, pps ?? this.pps);
+      if (sps || pps) {
+        if (!this.reconfigureDecoder(sps ?? this.sps, pps ?? this.pps)) return; // 重配失败已走 onFatal，可能已切换/销毁管道
+      }
     }
 
     const hasSlice = frame.nalus.some((n) => frame.codec === 'h265' ? isHevcVcl(n.type) : n.type >= 1 && n.type <= 5);
@@ -292,9 +294,10 @@ export class WebCodecsPipeline implements Pipeline {
     }
   }
 
-  /** in-band SPS/PPS 变化：reset 丢弃旧几何在途输出，重建 avcC 后等下一个 IDR。 */
-  private reconfigureDecoder(sps: Uint8Array, pps: Uint8Array): void {
-    if (!this.decoder) return;
+  /** in-band SPS/PPS 变化：reset 丢弃旧几何在途输出，重建 avcC 后等下一个 IDR。
+   * 返回 false 表示重配失败已触发 onFatal（管道可能已被降级链销毁），调用方须立即中止提交。 */
+  private reconfigureDecoder(sps: Uint8Array, pps: Uint8Array): boolean {
+    if (!this.decoder) return false;
     try {
       const codec = h264CodecString(sps);
       const config: VideoDecoderConfig = {
@@ -309,9 +312,11 @@ export class WebCodecsPipeline implements Pipeline {
       this.pps = pps;
       this.hasKey = false;
       log.info(`decoder reconfigured (${codec}, parameter sets changed)`);
+      return true;
     } catch (err) {
       log.error('reconfigure failed', err);
       this.ctx.onFatal('CONFIGURE_FAILED', err);
+      return false;
     }
   }
 
