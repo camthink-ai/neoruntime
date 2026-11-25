@@ -432,7 +432,11 @@ export class WebCodecsPipeline implements Pipeline {
         : Math.min(cssW / frame.displayWidth, cssH / frame.displayHeight);
     const drawW = frame.displayWidth * scale;
     const drawH = frame.displayHeight * scale;
-    c.drawImage(frame, (cssW - drawW) / 2, (cssH - drawH) / 2, drawW, drawH);
+    const drawX = (cssW - drawW) / 2;
+    const drawY = (cssH - drawH) / 2;
+    c.drawImage(frame, drawX, drawY, drawW, drawH);
+    // 供快照裁剪：记录画面在 backing store 中的精确矩形（设备像素）。
+    this.ctx.render.setContentRect({ x: drawX * dpr, y: drawY * dpr, w: drawW * dpr, h: drawH * dpr });
     this.statsData.videoSize = { width: frame.displayWidth, height: frame.displayHeight };
     this.drawTiming.record(performance.now());
     frame.close();

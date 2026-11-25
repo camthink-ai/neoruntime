@@ -9,6 +9,14 @@ const log = createLogger('render');
 
 export type SurfaceKind = 'video' | 'canvas';
 
+/** Picture rectangle inside the canvas backing store, in device pixels. */
+export interface ContentRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface RenderTargetOptions {
   /** 'contain'（默认）| 'cover' */
   objectFit?: 'contain' | 'cover';
@@ -25,6 +33,8 @@ export class RenderTargetManager {
   private ownedElements: HTMLElement[] = [];
   private externalVideo: HTMLVideoElement | null = null;
   private classObserver: MutationObserver | null = null;
+  /** Latest picture rectangle reported by the active canvas pipeline. */
+  private contentRect: ContentRect | null = null;
 
   constructor(options: RenderTargetOptions = {}) {
     this.objectFit = options.objectFit ?? 'contain';
@@ -118,12 +128,31 @@ export class RenderTargetManager {
     log.debug(`surface -> ${String(kind)}`);
   }
 
-  /** 截图（video 面走临时 canvas 抓帧；canvas 面直接 toBlob）。 */
+  /** Picture rectangle within the canvas (device pixels); null fills the canvas. */
+  setContentRect(rect: ContentRect | null): void {
+    this.contentRect = rect;
+  }
+
+  /** 截图（video 面走临时 canvas 抓帧；canvas 面按内容矩形裁剪后 toBlob）。 */
   async snapshot(): Promise<Blob> {
     if (this.activeSurface === 'canvas' && this.canvas && this.canvas.width > 0) {
-      return new Promise<Blob>((resolve, reject) => {
-        this.canvas!.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
-      });
+      const canvas = this.canvas;
+      // Canvas pipelines draw the letterboxed picture into a container-sized
+      // backing store; crop to the content rectangle so snapshots carry only
+      // the picture (cover rects are clamped to the canvas bounds).
+      const rect = this.contentRect;
+      const x = Math.max(0, Math.floor(rect?.x ?? 0));
+      const y = Math.max(0, Math.floor(rect?.y ?? 0));
+      const w = Math.min(canvas.width - x, Math.ceil(rect ? rect.w : canvas.width));
+      const h = Math.min(canvas.height - y, Math.ceil(rect ? rect.h : canvas.height));
+      if (w >= 1 && h >= 1 && (x > 0 || y > 0 || w < canvas.width || h < canvas.height)) {
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        c.getContext('2d')?.drawImage(canvas, x, y, w, h, 0, 0, w, h);
+        return canvasToPng(c);
+      }
+      return canvasToPng(canvas);
     }
     const video = this.video;
     if (!video || video.videoWidth === 0) {
@@ -134,14 +163,13 @@ export class RenderTargetManager {
     c.width = video.videoWidth;
     c.height = video.videoHeight;
     c.getContext('2d')?.drawImage(video, 0, 0, c.width, c.height);
-    return new Promise<Blob>((resolve, reject) => {
-      c.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
-    });
+    return canvasToPng(c);
   }
 
   private destroyElements(): void {
     this.classObserver?.disconnect();
     this.classObserver = null;
+    this.contentRect = null;
     for (const el of this.ownedElements) {
       el.remove();
     }
@@ -158,4 +186,10 @@ export class RenderTargetManager {
     this.destroyElements();
     this.container = null;
   }
+}
+
+function canvasToPng(c: HTMLCanvasElement): Promise<Blob> {
+  return new Promise<Blob>((resolve, reject) => {
+    c.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
+  });
 }

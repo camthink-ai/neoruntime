@@ -72,7 +72,7 @@ export class WasmPipeline implements Pipeline {
       return;
     }
     this.ctx.render.useSurface('canvas');
-    this.renderer = new WebGLYuvRenderer(canvas, this.ctx.objectFit);
+    this.renderer = new WebGLYuvRenderer(canvas, this.ctx.objectFit, rect => this.ctx.render.setContentRect(rect));
     if (!this.renderer.available) {
       this.renderer.destroy();
       this.renderer = null;

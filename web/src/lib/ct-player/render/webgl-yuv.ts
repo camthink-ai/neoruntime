@@ -37,9 +37,15 @@ export class WebGLYuvRenderer {
   private frameWidth = 0;
   private frameHeight = 0;
   private objectFit: 'contain' | 'cover';
+  private readonly onContentRect?: (rect: { x: number; y: number; w: number; h: number }) => void;
 
-  constructor(canvas: HTMLCanvasElement, objectFit: 'contain' | 'cover' = 'contain') {
+  constructor(
+    canvas: HTMLCanvasElement,
+    objectFit: 'contain' | 'cover' = 'contain',
+    onContentRect?: (rect: { x: number; y: number; w: number; h: number }) => void
+  ) {
     this.objectFit = objectFit;
+    this.onContentRect = onContentRect;
     // preserveDrawingBuffer：供截图/像素校验外部读取（性能代价可忽略）
     const gl = canvas.getContext('webgl', {
       alpha: false,
@@ -162,12 +168,13 @@ export class WebGLYuvRenderer {
         : Math.min(canvas.width / width, canvas.height / height);
     const drawW = width * scale;
     const drawH = height * scale;
-    gl.viewport(
-      Math.round((canvas.width - drawW) / 2),
-      Math.round((canvas.height - drawH) / 2),
-      Math.round(drawW),
-      Math.round(drawH)
-    );
+    const vx = Math.round((canvas.width - drawW) / 2);
+    const vy = Math.round((canvas.height - drawH) / 2);
+    const vw = Math.round(drawW);
+    const vh = Math.round(drawH);
+    gl.viewport(vx, vy, vw, vh);
+    // 供快照裁剪：画面在 backing store 中的精确矩形（设备像素）。
+    this.onContentRect?.({ x: vx, y: vy, w: vw, h: vh });
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);

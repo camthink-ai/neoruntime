@@ -244,7 +244,10 @@ export class VideoStreamPlayer {
         canvas.width = this.snapshotWidth!;
         canvas.height = this.snapshotHeight!;
         const ctx = canvas.getContext('2d');
-        ctx?.drawImage(image, 0, 0, Math.min(image.width, canvas.width), Math.min(image.height, canvas.height), 0, 0, canvas.width, canvas.height);
+        // The engine snapshot is picture-only (canvas path crops to the
+        // content rect; the video path captures videoWidth x videoHeight), so
+        // resample the whole image instead of cropping its top-left corner.
+        ctx?.drawImage(image, 0, 0, image.width, image.height, 0, 0, canvas.width, canvas.height);
         canvas.toBlob(result => { if (result) download(result); });
         URL.revokeObjectURL(source);
       };

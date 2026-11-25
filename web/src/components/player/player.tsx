@@ -73,6 +73,8 @@ export default function Player({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  // Stage wrapper hosting the video element and the engine-created canvas.
+  const stageRef = useRef<HTMLDivElement>(null);
   const idleTimerRef = useRef<number | null>(null);
   const audioPlayerRef = useRef<AudioPlayer | null>(null);
   const lastFrameSizeRef = useRef<{ width: number; height: number } | null>(
@@ -589,11 +591,13 @@ export default function Player({
     return () => document.removeEventListener('fullscreenchange', onFsChange);
   }, []);
 
-  // Double-click to fullscreen
+  // Double-click to fullscreen. The listener sits on the stage wrapper that
+  // hosts both the <video> and the engine-created canvas: canvas backends
+  // keep the video hidden, so a video-only listener would never fire.
   useEffect(() => {
     if (!enableDoubleClickFullscreen) return;
 
-    const el = videoRef.current;
+    const el = stageRef.current;
     if (!el) return;
     const onDbl = () => {
       handleFullscreen().catch(() => {
@@ -674,7 +678,7 @@ export default function Player({
         ref={containerRef}
         className="relative w-full h-full flex items-center justify-center overflow-hidden bg-black"
       >
-        <div className="w-full h-full flex items-center justify-center">
+        <div ref={stageRef} className="w-full h-full flex items-center justify-center">
           <video
             ref={videoRef}
             className={`h-full w-full ${resolvedObjectFit === 'cover' ? 'object-cover' : 'object-contain'} transition-opacity duration-500 ${videoVisible ? 'opacity-100' : 'opacity-0'}`}
