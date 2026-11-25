@@ -78,6 +78,9 @@ export class VideoStreamPlayer {
     this.player = player;
     let softwareHevc = false;
     let hasStartedPlaying = false;
+    // Set when the engine's request-stream fallback has been routed to the
+    // codec_mismatch event; the declined engine's terminal error is redundant.
+    let streamFallbackRouted = false;
     const markWorking = () => {
       if (!this.waitingForData) return;
       this.waitingForData = false;
@@ -103,16 +106,44 @@ export class VideoStreamPlayer {
     });
     player.on('error', error => {
       if (this.player !== player) return;
-      if (error.code === 'NETWORK_ERROR') {
+      // Terminal transport failures must surface the disconnected UI: the
+      // shared Player ignores plain wv_error events, so translate them into
+      // wv_close instead.
+      if (error.code === 'RETRY_EXHAUSTED' || error.code === 'SUPERSEDED') {
         window.dispatchEvent(new CustomEvent('wv_close', { detail: error.detail }));
-        this.waitForNextVideoData();
-      } else if (error.fatal) {
+        return;
+      }
+      if (error.code === 'NETWORK_ERROR') {
+        // Socket closes carry {code, reason} and are already beyond the
+        // reconnect policy — stay disconnected instead of re-entering
+        // buffering with no reconnect scheduled. Other transport errors
+        // (string detail) keep retrying and recover through state/stats.
+        if (error.detail && typeof error.detail === 'object') {
+          window.dispatchEvent(new CustomEvent('wv_close', { detail: error.detail }));
+        }
+        return;
+      }
+      if (error.fatal) {
+        if (streamFallbackRouted) return;
         const codecMismatch = error.code === 'CODEC_MISMATCH' || error.code === 'CODEC_UNSUPPORTED';
         window.dispatchEvent(new CustomEvent('wv_error', {
           detail: codecMismatch ? { type: 'codec_mismatch', codec: player.getStats().codec, message: error.code } : error,
         }));
         this.options.onEvent?.({ t: codecMismatch ? 'codecMismatch' : error.code });
       }
+    });
+    player.on('request-stream', request => {
+      if (this.player !== player) return;
+      // The engine exhausted its tech chain for HEVC (hardware + WASM) and
+      // asks for an H.264 stream. Route the request through the existing
+      // codec_mismatch fallback (useStreamFallback swaps the stream URL and
+      // rebuilds this facade), and decline so the old engine terminates
+      // instead of waiting on a stream that will never arrive.
+      streamFallbackRouted = true;
+      window.dispatchEvent(new CustomEvent('wv_error', {
+        detail: { type: 'codec_mismatch', codec: request.current.codec, message: request.reason },
+      }));
+      player.respondStreamChange({ accepted: false });
     });
     try {
       await player.play({
@@ -154,7 +185,8 @@ export class VideoStreamPlayer {
     const stats = this.player.getStats();
     return {
       bandwidth: stats.bitrateKBps,
-      latency: stats.latencyMs ?? 0,
+      // stats.latencyMs is milliseconds; the consumer renders seconds.
+      latency: (stats.latencyMs ?? 0) / 1000,
       bufferTime: (stats.bufferedMs ?? 0) / 1000,
       playbackRate: this.video?.playbackRate ?? 1,
       packetsPerSecond: stats.pps,
