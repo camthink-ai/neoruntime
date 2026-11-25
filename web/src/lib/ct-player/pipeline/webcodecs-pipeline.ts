@@ -136,6 +136,19 @@ export class WebCodecsPipeline implements Pipeline {
         return; // 等参数集
       }
       if (!this.decoder) return; // configure 失败已走 onFatal
+    } else if (frame.codec === 'h264' && this.sps && this.pps) {
+      // 跟踪 in-band 参数集变化（旋转/其他客户端重配分辨率）：frameToAvcc
+      // 会剥掉参数集，解码器若沿用旧 avcC 解新流必然花屏——检测到变化即
+      // 重建 description 重新 configure，并等新几何的 IDR 再恢复解码。
+      let sps: Uint8Array | null = null;
+      let pps: Uint8Array | null = null;
+      for (const nal of frame.nalus) {
+        if (nal.type !== 7 && nal.type !== 8) continue;
+        const payload = frame.data.subarray(nal.offset + 4, nal.offset + nal.size);
+        if (nal.type === 7 && !bytesEqual(this.sps, payload)) sps = payload;
+        else if (nal.type === 8 && !bytesEqual(this.pps, payload)) pps = payload;
+      }
+      if (sps || pps) this.reconfigureDecoder(sps ?? this.sps, pps ?? this.pps);
     }
 
     const hasSlice = frame.nalus.some((n) => frame.codec === 'h265' ? isHevcVcl(n.type) : n.type >= 1 && n.type <= 5);
@@ -275,6 +288,29 @@ export class WebCodecsPipeline implements Pipeline {
       log.info(`decoder configured (${codec})`);
     } catch (err) {
       log.error('configure failed', err);
+      this.ctx.onFatal('CONFIGURE_FAILED', err);
+    }
+  }
+
+  /** in-band SPS/PPS 变化：reset 丢弃旧几何在途输出，重建 avcC 后等下一个 IDR。 */
+  private reconfigureDecoder(sps: Uint8Array, pps: Uint8Array): void {
+    if (!this.decoder) return;
+    try {
+      const codec = h264CodecString(sps);
+      const config: VideoDecoderConfig = {
+        codec,
+        description: buildAvcConfigurationRecord(sps, pps),
+        optimizeForLatency: true,
+      };
+      this.decoder.reset();
+      this.decoder.configure(config);
+      this.decoderConfig = config;
+      this.sps = sps;
+      this.pps = pps;
+      this.hasKey = false;
+      log.info(`decoder reconfigured (${codec}, parameter sets changed)`);
+    } catch (err) {
+      log.error('reconfigure failed', err);
       this.ctx.onFatal('CONFIGURE_FAILED', err);
     }
   }
