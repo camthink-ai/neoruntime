@@ -8,9 +8,17 @@ import type { StreamPlayerOptions, StreamPlayerStats } from './types';
 // value at byte offset 6.
 export function deviceAdapter(): SourceAdapter {
   // 'avcc' is a registry builtin, so creation never yields null here.
+  // The relay accepts single-message access units up to 4 MiB
+  // (h264_stream.go payloadSize check); the framer's 2 MiB default would
+  // silently drop larger IDRs and leave the stream blank. The extra headroom
+  // covers the length-prefix → start-code conversion in normalizeToAnnexB.
   const adapter = createBuiltinAdapter({
     name: 'avcc',
-    options: { headerBytes: 18, ptsOffset: 6 },
+    options: {
+      headerBytes: 18,
+      ptsOffset: 6,
+      maxBufferBytes: 4 * 1024 * 1024 + 64 * 1024,
+    },
   })!;
   return {
     name: 'neoruntime',

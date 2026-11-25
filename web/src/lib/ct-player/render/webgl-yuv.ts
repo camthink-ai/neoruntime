@@ -54,6 +54,9 @@ export class WebGLYuvRenderer {
     }) as WebGLRenderingContext | null;
     if (!gl) return;
     this.gl = gl;
+    // 紧凑 Y/U/V 平面按行上传：宽度非 4 字节对齐（如 540 宽的 chroma 270）
+    // 时默认 UNPACK_ALIGNMENT=4 会按 4 字节行距读取，越界取到下一行数据。
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
     const compile = (type: number, src: string): WebGLShader | null => {
       const sh = gl.createShader(type);

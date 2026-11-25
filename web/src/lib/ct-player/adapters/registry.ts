@@ -9,7 +9,7 @@ export type AdapterFactory = (options?: Record<string, unknown>) => SourceAdapte
 export const BUILTIN_ADAPTERS: Record<string, AdapterFactory> = {
   auto: (options) => createAutoAdapter(options),
   annexb: (options) => createAnnexbAdapter((options ?? {}) as never),
-  avcc: () => createAvccAdapter(),
+  avcc: (options) => createAvccAdapter((options ?? {}) as { maxBufferBytes?: number }),
 };
 
 export function createBuiltinAdapter(desc: AdapterDescriptor): SourceAdapter | null {
