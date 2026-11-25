@@ -198,6 +198,10 @@ export default function Player({
     null
   );
 
+  // Resolved adaptive fit: captured at player creation below and kept in sync
+  // with dimension changes through the effect near the render output.
+  const resolvedFitRef = useRef<'contain' | 'cover'>('contain');
+
   useEffect(() => {
     if (streamWidth && streamHeight) {
       setVideoDimensions({ width: streamWidth, height: streamHeight });
@@ -284,7 +288,7 @@ export default function Player({
       if (isCancelled) return;
 
       videoRendererInstance.current = new VideoStreamPlayer({
-        objectFit: objectFit === 'cover' ? 'cover' : 'contain',
+        objectFit: resolvedFitRef.current,
       });
       videoRendererInstance.current.initPlayer(video);
       const dims = snapshotDimsRef.current;
@@ -654,6 +658,15 @@ export default function Player({
     videoDimensions.width,
     videoDimensions.height
   );
+  resolvedFitRef.current = resolvedObjectFit;
+
+  // Canvas pipelines cannot read the video element's object-fit class — the
+  // picture is letterboxed/cropped inside the canvas backing store — so keep
+  // the engine geometry in sync with the resolved adaptive fit. Overlay layers
+  // derive their geometry from the same resolved value.
+  useEffect(() => {
+    videoRendererInstance.current?.setObjectFit(resolvedObjectFit);
+  }, [resolvedObjectFit, videoRendererInstance]);
 
   return (
     <div className="w-full h-full">

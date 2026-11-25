@@ -433,6 +433,7 @@ export class WebCodecsPipeline implements Pipeline {
     const drawW = frame.displayWidth * scale;
     const drawH = frame.displayHeight * scale;
     c.drawImage(frame, (cssW - drawW) / 2, (cssH - drawH) / 2, drawW, drawH);
+    this.statsData.videoSize = { width: frame.displayWidth, height: frame.displayHeight };
     this.drawTiming.record(performance.now());
     frame.close();
 
@@ -447,6 +448,11 @@ export class WebCodecsPipeline implements Pipeline {
     this.presenting = false;
     this.drawTiming.pause();
     this.drainPresentQueue();
+  }
+
+  setObjectFit(fit: 'contain' | 'cover'): void {
+    // renderFrame reads ctx.objectFit per frame, so mutation is enough.
+    this.ctx.objectFit = fit;
   }
 
   resume(): void {

@@ -8,6 +8,8 @@ export interface PipelineStats {
   framesIn: number;
   framesOut: number;
   dropped: number;
+  /** Decoded display size of the most recent rendered frame (canvas pipelines). */
+  videoSize?: { width: number; height: number };
   drawTiming?: { currentGapMs: number | null; p95GapMs: number | null; stalls: number };
   decodeErrors?: number;
   avSync?: { status: 'waiting' | 'active' | 'unavailable'; driftMs: number | null; dropped: number; queued: number };
@@ -53,5 +55,7 @@ export interface Pipeline {
   seek?(sec: number): void;
   setSpeed?(rate: number): void;
   timeline?(): PipelineTimeline;
+  /** 运行时更新渲染填充模式（下一帧生效） */
+  setObjectFit?(fit: 'contain' | 'cover'): void;
   destroy(): void;
 }

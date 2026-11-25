@@ -39,6 +39,12 @@ export class VideoStreamPlayer {
 
   private readonly options: StreamPlayerOptions;
 
+  private objectFit?: 'contain' | 'cover';
+
+  private frameWidth = 0;
+
+  private frameHeight = 0;
+
   constructor(options: StreamPlayerOptions = {}) {
     if (options.protocol && options.protocol !== 'mse-h264') {
       throw new Error(`Unsupported stream protocol: ${options.protocol}`);
@@ -46,6 +52,7 @@ export class VideoStreamPlayer {
     this.options = options;
     this.snapshotWidth = options.snapshotWidth;
     this.snapshotHeight = options.snapshotHeight;
+    this.objectFit = options.objectFit;
   }
 
   initPlayer(video: HTMLVideoElement): this { this.video = video; return this; }
@@ -57,6 +64,12 @@ export class VideoStreamPlayer {
   get packetCount(): number { return this.packetsPerSecond; }
 
   resetStartState(): this { this.started = false; return this; }
+
+  /** 运行时更新渲染填充模式（adaptive 由宿主解析后传入，引擎下一帧生效）。 */
+  setObjectFit(fit: 'contain' | 'cover'): void {
+    this.objectFit = fit;
+    this.player?.setObjectFit(fit);
+  }
 
   waitForNextVideoData(): void {
     this.waitingForData = true;
@@ -72,7 +85,7 @@ export class VideoStreamPlayer {
     this.url = url;
     this.waitForNextVideoData();
     const player = new CTPlayer({
-      objectFit: this.options.objectFit,
+      objectFit: this.objectFit,
       wasm: { kernelBaseUrl: new URL(`${import.meta.env.BASE_URL}ct-player/wasm-kernel/`, window.location.origin).href },
     }).attach(this.video);
     this.player = player;
@@ -101,6 +114,19 @@ export class VideoStreamPlayer {
       if (nextSoftwareHevc !== softwareHevc) {
         softwareHevc = nextSoftwareHevc;
         this.video?.dispatchEvent(new CustomEvent('aipc:software-hevc', { detail: softwareHevc }));
+      }
+      // Canvas pipelines keep the <video> element empty, so publish the
+      // decoded frame size here for consumers (overlay geometry, snapshot
+      // dimensions, adaptive object-fit) that otherwise read videoWidth.
+      if (
+        stats.videoWidth && stats.videoHeight
+        && (stats.videoWidth !== this.frameWidth || stats.videoHeight !== this.frameHeight)
+      ) {
+        this.frameWidth = stats.videoWidth;
+        this.frameHeight = stats.videoHeight;
+        this.video?.dispatchEvent(new CustomEvent('aipc:video-frame-size', {
+          detail: { width: stats.videoWidth, height: stats.videoHeight },
+        }));
       }
       if (hasStartedPlaying && stats.pps > 0) markWorking();
     });

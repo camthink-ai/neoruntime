@@ -57,7 +57,7 @@ export class CTPlayer {
   private sourceRef: CTSource | null = null;
   private mode: PlayMode = 'live';
   private readonly wasmOptions: WasmKernelOptions | undefined;
-  private readonly objectFit: 'contain' | 'cover';
+  private objectFit: 'contain' | 'cover';
   private audio: PcmAudioChannel | null = null;
   private audioSyncMaxDriftMs: number | null = null;
   private talker: AudioTalker | null = null;
@@ -206,6 +206,13 @@ export class CTPlayer {
     // Takes effect on the next play call, when the pipeline is created.
   }
 
+  /** Update the render fit at runtime; pipelines apply it from the next frame. */
+  setObjectFit(fit: 'contain' | 'cover'): void {
+    this.objectFit = fit;
+    this.render?.setObjectFit(fit);
+    this.pipeline?.setObjectFit?.(fit);
+  }
+
   getStats(): CTStats {
     const info = this.pipeline?.latencyInfo() ?? { latencyMs: null, bufferedMs: null };
     const pipelineStats = this.pipeline?.stats();
@@ -221,6 +228,9 @@ export class CTPlayer {
       latencyMs: info.latencyMs,
       bufferedMs: info.bufferedMs,
       droppedFrames: pipelineStats?.dropped ?? this.droppedTotal,
+      ...(pipelineStats?.videoSize
+        ? { videoWidth: pipelineStats.videoSize.width, videoHeight: pipelineStats.videoSize.height }
+        : {}),
       ...(pipelineStats ? { pipelineFramesIn: pipelineStats.framesIn } : {}),
       ...(pipelineStats?.drawTiming ? { drawTiming: pipelineStats.drawTiming } : {}),
       ...(pipelineStats?.decodeErrors !== undefined ? { decodeErrors: pipelineStats.decodeErrors } : {}),

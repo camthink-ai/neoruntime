@@ -36,7 +36,7 @@ export class WebGLYuvRenderer {
   private textures: WebGLTexture[] = [];
   private frameWidth = 0;
   private frameHeight = 0;
-  private readonly objectFit: 'contain' | 'cover';
+  private objectFit: 'contain' | 'cover';
 
   constructor(canvas: HTMLCanvasElement, objectFit: 'contain' | 'cover' = 'contain') {
     this.objectFit = objectFit;
@@ -108,6 +108,11 @@ export class WebGLYuvRenderer {
 
   get available(): boolean {
     return this.gl !== null;
+  }
+
+  /** 运行时切换填充模式（下一帧生效）。 */
+  setObjectFit(fit: 'contain' | 'cover'): void {
+    this.objectFit = fit;
   }
 
   /** yuv 为连续 [Y | U | V] 缓冲（stride = width）。 */

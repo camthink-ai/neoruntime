@@ -245,6 +245,7 @@ export class WasmPipeline implements Pipeline {
       this.renderTotalMs += performance.now() - started;
       this.renderSamples++;
       this.statsData.framesOut += 1;
+      this.statsData.videoSize = { width, height };
       if (!this.readyReported) {
         this.readyReported = true;
         this.ctx.onReady();
@@ -252,6 +253,10 @@ export class WasmPipeline implements Pipeline {
     }
     // 缓冲寄回 worker 复用，消除逐帧大分配的 GC 停顿
     this.kernel?.recycle(yuv);
+  }
+
+  setObjectFit(fit: 'contain' | 'cover'): void {
+    this.renderer?.setObjectFit(fit);
   }
 
   suspend(): void {

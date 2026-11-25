@@ -20,7 +20,7 @@ export class RenderTargetManager {
   private canvas: HTMLCanvasElement | null = null;
   private canvasContext: '2d' | 'webgl' | null = null;
   private activeSurface: SurfaceKind | null = null;
-  private readonly objectFit: 'contain' | 'cover';
+  private objectFit: 'contain' | 'cover';
   /** 记录我们创建的元素以便销毁时移除 */
   private ownedElements: HTMLElement[] = [];
   private externalVideo: HTMLVideoElement | null = null;
@@ -72,8 +72,11 @@ export class RenderTargetManager {
       canvas.setAttribute('data-player-canvas', '');
       this.classObserver = new MutationObserver(() => { if (this.canvas) this.canvas.className = video.className; });
       this.classObserver.observe(video, { attributes: true, attributeFilter: ['class'] });
-    } else this.container.appendChild(video);
-    this.container.appendChild(canvas);
+    } else this.container.prepend(video);
+    // Insert engine elements at the head / right after the external video so
+    // host-rendered overlays (stats panel, OSd layers) that already sit in the
+    // container keep painting above the opaque canvas.
+    video.after(canvas);
     this.video = video;
     this.canvas = canvas;
     this.ownedElements = this.externalVideo ? [canvas] : [video, canvas];
@@ -82,6 +85,12 @@ export class RenderTargetManager {
   getVideo(): HTMLVideoElement | null {
     this.ensureElements();
     return this.video;
+  }
+
+  /** 运行时切换填充模式；自建 video 更新内联样式，外部 video 由宿主样式控制。 */
+  setObjectFit(fit: 'contain' | 'cover'): void {
+    this.objectFit = fit;
+    if (this.video && !this.externalVideo) this.video.style.objectFit = fit;
   }
 
   getCanvas(context?: '2d' | 'webgl'): HTMLCanvasElement | null {

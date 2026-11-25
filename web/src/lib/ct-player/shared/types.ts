@@ -68,6 +68,9 @@ export interface CTStats {
   bufferedMs: number | null;
   /** Frames dropped due to buffering limits or before the first IDR. */
   droppedFrames: number;
+  /** Decoded display size of the most recent rendered frame; MSE reports it via the video element instead. */
+  videoWidth?: number;
+  videoHeight?: number;
   /** Access units received by the current pipeline; reset when the pipeline is rebuilt. */
   pipelineFramesIn?: number;
   /** Canvas draw-call intervals; P95 covers the last five seconds, and stalls count completed intervals over 200 ms. */
