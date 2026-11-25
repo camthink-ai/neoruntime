@@ -481,6 +481,10 @@ export class CTPlayer {
     this.pipeline = pipeline;
     this.wasmNeedsParameters = tech === 'wasm';
     pipeline.init();
+    // Re-arm the watchdog for the fresh pipeline: a latched stall must not
+    // block escalation when the new pipeline also sees no frames —
+    // restart-tech otherwise depends on a frame arriving to clear the latch.
+    this.health?.reset();
     log.info(`pipeline created: ${tech}`);
   }
 
