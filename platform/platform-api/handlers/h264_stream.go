@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aipc/platform/common/logger"
@@ -82,15 +83,44 @@ type clientSender struct {
 	conn *websocket.Conn
 	ch   chan []byte
 	quit chan struct{}
+	// synced flips true once this client has received a real keyframe in
+	// THIS session; until then sendLoop holds mid-GOP delta frames (their
+	// references predate the connection, so decoding them corrupts the
+	// picture until the next IDR). started bounds the wait: a stream that
+	// somehow stops producing keyframes degrades to pass-through instead of
+	// black-screening the client forever.
+	synced  atomic.Bool
+	started time.Time
 }
 
 // newClientSender builds a clientSender with a bounded send queue.
 func newClientSender(conn *websocket.Conn) *clientSender {
 	return &clientSender{
-		conn: conn,
-		ch:   make(chan []byte, clientSendQueue),
-		quit: make(chan struct{}),
+		conn:    conn,
+		ch:      make(chan []byte, clientSendQueue),
+		quit:    make(chan struct{}),
+		started: time.Now(),
 	}
+}
+
+// clientSyncGateTimeout bounds how long the per-client keyframe gate may hold
+// delta frames before degrading to pass-through. Generously above the worst
+// natural GOP interval (gop=60 @30fps ≈ 2s) so the forced/natural IDR wins
+// the race in every healthy case.
+const clientSyncGateTimeout = 3 * time.Second
+
+// clientGatePasses decides whether a frame may be delivered to a client.
+// Unsynced clients only get keyframes (header FrameType==0); after the gate
+// timeout everything passes, matching the pre-gate behavior. Pure helper so
+// the decision table is unit-testable.
+func clientGatePasses(frame []byte, synced bool, elapsed time.Duration) (pass, syncedAfter bool) {
+	if synced {
+		return true, true
+	}
+	if len(frame) > 4 && frame[4] == 0 { // V2 header FrameType: 0 = keyframe
+		return true, true
+	}
+	return elapsed >= clientSyncGateTimeout, false
 }
 
 // H264Stream represents an H264 stream via UDS + WebSocket
@@ -522,6 +552,50 @@ func splitNALUnits(data []byte) [][]byte {
 	return nals
 }
 
+// mergeParameterSets folds extracted parameter-set NALs into the cache. An
+// SPS-led unit starts a new generation (replace); a PPS-only unit extends the
+// current set but never starts one — a PPS without its SPS is undecodable.
+func (s *H264Stream) mergeParameterSets(nalType int, params [][]byte) {
+	s.spsPPSMux.Lock()
+	defer s.spsPPSMux.Unlock()
+	if nalType == 7 {
+		s.spsPPS = params
+		return
+	}
+	if len(s.spsPPS) == 0 {
+		return
+	}
+	s.spsPPS = append(s.spsPPS, params...)
+	if len(s.spsPPS) > 2 {
+		s.spsPPS = s.spsPPS[len(s.spsPPS)-2:]
+	}
+}
+
+// extractParameterSets walks an AVCC access unit and returns the SPS/PPS
+// NALs, each re-prefixed with its own 4-byte length. Slices (and everything
+// else) are excluded so the cache can never carry a decodable frame.
+func extractParameterSets(frameData []byte) [][]byte {
+	var out [][]byte
+	for len(frameData) >= 8 {
+		size := int(binary.BigEndian.Uint32(frameData[0:4]))
+		if size <= 0 || 4+size > len(frameData) {
+			break
+		}
+		nal := frameData[4 : 4+size]
+		if len(nal) > 0 {
+			switch nal[0] & 0x1f {
+			case 7, 8: // SPS, PPS
+				entry := make([]byte, 4+size)
+				binary.BigEndian.PutUint32(entry[0:4], uint32(size))
+				copy(entry[4:], nal)
+				out = append(out, entry)
+			}
+		}
+		frameData = frameData[4+size:]
+	}
+	return out
+}
+
 // requestKeyframe sends a keyframe request to camera-daemon
 func (s *H264Stream) requestKeyframe() {
 	s.connMu.Lock()
@@ -611,6 +685,11 @@ func (s *H264Stream) sendLoop(cs *clientSender) {
 		case <-cs.quit:
 			return
 		case frame := <-cs.ch:
+			pass, synced := clientGatePasses(frame, cs.synced.Load(), time.Since(cs.started))
+			if !pass {
+				continue
+			}
+			cs.synced.Store(synced)
 			_ = cs.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			t0 := time.Now()
 			err := cs.conn.WriteMessage(websocket.BinaryMessage, frame)
@@ -660,21 +739,16 @@ func (s *H264Stream) broadcastNAL(frameData []byte, isKeyframe bool, pts90kHz ui
 	// stale init segments after resolution/bitrate/codec changes.
 	if len(frameData) >= 5 {
 		nalType := frameData[4] & 0x1f
-		if nalType == 7 { // SPS — start of a new parameter set
-			s.spsPPSMux.Lock()
-			cached := make([]byte, len(frameData))
-			copy(cached, frameData)
-			s.spsPPS = [][]byte{cached} // Replace, don't append
-			s.spsPPSMux.Unlock()
-		} else if nalType == 8 { // PPS — append to current set
-			s.spsPPSMux.Lock()
-			cached := make([]byte, len(frameData))
-			copy(cached, frameData)
-			s.spsPPS = append(s.spsPPS, cached)
-			if len(s.spsPPS) > 2 {
-				s.spsPPS = s.spsPPS[len(s.spsPPS)-2:]
+		// Cache ONLY the parameter-set NALs, never the whole access unit:
+		// an IDR frame is [len][SPS][len][PPS][len][IDR-slice] in AVCC, so
+		// caching frameData wholesale stored a stale decodable IDR. AddClient
+		// then injected that old keyframe into every fresh connection and the
+		// following mid-GOP deltas referenced frames the client never saw —
+		// macroblock corruption until the next real IDR.
+		if nalType == 7 || nalType == 8 {
+			if params := extractParameterSets(frameData); len(params) > 0 {
+				s.mergeParameterSets(int(nalType), params)
 			}
-			s.spsPPSMux.Unlock()
 		}
 	}
 
