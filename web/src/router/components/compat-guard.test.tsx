@@ -40,19 +40,19 @@ function renderGuardAt(path: string) {
         <Routes>
           <Route
             path="/dashboard"
-            element={
+            element={(
               <CompatGuard>
                 <div>dashboard-page</div>
               </CompatGuard>
-            }
+            )}
           />
           <Route
             path="/settings/device-info"
-            element={
+            element={(
               <CompatGuard>
                 <div>device-info-page</div>
               </CompatGuard>
-            }
+            )}
           />
           <Route
             path="/app-incompatible"

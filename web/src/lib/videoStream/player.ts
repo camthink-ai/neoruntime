@@ -1,504 +1,279 @@
-import H264Player from './MSE/msePlayer';
-import { sleep } from '@/utils/index.js';
-import type {
-  StreamPlayerOptions,
-  StreamPlayerStats,
-  StreamProtocol,
-} from './types';
+import { CTPlayer } from '@/lib/ct-player/core/player';
+import { createBuiltinAdapter } from '@/lib/ct-player/adapters/registry';
+import type { SourceAdapter } from '@/lib/ct-player/shared/types';
+import type { StreamPlayerOptions, StreamPlayerStats } from './types';
 
-interface WsWorkerMessage {
-  type: 'connecting' | 'open' | 'close' | 'error' | 'video-data';
-  error?: string;
-  payload?: ArrayBuffer;
-  code?: number;
-  reason?: string;
+// Device protocol (V2): every video message carries a fixed 18-byte private
+// header that must be stripped before decoding; PTS is a big-endian 90 kHz
+// value at byte offset 6.
+export function deviceAdapter(): SourceAdapter {
+  // 'avcc' is a registry builtin, so creation never yields null here.
+  // The relay accepts single-message access units up to 4 MiB
+  // (h264_stream.go payloadSize check); the framer's 2 MiB default would
+  // silently drop larger IDRs and leave the stream blank. The extra headroom
+  // covers the length-prefix → start-code conversion in normalizeToAnnexB.
+  const adapter = createBuiltinAdapter({
+    name: 'avcc',
+    options: {
+      headerBytes: 18,
+      ptsOffset: 6,
+      maxBufferBytes: 4 * 1024 * 1024 + 64 * 1024,
+    },
+  })!;
+  return {
+    name: 'neoruntime',
+    push(message) {
+      if (message.length === 0) return [];
+      return adapter.push(message);
+    },
+    reset() { adapter.reset(); },
+  };
 }
 
-/**
- * 协议无关的统一播放器封装
- *
- * - 当前仅支持 `mse-h264`，内部复用原来的 `H264Player`（msePlayer）做解码
- * - WebSocket 连接 / 断开、重连、事件派发全部提升到这一层
- * - 之后接入 webrtc / hls 时，只需要在这里扩展协议分发逻辑
- */
 export class VideoStreamPlayer {
-  private readonly protocol: StreamProtocol;
+  private player: CTPlayer | null = null;
 
-  // 目前的具体实现：MSE + H264
-  private mseH264Player: H264Player | null = null;
+  private video: HTMLVideoElement | null = null;
 
-  private webSocketWorker: Worker | null = null;
+  private url = '';
 
-  private wsUrl = '';
+  private started = false;
 
-  private isStarted = false;
-
-  private isConnected = false;
-
-  private hasReceivedVideoData = false;
-
-  private videoElement: HTMLVideoElement | null = null;
-
-  // Flag to prevent processing data after destroy
-  private isDestroyed = false;
-
-  private mseErrorCount = 0;
-
-  private lastMseErrorTime = 0;
-
-  private mseReconnecting = false;
-
-  // Stall detection
-  private stallCheckTimer: ReturnType<typeof setInterval> | null = null;
-
-  private stallZeroCount = 0;
-
-  private stallRecoveryCount = 0;
-
-  private static readonly STALL_CHECK_INTERVAL = 1000;
-
-  private static readonly STALL_ZERO_THRESHOLD = 3;
-
-  private static readonly STALL_MAX_RECOVERY = 3;
+  private waitingForData = true;
 
   private snapshotWidth?: number;
 
   private snapshotHeight?: number;
 
+  private readonly options: StreamPlayerOptions;
+
+  private objectFit?: 'contain' | 'cover';
+
+  private frameWidth = 0;
+
+  private frameHeight = 0;
+
   constructor(options: StreamPlayerOptions = {}) {
-    this.protocol = options.protocol ?? 'mse-h264';
+    if (options.protocol && options.protocol !== 'mse-h264') {
+      throw new Error(`Unsupported stream protocol: ${options.protocol}`);
+    }
+    this.options = options;
     this.snapshotWidth = options.snapshotWidth;
     this.snapshotHeight = options.snapshotHeight;
-
-    const wrappedOnEvent = (msg: { t: string; codec?: string }) => {
-      if (msg.t === 'mseError') {
-        this.handleMseError();
-      } else if (msg.t === 'codecMismatch') {
-        // Codec not supported (e.g. H265) — stop player, don't reconnect
-        console.error(
-          `[VideoStreamPlayer] Codec mismatch: ${msg.codec} not supported`
-        );
-        this.stopStallDetection();
-        this.wsDisconnect();
-        this.mseH264Player?.stopPlay();
-        window.dispatchEvent(
-          new CustomEvent('wv_error', {
-            detail: {
-              type: 'codec_mismatch',
-              codec: msg.codec,
-              message: `${msg.codec} is not supported`,
-            },
-          })
-        );
-      }
-      options.onEvent?.(msg);
-    };
-
-    switch (this.protocol) {
-      case 'mse-h264':
-        this.mseH264Player = new H264Player(wrappedOnEvent);
-        break;
-      default:
-        throw new Error(`Unsupported stream protocol: ${this.protocol}`);
-    }
+    this.objectFit = options.objectFit;
   }
 
-  private handleMseError(): void {
-    const now = Date.now();
-    if (now - this.lastMseErrorTime > 10_000) {
-      this.mseErrorCount = 0;
-    }
-    this.mseErrorCount++;
-    this.lastMseErrorTime = now;
+  initPlayer(video: HTMLVideoElement): this { this.video = video; return this; }
 
-    if (this.mseErrorCount >= 3 && !this.mseReconnecting) {
-      this.mseReconnecting = true;
-      this.mseErrorCount = 0;
-      this.reStart().finally(() => {
-        this.mseReconnecting = false;
-      });
-    }
+  get currentTime(): number { return this.video?.currentTime ?? 0; }
+
+  get packetsPerSecond(): number { return this.player?.getStats().pps ?? 0; }
+
+  get packetCount(): number { return this.packetsPerSecond; }
+
+  resetStartState(): this { this.started = false; return this; }
+
+  /** 运行时更新渲染填充模式（adaptive 由宿主解析后传入，引擎下一帧生效）。 */
+  setObjectFit(fit: 'contain' | 'cover'): void {
+    this.objectFit = fit;
+    this.player?.setObjectFit(fit);
   }
 
-  private startStallDetection(): void {
-    this.stopStallDetection();
-    this.stallZeroCount = 0;
-    this.stallCheckTimer = setInterval(() => {
-      if (this.isDestroyed || !this.isConnected) return;
-      if (this.packetsPerSecond === 0) {
-        this.stallZeroCount++;
-        if (
-          this.stallZeroCount >= VideoStreamPlayer.STALL_ZERO_THRESHOLD
-          && this.stallRecoveryCount < VideoStreamPlayer.STALL_MAX_RECOVERY
-        ) {
-          this.stallRecoveryCount++;
-          console.warn(
-            `[VideoStreamPlayer] Stream stall detected (0 pps for ${this.stallZeroCount}s), restarting (attempt ${this.stallRecoveryCount}/${VideoStreamPlayer.STALL_MAX_RECOVERY})`
-          );
-          this.stallZeroCount = 0;
-          this.reStart().catch(() => {});
-        }
-      } else {
-        this.stallZeroCount = 0;
-        this.stallRecoveryCount = 0;
-      }
-    }, VideoStreamPlayer.STALL_CHECK_INTERVAL);
-  }
-
-  private stopStallDetection(): void {
-    if (this.stallCheckTimer) {
-      clearInterval(this.stallCheckTimer);
-      this.stallCheckTimer = null;
-    }
-    this.stallZeroCount = 0;
-  }
-
-  /**
-   * 初始化 video 元素
-   */
-  initPlayer(videoElement: HTMLVideoElement): this {
-    this.videoElement = videoElement;
-
-    switch (this.protocol) {
-      case 'mse-h264':
-        this.mseH264Player?.initPlayer(videoElement);
-        break;
-      default:
-        break;
-    }
-    return this;
-  }
-
-  /**
-   * 外部可读的时间与统计信息
-   */
-  get currentTime(): number {
-    return this.mseH264Player?.currentTime ?? 0;
-  }
-
-  get packetsPerSecond(): number {
-    return this.mseH264Player?.packetsPerSecond ?? 0;
-  }
-
-  get packetCount(): number {
-    return this.mseH264Player?.packetCount ?? 0;
-  }
-
-  /**
-   * 内部：初始化 WS Worker & 解码 Worker
-   */
-  private initWorkers(): void {
-    if (this.protocol !== 'mse-h264') return;
-
-    if (!this.mseH264Player) return;
-
-    // 初始化解码 Worker（仅一次）
-    this.mseH264Player.initDecoder();
-
-    if (!this.webSocketWorker) {
-      // 启动连接前通知外部展示 loading
-      window.dispatchEvent(new CustomEvent('wv_work', { detail: false }));
-      this.webSocketWorker = new Worker(new URL('./ws.ts', import.meta.url), {
-        type: 'module',
-      });
-      this.setupWebSocketWorkerHandler();
-    }
-  }
-
-  /**
-   * 绑定 WS Worker 消息回调
-   */
-  private setupWebSocketWorkerHandler(): void {
-    if (!this.webSocketWorker) return;
-
-    this.webSocketWorker.onmessage = (ev: MessageEvent<WsWorkerMessage>) => {
-      const msg = ev.data;
-      if (!msg || typeof msg !== 'object') return;
-
-      switch (msg.type) {
-        case 'connecting':
-          this.hasReceivedVideoData = false;
-          // 连接建立中：展示 loading
-          window.dispatchEvent(new CustomEvent('wv_work', { detail: false }));
-          break;
-        case 'open':
-          this.isConnected = true;
-          // A connected socket may still have no stream data. Keep loading
-          // until the first non-empty video payload arrives.
-          window.dispatchEvent(new CustomEvent('wv_work', { detail: false }));
-          window.dispatchEvent(new CustomEvent('wv_open'));
-          break;
-        case 'close':
-          this.isConnected = false;
-          this.hasReceivedVideoData = false;
-          window.dispatchEvent(
-            new CustomEvent('wv_close', {
-              detail: { code: msg.code, reason: msg.reason },
-            })
-          );
-          break;
-        case 'error':
-          this.isConnected = false;
-          this.hasReceivedVideoData = false;
-          window.dispatchEvent(
-            new CustomEvent('wv_error', { detail: msg.error })
-          );
-          // 出错期间保持 loading
-          window.dispatchEvent(new CustomEvent('wv_work', { detail: false }));
-          break;
-        case 'video-data': {
-          // Skip processing if player is destroyed
-          if (this.isDestroyed) {
-            // console.warn('[VideoStreamPlayer] Ignoring video-data, player is destroyed');
-            return;
-          }
-
-          if (msg.payload instanceof ArrayBuffer) {
-            // 将 WS 数据交给底层解码器
-            this.mseH264Player?.handleVideoData(msg.payload);
-            if (!this.hasReceivedVideoData && msg.payload.byteLength > 0) {
-              this.hasReceivedVideoData = true;
-              window.dispatchEvent(
-                new CustomEvent('wv_work', { detail: true })
-              );
-            }
-          }
-          break;
-        }
-        default:
-          break;
-      }
-    };
-  }
-
-  private wsDisconnect(): void {
-    this.isConnected = false;
-    this.hasReceivedVideoData = false;
-    this.webSocketWorker?.postMessage({ type: 'disconnect' });
-  }
-
-  private wsConnect(url: string): void {
-    this.webSocketWorker?.postMessage({ type: 'connect', url });
-  }
-
-  private async shutdownWebSocketWorker(graceMs = 250): Promise<void> {
-    const worker = this.webSocketWorker;
-    if (!worker) return;
-
-    this.isConnected = false;
-    this.hasReceivedVideoData = false;
-    this.webSocketWorker = null;
-    try {
-      worker.postMessage({ type: 'disconnect' });
-    } catch {
-      // ignore
-    }
-    await sleep(graceMs);
-    try {
-      worker.terminate();
-    } catch {
-      // ignore
-    }
-  }
-
-  private releaseWebSocketWorker(graceMs = 250): void {
-    const worker = this.webSocketWorker;
-    if (!worker) return;
-
-    this.isConnected = false;
-    this.hasReceivedVideoData = false;
-    this.webSocketWorker = null;
-    try {
-      worker.postMessage({ type: 'disconnect' });
-    } catch {
-      // ignore
-    }
-    setTimeout(() => {
-      try {
-        worker.terminate();
-      } catch {
-        // ignore
-      }
-    }, graceMs);
-  }
-
-  resetStartState(): this {
-    this.isStarted = false;
-    return this;
-  }
-
-  // Force readiness to wait for a payload newer than the current one.
   waitForNextVideoData(): void {
-    this.hasReceivedVideoData = false;
+    this.waitingForData = true;
     window.dispatchEvent(new CustomEvent('wv_work', { detail: false }));
   }
 
-  /**
-   * 开始播放（由上层传入 WS URL）
-   */
   async start(url: string): Promise<this> {
-    const sameUrl = this.wsUrl === url;
-
-    // Prevent starting if already started with the same URL
-    if (this.isStarted && sameUrl && !this.isDestroyed) {
-      return this;
+    if (this.started && this.url === url) return this;
+    if (!this.video) throw new Error('Call initPlayer before start');
+    this.player?.destroy();
+    this.video.dispatchEvent(new CustomEvent('aipc:software-hevc', { detail: false }));
+    this.started = true;
+    this.url = url;
+    this.waitForNextVideoData();
+    const player = new CTPlayer({
+      objectFit: this.objectFit,
+      wasm: { kernelBaseUrl: new URL(`${import.meta.env.BASE_URL}ct-player/wasm-kernel/`, window.location.origin).href },
+    }).attach(this.video);
+    this.player = player;
+    let softwareHevc = false;
+    let hasStartedPlaying = false;
+    // Set when the engine's request-stream fallback has been routed to the
+    // codec_mismatch event; the declined engine's terminal error is redundant.
+    let streamFallbackRouted = false;
+    const markWorking = () => {
+      if (!this.waitingForData) return;
+      this.waitingForData = false;
+      window.dispatchEvent(new CustomEvent('wv_work', { detail: true }));
+    };
+    player.on('state', ({ state }) => {
+      if (this.player !== player) return;
+      if (state === 'buffering') window.dispatchEvent(new CustomEvent('wv_open'));
+      if (state === 'connecting' || state === 'degraded') this.waitForNextVideoData();
+      if (state === 'playing') {
+        hasStartedPlaying = true;
+        markWorking();
+      }
+    });
+    player.on('stats', stats => {
+      if (this.player !== player) return;
+      const nextSoftwareHevc = stats.codec === 'h265' && stats.tech === 'wasm';
+      if (nextSoftwareHevc !== softwareHevc) {
+        softwareHevc = nextSoftwareHevc;
+        this.video?.dispatchEvent(new CustomEvent('aipc:software-hevc', { detail: softwareHevc }));
+      }
+      // Canvas pipelines keep the <video> element empty, so publish the
+      // decoded frame size here for consumers (overlay geometry, snapshot
+      // dimensions, adaptive object-fit) that otherwise read videoWidth.
+      if (
+        stats.videoWidth && stats.videoHeight
+        && (stats.videoWidth !== this.frameWidth || stats.videoHeight !== this.frameHeight)
+      ) {
+        this.frameWidth = stats.videoWidth;
+        this.frameHeight = stats.videoHeight;
+        this.video?.dispatchEvent(new CustomEvent('aipc:video-frame-size', {
+          detail: { width: stats.videoWidth, height: stats.videoHeight },
+        }));
+      }
+      if (hasStartedPlaying && stats.pps > 0) markWorking();
+    });
+    player.on('error', error => {
+      if (this.player !== player) return;
+      // Terminal transport failures must surface the disconnected UI: the
+      // shared Player ignores plain wv_error events, so translate them into
+      // wv_close instead. RETRY_EXHAUSTED carries no detail — default to an
+      // empty payload, the close handler dereferences event.detail.
+      if (error.code === 'RETRY_EXHAUSTED' || error.code === 'SUPERSEDED') {
+        window.dispatchEvent(new CustomEvent('wv_close', { detail: error.detail ?? {} }));
+        return;
+      }
+      if (error.code === 'NETWORK_ERROR') {
+        // Socket closes carry {code, reason} and are already beyond the
+        // reconnect policy — stay disconnected instead of re-entering
+        // buffering with no reconnect scheduled. Other transport errors
+        // (string detail) keep retrying and recover through state/stats.
+        if (error.detail && typeof error.detail === 'object') {
+          window.dispatchEvent(new CustomEvent('wv_close', { detail: error.detail }));
+        }
+        return;
+      }
+      if (error.fatal) {
+        if (streamFallbackRouted) return;
+        const codecMismatch = error.code === 'CODEC_MISMATCH' || error.code === 'CODEC_UNSUPPORTED';
+        window.dispatchEvent(new CustomEvent('wv_error', {
+          detail: codecMismatch ? { type: 'codec_mismatch', codec: player.getStats().codec, message: error.code } : error,
+        }));
+        // Machine-terminal failure (tech chain exhausted, startup stall, …)
+        // with no engine recovery left: land the shared Player on its
+        // disconnected state with the Reload control instead of an endless
+        // spinner. A codec_mismatch hook response swaps the stream URL in the
+        // same React batch, superseding this state without a visible flicker.
+        window.dispatchEvent(new CustomEvent('wv_close', { detail: error.detail ?? {} }));
+        this.options.onEvent?.({ t: codecMismatch ? 'codecMismatch' : error.code });
+      }
+    });
+    player.on('request-stream', request => {
+      if (this.player !== player) return;
+      // The engine exhausted its tech chain for HEVC (hardware + WASM) and
+      // asks for an H.264 stream. Route the request through the existing
+      // codec_mismatch fallback (useStreamFallback swaps the stream URL and
+      // rebuilds this facade), and decline so the old engine terminates
+      // instead of waiting on a stream that will never arrive.
+      streamFallbackRouted = true;
+      window.dispatchEvent(new CustomEvent('wv_error', {
+        detail: { type: 'codec_mismatch', codec: request.current.codec, message: request.reason },
+      }));
+      // The engine is terminal either way: land on the disconnected state
+      // (Reload control) instead of an endless spinner while the fallback
+      // hook decides whether an H.264 stream can take over.
+      window.dispatchEvent(new CustomEvent('wv_close', { detail: {} }));
+      player.respondStreamChange({ accepted: false });
+    });
+    try {
+      await player.play({
+        transport: { type: 'ws', url },
+        adapter: async () => deviceAdapter(),
+      });
+    } catch (error) {
+      if (this.player === player) {
+        this.started = false;
+        window.dispatchEvent(new CustomEvent('wv_error', { detail: error }));
+      }
     }
-
-    this.wsUrl = url;
-
-    // Reset destroyed flag when starting
-    this.isDestroyed = false;
-    this.hasReceivedVideoData = false;
-
-    // Clean up existing connection first
-    if (this.isConnected || this.webSocketWorker) {
-      await this.shutdownWebSocketWorker();
-    }
-
-    this.isStarted = true;
-    this.initWorkers();
-    this.wsConnect(url);
-
-    // 通知解码器进入新流
-    this.mseH264Player?.initDecoderForNewStream();
-
-    this.startStallDetection();
-
     return this;
   }
 
-  /**
-   * 暂停：断开 WS，但保留 MSE 缓冲和 video 元素
-   */
   pause(): void {
-    this.isConnected = false;
-    this.hasReceivedVideoData = false;
-    this.isStarted = false;
-    this.stopStallDetection();
-
-    if (this.webSocketWorker) {
-      this.releaseWebSocketWorker();
-    }
-
-    // 仅暂停视频播放 & 清缓冲
-    this.mseH264Player?.clearBuffer();
-    if (this.videoElement && !this.videoElement.paused) {
-      this.videoElement.pause();
-    }
+    this.started = false;
+    this.player?.destroy();
+    this.player = null;
   }
 
-  /**
-   * 重启流：清空缓冲并重新建立 WS 连接
-   */
   async reStart(): Promise<void> {
-    if (!this.wsUrl || !this.videoElement) return;
-
-    // Reset destroyed flag when restarting
-    this.isDestroyed = false;
-    this.hasReceivedVideoData = false;
-
-    if (this.isConnected && this.webSocketWorker) {
-      this.wsDisconnect();
-      await sleep(500);
-    }
-
-    this.initWorkers();
-
-    // 重新关联 video 元素
-    if (this.mseH264Player && this.videoElement) {
-      this.mseH264Player.initPlayer(this.videoElement);
-    }
-
-    // 清空 MSE buffer
-    this.mseH264Player?.clearBuffer();
-
-    // 重连 WS
-    this.wsConnect(this.wsUrl);
-
-    // 重新初始化解码器
-    this.mseH264Player?.initDecoderForNewStream();
-
-    this.isStarted = true;
+    if (!this.url || !this.video) return;
+    this.started = false;
+    await this.start(this.url);
   }
 
-  /**
-   * 彻底销毁播放器实例
-   */
   destroy(): void {
-    // Set flag immediately to prevent processing any remaining WebSocket messages
-    this.isDestroyed = true;
-    this.isStarted = false;
-    this.isConnected = false;
-    this.hasReceivedVideoData = false;
-    this.stopStallDetection();
-
-    if (this.webSocketWorker) {
-      this.releaseWebSocketWorker();
-    }
-
-    this.mseH264Player?.stopPlay();
-    this.mseH264Player?.destroy();
-    this.mseH264Player = null;
-
-    this.videoElement = null;
-    this.wsUrl = '';
+    const { player } = this;
+    this.player = null;
+    this.started = false;
+    player?.destroy();
+    this.video = null;
+    this.url = '';
   }
 
-  /**
-   * 获取底层实现暴露的统计指标
-   */
   getStats(): StreamPlayerStats | null {
-    switch (this.protocol) {
-      case 'mse-h264':
-        return this.mseH264Player?.getStats() ?? null;
-      default:
-        return null;
-    }
+    if (!this.player) return null;
+    const stats = this.player.getStats();
+    return {
+      bandwidth: stats.bitrateKBps,
+      // stats.latencyMs is milliseconds; the consumer renders seconds.
+      latency: (stats.latencyMs ?? 0) / 1000,
+      bufferTime: (stats.bufferedMs ?? 0) / 1000,
+      playbackRate: this.video?.playbackRate ?? 1,
+      packetsPerSecond: stats.pps,
+    };
   }
 
-  /**
-   * Update snapshot dimensions (e.g. after media config loads or changes)
-   */
   setSnapshotDimensions(width: number, height: number): void {
     this.snapshotWidth = width;
     this.snapshotHeight = height;
   }
 
-  /**
-   * 截图当前帧
-   */
   doSnapshot(): void {
-    const videoEl = this.videoElement;
-    if (!videoEl) return;
-
-    const canvas = document.createElement('canvas');
-    const targetW = this.snapshotWidth || videoEl.videoWidth || videoEl.clientWidth;
-    const targetH = this.snapshotHeight || videoEl.videoHeight || videoEl.clientHeight;
-    canvas.width = targetW;
-    canvas.height = targetH;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    // Crop source to configured dimensions to remove macroblock padding
-    // (e.g. 1088→1080, 368→360) instead of stretching
-    const srcH = Math.min(targetH, videoEl.videoHeight);
-    ctx.drawImage(videoEl, 0, 0, targetW, srcH, 0, 0, targetW, targetH);
-
-    canvas.toBlob(blob => {
-      if (!blob) return;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `snapshot-${Date.now()}.png`;
-      a.click();
-      URL.revokeObjectURL(url);
-    });
+    const { player } = this;
+    if (!player) return;
+    player.snapshot().then(blob => {
+      const download = (image: Blob) => {
+        const url = URL.createObjectURL(image);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `snapshot-${Date.now()}.png`;
+        link.click();
+        URL.revokeObjectURL(url);
+      };
+      if (!this.snapshotWidth || !this.snapshotHeight) { download(blob); return; }
+      const source = URL.createObjectURL(blob);
+      const image = new Image();
+      image.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = this.snapshotWidth!;
+        canvas.height = this.snapshotHeight!;
+        const ctx = canvas.getContext('2d');
+        // The engine snapshot is picture-only (canvas path crops to the
+        // content rect; the video path captures videoWidth x videoHeight), so
+        // resample the whole image instead of cropping its top-left corner.
+        ctx?.drawImage(image, 0, 0, image.width, image.height, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(result => { if (result) download(result); });
+        URL.revokeObjectURL(source);
+      };
+      image.onerror = () => URL.revokeObjectURL(source);
+      image.src = source;
+    }).catch(error => console.warn('[VideoStreamPlayer] Snapshot unavailable', error));
   }
 }
 
-export type {
-  StreamPlayerOptions,
-  StreamPlayerStats,
-  StreamProtocol,
-} from './types';
+export type { StreamPlayerOptions, StreamPlayerStats, StreamProtocol } from './types';

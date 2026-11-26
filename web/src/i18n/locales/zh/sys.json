@@ -694,7 +694,9 @@
       "delay": "延迟",
       "live": "实时",
       "transform_flipping": "正在翻转画面...",
-      "transform_updating": "正在更新画面..."
+      "transform_updating": "正在更新画面...",
+      "software_hevc_warning": "当前 H.265 视频正在使用软件解码，可能出现卡顿或掉帧。建议尝试使用支持 H.265 硬件解码的浏览器（如 Chrome），并开启硬件加速。",
+      "dismiss_warning": "关闭提示"
     },
     "ptz": {
       "title": "云台控制",

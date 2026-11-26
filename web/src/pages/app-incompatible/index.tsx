@@ -47,21 +47,24 @@ export default function AppIncompatible() {
   }
 
   const rows: Array<{ label: string; value: string }> = [];
-  if (verdict?.app_version)
-    rows.push({
+  if (verdict?.app_version) {
+ rows.push({
       label: t('sys.compatibility.app_version_label', '应用版本'),
       value: verdict.app_version,
-    });
-  if (verdict?.app_min_os_version)
-    rows.push({
+    }); 
+}
+  if (verdict?.app_min_os_version) {
+ rows.push({
       label: t('sys.compatibility.supported_os_label', '支持 OS 范围'),
       value: `${verdict.app_min_os_version} – ${verdict.app_max_os_version ?? '-'}`,
-    });
-  if (verdict?.os_version)
-    rows.push({
+    }); 
+}
+  if (verdict?.os_version) {
+ rows.push({
       label: t('sys.compatibility.current_os_label', '当前设备 OS'),
       value: verdict.os_version,
-    });
+    }); 
+}
 
   return (
     <div className="relative flex min-h-dvh items-center justify-center bg-background px-4 py-10">

@@ -1,5 +1,8 @@
 module.exports = {
   root: true,
+  // Vendored CT player engine (third-party SDK source, see docs in
+  // src/lib/ct-player) — exempt from the app's style rules.
+  ignorePatterns: ['src/lib/ct-player/**'],
   env: {
     browser: true,
     es2021: true,

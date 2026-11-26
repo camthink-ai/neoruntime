@@ -63,8 +63,8 @@ export default function Layout() {
         <main
           className={cn(
             'flex-1 overflow-auto w-full relative bg-background',
-            showMobileChrome &&
-              'mt-[calc(3.5rem+env(safe-area-inset-top,0px))] h-[calc(100dvh-(3.5rem+env(safe-area-inset-top,0px)))]'
+            showMobileChrome
+              && 'mt-[calc(3.5rem+env(safe-area-inset-top,0px))] h-[calc(100dvh-(3.5rem+env(safe-area-inset-top,0px)))]'
           )}
         >
           {showInitialLoading ? <Loading fullHeight /> : <Outlet />}

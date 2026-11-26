@@ -694,7 +694,9 @@
       "delay": "Delay",
       "live": "Live",
       "transform_flipping": "Flipping image...",
-      "transform_updating": "Updating image..."
+      "transform_updating": "Updating image...",
+      "software_hevc_warning": "H.265 video is using software decoding, which may cause stuttering or dropped frames. Try a browser that supports H.265 hardware decoding, such as Chrome, with hardware acceleration enabled.",
+      "dismiss_warning": "Dismiss warning"
     },
     "ptz": {
       "title": "PTZ Control",

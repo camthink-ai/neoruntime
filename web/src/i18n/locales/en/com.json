@@ -128,7 +128,6 @@
     "export": "Export",
     "import": "Import",
     "processing": "Processing...",
-    "clear": "Clear",
     "pause": "Pause",
     "resume": "Resume",
     "reconnect": "Reconnect",

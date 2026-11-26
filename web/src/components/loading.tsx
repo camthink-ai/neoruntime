@@ -1,6 +1,7 @@
 import { createPortal } from 'react-dom';
 import { cn } from '@/lib/utils';
 import SvgIcon from '@/components/svg-icon';
+import { useTranslation } from 'react-i18next';
 
 interface LoadingProps {
   /** Show a full-screen mask overlay */
@@ -22,6 +23,7 @@ export default function Loading({
   size = 'md',
   placeholder,
 }: LoadingProps) {
+  const { t } = useTranslation();
   const iconSizeClasses = {
     sm: 'w-8 h-8',
     md: 'w-12 h-12',
@@ -46,7 +48,7 @@ export default function Loading({
         )}
       />
       <span className="text-sm mt-2 text-muted-foreground flex items-center justify-center">
-        {placeholder || 'loading'}
+        {placeholder || t('common.loading').replace(/\.{3}$/, '')}
         {!placeholder && (
           <span className="inline-flex w-4 overflow-hidden ml-0.5">
             <span className="animate-[dotBounce_1.4s_ease-in-out_infinite]">

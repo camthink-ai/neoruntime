@@ -9,13 +9,14 @@ export interface StreamPlayerStats {
 }
 
 export interface StreamPlayerOptions {
+  objectFit?: 'contain' | 'cover';
   /**
-   * 播放协议类型，当前仅实现 mse-h264，预留 webrtc / hls
+   * Playback protocol type; only mse-h264 is implemented, webrtc / hls reserved.
    */
   protocol?: StreamProtocol;
 
   /**
-   * 内部事件回调（目前与 msePlayer 保持一致）
+   * Internal event callbacks (kept from the legacy player contract).
    */
   onEvent?: (event: { t: string }) => void;
 

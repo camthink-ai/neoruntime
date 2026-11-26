@@ -40,6 +40,11 @@ type PlayerProps = {
    * instance that owns audio (Media page) — other players stay engine-free.
    */
   audioOverlay?: boolean;
+  /**
+   * Notifies when the engine switches to (or back from) WASM software HEVC
+   * decoding (fired as `aipc:software-hevc` on the video element).
+   */
+  onSoftwareHevcChange?: (active: boolean) => void;
 };
 
 const STREAM_STATS_KEY = 'deviceToolStreamStatsVisible';
@@ -58,6 +63,7 @@ export default function Player({
   configuring = false,
   onFrameSizeChange,
   audioOverlay = false,
+  onSoftwareHevcChange,
 }: PlayerProps) {
   const [loading, setLoading] = useState(false);
   const { t } = useTranslation();
@@ -67,6 +73,8 @@ export default function Player({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  // Stage wrapper hosting the video element and the engine-created canvas.
+  const stageRef = useRef<HTMLDivElement>(null);
   const idleTimerRef = useRef<number | null>(null);
   const audioPlayerRef = useRef<AudioPlayer | null>(null);
   const lastFrameSizeRef = useRef<{ width: number; height: number } | null>(
@@ -115,7 +123,7 @@ export default function Player({
   // useAudioTalk owns the click-to-toggle talk engine (PC mic → device
   // speaker) + device audio-status sync (captureAvailable / playbackEnabled),
   // refreshed on mount, window-focus, and cross-page Peripheral events.
-  const { talking, level, toggleTalk } = useAudioTalk({
+  const { talking, toggleTalk } = useAudioTalk({
     enabled: audioOverlay,
   });
 
@@ -192,6 +200,10 @@ export default function Player({
     null
   );
 
+  // Resolved adaptive fit: captured at player creation below and kept in sync
+  // with dimension changes through the effect near the render output.
+  const resolvedFitRef = useRef<'contain' | 'cover'>('contain');
+
   useEffect(() => {
     if (streamWidth && streamHeight) {
       setVideoDimensions({ width: streamWidth, height: streamHeight });
@@ -223,7 +235,21 @@ export default function Player({
         width?: number;
         height?: number;
       }>;
-      publishFrameSize(detail?.width ?? 0, detail?.height ?? 0);
+      const width = detail?.width ?? 0;
+      const height = detail?.height ?? 0;
+      publishFrameSize(width, height);
+      // Canvas pipelines keep the video element empty, so its resize events
+      // never fire and pages without an onFrameSizeChange callback (Media)
+      // would resolve the adaptive fit from stale configured dimensions.
+      // Feed the decoded size into the local state so the fit re-resolves
+      // and reaches the engine even after an in-place rotation.
+      if (width > 0 && height > 0) {
+        setVideoDimensions(current => (
+          current.width === width && current.height === height
+            ? current
+            : { width, height }
+        ));
+      }
     };
 
     video.addEventListener('loadedmetadata', syncFromVideo);
@@ -277,7 +303,9 @@ export default function Player({
       });
       if (isCancelled) return;
 
-      videoRendererInstance.current = new VideoStreamPlayer();
+      videoRendererInstance.current = new VideoStreamPlayer({
+        objectFit: resolvedFitRef.current,
+      });
       videoRendererInstance.current.initPlayer(video);
       const dims = snapshotDimsRef.current;
       if (dims) {
@@ -308,7 +336,24 @@ export default function Player({
         audioPlayerRef.current = null;
       }
     };
-  }, [videoUrl]);
+  }, [videoUrl, objectFit]);
+
+  // Forward WASM software-HEVC status (dispatched on the video element by the
+  // engine facade when stats report h265 decoding via wasm) to the host page,
+  // which shows a performance notice. Cleanup reports inactive.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const onSoftwareHevc = (event: Event) => {
+      const active = (event as CustomEvent<boolean>).detail;
+      onSoftwareHevcChange?.(active);
+    };
+    video.addEventListener('aipc:software-hevc', onSoftwareHevc);
+    return () => {
+      video.removeEventListener('aipc:software-hevc', onSoftwareHevc);
+      onSoftwareHevcChange?.(false);
+    };
+  }, [onSoftwareHevcChange]);
 
   // Autoplay fallback. Audio starts on mount in the effect above, but if this
   // is a cold page-load with no prior user activation in the document the
@@ -339,7 +384,7 @@ export default function Player({
   }, [enableAudio]);
 
   // Default the browser listen state to ON when the audio-owning player
-  // mounts ("喇叭默认开启"). The store is a module singleton that survives
+  // mounts ("speaker on by default"). The store is a module singleton that survives
   // route changes; without resetting, the speaker could re-enter in an
   // inconsistent state. With autoplay-on-mount, this intent immediately
   // starts the AudioPlayer (the reactive effect above) — no click needed for
@@ -372,8 +417,11 @@ export default function Player({
   }, [isShowStreamStats]);
 
   const handleReload = () => {
+    // Loading is intentionally NOT cleared here: under the CT engine the
+    // loading overlay only clears on real playback (wv_work after
+    // state:'playing'), so a reload shows the connecting state until the
+    // stream actually renders again.
     videoRendererInstance.current?.resetStartState().start(videoUrl);
-    setLoading(false);
   };
 
   // Keep latest handleReload in a ref so the global reload listener (subscribed
@@ -383,8 +431,8 @@ export default function Player({
 
   // External callers (e.g. encoder reconfigure) request a full player reconnect
   // by dispatching 'player-reload'. This tears down WS + MSE and reconnects,
-  // fetching fresh SPS/PPS and waiting for a clean IDR — avoiding 花屏/黑屏
-  // after a resolution/codec/fps change.
+  // fetching fresh SPS/PPS and waiting for a clean IDR — avoiding corrupted
+  // or black frames after a resolution/codec/fps change.
   useEffect(() => {
     const onPlayerReload = () => {
       handleReloadRef.current?.();
@@ -395,7 +443,7 @@ export default function Player({
 
   // AI ISP profile switches restart the daemon's GStreamer pipeline for
   // ~interrupt_ms (reported by the switch RPC). Reconnecting immediately would
-  // hit a half-rebuilt pipeline and 花屏/黑屏. Wait out the interrupt window,
+  // hit a half-rebuilt pipeline and corrupted or black frames. Wait out the interrupt window,
   // then reuse the canonical reload path. The switching ref suppresses the
   // transient "Disconnected" state the WS close produces during the wait.
   useEffect(() => {
@@ -483,8 +531,8 @@ export default function Player({
 
   useEffect(() => {
     const handlWvClose = (e: Event) => {
-      const event = e as CustomEvent<{ code?: number; reason?: string }>;
-      if (event.detail.reason === 'Connection replaced') {
+      const event = e as CustomEvent<{ code?: number; reason?: string } | null>;
+      if (event.detail?.reason === 'Connection replaced') {
         toast.error(t('sys.device_tool.preview_disconnected'));
       }
       // During a profile-switch pipeline restart the WS close is expected; keep
@@ -557,11 +605,13 @@ export default function Player({
     return () => document.removeEventListener('fullscreenchange', onFsChange);
   }, []);
 
-  // Double-click to fullscreen
+  // Double-click to fullscreen. The listener sits on the stage wrapper that
+  // hosts both the <video> and the engine-created canvas: canvas backends
+  // keep the video hidden, so a video-only listener would never fire.
   useEffect(() => {
     if (!enableDoubleClickFullscreen) return;
 
-    const el = videoRef.current;
+    const el = stageRef.current;
     if (!el) return;
     const onDbl = () => {
       handleFullscreen().catch(() => {
@@ -626,6 +676,15 @@ export default function Player({
     videoDimensions.width,
     videoDimensions.height
   );
+  resolvedFitRef.current = resolvedObjectFit;
+
+  // Canvas pipelines cannot read the video element's object-fit class — the
+  // picture is letterboxed/cropped inside the canvas backing store — so keep
+  // the engine geometry in sync with the resolved adaptive fit. Overlay layers
+  // derive their geometry from the same resolved value.
+  useEffect(() => {
+    videoRendererInstance.current?.setObjectFit(resolvedObjectFit);
+  }, [resolvedObjectFit, videoRendererInstance]);
 
   return (
     <div className="w-full h-full">
@@ -633,7 +692,7 @@ export default function Player({
         ref={containerRef}
         className="relative w-full h-full flex items-center justify-center overflow-hidden bg-black"
       >
-        <div className="w-full h-full flex items-center justify-center">
+        <div ref={stageRef} className="w-full h-full flex items-center justify-center">
           <video
             ref={videoRef}
             className={`h-full w-full ${resolvedObjectFit === 'cover' ? 'object-cover' : 'object-contain'} transition-opacity duration-500 ${videoVisible ? 'opacity-100' : 'opacity-0'}`}
@@ -692,7 +751,6 @@ export default function Player({
             onVolumeChange={setVolume}
             captureAvailable={captureAvailable}
             talking={talking}
-            talkLevel={level}
             onToggleTalk={toggleTalk}
             playbackEnabled={playbackEnabled}
           />

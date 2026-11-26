@@ -20,10 +20,9 @@ vi.mock('react-i18next', () => ({
       const options = (opts ?? {}) as Record<string, string>;
       const base = options.defaultValue ?? key;
       return Object.entries(options).reduce(
-        (text, [name, value]) =>
-          typeof value === 'string'
+        (text, [name, value]) => (typeof value === 'string'
             ? text.replaceAll(`{{${name}}}`, value)
-            : text,
+            : text),
         base
       );
     },
@@ -50,8 +49,7 @@ vi.mock('@/services/api/system', () => ({
 // The rescue dialog is the device-info page's own component with its own
 // test coverage; stub it to a marker that reflects its open state.
 vi.mock('@/pages/settings/device-info/components/FirmwareUpdateDialog', () => ({
-  FirmwareUpdateDialog: ({ open }: { open: boolean }) =>
-    open ? <div>firmware-dialog-open</div> : null,
+  FirmwareUpdateDialog: ({ open }: { open: boolean }) => (open ? <div>firmware-dialog-open</div> : null),
 }));
 
 const mockCompat = systemApi.appCompatStatus as unknown as ReturnType<
