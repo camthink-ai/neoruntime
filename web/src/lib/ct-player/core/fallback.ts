@@ -257,6 +257,15 @@ export class FallbackMachine {
       };
     }
     if (this.state !== 'running' && this.state !== 'restarting') {
+      // A stall while 'switching' means the freshly selected tech produced
+      // no frame within its re-armed watchdog window (e.g. the transport
+      // died between the first frame and pipeline readiness). Discarding it
+      // latches the monitor forever with no frame to clear it. Treat the
+      // tech as failed so the machine moves on to the remaining tiers (or
+      // the terminal/disconnected UI) instead.
+      if (this.state === 'switching') {
+        return this.onFatal('NO_KEYFRAME_TIMEOUT', { type: 'stall' });
+      }
       return { actions: [] };
     }
     const tech = this.currentTech;
