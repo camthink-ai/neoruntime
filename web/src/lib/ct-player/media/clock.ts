@@ -2,7 +2,7 @@
  * MediaClock：全库唯一时间源（P6）。
  *
  * 时间戳策略（移植 ne301 getAdaptivePreviewFrameDuration 的结论）：
- * - 设备 PTS 存在**细粒度**差值（连续 ≥2 次落在 5–60fps 窗口）→ 采信：ptsRelative/cto 用真实值
+ * - 设备 PTS 存在**细粒度**差值（连续 ≥2 次落在 1–60fps 窗口）→ 采信：ptsRelative/cto 用真实值
  *   （B 帧/解码序乱序流必需）；帧率仅在差值**连续一致**时才交给 PTS——
  *   解码序乱序流（Hailo 系按解码序推流、PTS 为显示序）的到达序差值正负交错，
  *   单差值测得的帧率是噪声，此时帧率由到达节奏 EWMA 供数（内容 20fps 打在
@@ -23,14 +23,17 @@ export interface FrameTiming {
   fps: number;
 }
 
-const FPS_MIN = 5;
+// 下限 1fps 对齐媒体设置的帧率范围（1–30fps）：更低的门限会把 3–4fps 低帧率
+// 流的合法 PTS 判成粗粒度，合成轨道又钳在原 FPS_MIN 上 → 呈现过快、抖动。
+// 粗粒度 PTS（同秒同值）的零差值仍走 else 分支重置 streak，不会被放宽误伤。
+const FPS_MIN = 1;
 const FPS_MAX = 60;
-/** 5–60fps 对应的 PTS 差值窗口（90kHz ticks） */
+/** 1–60fps 对应的 PTS 差值窗口（90kHz ticks） */
 const PTS_DIFF_MIN = 1500;
-const PTS_DIFF_MAX = 18000;
-/** 到达间隔合理窗口（ms）：5–66fps；窗口外的间隔（暂停/网络空洞）不计入估计 */
+const PTS_DIFF_MAX = 90000;
+/** 到达间隔合理窗口（ms）：2–66fps；窗口外的间隔（暂停/网络空洞）不计入估计 */
 const ARRIVAL_DT_MIN = 15;
-const ARRIVAL_DT_MAX = 200;
+const ARRIVAL_DT_MAX = 500;
 /** 采信 PTS 所需的连续有效差值次数 */
 const PTS_TRUST_THRESHOLD = 2;
 /** PTS 差值帧率采信所需的连续一致次数 */
