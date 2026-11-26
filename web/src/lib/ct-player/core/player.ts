@@ -63,7 +63,7 @@ export class CTPlayer {
   private talker: AudioTalker | null = null;
   private codecDetected: VideoCodec | null = null;
   private parameterSets = new Map<number, Uint8Array>();
-  private wasmNeedsParameters = false;
+  private pipelineNeedsParameters = false;
   private state: PlayerState = 'idle';
   private destroyed = false;
   private playing = false;
@@ -288,7 +288,7 @@ export class CTPlayer {
     this.pipeline = null;
     this.codecDetected = null;
     this.parameterSets.clear();
-    this.wasmNeedsParameters = false;
+    this.pipelineNeedsParameters = false;
     this.playing = false;
     this.lastTransportStats = { bytes: 0, messages: 0 };
   }
@@ -392,7 +392,12 @@ export class CTPlayer {
   }
 
   private submitFrame(frame: EncodedFrame): void {
-    if (this.pipeline?.tech === 'wasm' && this.wasmNeedsParameters && frame.keyframe) {
+    // Seed every freshly (re)built pipeline — not just WASM — with the cached
+    // parameter sets: streams that carry SPS/PPS only at startup leave a
+    // rebuilt WebCodecs/MSE pipeline unconfigured forever, because headerless
+    // IDRs cannot bootstrap it while the frames keep the transport watchdog
+    // fed (no stall ever fires).
+    if (this.pipeline && this.pipelineNeedsParameters && frame.keyframe) {
       const types = frame.codec === 'h265' ? [32, 33, 34] : [7, 8];
       const missing = types.filter((type) => !frame.nalus.some((nalu) => nalu.type === type));
       const sets = missing.map((type) => ({ type, data: this.parameterSets.get(type) }));
@@ -409,7 +414,7 @@ export class CTPlayer {
         data.set(frame.data, offset);
         nalus.push(...frame.nalus.map((nalu) => ({ ...nalu, offset: nalu.offset + offset })));
         frame = { ...frame, data, nalus };
-        this.wasmNeedsParameters = false;
+        this.pipelineNeedsParameters = false;
       }
     }
     this.pipeline?.submit(frame);
@@ -491,7 +496,10 @@ export class CTPlayer {
       return;
     }
     this.pipeline = pipeline;
-    this.wasmNeedsParameters = tech === 'wasm';
+    // Any pipeline built after the stream started may miss the parameter
+    // sets the device only sent once; submitFrame seeds the next keyframe
+    // from the cache (no-op when the keyframe already carries them).
+    this.pipelineNeedsParameters = true;
     pipeline.init();
     // Re-arm the watchdog for the fresh pipeline: a latched stall must not
     // block escalation when the new pipeline also sees no frames —

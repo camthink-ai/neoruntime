@@ -20,6 +20,7 @@ import { createLogger } from '../shared/log';
 import { DrawTiming } from './draw-timing';
 import { AudioPresenter } from '../media/audio-presenter';
 import { PacedPresenter } from '../media/paced-presenter';
+import { MediaClock } from '../media/clock';
 
 const log = createLogger('wasm-pipeline');
 
@@ -55,6 +56,8 @@ export class WasmPipeline implements Pipeline {
   private renderTotalMs = 0;
   private renderSamples = 0;
   private readonly drawTiming = new DrawTiming();
+  /** 粗粒度 PTS 归一化（与硬件路径同款裁决：不可信 PTS → 到达节奏合成轨）。 */
+  private readonly clock = new MediaClock();
   private statsData: PipelineStats = { framesIn: 0, framesOut: 0, dropped: 0 };
   private dropReasons = { beforeConfiguration: 0, waitingForKeyframe: 0, queueOverflow: 0, suspended: 0, presentation: 0 };
   /** 等待下发 worker 的帧（信用制：仅在途 < MAX_INFLIGHT_DECODES 时发送） */
@@ -207,7 +210,14 @@ export class WasmPipeline implements Pipeline {
         // The kernel returns display-order pictures with their own PTS when available.
         if (!this.suspended && this.renderer) {
           if (this.presenter && ev.pts90k !== undefined) this.presenter.push({ yuv: ev.yuv, width: ev.width, height: ev.height }, ev.pts90k);
-          else if (this.pacedPresenter && ev.pts90k !== undefined) this.pacedPresenter.push([{ pts: ev.pts90k, item: { yuv: ev.yuv, width: ev.width, height: ev.height } }]);
+          else if (this.pacedPresenter && ev.pts90k !== undefined) {
+            // Coarse device PTS (one value shared by a second of frames) would
+            // give every picture the same due time and collapse them as overdue
+            // duplicates. Route through MediaClock like the hardware paths so
+            // untrusted PTS falls back to the arrival-based track.
+            const timing = this.clock.next(ev.pts90k);
+            this.pacedPresenter.push([{ pts: timing.ptsRelative, item: { yuv: ev.yuv, width: ev.width, height: ev.height } }]);
+          }
           else { this.presenter?.untimed(); this.pacedPresenter?.clear(); this.drawFrame(ev.yuv, ev.width, ev.height); }
         } else {
           // 缓冲寄回 worker 复用（挂起未渲染的帧也回收），消除逐帧大分配的 GC 停顿
