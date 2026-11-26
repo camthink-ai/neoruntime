@@ -5129,6 +5129,14 @@ void CameraDaemon::stop_grpc_server() {
         autofocus_controller_->stop();
         autofocus_controller_.reset();
     }
+    // End the RS-485 RX streams first. Server::Shutdown() does not cancel
+    // in-flight RPCs: these handlers exit only when their client goes away
+    // or the hub is shut down, and device-control keeps its stream open for
+    // as long as any SDK client subscribes. Without this a daemon stop with
+    // an active subscriber hangs here until systemd kills the process.
+    if (camera_control_service_) {
+        camera_control_service_->StopRs485Streams();
+    }
     if (grpc_server_) {
         grpc_server_->Shutdown();
         grpc_server_.reset();

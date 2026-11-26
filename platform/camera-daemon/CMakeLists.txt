@@ -202,6 +202,7 @@ set(SOURCES
     src/illumination_controller.cpp
     src/daynight_policy.cpp
     src/camera_control_service.cpp
+    src/rs485_event_hub.cpp
     src/lens_hal_service.cpp
     src/camera_daemon.cpp
     ${AUTO_AF_CORE_DIR}/af_calibration.cpp
@@ -461,6 +462,24 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     )
     target_link_libraries(dsp-import-write-target-test PRIVATE pthread rt)
     add_test(NAME dsp-import-write-target-test COMMAND dsp-import-write-target-test)
+
+    # RS-485 RX fan-out hub: bounded per-subscriber queues with drop policy,
+    # refcounted HAL subscription guard, and a stub-HAL injection round trip.
+    add_executable(rs485-event-hub-test
+        tests/rs485_event_hub_test.cpp
+        src/rs485_event_hub.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/platforms/stub/peripherals/stub_rs485_impl.c
+    )
+    # The test is assert()-based: keep the asserts in Release builds too.
+    target_compile_options(rs485-event-hub-test PRIVATE -UNDEBUG)
+    target_include_directories(rs485-event-hub-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/peripheral
+        ${HAL_V2_INC}/peripheral/devices
+    )
+    target_link_libraries(rs485-event-hub-test PRIVATE pthread)
+    add_test(NAME rs485-event-hub-test COMMAND rs485-event-hub-test)
 
     add_executable(injection-owner-test
         tests/injection_owner_test.cpp

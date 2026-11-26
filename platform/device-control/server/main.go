@@ -137,6 +137,11 @@ type DeviceControlServer struct {
 	eventSubsMu        sync.Mutex
 	eventSubs          map[chan *pb.DeviceEvent]struct{}
 	eventPollerStarted bool
+
+	// RS-485 RX hub: one shared upstream stream to camera-daemon
+	// (SubscribeRs485Rx), fanned out to per-subscriber channels with
+	// queue_size/drop_old policy. See rs485_hub.go.
+	rs485 *rs485Hub
 }
 
 type lensStatusCache struct {
@@ -163,6 +168,7 @@ func NewDeviceControlServer(cfg *Config, lensHal hal.LensHAL, cameraDaemonClient
 		cameraDaemonClient: cameraDaemonClient,
 		cameraDaemonConn:   cameraDaemonConn,
 	}
+	server.rs485 = newRs485Hub(cameraDaemonClient)
 
 	// Connect to Event Bus if enabled
 	if cfg.EventBus.Enabled && cfg.EventBus.Endpoint != "" {
@@ -2231,6 +2237,10 @@ func main() {
 	// Device event poller (SubscribeEvents) — tied to the reconcile
 	// context so shutdown stops it.
 	deviceServer.StartEventPoller(reconcileCtx)
+
+	// RS-485 RX upstream (SubscribeRs485Rx) — same lifecycle as the poller;
+	// the pump itself starts lazily on the first subscriber.
+	deviceServer.rs485.Start(reconcileCtx)
 
 	// Handle shutdown gracefully
 	sigChan := make(chan os.Signal, 1)

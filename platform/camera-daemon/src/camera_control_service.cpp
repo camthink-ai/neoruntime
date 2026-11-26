@@ -57,7 +57,11 @@ void fill_infrared_status(const IlluminationStatus& status, bool success,
 } // namespace
 
 CameraControlServiceImpl::CameraControlServiceImpl(CameraDaemon* daemon)
-    : daemon_(daemon) {
+    : daemon_(daemon),
+      rs485_hal_sub_(std::make_unique<aipc::Rs485HalSubscription>(
+          &CameraControlServiceImpl::rs485_hal_subscribe_thunk,
+          &CameraControlServiceImpl::rs485_hal_unsubscribe_thunk,
+          this)) {
 }
 /* ~CameraControlServiceImpl is defined at the end of this file:
  * JpegShotState (held by unique_ptr) is incomplete until then. */
@@ -1329,6 +1333,114 @@ grpc::Status CameraControlServiceImpl::Rs485Tx(
     return grpc::Status::OK;
 }
 
+// ---- RS485 RX streaming ----------------------------------------------------
+
+void CameraControlServiceImpl::rs485_rx_trampoline(void* /*mcu_ctx*/,
+                                                   const uint8_t* data,
+                                                   uint16_t len,
+                                                   void* userdata) {
+    auto* self = static_cast<CameraControlServiceImpl*>(userdata);
+    self->rs485_hub_.publish(data, len);
+}
+
+void CameraControlServiceImpl::StopRs485Streams() {
+    /* Wakes every SubscribeRs485Rx handler (they poll the hub with a 250 ms
+     * tick); each then releases its share of the HAL subscription while the
+     * MCU context is still alive. */
+    rs485_hub_.shutdown();
+}
+
+int CameraControlServiceImpl::rs485_hal_subscribe_thunk(void* userdata) {
+    auto* self = static_cast<CameraControlServiceImpl*>(userdata);
+    if (!self->daemon_) {
+        return -1;
+    }
+    auto* hal = self->daemon_->hal_loader();
+    if (!hal || !hal->has_rs485() || !hal->rs485() || !hal->mcu_ctx()) {
+        return -1;
+    }
+    return hal->rs485()->subscribe(hal->mcu_ctx(), rs485_rx_trampoline, userdata);
+}
+
+int CameraControlServiceImpl::rs485_hal_unsubscribe_thunk(void* userdata) {
+    auto* self = static_cast<CameraControlServiceImpl*>(userdata);
+    if (!self->daemon_) {
+        return 0;
+    }
+    auto* hal = self->daemon_->hal_loader();
+    if (!hal || !hal->rs485()) {
+        return 0;
+    }
+    /* Runs only from a stream handler, i.e. while the gRPC server is up and
+     * the shared MCU context is alive — the HAL unregister dereferences it.
+     * It must never be called from the destructor: the lens service (and with
+     * it the MCU context) is torn down first, see ~CameraDaemon. */
+    return hal->rs485()->unsubscribe(hal->mcu_ctx());
+}
+
+grpc::Status CameraControlServiceImpl::SubscribeRs485Rx(
+    grpc::ServerContext* context,
+    const aipc::camera::Empty*,
+    grpc::ServerWriter<aipc::camera::Rs485RxEvent>* writer) {
+
+    if (!daemon_) {
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+    auto* hal = daemon_->hal_loader();
+    if (!hal || !hal->has_rs485() || !hal->rs485() || !hal->mcu_ctx()) {
+        return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "RS485 HAL not loaded");
+    }
+
+    const int rc = rs485_hal_sub_->acquire();
+    if (rc != 0) {
+        return grpc::Status(grpc::StatusCode::INTERNAL,
+                            "HAL subscribe failed: " + std::to_string(rc));
+    }
+    /* One release() on every exit path below. */
+    struct ReleaseOnExit {
+        aipc::Rs485HalSubscription* sub;
+        ~ReleaseOnExit() { sub->release(); }
+    } release_on_exit{rs485_hal_sub_.get()};
+
+    HAL_LOG_INFO("[CameraControl] SubscribeRs485Rx: stream opened");
+
+    /* Daemon-level policy is fixed (bounded 16, drop-oldest): this hop has a
+     * single consumer (device-control), which enforces the per-subscriber
+     * queue_size/drop_old policy requested by SDK clients. */
+    auto sub = rs485_hub_.subscribe(aipc::Rs485EventHub::kDefaultQueueSize, /*drop_old=*/true);
+
+    aipc::Rs485Frame frame;
+    for (;;) {
+        const bool got = sub->next(&frame, std::chrono::milliseconds(250));
+        if (!got && !sub->alive()) {
+            break; /* hub shut down (daemon stopping) */
+        }
+        if (context->IsCancelled()) {
+            break;
+        }
+        if (!got) {
+            continue; /* timeout tick: re-check cancellation */
+        }
+        aipc::camera::Rs485RxEvent ev;
+        ev.set_data(frame.data.data(), frame.data.size());
+        ev.set_timestamp_ns(frame.timestamp_ns);
+        if (!writer->Write(ev)) {
+            break; /* client gone / stream broken */
+        }
+    }
+
+    const uint64_t dropped = sub->dropped();
+    if (dropped > 0) {
+        HAL_LOG_WARNING("[CameraControl] SubscribeRs485Rx: dropped %llu frames",
+                        static_cast<unsigned long long>(dropped));
+    }
+    HAL_LOG_INFO("[CameraControl] SubscribeRs485Rx: stream closed");
+    return grpc::Status::OK;
+    /* Scope exit, in reverse declaration order: `sub` detaches from the hub
+     * first, then release_on_exit drops the HAL subscription (the last stream
+     * out unsubscribes). */
+}
+
 grpc::Status CameraControlServiceImpl::GetCapabilities(
     grpc::ServerContext*,
     const aipc::camera::Empty*,
@@ -2183,6 +2295,15 @@ CameraControlServiceImpl::~CameraControlServiceImpl() {
      * jpeg_ (unique_ptr<JpegShotState>) needs the complete type. */
     std::lock_guard<std::mutex> lk(jpeg_mu_);
     jpeg_.reset();
+    /* Wake every SubscribeRs485Rx stream. Handlers release the HAL
+     * subscription themselves on exit, and the gRPC server has already
+     * joined them (see ~CameraDaemon), so nothing is normally held here.
+     * Do NOT call the HAL from this point on: the shared MCU context is
+     * destroyed before this object and the HAL unregister dereferences it. */
+    rs485_hub_.shutdown();
+    if (rs485_hal_sub_ && rs485_hal_sub_->held()) {
+        HAL_LOG_WARNING("[CameraControl] SubscribeRs485Rx: HAL subscription still held at shutdown");
+    }
 }
 
 // ---- App frame injection (PushFrame P0-P2) ------------------------------

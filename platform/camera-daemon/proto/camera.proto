@@ -515,6 +515,12 @@ message Rs485TxRequest {
   bytes data = 1;
 }
 
+// One RS-485 frame received on the bus (idle-delimited DMA chunk, <= 512 bytes).
+message Rs485RxEvent {
+  bytes  data = 1;         // raw frame bytes
+  uint64 timestamp_ns = 2; // camera-daemon receive time (host clock, not MCU capture time)
+}
+
 // MCU raw request (for PTZ, GPIO, etc.)
 message McuRawRequestMessage {
   uint32 cmd = 1;
@@ -720,6 +726,10 @@ service CameraControl {
   rpc Rs485Init(Rs485InitRequest) returns (Status);
   rpc Rs485Deinit(Empty) returns (Status);
   rpc Rs485Tx(Rs485TxRequest) returns (Status);
+  // Stream RS-485 RX frames (one event per received bus frame). Valid before
+  // Rs485Init as well: the stream simply stays silent until the MCU driver
+  // produces frames. Policy (queueing/drop) is enforced by device-control.
+  rpc SubscribeRs485Rx(Empty) returns (stream Rs485RxEvent);
 
   // Capabilities (auto-detected from HAL)
   rpc GetCapabilities(Empty) returns (CapabilitiesResponse);

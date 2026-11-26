@@ -1,11 +1,17 @@
-/** @file stub_rs485_impl.c — HAL_RS485_OPS (stub) */
+/** @file stub_rs485_impl.c — HAL_RS485_OPS (stub, RX-injectable for tests) */
 #include "peripheral/devices/hal_rs485.h"
+
+#include <stddef.h>
+
+static HalRs485RxCallback s_rx_cb;
+static void *s_rx_cb_user;
+static void *s_mcu_ctx;
 
 static int stub_rs485_init(void *mcu_ctx, uint32_t baudrate, const char config[HAL_RS485_CONFIG_LEN])
 {
-    (void)mcu_ctx;
     (void)baudrate;
     (void)config;
+    s_mcu_ctx = mcu_ctx;
     return HAL_ERR_NOT_SUPPORTED;
 }
 
@@ -25,16 +31,30 @@ static int stub_rs485_tx(void *mcu_ctx, const uint8_t *data, uint16_t len)
 
 static int stub_rs485_subscribe(void *mcu_ctx, HalRs485RxCallback cb, void *userdata)
 {
-    (void)mcu_ctx;
-    (void)cb;
-    (void)userdata;
-    return HAL_ERR_NOT_SUPPORTED;
+    if (cb == NULL) {
+        return HAL_ERR_INVALID_ARG;
+    }
+    s_mcu_ctx = mcu_ctx;
+    s_rx_cb = cb;
+    s_rx_cb_user = userdata;
+    return HAL_OK;
 }
 
 static int stub_rs485_unsubscribe(void *mcu_ctx)
 {
     (void)mcu_ctx;
-    return HAL_ERR_NOT_SUPPORTED;
+    s_rx_cb = NULL;
+    s_rx_cb_user = NULL;
+    return HAL_OK;
+}
+
+int stub_rs485_inject_rx(const uint8_t *data, uint16_t len)
+{
+    if (s_rx_cb == NULL || data == NULL || len == 0u) {
+        return HAL_ERR_INVALID_STATE;
+    }
+    s_rx_cb(s_mcu_ctx, data, len, s_rx_cb_user);
+    return HAL_OK;
 }
 
 static const char *stub_rs485_get_version(void)
