@@ -304,11 +304,23 @@ export class CTPlayer {
         if (!this.pipeline) this.setState('connecting');
         break;
       case 'open':
-        if (this.health) this.health.isOpen = true;
+        if (this.health) {
+          this.health.isOpen = true;
+          // Re-arm the stall baseline: lastFrameAt predates the outage and
+          // would fire a spurious stall on the next tick before the first
+          // post-reconnect frame lands.
+          this.health.reset();
+        }
         if (!this.pipeline) this.setState('buffering');
         break;
       case 'reconnecting':
         this.reconnectCount += 1;
+        // No socket is open during the backoff window: suspend the stall
+        // watchdog so a recoverable outage doesn't burn the decoder fallback
+        // chain (restart budget → tech switches → terminal) while the
+        // transport still has retry budget left. Long outages terminate via
+        // retry-exhausted instead.
+        if (this.health) this.health.isOpen = false;
         if (this.pipeline) this.setState('degraded', `reconnect #${s.attempt}`);
         break;
       case 'closed':

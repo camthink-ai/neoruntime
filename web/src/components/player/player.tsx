@@ -235,7 +235,21 @@ export default function Player({
         width?: number;
         height?: number;
       }>;
-      publishFrameSize(detail?.width ?? 0, detail?.height ?? 0);
+      const width = detail?.width ?? 0;
+      const height = detail?.height ?? 0;
+      publishFrameSize(width, height);
+      // Canvas pipelines keep the video element empty, so its resize events
+      // never fire and pages without an onFrameSizeChange callback (Media)
+      // would resolve the adaptive fit from stale configured dimensions.
+      // Feed the decoded size into the local state so the fit re-resolves
+      // and reaches the engine even after an in-place rotation.
+      if (width > 0 && height > 0) {
+        setVideoDimensions(current => (
+          current.width === width && current.height === height
+            ? current
+            : { width, height }
+        ));
+      }
     };
 
     video.addEventListener('loadedmetadata', syncFromVideo);
