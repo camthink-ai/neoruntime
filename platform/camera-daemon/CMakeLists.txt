@@ -468,8 +468,10 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     add_executable(rs485-event-hub-test
         tests/rs485_event_hub_test.cpp
         src/rs485_event_hub.cpp
-        ${HAL_COMMON_DIR}/../platforms/stub/peripherals/stub_rs485_impl.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/platforms/stub/peripherals/stub_rs485_impl.c
     )
+    # The test is assert()-based: keep the asserts in Release builds too.
+    target_compile_options(rs485-event-hub-test PRIVATE -UNDEBUG)
     target_include_directories(rs485-event-hub-test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${HAL_V2_INC}

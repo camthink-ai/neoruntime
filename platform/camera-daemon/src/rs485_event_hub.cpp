@@ -96,7 +96,16 @@ std::shared_ptr<Rs485EventHub::Subscription> Rs485EventHub::subscribe(uint32_t q
 
     {
         std::lock_guard<std::mutex> lk(mu_);
-        subs_.push_back(state);
+        if (shutdown_) {
+            /* Stopped for good (daemon shutting down): hand out a
+             * subscription that is already closed, so its handler ends on
+             * its first tick instead of waiting for a wake that never
+             * comes — gRPC's Shutdown() does not cancel in-flight RPCs. */
+            std::lock_guard<std::mutex> slk(state->mu);
+            state->closed = true;
+        } else {
+            subs_.push_back(state);
+        }
     }
     return sub;
 }
@@ -145,6 +154,7 @@ void Rs485EventHub::shutdown() {
     std::vector<std::shared_ptr<detail::Rs485SubState>> targets;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        shutdown_ = true; /* sticky: subscriptions created later start closed */
         targets = std::move(subs_);
         subs_.clear();
     }

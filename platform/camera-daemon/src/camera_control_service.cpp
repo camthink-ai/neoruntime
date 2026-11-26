@@ -1343,6 +1343,13 @@ void CameraControlServiceImpl::rs485_rx_trampoline(void* /*mcu_ctx*/,
     self->rs485_hub_.publish(data, len);
 }
 
+void CameraControlServiceImpl::StopRs485Streams() {
+    /* Wakes every SubscribeRs485Rx handler (they poll the hub with a 250 ms
+     * tick); each then releases its share of the HAL subscription while the
+     * MCU context is still alive. */
+    rs485_hub_.shutdown();
+}
+
 int CameraControlServiceImpl::rs485_hal_subscribe_thunk(void* userdata) {
     auto* self = static_cast<CameraControlServiceImpl*>(userdata);
     if (!self->daemon_) {
@@ -1364,8 +1371,10 @@ int CameraControlServiceImpl::rs485_hal_unsubscribe_thunk(void* userdata) {
     if (!hal || !hal->rs485()) {
         return 0;
     }
-    /* mcu_ctx may already be torn down during daemon shutdown; the hailo15
-     * unregister path only needs the ctx pointer identity. */
+    /* Runs only from a stream handler, i.e. while the gRPC server is up and
+     * the shared MCU context is alive — the HAL unregister dereferences it.
+     * It must never be called from the destructor: the lens service (and with
+     * it the MCU context) is torn down first, see ~CameraDaemon. */
     return hal->rs485()->unsubscribe(hal->mcu_ctx());
 }
 
@@ -1387,6 +1396,11 @@ grpc::Status CameraControlServiceImpl::SubscribeRs485Rx(
         return grpc::Status(grpc::StatusCode::INTERNAL,
                             "HAL subscribe failed: " + std::to_string(rc));
     }
+    /* One release() on every exit path below. */
+    struct ReleaseOnExit {
+        aipc::Rs485HalSubscription* sub;
+        ~ReleaseOnExit() { sub->release(); }
+    } release_on_exit{rs485_hal_sub_.get()};
 
     HAL_LOG_INFO("[CameraControl] SubscribeRs485Rx: stream opened");
 
@@ -1420,10 +1434,11 @@ grpc::Status CameraControlServiceImpl::SubscribeRs485Rx(
         HAL_LOG_WARNING("[CameraControl] SubscribeRs485Rx: dropped %llu frames",
                         static_cast<unsigned long long>(dropped));
     }
-    sub.reset(); /* detach before releasing the HAL subscription */
-    (void)rs485_hal_sub_->release();
     HAL_LOG_INFO("[CameraControl] SubscribeRs485Rx: stream closed");
     return grpc::Status::OK;
+    /* Scope exit, in reverse declaration order: `sub` detaches from the hub
+     * first, then release_on_exit drops the HAL subscription (the last stream
+     * out unsubscribes). */
 }
 
 grpc::Status CameraControlServiceImpl::GetCapabilities(
@@ -2280,11 +2295,14 @@ CameraControlServiceImpl::~CameraControlServiceImpl() {
      * jpeg_ (unique_ptr<JpegShotState>) needs the complete type. */
     std::lock_guard<std::mutex> lk(jpeg_mu_);
     jpeg_.reset();
-    /* Wake every SubscribeRs485Rx stream, then drop the HAL subscription if
-     * still held (streams normally release it themselves on exit). */
+    /* Wake every SubscribeRs485Rx stream. Handlers release the HAL
+     * subscription themselves on exit, and the gRPC server has already
+     * joined them (see ~CameraDaemon), so nothing is normally held here.
+     * Do NOT call the HAL from this point on: the shared MCU context is
+     * destroyed before this object and the HAL unregister dereferences it. */
     rs485_hub_.shutdown();
     if (rs485_hal_sub_ && rs485_hal_sub_->held()) {
-        (void)rs485_hal_sub_->release();
+        HAL_LOG_WARNING("[CameraControl] SubscribeRs485Rx: HAL subscription still held at shutdown");
     }
 }
 

@@ -279,6 +279,11 @@ public:
         const aipc::camera::Empty* request,
         grpc::ServerWriter<aipc::camera::Rs485RxEvent>* writer) override;
 
+    /* Ends every SubscribeRs485Rx stream. Must run before the gRPC server is
+     * shut down: Shutdown() does not cancel in-flight RPCs, and these
+     * handlers otherwise exit only when their client goes away. */
+    void StopRs485Streams();
+
     grpc::Status GetCapabilities(
         grpc::ServerContext* context,
         const aipc::camera::Empty* request,

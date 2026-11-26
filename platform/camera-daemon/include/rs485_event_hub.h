@@ -73,6 +73,10 @@ public:
         std::shared_ptr<detail::Rs485SubState> state_;
     };
 
+    /* Lifetime: subscriptions must not outlive the hub — ~Subscription()
+     * detaches through the hub pointer. In the daemon the hub is a member of
+     * the gRPC service object, and the server joins every handler (so
+     * destroying every subscription) before that object goes away. */
     Rs485EventHub() = default;
     Rs485EventHub(const Rs485EventHub&) = delete;
     Rs485EventHub& operator=(const Rs485EventHub&) = delete;
@@ -83,7 +87,8 @@ public:
     /** Non-blocking fan-out; timestamps with the host clock. */
     void publish(const uint8_t* data, uint16_t len);
 
-    /** Closes every subscription and wakes all waiters (idempotent). */
+    /** Closes every subscription and wakes all waiters. Idempotent, and
+     *  final: subscriptions created afterwards start out closed. */
     void shutdown();
 
     size_t subscriber_count() const;
@@ -93,6 +98,7 @@ private:
 
     mutable std::mutex mu_;
     std::vector<std::shared_ptr<detail::Rs485SubState>> subs_;
+    bool shutdown_ = false;
 };
 
 /**

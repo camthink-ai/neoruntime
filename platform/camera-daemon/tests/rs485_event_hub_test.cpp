@@ -127,6 +127,21 @@ static void test_shutdown_wakes_blocked_next() {
                 static_cast<long long>(waited.count()));
 }
 
+static void test_subscribe_after_shutdown_is_closed() {
+    /* A stream admitted while the daemon is already shutting down must not
+     * wait for a wake that never comes. */
+    Rs485EventHub hub;
+    hub.shutdown();
+    auto s = hub.subscribe(4, true);
+    assert(!s->alive());
+    Rs485Frame f;
+    assert(!s->next(&f, std::chrono::milliseconds(10)));
+    assert(hub.subscriber_count() == 0);
+    publish_bytes(hub, "x"); /* nothing registered: no queueing, no crash */
+    assert(!s->next(&f, std::chrono::milliseconds(10)));
+    std::printf("  subscribe after shutdown: ok\n");
+}
+
 static void test_destructor_detach() {
     Rs485EventHub hub;
     {
@@ -209,6 +224,7 @@ int main() {
     test_drop_policy();
     test_capacity_clamp();
     test_shutdown_wakes_blocked_next();
+    test_subscribe_after_shutdown_is_closed();
     test_destructor_detach();
     test_hal_subscription_refcount();
     test_stub_hal_injection_roundtrip();
