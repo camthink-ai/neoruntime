@@ -278,6 +278,44 @@ the first sample and after an absolute change of 50 mV or a relative change of
 an independent bounded queue, so a client that stops reading cannot delay
 other subscribers or the hardware poller.
 
+### RS-485
+
+| RPC | Request | Response | Description |
+|-----|---------|----------|-------------|
+| `Rs485Init` | `Rs485InitRequest` | `Status` | Initialize the RS-485 port |
+| `Rs485Tx` | `Rs485TxRequest` | `Status` | Transmit raw bytes |
+| `Rs485Deinit` | `Empty` | `Status` | Release the RS-485 port |
+| `SubscribeRs485Rx` | `Rs485SubscribeRequest` | `stream Rs485RxEvent` | Push stream of received frames |
+
+```protobuf
+message Rs485SubscribeRequest {
+  uint32 queue_size = 1; // backlog depth; 0 = default (16), clamped to 128
+  bool drop_old = 2;     // true: drop oldest frame when full; false: drop newest
+}
+
+message Rs485RxEvent {
+  bytes  data = 1;         // raw frame bytes
+  uint64 timestamp_ns = 2; // receive time on the device (host clock)
+}
+```
+
+`SubscribeRs485Rx` delivers one event per frame the MCU receives on the bus
+(idle-delimited, at most 512 bytes). `timestamp_ns` is stamped by camera-daemon
+when the frame arrives, not by the MCU. The stream may be opened before
+`Rs485Init`: it then stays silent until the RS-485 driver produces frames.
+Delivery is at least once: the MCU link re-sends an event when its
+acknowledgement is lost, so a consumer that needs exactly-once semantics has
+to de-duplicate.
+
+Every subscriber owns a bounded queue and never delays the others: when the
+queue is full, `drop_old` selects whether the oldest queued frame or the
+newest one is discarded. All subscribers share one upstream stream to
+camera-daemon, which opens on the first subscriber and closes when the last
+one leaves. A lost upstream (for example a camera-daemon restart) is reopened
+after one second, or after ten seconds when the upstream rejects the stream
+outright (no MCU link, or a camera-daemon without the RPC); subscribers stay
+connected across the reconnect.
+
 ## Configuration
 
 Configuration file: `configs/platform/device-control.yaml`
