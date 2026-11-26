@@ -19,13 +19,20 @@ extern "C" {
 
 /**
  * RS485 RX event forwarder: the driver rx callback only enqueues into a static
- * queue; this low-priority task drains it and performs the blocking
- * host_link_send_event(), so the rs485_rx task can re-arm its DMA immediately
- * (host_link_send_event blocks up to ~1.9 s when the host does not ACK).
+ * queue; this task drains it and performs the blocking host_link_send_event(),
+ * so the rs485_rx task can re-arm its DMA immediately (host_link_send_event
+ * blocks up to ~1.9 s when the host does not ACK). The task spends nearly all
+ * of its life blocked (queue, ACK wait), so its priority only governs how
+ * soon a queued frame is put on the wire.
  */
 #define HL_RS485_TX_TASK_NAME        "hl_rs485tx"
 #define HL_RS485_TX_TASK_STACK       (1024u)
-#define HL_RS485_TX_TASK_PRIORITY    (tskIDLE_PRIORITY + 1u)  /* below rs485_rx (+2) */
+/* Same priority the forwarding ran at before the queue existed (inside the
+ * rs485_rx task): not the system's lowest, where any busier task would
+ * delay the frames. Blocking on the ACK never blocks rs485_rx or the poll
+ * path: the host-link mutex inherits priority and is not held across the
+ * ACK wait. */
+#define HL_RS485_TX_TASK_PRIORITY    (tskIDLE_PRIORITY + 2u)
 
 /** RS485 event queue: depth x max frame (== RS485_RX_BUFFER_SIZE == max host_link payload). */
 #define HL_RS485_EVT_QUEUE_LEN       (4u)
