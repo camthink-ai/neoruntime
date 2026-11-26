@@ -1,9 +1,11 @@
 package main
 
 // rs485_hub_test.go — covers the device-control RS-485 RX hub: subscribe
-// validation/clamping, fan-out drop policies, single-shared-upstream
-// lifecycle (lazy start, park on last unsubscribe, reconnect), and the
-// SubscribeRs485Rx handler glue, against an in-memory fake camera-daemon.
+// validation/clamping, fan-out drop policies, the single-shared-upstream
+// lifecycle (lazy start, park on last unsubscribe, prompt reopen on
+// resubscribe and after an upstream loss, slow cadence when the upstream
+// rejects the stream), and the SubscribeRs485Rx handler glue, against an
+// in-memory fake camera-daemon.
 
 import (
 	"context"
@@ -35,31 +37,68 @@ func TestRs485HubSubscribeValidation(t *testing.T) {
 	if _, err := h.subscribe(4, true); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("want FailedPrecondition with nil client, got %v", err)
 	}
-	if rs485DefaultQueueSize != 16 || rs485MaxQueueSize != 128 {
-		t.Fatalf("unexpected clamp bounds: %d..%d", rs485DefaultQueueSize, rs485MaxQueueSize)
+}
+
+func TestRs485HubClampsQueueSize(t *testing.T) {
+	h, _ := newTestHub(t, 0)
+
+	def, err := h.subscribe(0, true)
+	if err != nil {
+		t.Fatalf("subscribe(0): %v", err)
+	}
+	big, err := h.subscribe(200, false)
+	if err != nil {
+		t.Fatalf("subscribe(200): %v", err)
+	}
+	small, err := h.subscribe(5, true)
+	if err != nil {
+		t.Fatalf("subscribe(5): %v", err)
+	}
+	if cap(def.ch) != 16 || cap(big.ch) != 128 || cap(small.ch) != 5 {
+		t.Fatalf("queue clamps: want 16/128/5, got %d/%d/%d",
+			cap(def.ch), cap(big.ch), cap(small.ch))
+	}
+	if !def.dropOld || big.dropOld {
+		t.Fatalf("drop_old not carried through: %v/%v", def.dropOld, big.dropOld)
 	}
 }
 
 // ---- fake camera-daemon ----------------------------------------------------
 
+// fakeCameraDaemon stands in for camera-daemon's SubscribeRs485Rx: it pushes
+// `burst` frames when a stream opens, then holds the stream until the client
+// goes away or the test kills it.
 type fakeCameraDaemon struct {
 	camerapb.UnimplementedCameraControlServer
 
-	mu      sync.Mutex
-	opens   int
-	streams []chan struct{} // one closer chan per open stream
+	mu     sync.Mutex
+	opens  int   // SubscribeRs485Rx calls seen
+	closes int   // streams that ended
+	burst  int   // frames pushed when a stream opens
+	reject error // when set, every stream fails with this error
+	kill   chan struct{}
+}
+
+func newFakeCameraDaemon(burst int) *fakeCameraDaemon {
+	return &fakeCameraDaemon{burst: burst, kill: make(chan struct{})}
 }
 
 func (f *fakeCameraDaemon) SubscribeRs485Rx(_ *camerapb.Empty,
 	stream camerapb.CameraControl_SubscribeRs485RxServer) error {
 	f.mu.Lock()
 	f.opens++
-	closer := make(chan struct{})
-	f.streams = append(f.streams, closer)
+	kill, reject, burst := f.kill, f.reject, f.burst
 	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.closes++
+		f.mu.Unlock()
+	}()
 
-	// Deliver 3 frames, then hold the stream open until cancelled.
-	for i := 0; i < 3; i++ {
+	if reject != nil {
+		return reject
+	}
+	for i := 0; i < burst; i++ {
 		if err := stream.Send(&camerapb.Rs485RxEvent{
 			Data:        []byte{byte('a' + i)},
 			TimestampNs: uint64(i + 1),
@@ -67,19 +106,36 @@ func (f *fakeCameraDaemon) SubscribeRs485Rx(_ *camerapb.Empty,
 			return err
 		}
 	}
-	<-closer
+	select {
+	case <-kill:
+	case <-stream.Context().Done():
+	}
 	return stream.Context().Err()
 }
 
-func (f *fakeCameraDaemon) openCount() int {
+// killStreams ends every open stream the way a camera-daemon restart would.
+func (f *fakeCameraDaemon) killStreams() {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.opens
+	close(f.kill)
+	f.kill = make(chan struct{})
+	f.mu.Unlock()
 }
 
-func newFakeCameraDaemonClient(t *testing.T) (camerapb.CameraControlClient, *fakeCameraDaemon) {
+func (f *fakeCameraDaemon) setReject(err error) {
+	f.mu.Lock()
+	f.reject = err
+	f.mu.Unlock()
+}
+
+func (f *fakeCameraDaemon) counts() (opens, closes int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.opens, f.closes
+}
+
+func newFakeCameraDaemonClient(t *testing.T, burst int) (camerapb.CameraControlClient, *fakeCameraDaemon) {
 	t.Helper()
-	fake := &fakeCameraDaemon{}
+	fake := newFakeCameraDaemon(burst)
 	lis := bufconn.Listen(1024 * 1024)
 	srv := grpc.NewServer()
 	camerapb.RegisterCameraControlServer(srv, fake)
@@ -99,18 +155,56 @@ func newFakeCameraDaemonClient(t *testing.T) (camerapb.CameraControlClient, *fak
 	return camerapb.NewCameraControlClient(conn), fake
 }
 
-// ---- end-to-end through the pump ------------------------------------------
+// ---- harness ---------------------------------------------------------------
 
-func TestRs485HubEndToEndSingleUpstream(t *testing.T) {
-	client, fake := newFakeCameraDaemonClient(t)
+const rs485TestRetry = 10 * time.Millisecond
+
+// newTestHub returns a started hub against a fake upstream, on a lifecycle
+// context cancelled when the test ends.
+func newTestHub(t *testing.T, burst int) (*rs485Hub, *fakeCameraDaemon) {
+	t.Helper()
+	client, fake := newFakeCameraDaemonClient(t, burst)
 	h := newRs485Hub(client)
-	h.backoffBase = 10 * time.Millisecond
-	h.backoffMax = 40 * time.Millisecond
+	h.retryInterval = rs485TestRetry
+	h.slowRetryInterval = 10 * time.Second
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 	h.Start(ctx)
+	return h, fake
+}
 
-	// Two subscribers share ONE upstream stream.
+// waitFor polls cond until it holds or the (generous) deadline passes.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func readN(t *testing.T, s *rs485Sub, n int) []*pb.Rs485RxEvent {
+	t.Helper()
+	var out []*pb.Rs485RxEvent
+	deadline := time.After(3 * time.Second)
+	for len(out) < n {
+		select {
+		case ev := <-s.ch:
+			out = append(out, ev)
+		case <-deadline:
+			t.Fatalf("want %d frames, got %d", n, len(out))
+		}
+	}
+	return out
+}
+
+// ---- lifecycle -------------------------------------------------------------
+
+func TestRs485HubSharesOneUpstreamAndParksWhenIdle(t *testing.T) {
+	h, fake := newTestHub(t, 3)
+
 	subA, err := h.subscribe(8, true)
 	if err != nil {
 		t.Fatalf("subscribe A: %v", err)
@@ -120,72 +214,193 @@ func TestRs485HubEndToEndSingleUpstream(t *testing.T) {
 		t.Fatalf("subscribe B: %v", err)
 	}
 
-	readN := func(s *rs485Sub, n int, timeout time.Duration) []*pb.Rs485RxEvent {
-		var out []*pb.Rs485RxEvent
-		deadline := time.After(timeout)
-		for len(out) < n {
-			select {
-			case ev := <-s.ch:
-				out = append(out, ev)
-			case <-deadline:
-				return out
-			}
-		}
-		return out
-	}
-
-	got := readN(subA, 3, 3*time.Second)
-	if len(got) != 3 {
-		t.Fatalf("subscriber A: want 3 frames, got %d", len(got))
-	}
+	// Two subscribers share ONE upstream stream and both see its frames.
+	got := readN(t, subA, 3)
 	if got[0].Data[0] != 'a' || got[2].Data[0] != 'c' || got[2].TimestampNs != 3 {
 		t.Fatalf("subscriber A: unexpected payloads: %+v", got)
 	}
-	if gotB := readN(subB, 3, time.Second); len(gotB) != 3 {
+	if gotB := readN(t, subB, 3); len(gotB) != 3 {
 		t.Fatalf("subscriber B: want 3 frames, got %d", len(gotB))
 	}
-
-	// Allow the lazy pump + reconnect timing to settle, then require that
-	// exactly one upstream stream was opened for both subscribers.
-	time.Sleep(150 * time.Millisecond)
-	if n := fake.openCount(); n != 1 {
-		t.Fatalf("want exactly 1 upstream open for 2 subscribers, got %d", n)
+	if opens, _ := fake.counts(); opens != 1 {
+		t.Fatalf("want exactly 1 upstream open for 2 subscribers, got %d", opens)
 	}
 
-	// Last unsubscribe parks the pump (upstream cancelled, no new opens).
+	// Last unsubscribe closes the upstream; an idle hub stays parked.
 	h.unsubscribe(subA)
 	h.unsubscribe(subB)
-	time.Sleep(150 * time.Millisecond)
-	if n := fake.openCount(); n != 1 {
-		t.Fatalf("park: upstream reopened while idle (opens=%d)", n)
+	waitFor(t, "upstream closed after the last unsubscribe", func() bool {
+		_, closes := fake.counts()
+		return closes == 1
+	})
+	time.Sleep(10 * rs485TestRetry)
+	if opens, _ := fake.counts(); opens != 1 {
+		t.Fatalf("parked hub reopened its upstream (opens=%d)", opens)
 	}
 
-	// A new subscriber restarts the upstream exactly once more.
+	// A new subscriber reopens it exactly once more.
 	subC, err := h.subscribe(8, true)
 	if err != nil {
 		t.Fatalf("subscribe C: %v", err)
 	}
-	if got := readN(subC, 3, 3*time.Second); len(got) != 3 {
-		t.Fatalf("subscriber C after park: want 3 frames, got %d", len(got))
-	}
-	if n := fake.openCount(); n != 2 {
-		t.Fatalf("want 2 upstream opens total, got %d", n)
+	readN(t, subC, 3)
+	if opens, _ := fake.counts(); opens != 2 {
+		t.Fatalf("want 2 upstream opens total, got %d", opens)
 	}
 	h.unsubscribe(subC)
+}
+
+func TestRs485HubResubscribeReopensWithoutWaitingOutRetry(t *testing.T) {
+	// Regression: a subscriber arriving while the pump is parked or waiting
+	// to retry must reopen the upstream at once. Frames arriving before the
+	// reopen never reach a subscriber policy, so a missed wake — or a backoff
+	// grown by earlier cycles — is a silent blind window. The retry timer is
+	// far beyond the deadline, so only the wake can make this pass.
+	h, fake := newTestHub(t, 3)
+	h.retryInterval = 10 * time.Second
+
+	for cycle := 1; cycle <= 3; cycle++ {
+		subA, err := h.subscribe(8, true)
+		if err != nil {
+			t.Fatalf("cycle %d subscribe A: %v", cycle, err)
+		}
+		readN(t, subA, 3) // busy stream: frames were just delivered
+		h.unsubscribe(subA)
+		// Every earlier cycle closed two streams; this cycle's first one
+		// must be closed too before the resubscribe.
+		wantCloses := 2*(cycle-1) + 1
+		waitFor(t, "upstream closed", func() bool {
+			_, closes := fake.counts()
+			return closes >= wantCloses
+		})
+
+		subB, err := h.subscribe(8, true)
+		if err != nil {
+			t.Fatalf("cycle %d subscribe B: %v", cycle, err)
+		}
+		// Must not wait out the 10 s retry timer: readN's own deadline is
+		// the bound.
+		readN(t, subB, 3)
+		if opens, _ := fake.counts(); opens != 2*cycle {
+			t.Fatalf("cycle %d: want %d upstream opens, got %d", cycle, 2*cycle, opens)
+		}
+		h.unsubscribe(subB)
+	}
+}
+
+func TestRs485HubResubscribeOnIdleUpstreamReopensAtOnce(t *testing.T) {
+	// Same property for a stream that never carried a frame.
+	h, fake := newTestHub(t, 0)
+	h.retryInterval = 10 * time.Second
+
+	subA, err := h.subscribe(8, true)
+	if err != nil {
+		t.Fatalf("subscribe A: %v", err)
+	}
+	waitFor(t, "first upstream open", func() bool {
+		opens, _ := fake.counts()
+		return opens == 1
+	})
+	h.unsubscribe(subA)
+	waitFor(t, "upstream closed", func() bool {
+		_, closes := fake.counts()
+		return closes == 1
+	})
+
+	start := time.Now()
+	subB, err := h.subscribe(8, true)
+	if err != nil {
+		t.Fatalf("subscribe B: %v", err)
+	}
+	waitFor(t, "reopened upstream", func() bool {
+		opens, _ := fake.counts()
+		return opens == 2
+	})
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("resubscribe on an idle stream waited %v", elapsed)
+	}
+	h.unsubscribe(subB)
+}
+
+func TestRs485HubReopensAfterUpstreamLoss(t *testing.T) {
+	h, fake := newTestHub(t, 3)
+
+	sub, err := h.subscribe(8, true)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	readN(t, sub, 3)
+
+	// The subscriber stays; only the upstream dies (camera-daemon restart).
+	fake.killStreams()
+	readN(t, sub, 3) // frames from the reopened stream
+	waitFor(t, "upstream reopened", func() bool {
+		opens, _ := fake.counts()
+		return opens == 2
+	})
+	h.unsubscribe(sub)
+}
+
+func TestRs485HubNewSubscriberInterruptsRetryWait(t *testing.T) {
+	// Regression for the non-interruptible backoff, on the path the tests
+	// above do not reach: here the pump is INSIDE the retry wait (upstream
+	// lost while a subscriber stayed) when the new subscriber arrives. It
+	// must abandon the wait rather than let the newcomer sit out the timer.
+	h, fake := newTestHub(t, 3)
+	h.retryInterval = 10 * time.Second
+
+	subA, err := h.subscribe(8, true)
+	if err != nil {
+		t.Fatalf("subscribe A: %v", err)
+	}
+	readN(t, subA, 3)
+
+	fake.killStreams() // upstream lost; A stays subscribed
+	waitFor(t, "lost upstream to close", func() bool {
+		_, closes := fake.counts()
+		return closes >= 1
+	})
+	time.Sleep(10 * rs485TestRetry) // let the pump settle into the retry wait
+
+	subB, err := h.subscribe(8, true)
+	if err != nil {
+		t.Fatalf("subscribe B: %v", err)
+	}
+	readN(t, subB, 3) // frames only exist once the upstream has been reopened
+	h.unsubscribe(subA)
+	h.unsubscribe(subB)
+}
+
+func TestRs485HubBacksOffWhenUpstreamRejectsStream(t *testing.T) {
+	// A unit that cannot serve RS-485 (no MCU link) or an old camera-daemon
+	// rejects every attempt: keep retrying, but not at the fast cadence and
+	// not at a warning per attempt.
+	h, fake := newTestHub(t, 0)
+	fake.setReject(status.Error(codes.FailedPrecondition, "RS485 HAL not loaded"))
+
+	sub, err := h.subscribe(8, true)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	waitFor(t, "first rejected attempt", func() bool {
+		opens, _ := fake.counts()
+		return opens == 1
+	})
+	time.Sleep(20 * rs485TestRetry) // many fast intervals
+	if opens, _ := fake.counts(); opens != 1 {
+		t.Fatalf("rejected upstream retried at the fast cadence (opens=%d)", opens)
+	}
+	h.unsubscribe(sub)
 }
 
 // ---- drop policy via fanout -------------------------------------------------
 
 func TestRs485HubFanoutDropPolicies(t *testing.T) {
-	h := newRs485Hub(nil)
-	h.Start(context.Background())
+	h, _ := newTestHub(t, 0)
 
 	oldSub := &rs485Sub{ch: make(chan *pb.Rs485RxEvent, 2), dropOld: true}
 	newSub := &rs485Sub{ch: make(chan *pb.Rs485RxEvent, 2), dropOld: false}
 	h.mu.Lock()
-	if h.subs == nil {
-		h.subs = make(map[*rs485Sub]struct{})
-	}
 	h.subs[oldSub] = struct{}{}
 	h.subs[newSub] = struct{}{}
 	h.mu.Unlock()
@@ -236,14 +451,11 @@ func (f *fakeRs485Stream) SendMsg(m interface{}) error     { return nil }
 func (f *fakeRs485Stream) RecvMsg(m interface{}) error     { return nil }
 
 func TestSubscribeRs485RxHandler(t *testing.T) {
-	client, _ := newFakeCameraDaemonClient(t)
-	srv := &DeviceControlServer{rs485: newRs485Hub(client)}
-	srv.rs485.backoffBase = 10 * time.Millisecond
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	srv.rs485.Start(ctx)
+	h, _ := newTestHub(t, 3)
+	srv := &DeviceControlServer{rs485: h}
 
 	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
 	fs := &fakeRs485Stream{ctx: streamCtx, received: make(chan *pb.Rs485RxEvent, 16)}
 
 	errCh := make(chan error, 1)
