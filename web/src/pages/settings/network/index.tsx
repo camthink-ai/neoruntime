@@ -26,6 +26,7 @@ import {
 import { toast } from 'sonner';
 import { NetworkSkeleton } from './components/NetworkSkeleton';
 import CellularPanel from './components/CellularPanel';
+import { localizeBackendMessage } from './components/backendMessages';
 import ErrorState from '@/components/ErrorState';
 import {
   AlertDialog,
@@ -175,7 +176,7 @@ function WiredNetworkPanel() {
       queryClient.invalidateQueries({ queryKey: ['networkConfig'] });
     },
     onError: (err: Error) => {
-      toast.error(err.message || t('common.error'));
+      toast.error(localizeBackendMessage(err.message, t) || t('common.error'));
     },
   });
 
@@ -266,7 +267,9 @@ function WiredNetworkPanel() {
                 onValueChange={(value: 'dhcp' | 'static') => setFormData({ ...formData, mode: value })}
               >
                 <SelectTrigger className="w-full">
-                  <SelectValue placeholder="Select mode" />
+                  <SelectValue
+                    placeholder={t('sys.network.mode_placeholder', 'Select mode')}
+                  />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="dhcp">

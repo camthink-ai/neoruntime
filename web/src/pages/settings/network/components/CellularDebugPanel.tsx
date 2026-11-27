@@ -24,6 +24,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { toast } from 'sonner';
+import { localizeBackendMessage } from './backendMessages';
 
 type Props = {
   iface?: string;
@@ -83,12 +84,13 @@ export default function CellularDebugPanel({ iface = '', disabled }: Props) {
         count: 4,
         iface: iface.trim() || undefined,
       });
-      setPingOut(res.output || res.message || '');
+      setPingOut(res.output || localizeBackendMessage(res.message, t) || '');
       if (!res.ok) {
-        toast.error(res.message || t('common.error'));
+        toast.error(localizeBackendMessage(res.message, t) || t('common.error'));
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : t('common.error');
+      const msg =        localizeBackendMessage(err instanceof Error ? err.message : null, t)
+        || t('common.error');
       setPingOut(msg);
       toast.error(msg);
     } finally {
@@ -101,12 +103,13 @@ export default function CellularDebugPanel({ iface = '', disabled }: Props) {
     setAtOut('');
     try {
       const res = await sendCellularAT(atCmd.trim());
-      setAtOut(res.response || res.message || '');
+      setAtOut(res.response || localizeBackendMessage(res.message, t) || '');
       if (!res.ok) {
-        toast.error(res.message || t('common.error'));
+        toast.error(localizeBackendMessage(res.message, t) || t('common.error'));
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : t('common.error');
+      const msg =        localizeBackendMessage(err instanceof Error ? err.message : null, t)
+        || t('common.error');
       setAtOut(msg);
       toast.error(msg);
     } finally {
@@ -119,7 +122,7 @@ export default function CellularDebugPanel({ iface = '', disabled }: Props) {
     try {
       const res = await startCellularQLog();
       if (!res.ok) {
-        toast.error(res.message || t('common.error'));
+        toast.error(localizeBackendMessage(res.message, t) || t('common.error'));
         await refreshQLog();
         return;
       }
@@ -136,7 +139,10 @@ export default function CellularDebugPanel({ iface = '', disabled }: Props) {
       );
       await refreshQLog();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t('common.error'));
+      toast.error(
+        localizeBackendMessage(err instanceof Error ? err.message : null, t)
+          || t('common.error')
+      );
     } finally {
       setQlogAction(null);
     }
@@ -148,7 +154,7 @@ export default function CellularDebugPanel({ iface = '', disabled }: Props) {
       const res = await stopCellularQLog();
       if (!res.ok) {
         toast.error(
-          res.message
+          localizeBackendMessage(res.message, t)
             || t(
               'sys.cellular.debug_qlog_stop_stuck',
               'QLog did not exit; retry or toggle cellular power'
@@ -186,7 +192,10 @@ export default function CellularDebugPanel({ iface = '', disabled }: Props) {
         );
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t('common.error'));
+      toast.error(
+        localizeBackendMessage(err instanceof Error ? err.message : null, t)
+          || t('common.error')
+      );
     } finally {
       setQlogAction(null);
     }
@@ -198,7 +207,10 @@ export default function CellularDebugPanel({ iface = '', disabled }: Props) {
       await downloadCellularQLog();
       toast.success(t('sys.cellular.debug_qlog_exported', 'QLog exported'));
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t('common.error'));
+      toast.error(
+        localizeBackendMessage(err instanceof Error ? err.message : null, t)
+          || t('common.error')
+      );
     } finally {
       setQlogAction(null);
     }
@@ -209,7 +221,7 @@ export default function CellularDebugPanel({ iface = '', disabled }: Props) {
     try {
       const res = await clearCellularQLog();
       if (!res.ok) {
-        toast.error(res.message || t('common.error'));
+        toast.error(localizeBackendMessage(res.message, t) || t('common.error'));
       } else {
         toast.success(
           t('sys.cellular.debug_qlog_cleared', 'QLog files cleared')
@@ -217,7 +229,10 @@ export default function CellularDebugPanel({ iface = '', disabled }: Props) {
       }
       await refreshQLog();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t('common.error'));
+      toast.error(
+        localizeBackendMessage(err instanceof Error ? err.message : null, t)
+          || t('common.error')
+      );
     } finally {
       setQlogAction(null);
     }

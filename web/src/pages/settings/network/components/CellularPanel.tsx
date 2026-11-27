@@ -64,6 +64,7 @@ import {
 } from './cellularPanelUi';
 import GnssMap from './GnssMap';
 import CellularDebugPanel from './CellularDebugPanel';
+import { localizeBackendMessage, regStateLabel } from './backendMessages';
 import { parseGnssFix } from './gnssGeo';
 import { fetchGnssPlaceName } from './gnssPlace';
 
@@ -135,7 +136,7 @@ export default function CellularPanel() {
               'sys.cellular.enable_no_module',
               'No cellular module detected. Cellular has been turned off.'
             )
-          : msg
+          : localizeBackendMessage(msg, t)
       );
       queryClient
         .refetchQueries({ queryKey: ['cellularStatus'] })
@@ -224,7 +225,9 @@ export default function CellularPanel() {
       };
       return {
         ...cleared,
-        message: enabled ? 'Powering module…' : 'Cellular is disabled.',
+        message: enabled
+          ? t('sys.cellular.process_powering', 'Powering module…')
+          : t('sys.cellular.msg_disabled', 'Cellular is disabled.'),
       };
     });
   };
@@ -435,7 +438,7 @@ export default function CellularPanel() {
                         <span>{dash(status?.network)}</span>
                         {status?.reg_state && status.reg_state !== 'unknown' ? (
                           <span className="text-[10px] font-normal uppercase tracking-wide text-muted-foreground">
-                            {status.reg_state.replace(/_/g, ' ')}
+                            {regStateLabel(status.reg_state, t)}
                           </span>
                         ) : null}
                       </span>
@@ -557,7 +560,8 @@ export default function CellularPanel() {
                   </div>
                   {(placeQuery.data?.trim() || gnss?.message) && (
                     <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
-                      {placeQuery.data?.trim() || gnss?.message}
+                      {placeQuery.data?.trim()
+                        || localizeBackendMessage(gnss?.message, t)}
                     </p>
                   )}
                   <GnssMap

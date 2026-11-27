@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { cn } from '@/lib/utils';
 import type { LucideIcon } from 'lucide-react';
+import { localizeBackendMessage } from './backendMessages';
 
 export function SignalBars({
   rsrp,
@@ -172,9 +173,9 @@ export function processStatusText(
   if (status?.connected) return null;
   if (msg) {
     const busy =      /dialer running|auto-dial will start|waiting for data|re-reading|preparing|no sim detected/i.test(
-        msg
-      );
-    return { text: msg, busy };
+      msg
+    );
+    return { text: localizeBackendMessage(msg, t), busy };
   }
   if (!status?.module_present) {
     return {
