@@ -6759,11 +6759,16 @@ static bool reconfigure_is_light_eligible(const config_profile_t &prev_p,
  * set_override_parameters(), which mitigates the VCEnc -3 stride stall that
  * encoder_input_layout_changed() otherwise guards against with a full reinit.
  *
- * Eligibility is reconfigure_is_light_eligible(prev_p, p): resolution and
- * framerate deltas ARE eligible (the vendor's set_override_parameters handles
- * them with internal stop/start, ~1-2s vs ~5-6s for full reinit). Codec and
- * bitrate/GOP deltas are NOT eligible (codec is fake-success on medialib
- * 1.13; bitrate/GOP go through the existing in-place path).
+ * Eligibility is reconfigure_is_light_eligible(prev_p, p) AND
+ * ml_stream_restart_required(prev_p, p): resolution and framerate deltas ARE
+ * eligible only when the vendor's set_override_parameters handles them with
+ * its internal stop/start (~1-2s vs ~5-6s for full reinit). When the stream
+ * being changed leaves a resolution another stream still uses, that predicate
+ * stays false and the vendor would reconfigure the LIVE encoder instead -
+ * refused here, the caller takes the full reinit (2026-11-27 VCEnc -3 black
+ * screens). Codec and bitrate/GOP deltas are NOT eligible (codec is
+ * fake-success on medialib 1.13; bitrate/GOP go through the existing in-place
+ * path).
  *
  * Safety: feeds are suspended for ALL streams before the loop and resumed
  * by FeedResumeGuard on every exit path. A 5s cooldown paces repeated
@@ -6784,6 +6789,17 @@ static int try_light_reconfigure(HalMediaContext *hm, Hailo15MediaPriv *priv,
     if (!reconfigure_is_light_eligible(prev_p, p))
     {
         return HAL_OK; /* codec/bitrate/gop changed — caller takes the heavy path */
+    }
+
+    /* Caller invariant, enforced here: the vendor only stop/starts the
+     * pipeline when MediaLibrary::stream_restart_required() fires. Without
+     * that restart this path is update_stride() on a running encoder - the
+     * VCEnc -3 garbage-stream failure. Never run it in that state. */
+    if (!ml_stream_restart_required(prev_p, p))
+    {
+        HAL_LOG_INFO("hailo15_media: light path refused: the vendor would not restart the "
+                     "pipeline for this change — heavy path instead");
+        return HAL_OK; /* not attempted; caller takes the heavy path */
     }
 
     /* Cooldown: the vendor's internal stop/start leaves dataflow threads
@@ -7085,13 +7101,36 @@ static int hailo15_media_reconfigure_pipeline(void *media_ctx, const HalPipeline
      * deltas it takes the restart level (stop_pipeline → apply → start),
      * draining all dataflow threads before touching state — the safety the
      * old HAL light path lacked. Running pipelines are therefore eligible.
+     *
+     * That restart happens ONLY when MediaLibrary::stream_restart_required()
+     * is true (mirrored by ml_stream_restart_required), and that predicate
+     * matches output resolutions by DIMENSIONS, not by stream id. When the
+     * stream being changed leaves a resolution another stream still uses
+     * (main 1280x720 -> anything else while sub stays 1280x720), every
+     * previous row still finds a dimension-equal row, the predicate stays
+     * false and the vendor keeps the pipeline RUNNING - medialib 1.13.0 logs
+     * "Recreating encoders due to profile change" with no "Restarting
+     * pipeline". The live HEVC instance then rejects the new geometry in
+     * update_stride() (VCEncSetPreProcessing "Invalid cropping values", error
+     * -3) AFTER set_override_parameters() already returned SUCCESS: the
+     * read-back verify passes, the stream emits constant-size garbage packets
+     * until the process restarts, and the next stop of that encoder
+     * double-frees inside VCEncRelease (SIGABRT). Measured on a bench unit
+     * 2026-11-27: all 8 such switches lost the stream, and 4 of the 6
+     * operations that followed crashed the daemon.
+     *
+     * So the light path additionally requires vendor_restarts: an encoder
+     * layout change with no vendor restart goes straight to the full reinit,
+     * which applies the geometry at encoder creation.
+     *
      * Only layout-level changes (stream add/remove) and full_reinit_required
      * conditions outside the light path's scope still go heavy. */
     const bool pipeline_running = priv->media_lib->get_pipeline_state() ==
         media_library_pipeline_state_t::PIPELINE_STATE_RUNNING;
     (void)pipeline_running; /* observed in the log below; gate no longer blocks on it */
+    const bool vendor_restarts = ml_stream_restart_required(prev_p, p);
     const bool full_reinit_required =
-        ml_stream_restart_required(prev_p, p) || encoder_input_layout_changed(prev_p, p);
+        vendor_restarts || encoder_input_layout_changed(prev_p, p);
     if (full_reinit_required)
     {
         /* Layout add/remove: the in-place profile `p` was derived from the live
@@ -7110,13 +7149,19 @@ static int hailo15_media_reconfigure_pipeline(void *media_ctx, const HalPipeline
             live_ids.insert(kv.first);
         }
         const bool same_stream_set = (requested_ids == live_ids);
+        /* Restart-less layout change = the live update_stride path; never
+         * light (see the vendor_restarts note above). */
+        const bool light_path_safe = same_stream_set && vendor_restarts;
         bool light_attempted = false;
         HAL_LOG_INFO("hailo15_media: reconfigure_pipeline: pipeline_running=%d, "
-                     "same_stream_set=%d — light-path eligible",
-                     pipeline_running ? 1 : 0, same_stream_set ? 1 : 0);
-        const int light_rc = (same_stream_set)
+                     "same_stream_set=%d, vendor_restarts=%d — %s",
+                     pipeline_running ? 1 : 0, same_stream_set ? 1 : 0, vendor_restarts ? 1 : 0,
+                     !same_stream_set ? "encoder set change, heavy path"
+                                      : (vendor_restarts ? "light-path eligible"
+                                                         : "encoder layout change without vendor restart, full reinit"));
+        const int light_rc = light_path_safe
                                  ? try_light_reconfigure(hm, priv, prev_p, p, reconfig, light_attempted)
-                                 : HAL_OK; /* encoder set change — heavy path below */
+                                 : HAL_OK; /* not attempted — heavy path below */
         if (light_attempted && light_rc == HAL_OK)
         {
             HAL_LOG_INFO("hailo15_media: reconfigure_pipeline: light-path success (%u streams)", reconfig->stream_count);
